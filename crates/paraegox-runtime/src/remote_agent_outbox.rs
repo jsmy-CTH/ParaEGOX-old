@@ -10,12 +10,11 @@
 use core::fmt;
 
 use paraegox_agent_contracts::control::{
-    AgentConversationControlBodyV1, AgentConversationControlV1,
-    AgentConversationOpenOutcomeV1, MAX_AGENT_CONVERSATION_CONTROL_FRAME_BYTES,
+    AgentConversationControlBodyV1, AgentConversationControlV1, AgentConversationOpenOutcomeV1,
+    MAX_AGENT_CONVERSATION_CONTROL_FRAME_BYTES,
 };
 use paraegox_agent_contracts::{
-    AgentConversationRequestV1, AgentConversationTerminalV1,
-    MAX_AGENT_CONVERSATION_FRAME_BYTES,
+    AgentConversationRequestV1, AgentConversationTerminalV1, MAX_AGENT_CONVERSATION_FRAME_BYTES,
 };
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
 use paraegox_runtime_contracts::remote_agent_access::{
@@ -30,17 +29,16 @@ pub(crate) const MAX_REMOTE_AGENT_OUTBOX_RECORDS: usize = 5;
 
 const RECORD_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.remote-agent-outbox.record.sha256.v1";
 const ZERO_DIGEST: Digest32 = Digest32::from_bytes([0; 32]);
-const PREPARED_PAYLOAD_BYTES: usize = 8
-    + MAX_AGENT_CONVERSATION_CONTROL_FRAME_BYTES
-    + MAX_AGENT_CONVERSATION_FRAME_BYTES;
+const PREPARED_PAYLOAD_BYTES: usize =
+    8 + MAX_AGENT_CONVERSATION_CONTROL_FRAME_BYTES + MAX_AGENT_CONVERSATION_FRAME_BYTES;
 const CLAIM_PAYLOAD_BYTES: usize =
     8 + MAX_REMOTE_AGENT_ACCESS_REQUEST_BYTES + MAX_REMOTE_AGENT_ACCESS_RESPONSE_BYTES;
-const MAX_REMOTE_AGENT_OUTBOX_JOURNAL_BYTES: usize =
-    MAX_REMOTE_AGENT_OUTBOX_RECORDS * REMOTE_AGENT_OUTBOX_RECORD_HEADER_BYTES
-        + PREPARED_PAYLOAD_BYTES
-        + 2 * CLAIM_PAYLOAD_BYTES
-        + MAX_AGENT_CONVERSATION_CONTROL_FRAME_BYTES
-        + MAX_AGENT_CONVERSATION_FRAME_BYTES;
+const MAX_REMOTE_AGENT_OUTBOX_JOURNAL_BYTES: usize = MAX_REMOTE_AGENT_OUTBOX_RECORDS
+    * REMOTE_AGENT_OUTBOX_RECORD_HEADER_BYTES
+    + PREPARED_PAYLOAD_BYTES
+    + 2 * CLAIM_PAYLOAD_BYTES
+    + MAX_AGENT_CONVERSATION_CONTROL_FRAME_BYTES
+    + MAX_AGENT_CONVERSATION_FRAME_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -129,10 +127,7 @@ pub(crate) enum RemoteAgentOutboxPhaseV1 {
 }
 
 pub(crate) trait RemoteAgentOutboxCommitV1 {
-    fn commit_record(
-        &mut self,
-        record: &[u8],
-    ) -> Result<(), RemoteAgentOutboxCommitFailureV1>;
+    fn commit_record(&mut self, record: &[u8]) -> Result<(), RemoteAgentOutboxCommitFailureV1>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,10 +531,7 @@ fn decode_proof_payload(
         return Err(RemoteAgentOutboxError::InvalidRecordLength);
     }
     let request_end = 8 + request_length;
-    RemoteAgentDescribeProofBytesV1::try_new(
-        &payload[8..request_end],
-        &payload[request_end..],
-    )
+    RemoteAgentDescribeProofBytesV1::try_new(&payload[8..request_end], &payload[request_end..])
 }
 
 fn decode_open_result(
