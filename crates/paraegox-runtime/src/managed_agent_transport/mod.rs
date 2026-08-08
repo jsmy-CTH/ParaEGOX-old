@@ -100,6 +100,22 @@ pub(crate) struct AgentConversationClientPortV1 {
     control_binding: ClientPortBindingV1,
 }
 
+impl AgentConversationClientPortV1 {
+    #[must_use]
+    pub(crate) fn binding_facts(&self) -> [([u8; 16], u64); 2] {
+        [
+            (
+                *self.submit_binding.binding_id().as_bytes(),
+                self.submit_binding.binding_epoch().value(),
+            ),
+            (
+                *self.control_binding.binding_id().as_bytes(),
+                self.control_binding.binding_epoch().value(),
+            ),
+        ]
+    }
+}
+
 /// Fully validated inputs for one opaque two-lane conversation port.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentConversationPortSpec {
@@ -524,7 +540,6 @@ pub struct AgentConversationClient<'fabric> {
 
 enum AgentConversationClientRouteV1 {
     Owner(AgentConversationPort),
-    Recovered(AgentConversationClientPortV1),
 }
 
 impl<'fabric> AgentConversationClient<'fabric> {
@@ -534,18 +549,6 @@ impl<'fabric> AgentConversationClient<'fabric> {
         Self {
             fabric,
             port: AgentConversationClientRouteV1::Owner(port),
-        }
-    }
-
-    /// Binds a Fabric owner reference to a descriptor-recovered request route.
-    #[must_use]
-    pub(crate) fn from_client_port_v1(
-        fabric: &'fabric FabricService,
-        port: AgentConversationClientPortV1,
-    ) -> Self {
-        Self {
-            fabric,
-            port: AgentConversationClientRouteV1::Recovered(port),
         }
     }
 
@@ -565,11 +568,6 @@ impl<'fabric> AgentConversationClient<'fabric> {
             AgentConversationClientRouteV1::Owner(port) => {
                 self.fabric
                     .request(&port.submit_binding, fabric_request_id, body, timeout)
-                    .await
-            }
-            AgentConversationClientRouteV1::Recovered(port) => {
-                self.fabric
-                    .request_client_v1(&port.submit_binding, fabric_request_id, body, timeout)
                     .await
             }
         }
@@ -680,11 +678,6 @@ impl<'fabric> AgentConversationClient<'fabric> {
             AgentConversationClientRouteV1::Owner(port) => {
                 self.fabric
                     .request(&port.control_binding, fabric_request_id, body, timeout)
-                    .await
-            }
-            AgentConversationClientRouteV1::Recovered(port) => {
-                self.fabric
-                    .request_client_v1(&port.control_binding, fabric_request_id, body, timeout)
                     .await
             }
         }

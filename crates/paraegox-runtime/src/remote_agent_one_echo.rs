@@ -560,6 +560,8 @@ mod tests {
         open_calls: usize,
         echo_calls: usize,
         observed_generations: Vec<(u64, u64, u64)>,
+        observed_profile_digests: Vec<Digest32>,
+        observed_binding_facts: Vec<[([u8; 16], u64); 2]>,
         mismatched_terminal: bool,
     }
 
@@ -571,6 +573,8 @@ mod tests {
                 open_calls: 0,
                 echo_calls: 0,
                 observed_generations: Vec::new(),
+                observed_profile_digests: Vec::new(),
+                observed_binding_facts: Vec::new(),
                 mismatched_terminal: false,
             }
         }
@@ -584,6 +588,10 @@ mod tests {
         ) -> Result<AgentConversationOpenOutcomeV1, RemoteAgentOnceTransportErrorV1> {
             self.open_calls += 1;
             self.observed_generations.push(binding.generations());
+            self.observed_profile_digests
+                .push(binding.profile().profile_digest());
+            self.observed_binding_facts
+                .push(binding.port().binding_facts());
             self.events.borrow_mut().push(Event::SendOpen);
             Ok(self.open_outcome)
         }
@@ -595,6 +603,10 @@ mod tests {
         ) -> Result<AgentConversationTerminalV1, RemoteAgentOnceTransportErrorV1> {
             self.echo_calls += 1;
             self.observed_generations.push(binding.generations());
+            self.observed_profile_digests
+                .push(binding.profile().profile_digest());
+            self.observed_binding_facts
+                .push(binding.port().binding_facts());
             self.events.borrow_mut().push(Event::SendEcho);
             if self.mismatched_terminal {
                 return AgentConversationTerminalV1::try_success(&other_echo_request(), "Echo")
@@ -798,6 +810,7 @@ mod tests {
         assert_eq!(commit.records.len(), 1);
         let recovered = RemoteAgentOutboxV1::decode(&commit.records.concat()).expect("recovery");
         assert_eq!(recovered, outbox);
+        assert_eq!(recovered.attempt_id(), [0x51; 16]);
         assert_eq!(recovered.echo_request(), &echo_request());
         assert!(matches!(
             recovered.open_request().body(),
@@ -830,6 +843,17 @@ mod tests {
         assert_eq!(
             transport.observed_generations,
             vec![(9, 10, 11), (12, 13, 14)]
+        );
+        assert_eq!(
+            transport.observed_profile_digests,
+            vec![request.profile_digest(), request.profile_digest()]
+        );
+        assert_eq!(
+            transport.observed_binding_facts,
+            vec![
+                [([0x31; 16], 3), ([0x32; 16], 4)],
+                [([0x31; 16], 3), ([0x32; 16], 4)]
+            ]
         );
         assert_eq!(verifier.controller_calls, 2);
         assert_eq!(verifier.runtime_calls, 2);
@@ -1153,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn pxoj_rejects_cross_magic_checksum_gap_and_wrong_phase() {
+    fn pxoj_rejects_cross_magic_checksum_and_record_gaps() {
         let events = Events::default();
         let mut commit = FakeCommit::new(events.clone());
         let outbox = prepared(events, &mut commit);
@@ -1178,7 +1202,7 @@ mod tests {
             Err(RemoteAgentOutboxError::RecordGap)
         );
 
-        let (request, open, _) = valid_proofs();
+        let (_, open, _) = valid_proofs();
         let mut claimed_commit = FakeCommit::new(Events::default());
         let mut claimed =
             RemoteAgentOutboxV1::try_prepare([0x61; 16], echo_request(), &mut claimed_commit)
@@ -1193,8 +1217,7 @@ mod tests {
         let first_length = claimed_commit.records[0].len();
         assert_eq!(
             RemoteAgentOutboxV1::decode(&claimed.canonical_wire()[first_length..]),
-            Err(RemoteAgentOutboxError::InvalidPhaseTransition)
+            Err(RemoteAgentOutboxError::RecordGap)
         );
-        let _ = request;
     }
 }
