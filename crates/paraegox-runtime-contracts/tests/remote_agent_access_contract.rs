@@ -40,6 +40,10 @@ const FABRIC_FIXTURE: &str =
     include_str!("../../../tests/fixtures/wire/s7_managed_fabric_successor_v1.json");
 const AGENT_STACK_FIXTURE: &str =
     include_str!("../../../tests/fixtures/wire/s7_managed_agent_stack_successor_v1.json");
+const DATA_PLANE_GOLDEN: &str =
+    include_str!("../../../tests/fixtures/wire/t2_remote_agent_data_plane_v1.json");
+const ACCESS_GOLDEN: &str =
+    include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v1.json");
 const EMPTY_PXTA: &[u8; 10] = b"PXTA\0\x01\0\0\0\0";
 const OLD_DESCRIPTOR: &[u8] = b"PXAP\0\x01bootstrap-agent-port-v1";
 const FRESH_DESCRIPTOR: &[u8] = b"PXAP\0\x01current-agent-port-v2";
@@ -71,6 +75,28 @@ fn fixture_hex_after(fixture: &str, section: &str, key: &str) -> Vec<u8> {
         .chunks_exact(2)
         .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect()
+}
+
+fn fixture_digest_after(fixture: &str, section: &str, key: &str) -> Digest32 {
+    Digest32::from_bytes(
+        fixture_hex_after(fixture, section, key)
+            .try_into()
+            .expect("32-byte fixture digest"),
+    )
+}
+
+fn fixture_u64_after(fixture: &str, section: &str, key: &str) -> u64 {
+    let section_start = fixture.find(section).expect("fixture section");
+    let key_start = fixture[section_start..]
+        .find(key)
+        .map(|offset| section_start + offset + key.len())
+        .expect("fixture key");
+    let value = fixture[key_start..]
+        .trim_start_matches(|character: char| character == ':' || character.is_whitespace());
+    let end = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    value[..end].parse().expect("fixture integer")
 }
 
 fn managed_agent_request() -> ManagedAgentStackApplyRequestV1 {
@@ -281,22 +307,20 @@ fn accepts_terminal(
 fn carrier_for(
     request: &RemoteAgentDataPlaneApplyRequestV1,
 ) -> RestrictedRuntimeApplyCarrierBindingV1 {
-    RestrictedRuntimeApplyCarrierBindingV1::try_new(
-        RestrictedRuntimeApplyCarrierBindingFieldsV1 {
-            target: request.target(),
-            runtime_principal: terminal_auth().runtime_principal(),
-            controller_principal: request.authentication().claim().principal(),
-            endpoint_ref: [0xb5; 16],
-            endpoint_generation: 11,
-            route: "paraegox/runtime/control/v1/apply",
-            controller_request_key: request.authentication().claim().key(),
-            controller_request_key_fingerprint: Digest32::from_bytes([0xb6; 32]),
-            runtime_response_key: ApplyAuthKeyRef::from_bytes([0xb7; 16]),
-            runtime_response_key_fingerprint: Digest32::from_bytes([0xb8; 32]),
-            control_transport_profile_ref: [0xb9; 16],
-            control_transport_profile_digest: Digest32::from_bytes([0xba; 32]),
-        },
-    )
+    RestrictedRuntimeApplyCarrierBindingV1::try_new(RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+        target: request.target(),
+        runtime_principal: terminal_auth().runtime_principal(),
+        controller_principal: request.authentication().claim().principal(),
+        endpoint_ref: [0xb5; 16],
+        endpoint_generation: 11,
+        route: "paraegox/runtime/control/v1/apply",
+        controller_request_key: request.authentication().claim().key(),
+        controller_request_key_fingerprint: Digest32::from_bytes([0xb6; 32]),
+        runtime_response_key: ApplyAuthKeyRef::from_bytes([0xb7; 16]),
+        runtime_response_key_fingerprint: Digest32::from_bytes([0xb8; 32]),
+        control_transport_profile_ref: [0xb9; 16],
+        control_transport_profile_digest: Digest32::from_bytes([0xba; 32]),
+    })
     .expect("restricted PXCB")
 }
 
@@ -306,8 +330,10 @@ fn access_fields(
     nonce: &[u8],
 ) -> RemoteAgentAccessRequestFieldsV1 {
     RemoteAgentAccessRequestFieldsV1 {
-        request_id: RemoteAgentAccessRequestIdV1::try_from_bytes(*request.operation_id().as_bytes())
-            .expect("PXRA request id"),
+        request_id: RemoteAgentAccessRequestIdV1::try_from_bytes(
+            *request.operation_id().as_bytes(),
+        )
+        .expect("PXRA request id"),
         target: request.target(),
         expected_runtime_store_instance_id: request.expected_runtime_store_instance_id(),
         expected_runtime_host_epoch: RUNTIME_EPOCH,
@@ -379,8 +405,8 @@ fn active_terminal_receipt(
         fresh,
     );
     fields.completion_runtime_host_epoch = completion_runtime_host_epoch;
-    let evidence = RemoteAgentDataPlaneTerminalEvidenceV1::try_new(fields)
-        .expect("active terminal evidence");
+    let evidence =
+        RemoteAgentDataPlaneTerminalEvidenceV1::try_new(fields).expect("active terminal evidence");
     RemoteAgentDataPlaneTerminalReceiptDraftV1::try_new(request, state, evidence, auth)
         .expect("active PXAU draft")
         .finalize(&[0xd3; 64])
@@ -874,10 +900,13 @@ fn pxra_apply_and_describe_round_trip_authenticate_exact_cross_pins() {
     let terminal = active_terminal_receipt(&inner, terminal_auth(), RUNTIME_EPOCH);
 
     let apply = apply_access_request(&inner, carrier.clone());
-    let decoded_apply = RemoteAgentAccessRequestV1::decode(apply.canonical_wire())
-        .expect("PXRA Apply round trip");
+    let decoded_apply =
+        RemoteAgentAccessRequestV1::decode(apply.canonical_wire()).expect("PXRA Apply round trip");
     assert_eq!(decoded_apply, apply);
-    assert_eq!(decoded_apply.request_id().as_bytes(), inner.operation_id().as_bytes());
+    assert_eq!(
+        decoded_apply.request_id().as_bytes(),
+        inner.operation_id().as_bytes()
+    );
     assert_eq!(decoded_apply.carrier(), &carrier);
     assert_eq!(
         decoded_apply
@@ -897,7 +926,10 @@ fn pxra_apply_and_describe_round_trip_authenticate_exact_cross_pins() {
         .expect("PXRA Describe round trip");
     assert_eq!(decoded_describe, describe);
     assert!(decoded_describe.apply_request().is_none());
-    assert_eq!(decoded_describe.expected_pxau_digest(), terminal.receipt_digest());
+    assert_eq!(
+        decoded_describe.expected_pxau_digest(),
+        terminal.receipt_digest()
+    );
     assert_eq!(
         decoded_describe.profile_digest(),
         inner.target_execution().profile().profile_digest(),
@@ -927,12 +959,14 @@ fn pxra_rejects_non_ed25519_inner_outer_nonce_and_principal_aliases() {
         &[0xe1; 32],
     )
     .expect("algorithm-agile base claim");
-    assert!(RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
-        non_ed25519_outer,
-        pxst,
-        inner.clone(),
-    )
-    .is_err());
+    assert!(
+        RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
+            non_ed25519_outer,
+            pxst,
+            inner.clone(),
+        )
+        .is_err()
+    );
 
     let mut same_nonce = access_fields(&inner, carrier.clone(), &[0xe1; 32]);
     same_nonce.auth_claim = ApplyRequestAuthClaim::try_new(
@@ -943,12 +977,10 @@ fn pxra_rejects_non_ed25519_inner_outer_nonce_and_principal_aliases() {
         inner.authentication().claim().nonce(),
     )
     .expect("same-nonce claim remains structurally valid");
-    assert!(RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
-        same_nonce,
-        pxst,
-        inner.clone(),
-    )
-    .is_err());
+    assert!(
+        RemoteAgentAccessRequestDraftV1::try_apply_remote_access(same_nonce, pxst, inner.clone(),)
+            .is_err()
+    );
 
     let mut zero_nonce = access_fields(&inner, carrier.clone(), &[0xe1; 32]);
     zero_nonce.auth_claim = ApplyRequestAuthClaim::try_new(
@@ -959,12 +991,10 @@ fn pxra_rejects_non_ed25519_inner_outer_nonce_and_principal_aliases() {
         &[0; 32],
     )
     .expect("base claim permits opaque zero bytes");
-    assert!(RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
-        zero_nonce,
-        pxst,
-        inner.clone(),
-    )
-    .is_err());
+    assert!(
+        RemoteAgentAccessRequestDraftV1::try_apply_remote_access(zero_nonce, pxst, inner.clone(),)
+            .is_err()
+    );
 
     let invalid_inner_claim = ApplyRequestAuthClaim::try_new(
         inner.authentication().claim().principal(),
@@ -975,24 +1005,25 @@ fn pxra_rejects_non_ed25519_inner_outer_nonce_and_principal_aliases() {
     )
     .expect("algorithm-agile inner claim");
     let invalid_inner = reissue_data_plane_request(&inner, invalid_inner_claim, &[0xc2; 64]);
-    assert!(RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
-        access_fields(&invalid_inner, carrier.clone(), &[0xe1; 32]),
-        pxst,
-        invalid_inner,
-    )
-    .is_err());
-
-    let short_inner = reissue_data_plane_request(
-        &inner,
-        inner.authentication().claim().clone(),
-        &[0xc3; 63],
+    assert!(
+        RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
+            access_fields(&invalid_inner, carrier.clone(), &[0xe1; 32]),
+            pxst,
+            invalid_inner,
+        )
+        .is_err()
     );
-    assert!(RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
-        access_fields(&short_inner, carrier.clone(), &[0xe1; 32]),
-        pxst,
-        short_inner,
-    )
-    .is_err());
+
+    let short_inner =
+        reissue_data_plane_request(&inner, inner.authentication().claim().clone(), &[0xc3; 63]);
+    assert!(
+        RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
+            access_fields(&short_inner, carrier.clone(), &[0xe1; 32]),
+            pxst,
+            short_inner,
+        )
+        .is_err()
+    );
 
     let apply_draft = RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
         access_fields(&inner, carrier.clone(), &[0xe1; 32]),
@@ -1004,22 +1035,26 @@ fn pxra_rejects_non_ed25519_inner_outer_nonce_and_principal_aliases() {
 
     let terminal = active_terminal_receipt(&inner, terminal_auth(), RUNTIME_EPOCH);
     let profile = inner.target_execution().profile();
-    assert!(RemoteAgentAccessRequestDraftV1::try_describe_remote_access(
-        access_fields(&inner, carrier.clone(), &[0xe3; 32]),
-        terminal.receipt_digest(),
-        pxst,
-        profile.profile_digest(),
-        carrier.controller_principal(),
-    )
-    .is_err());
-    assert!(RemoteAgentAccessRequestDraftV1::try_describe_remote_access(
-        access_fields(&inner, carrier.clone(), &[0xe3; 32]),
-        terminal.receipt_digest(),
-        pxst,
-        profile.profile_digest(),
-        carrier.runtime_principal(),
-    )
-    .is_err());
+    assert!(
+        RemoteAgentAccessRequestDraftV1::try_describe_remote_access(
+            access_fields(&inner, carrier.clone(), &[0xe3; 32]),
+            terminal.receipt_digest(),
+            pxst,
+            profile.profile_digest(),
+            carrier.controller_principal(),
+        )
+        .is_err()
+    );
+    assert!(
+        RemoteAgentAccessRequestDraftV1::try_describe_remote_access(
+            access_fields(&inner, carrier.clone(), &[0xe3; 32]),
+            terminal.receipt_digest(),
+            pxst,
+            profile.profile_digest(),
+            carrier.runtime_principal(),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1032,13 +1067,9 @@ fn pxrr_apply_requires_both_signatures_exact_runtime_epoch_and_runtime_principal
     assert_ne!(inner_auth.key(), carrier.runtime_response_key());
     let terminal = active_terminal_receipt(&inner, inner_auth, RUNTIME_EPOCH);
     let authenticated_terminal = terminal
-        .verify_runtime_terminal(
-            &inner,
-            inner_auth,
-            |_, _, _, _, transcript, signature| {
-                !transcript.is_empty() && signature == [0xd3; 64]
-            },
-        )
+        .verify_runtime_terminal(&inner, inner_auth, |_, _, _, _, transcript, signature| {
+            !transcript.is_empty() && signature == [0xd3; 64]
+        })
         .expect("Runtime-authenticated inner PXAU");
     let response = RemoteAgentAccessResponseDraftV1::try_apply_remote_access(
         authenticated_request,
@@ -1088,36 +1119,41 @@ fn pxrr_apply_requires_both_signatures_exact_runtime_epoch_and_runtime_principal
     assert_eq!(inner_calls.get(), 1);
     assert_eq!(outer_calls.get(), 1);
 
-    assert!(decoded
-        .verify_runtime_apply_response(
-            &request,
-            &carrier,
-            inner_auth,
-            |_, _, _, _, _, _| false,
-            |_, _, _, _, _| true,
-        )
-        .is_err());
-    assert!(decoded
-        .verify_runtime_apply_response(
-            &request,
-            &carrier,
-            inner_auth,
-            |_, _, _, _, _, _| true,
-            |_, _, _, _, _| false,
-        )
-        .is_err());
+    assert!(
+        decoded
+            .verify_runtime_apply_response(
+                &request,
+                &carrier,
+                inner_auth,
+                |_, _, _, _, _, _| false,
+                |_, _, _, _, _| true,
+            )
+            .is_err()
+    );
+    assert!(
+        decoded
+            .verify_runtime_apply_response(
+                &request,
+                &carrier,
+                inner_auth,
+                |_, _, _, _, _, _| true,
+                |_, _, _, _, _| false,
+            )
+            .is_err()
+    );
 
-    let wrong_epoch_terminal =
-        active_terminal_receipt(&inner, inner_auth, RUNTIME_EPOCH + 1);
+    let wrong_epoch_terminal = active_terminal_receipt(&inner, inner_auth, RUNTIME_EPOCH + 1);
     let wrong_epoch_marker = wrong_epoch_terminal
         .verify_runtime_terminal(&inner, inner_auth, |_, _, _, _, _, _| true)
         .expect("independently valid wrong-epoch PXAU");
-    assert!(RemoteAgentAccessResponseDraftV1::try_apply_remote_access(
-        authenticated_request,
-        wrong_epoch_marker,
-        access_response_auth(&carrier),
-    )
-    .is_err());
+    assert!(
+        RemoteAgentAccessResponseDraftV1::try_apply_remote_access(
+            authenticated_request,
+            wrong_epoch_marker,
+            access_response_auth(&carrier),
+        )
+        .is_err()
+    );
 
     let wrong_principal_auth = RemoteAgentDataPlaneTerminalAuthClaimV1::try_new(
         PrincipalRef::from_bytes([0xbc; 16]),
@@ -1131,12 +1167,14 @@ fn pxrr_apply_requires_both_signatures_exact_runtime_epoch_and_runtime_principal
     let wrong_principal_marker = wrong_principal_terminal
         .verify_runtime_terminal(&inner, wrong_principal_auth, |_, _, _, _, _, _| true)
         .expect("independently valid wrong-principal PXAU");
-    assert!(RemoteAgentAccessResponseDraftV1::try_apply_remote_access(
-        authenticated_request,
-        wrong_principal_marker,
-        access_response_auth(&carrier),
-    )
-    .is_err());
+    assert!(
+        RemoteAgentAccessResponseDraftV1::try_apply_remote_access(
+            authenticated_request,
+            wrong_principal_marker,
+            access_response_auth(&carrier),
+        )
+        .is_err()
+    );
 
     let mut epoch_tamper = response.canonical_wire().to_vec();
     epoch_tamper[159] ^= 1;
@@ -1219,4 +1257,343 @@ fn pxrr_describe_is_correlated_opaque_structure_not_capability_and_cross_rejects
         cross_response[..4].copy_from_slice(magic);
         assert!(RemoteAgentAccessResponseV1::decode(&cross_response).is_err());
     }
+}
+
+#[test]
+fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
+    let data = "\"data_plane\"";
+    let access = "\"access\"";
+    assert!(DATA_PLANE_GOLDEN.contains("\"format\": \"paraegox-t2-remote-agent-data-plane-v1\""));
+    assert!(ACCESS_GOLDEN.contains("\"format\": \"paraegox-t2-remote-agent-access-v1\""));
+    for fixture in [DATA_PLANE_GOLDEN, ACCESS_GOLDEN] {
+        assert!(fixture.contains("\"source\": \"independent Python struct/hashlib/cryptography T2 oracle\""));
+        assert!(fixture.contains(
+            "57cbe94fcd52b93b1471446c5cdf804a5536768c8f5dc03041794668e91da038"
+        ));
+        assert!(fixture.contains(
+            "d444e7914045fc4f0d914a8483dd5fadbca78e008a00bf27ae1f7fbe233be736"
+        ));
+        assert!(fixture.contains(
+            "9c1dbd62db65ac59612759633d713986d78a8a811f6a1c4629824abee74dcb74"
+        ));
+    }
+
+    let pxad_wire = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxad_hex\"");
+    let pxad = RemoteAgentDataPlaneProfileV1::decode(&pxad_wire).expect("golden PXAD");
+    assert_eq!(pxad.canonical_wire(), pxad_wire.as_slice());
+    assert_eq!(
+        pxad.profile_digest(),
+        fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"pxad_digest_hex\"")
+    );
+
+    let pxae_wire = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxae_hex\"");
+    let pxae = RemoteAgentDataPlaneProjectionV1::decode(&pxae_wire).expect("golden PXAE");
+    assert_eq!(pxae.canonical_wire(), pxae_wire.as_slice());
+    assert_eq!(
+        pxae.compatibility_digest(),
+        fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"compatibility_digest_hex\"")
+    );
+
+    let pxte_wire = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxte_v9_hex\"");
+    let pxte = RemoteAgentDataPlaneTargetExecutionV1::decode(&pxte_wire).expect("golden PXTE v9");
+    assert_eq!(pxte.canonical_wire(), pxte_wire.as_slice());
+    assert_eq!(
+        pxte.execution_digest(),
+        fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"pxte_v9_digest_hex\"")
+    );
+    assert_eq!(pxte.profile(), &pxad);
+    assert_eq!(pxte.projection(), &pxae);
+
+    let pxar_wire = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxar_v10_hex\"");
+    let pxar = RemoteAgentDataPlaneApplyRequestV1::decode(&pxar_wire).expect("golden PXAR v10");
+    assert_eq!(pxar.canonical_wire(), pxar_wire.as_slice());
+    assert_eq!(pxar.target_execution(), &pxte);
+    assert_eq!(
+        pxar.request_digest(),
+        fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"pxar_v10_digest_hex\"")
+    );
+    assert_eq!(
+        pxar.assignment_digest().value(),
+        &fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"assignment_v10_digest_hex\"")
+    );
+    let inner_transcript = fixture_hex_after(
+        DATA_PLANE_GOLDEN,
+        data,
+        "\"inner_apply_transcript_hex\"",
+    );
+    assert_eq!(
+        pxar.signing_transcript()
+            .expect("golden PXAR transcript")
+            .as_bytes(),
+        inner_transcript.as_slice(),
+    );
+    assert_eq!(
+        pxar.authentication().signature(),
+        fixture_hex_after(
+            DATA_PLANE_GOLDEN,
+            data,
+            "\"inner_apply_signature_hex\""
+        )
+    );
+
+    let pxau_wire = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxau_hex\"");
+    let pxau = RemoteAgentDataPlaneTerminalReceiptV1::decode(&pxau_wire).expect("golden PXAU");
+    assert_eq!(pxau.canonical_wire(), pxau_wire.as_slice());
+    assert_eq!(
+        pxau.receipt_digest(),
+        fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"pxau_digest_hex\"")
+    );
+    let pxau_transcript = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxau_transcript_hex\"");
+    assert_eq!(
+        pxau.signing_transcript()
+            .expect("golden PXAU transcript")
+            .as_bytes(),
+        pxau_transcript.as_slice(),
+    );
+    assert_eq!(
+        pxau.authentication_signature(),
+        fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxau_signature_hex\"")
+    );
+
+    let bootstrap_pxap = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"bootstrap_pxap_hex\"");
+    let fresh_pxap = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"fresh_pxap_hex\"");
+    let bootstrap_shared = fixture_digest_after(
+        DATA_PLANE_GOLDEN,
+        data,
+        "\"bootstrap_pxap_shared_digest_hex\"",
+    );
+    let fresh_shared = fixture_digest_after(
+        DATA_PLANE_GOLDEN,
+        data,
+        "\"fresh_pxap_shared_digest_hex\"",
+    );
+    assert_eq!(
+        runtime_agent_control_descriptor_payload_digest_v1(&bootstrap_pxap)
+            .expect("golden bootstrap PXAP digest"),
+        bootstrap_shared,
+    );
+    assert_eq!(
+        runtime_agent_control_descriptor_payload_digest_v1(&bootstrap_pxap)
+            .expect("same PXAP bytes have one shared digest"),
+        bootstrap_shared,
+    );
+    assert_eq!(
+        runtime_agent_control_descriptor_payload_digest_v1(&fresh_pxap)
+            .expect("golden fresh PXAP digest"),
+        fresh_shared,
+    );
+    assert_ne!(bootstrap_shared, fresh_shared);
+
+    let bootstrap_pxah = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"bootstrap_pxah_hex\"");
+    assert_eq!(&bootstrap_pxah[..4], b"PXAH");
+    let bootstrap_pxah_whole = fixture_digest_after(
+        DATA_PLANE_GOLDEN,
+        data,
+        "\"bootstrap_pxah_whole_digest_hex\"",
+    );
+    assert_ne!(bootstrap_pxah_whole, bootstrap_shared);
+    let cas = pxte.bootstrap_cas().expect("golden active CAS");
+    assert_eq!(
+        cas.expected_bootstrap_descriptor_receipt_digest(),
+        bootstrap_pxah_whole,
+    );
+    assert_eq!(
+        cas.expected_bootstrap_descriptor_payload_digest(),
+        bootstrap_shared,
+    );
+    let terminal_evidence = pxau.facts().evidence().fields();
+    assert_eq!(
+        terminal_evidence.echoed_bootstrap_descriptor_receipt_digest,
+        bootstrap_pxah_whole,
+    );
+    assert_eq!(
+        terminal_evidence.echoed_bootstrap_descriptor_payload_digest,
+        bootstrap_shared,
+    );
+    assert_eq!(
+        terminal_evidence.fresh_current_descriptor_payload_digest,
+        fresh_shared,
+    );
+
+    let pxcb_wire = fixture_hex_after(ACCESS_GOLDEN, access, "\"pxcb_hex\"");
+    let pxcb = RestrictedRuntimeApplyCarrierBindingV1::decode(&pxcb_wire).expect("golden PXCB");
+    assert_eq!(pxcb.canonical_wire(), pxcb_wire.as_slice());
+    assert_eq!(
+        pxcb.binding_digest(),
+        fixture_digest_after(ACCESS_GOLDEN, access, "\"pxcb_digest_hex\"")
+    );
+
+    let pxra_apply_wire = fixture_hex_after(ACCESS_GOLDEN, access, "\"pxra_apply_hex\"");
+    let pxra_apply =
+        RemoteAgentAccessRequestV1::decode(&pxra_apply_wire).expect("golden PXRA Apply");
+    assert_eq!(pxra_apply.canonical_wire(), pxra_apply_wire.as_slice());
+    assert_eq!(
+        pxra_apply_wire.len() as u64,
+        fixture_u64_after(ACCESS_GOLDEN, "\"pxra_apply\"", "\"wire_length\"")
+    );
+    assert_eq!(
+        pxra_apply.request_digest(),
+        fixture_digest_after(ACCESS_GOLDEN, "\"pxra_apply\"", "\"digest_hex\"")
+    );
+    assert_eq!(
+        pxra_apply.payload_wire_digest(),
+        fixture_digest_after(
+            ACCESS_GOLDEN,
+            "\"pxra_apply\"",
+            "\"payload_digest_hex\"",
+        )
+    );
+    assert_eq!(pxra_apply.carrier(), &pxcb);
+    assert_eq!(
+        pxra_apply
+            .apply_request()
+            .expect("golden embedded PXAR v10"),
+        &pxar,
+    );
+    let pxra_apply_transcript = fixture_hex_after(
+        ACCESS_GOLDEN,
+        "\"pxra_apply\"",
+        "\"transcript_hex\"",
+    );
+    assert_eq!(
+        pxra_apply
+            .signing_transcript()
+            .expect("golden PXRA Apply transcript")
+            .as_bytes(),
+        pxra_apply_transcript.as_slice(),
+    );
+    assert_eq!(
+        pxra_apply.authentication().signature(),
+        fixture_hex_after(ACCESS_GOLDEN, "\"pxra_apply\"", "\"signature_hex\"")
+    );
+
+    let pxra_describe_wire =
+        fixture_hex_after(ACCESS_GOLDEN, access, "\"pxra_describe_hex\"");
+    let pxra_describe = RemoteAgentAccessRequestV1::decode(&pxra_describe_wire)
+        .expect("golden PXRA Describe");
+    assert_eq!(
+        pxra_describe.canonical_wire(),
+        pxra_describe_wire.as_slice()
+    );
+    assert_eq!(
+        pxra_describe_wire.len() as u64,
+        fixture_u64_after(
+            ACCESS_GOLDEN,
+            "\"pxra_describe\"",
+            "\"wire_length\""
+        )
+    );
+    assert_eq!(
+        pxra_describe.request_digest(),
+        fixture_digest_after(ACCESS_GOLDEN, "\"pxra_describe\"", "\"digest_hex\"")
+    );
+    assert!(pxra_describe.apply_request().is_none());
+    assert_eq!(pxra_describe.expected_pxau_digest(), pxau.receipt_digest());
+    let pxra_describe_transcript = fixture_hex_after(
+        ACCESS_GOLDEN,
+        "\"pxra_describe\"",
+        "\"transcript_hex\"",
+    );
+    assert_eq!(
+        pxra_describe
+            .signing_transcript()
+            .expect("golden PXRA Describe transcript")
+            .as_bytes(),
+        pxra_describe_transcript.as_slice(),
+    );
+
+    let pxrr_apply_wire = fixture_hex_after(ACCESS_GOLDEN, access, "\"pxrr_apply_hex\"");
+    let pxrr_apply =
+        RemoteAgentAccessResponseV1::decode(&pxrr_apply_wire).expect("golden PXRR Apply");
+    assert_eq!(pxrr_apply.canonical_wire(), pxrr_apply_wire.as_slice());
+    assert_eq!(
+        pxrr_apply_wire.len() as u64,
+        fixture_u64_after(ACCESS_GOLDEN, "\"pxrr_apply\"", "\"wire_length\"")
+    );
+    assert_eq!(
+        pxrr_apply.response_digest(),
+        fixture_digest_after(ACCESS_GOLDEN, "\"pxrr_apply\"", "\"digest_hex\"")
+    );
+    assert_eq!(
+        pxrr_apply.payload_wire_digest(),
+        fixture_digest_after(
+            ACCESS_GOLDEN,
+            "\"pxrr_apply\"",
+            "\"payload_digest_hex\"",
+        )
+    );
+    assert_eq!(
+        pxrr_apply
+            .apply_receipt()
+            .expect("golden embedded PXAU"),
+        &pxau,
+    );
+    let pxrr_apply_transcript = fixture_hex_after(
+        ACCESS_GOLDEN,
+        "\"pxrr_apply\"",
+        "\"transcript_hex\"",
+    );
+    assert_eq!(
+        pxrr_apply
+            .signing_transcript()
+            .expect("golden PXRR Apply transcript")
+            .as_bytes(),
+        pxrr_apply_transcript.as_slice(),
+    );
+    assert_eq!(
+        pxrr_apply.authentication_signature(),
+        fixture_hex_after(ACCESS_GOLDEN, "\"pxrr_apply\"", "\"signature_hex\"")
+    );
+
+    let pxrr_describe_wire =
+        fixture_hex_after(ACCESS_GOLDEN, access, "\"pxrr_describe_hex\"");
+    let pxrr_describe = RemoteAgentAccessResponseV1::decode(&pxrr_describe_wire)
+        .expect("golden PXRR Describe");
+    assert_eq!(
+        pxrr_describe.canonical_wire(),
+        pxrr_describe_wire.as_slice()
+    );
+    assert_eq!(
+        pxrr_describe_wire.len() as u64,
+        fixture_u64_after(
+            ACCESS_GOLDEN,
+            "\"pxrr_describe\"",
+            "\"wire_length\""
+        )
+    );
+    assert_eq!(
+        pxrr_describe.response_digest(),
+        fixture_digest_after(ACCESS_GOLDEN, "\"pxrr_describe\"", "\"digest_hex\"")
+    );
+    assert_eq!(
+        pxrr_describe.payload_wire_digest(),
+        fixture_digest_after(
+            ACCESS_GOLDEN,
+            "\"pxrr_describe\"",
+            "\"payload_digest_hex\"",
+        )
+    );
+    assert_eq!(pxrr_describe.profile(), Some(&pxad));
+    assert_eq!(pxrr_describe.descriptor(), Some(fresh_pxap.as_slice()));
+    assert_eq!(pxrr_describe.descriptor_digest(), fresh_shared);
+    let pxrr_describe_transcript = fixture_hex_after(
+        ACCESS_GOLDEN,
+        "\"pxrr_describe\"",
+        "\"transcript_hex\"",
+    );
+    assert_eq!(
+        pxrr_describe
+            .signing_transcript()
+            .expect("golden PXRR Describe transcript")
+            .as_bytes(),
+        pxrr_describe_transcript.as_slice(),
+    );
+    assert_eq!(
+        pxrr_describe.authentication_signature(),
+        fixture_hex_after(
+            ACCESS_GOLDEN,
+            "\"pxrr_describe\"",
+            "\"signature_hex\""
+        )
+    );
 }
