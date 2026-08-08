@@ -1947,15 +1947,6 @@ impl ManagedFabricControlService {
                 self.core
                     .commit_remote_agent_descriptor_evidence(evidence)
                     .map_err(map_managed_fabric_error)?;
-                #[cfg(test)]
-                if self
-                    .core
-                    .take_remote_agent_descriptor_post_commit_reverify_failure_for_test()
-                {
-                    return Err(RuntimeControlRequestError::Internal(
-                        RuntimeBootstrapEndpointError::InvalidStartedState,
-                    ));
-                }
                 let committed = self
                     .latest_verified_remote_agent_descriptor_evidence_v1(request.carrier())
                     .await?
@@ -1985,9 +1976,18 @@ impl ManagedFabricControlService {
     /// brokered and returns the current exact PXAP and physical generations;
     /// protected provisioning supplies both retained-signature verifiers.
     pub(crate) async fn latest_verified_remote_agent_descriptor_evidence_v1(
-        &self,
+        &mut self,
         expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
     ) -> Result<RemoteAgentVerifiedDescriptorEvidenceV1<'_>, RuntimeControlRequestError> {
+        #[cfg(test)]
+        if self
+            .core
+            .take_remote_agent_descriptor_post_commit_reverify_failure_for_test()
+        {
+            return Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::InvalidStartedState,
+            ));
+        }
         validate_restricted_runtime_apply_carrier_pins(&self.provisioning, expected_carrier)
             .map_err(|error| match error {
                 RuntimeRestrictedRemoteApplyErrorV1::Rejected
