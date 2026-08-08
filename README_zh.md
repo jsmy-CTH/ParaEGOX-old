@@ -260,6 +260,42 @@ T1 本地结果依赖精确锁定的 Zenoh 1.9 中 same-session local-face 边�
 该矩阵。错误 CN peer 可在 ACL 拒绝前占用唯一 session，因此 `max_sessions = 1` 仍有可用性风险，
 但这不是认证绕过。现有证据只是单 Ubuntu 主机上的网络测试，并非真实双机 Mac process 证明。
 
+## T2-C0 持久 PXAG/PXAH descriptor evidence
+
+精确 r176 `9eb8e6a7e61d0ba6149d4313dd66bce1b2f2ff3f` 在既有 Runtime store 与同一
+`runtime.lock` 下增加一个 crate-private、有界的 PXDE v1 latest-slot ledger。每个 slot 保留逐字不变、
+已认证的 PXAG 与 PXAH、whole-PXAH receipt digest、shared-domain PXAP payload digest、active PXST
+digest、target、Runtime store instance、RuntimeHost epoch、Fabric/Agent generations、request digest、
+slot sequence、previous-slot digest 与完整 record checksum。它是单个可替换 slot，不是 append-only
+历史。
+
+对于已认证的 Describe，Runtime 会导出以精确 active PXST 为根的当前 descriptor，签出 PXAH，构造
+PXDE，并发布 mode-0600、single-link 的私有临时文件。它先同步临时文件，再重验目录、持有中的 writer
+lock、Agent-stack authority 与旧 slot identity，随后 rename、同步目录，并读回逐字一致的 strict final
+bytes。只有完成这些步骤后，endpoint 才会对所保留的双签名以及独立导出的 descriptor、PXST、
+target/store/epoch 与 generations 做 post-commit live reverification，然后返回精确 PXAH。临时文件永不
+成为 recovery candidate；publication 前失败或 rename 后 uncertainty 都会让内存 owner fail-stop，直至
+strict reopen 选择具名 final state。
+
+slot sequence 与 previous digest 只表示当前 slot 内 owner-private replacement continuity；它们
+不证明历史真实性或 anti-rollback，也不提供 durable high-water 或 key-rotation continuity。首次 PXDE
+提交后，旧 binary reopen 会 fail closed；不保证 downgrade compatibility。对同一 PXAG 的 retry 即使
+得到逐字一致的 signed PXAH，也会创建下一 sequence，并重复临时写入、file sync、rename、directory
+sync 与 readback：不保证 idempotent no-write，也不保证有界 write amplification 或 SSD
+lifetime/performance SLO。
+
+Ubuntu r176 已通过 format、Runtime all-target check、warnings-denied Clippy，以及以 `nobody` 和
+link-count-1 test binary 运行的精确 endpoint test 1/1。r174 机制基线
+`baa64655f1f15c6ec03c6ad170fc3b0bbfd1a3fc` 的七项 PXDE/store focused tests 全部通过，完整 Runtime
+suite 为 633 passed、0 failed、2 ignored。这七项 focused tests 只证明 strict codec、replacement、
+temporary-file 与注入式 rename 前后分支语义，不构成 process-abort 或 power-cut 认证。
+
+PXDE 不是 PXRA dispatcher，不是 descriptor/access capability，也不证明已部署 remote-Agent
+reachability。它不新增 authorization、live session、remote conversation/Echo、connector activation、
+reconnect/partition recovery、TUI、双机或 production-platform 声明。
+
+## T2-D0 单次 Echo owner 边界
+
 T2-D0 现在仅新增 crate-private 的 PXOJ v1 有界 codec，以及一个只处理一次精确 Open 加字面量
 `Echo` 尝试的可 fake owner。Prepared 会固定完整 attempt/request scope、只作为可信 proof scope 的
 PXCB，以及两组不同且预分配的 Describe challenge。不可 clone 的 verified bundle 会把双签名、严格

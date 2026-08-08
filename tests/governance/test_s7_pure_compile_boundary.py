@@ -24,6 +24,9 @@ REMOTE_AGENT_D0_SOURCES = (
     RUNTIME_SRC / "remote_agent_outbox.rs",
     RUNTIME_SRC / "remote_agent_one_echo.rs",
 )
+REMOTE_AGENT_DESCRIPTOR_EVIDENCE_SOURCE = RUNTIME_SRC / "remote_agent_descriptor_evidence.rs"
+RUNTIME_STORE_SOURCE = RUNTIME_SRC / "runtime_store.rs"
+RUNTIME_CONTROL_ENDPOINT_SOURCE = RUNTIME_SRC / "runtime_control_endpoint.rs"
 
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
 FORBIDDEN_RUNTIME_DEPENDENCIES = {"paraegox-deployment", "paraegox-decks"}
@@ -303,6 +306,113 @@ def test_t2_d0_remote_agent_owner_stays_private_and_fake_only() -> None:
         if str(api["module"]).replace("-", "_") == "paraegox_runtime":
             symbols = {str(symbol) for symbol in api["symbols"]}
             assert not any("RemoteAgent" in symbol or "PXOJ" in symbol for symbol in symbols)
+
+
+def test_t2_c0_descriptor_evidence_stays_private_and_documents_exact_limits() -> None:
+    library = _read_required(RUNTIME_SRC / "lib.rs")
+    evidence = _read_required(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_SOURCE)
+    store = _read_required(RUNTIME_STORE_SOURCE)
+    endpoint = _read_required(RUNTIME_CONTROL_ENDPOINT_SOURCE)
+    module = REMOTE_AGENT_DESCRIPTOR_EVIDENCE_SOURCE.stem
+
+    assert re.search(rf"(?m)^\s*mod\s+{module}\s*;\s*$", library)
+    assert not re.search(
+        rf"(?m)^\s*pub(?:\s*\([^)]*\))?\s+mod\s+{module}\s*;\s*$",
+        library,
+    )
+    assert not re.search(
+        rf"\bpub(?:\s*\([^)]*\))?\s+use\s+[^;]*\b{module}\b",
+        library,
+    )
+    assert not re.search(
+        r"(?m)^\s*pub\s+(?:const|enum|fn|mod|static|struct|trait|type|use)\b",
+        evidence,
+    )
+    assert "single-slot owner-private ledger" in evidence
+    assert "not an access grant or a PXRA" in evidence
+    assert "paraegox_runtime_contracts::remote_agent_access" not in evidence
+
+    assert 'const LOCK_FILE_NAME: &str = "runtime.lock";' in store
+    assert '"remote-agent-descriptor-evidence-v1"' in store
+    assert '".remote-agent-descriptor-evidence-v1.tmp-"' in store
+    assert "remote-agent-descriptor-evidence-v1.lock" not in store
+
+    handler = endpoint.split(
+        "async fn handle_authenticated_runtime_agent_control_request_v1", 1
+    )[1].split("/// Revalidates the latest durable Describe record", 1)[0]
+    commit_position = handler.index(".commit_remote_agent_descriptor_evidence(evidence)")
+    reverify_position = handler.index(
+        ".latest_verified_remote_agent_descriptor_evidence_v1(request.carrier())"
+    )
+    reply_position = handler.index("return Ok(response_wire)")
+    assert commit_position < reverify_position < reply_position
+
+    reverify = endpoint.split(
+        "pub(crate) async fn latest_verified_remote_agent_descriptor_evidence_v1", 1
+    )[1].split("async fn handle_authenticated_runtime_control_carrier_v1", 1)[0]
+    assert "take_remote_agent_descriptor_post_commit_reverify_failure_for_test" in reverify
+    assert "verify_remote_agent_descriptor_evidence_v1(" in reverify
+
+    governance = _load_toml(REPO_ROOT / "governance.toml")
+    runtime_rows = [
+        package
+        for package in governance["registry"]["packages"]
+        if package.get("cargo_package") == "paraegox-runtime"
+    ]
+    assert len(runtime_rows) == 1
+    runtime_row = runtime_rows[0]
+    assert {
+        str(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_SOURCE.relative_to(REPO_ROOT)),
+        str(RUNTIME_STORE_SOURCE.relative_to(REPO_ROOT)),
+        str(RUNTIME_CONTROL_ENDPOINT_SOURCE.relative_to(REPO_ROOT)),
+    }.issubset(runtime_row["first_tests"])
+    for claim in (
+        "crate-private, bounded PXDE v1 latest-slot ledger",
+        "same `runtime.lock`",
+        "byte-exact authenticated PXAG and PXAH",
+        "commit-before-reply",
+        "post-commit live reverification",
+    ):
+        assert claim in runtime_row["responsibility"]
+    for limit in (
+        "replacement continuity inside the current slot",
+        "neither historical authenticity nor anti-rollback",
+        "downgrade compatibility is not guaranteed",
+        "no idempotent no-write guarantee",
+        "not process-abort or power-cut certification",
+        "not a PXRA dispatcher",
+        "not a descriptor or access capability",
+        "not proof of deployed remote-Agent reachability",
+    ):
+        assert limit in runtime_row["current_capability_limit"]
+
+    for entrypoint in runtime_row["public_entrypoints"]:
+        assert "RemoteAgentDescriptorEvidence" not in entrypoint
+        assert "PXDE" not in entrypoint
+    for api in governance["registry"]["public_apis"]:
+        if str(api["module"]).replace("-", "_") == "paraegox_runtime":
+            symbols = {str(symbol) for symbol in api["symbols"]}
+            assert not any(
+                "RemoteAgentDescriptorEvidence" in symbol or "PXDE" in symbol
+                for symbol in symbols
+            )
+
+    readme = " ".join(_read_required(REPO_ROOT / "README.md").split())
+    for phrase in (
+        "neither historical authenticity nor anti-rollback",
+        "downgrade compatibility is not guaranteed",
+        "no idempotent no-write guarantee",
+        "not process-abort or power-cut certification",
+    ):
+        assert phrase in readme
+    readme_zh = " ".join(_read_required(REPO_ROOT / "README_zh.md").split())
+    for phrase in (
+        "不证明历史真实性或 anti-rollback",
+        "不保证 downgrade compatibility",
+        "不保证 idempotent no-write",
+        "不构成 process-abort 或 power-cut 认证",
+    ):
+        assert phrase in readme_zh
 
 
 def test_restricted_runtime_apply_send_stays_in_controller_owner_allowlist() -> None:

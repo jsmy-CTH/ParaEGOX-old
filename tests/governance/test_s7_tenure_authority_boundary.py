@@ -64,6 +64,35 @@ PUBLIC_DEVELOPER_LOCAL_SYMBOLS = {
     "run_developer_provisioned_model_agent_stack_v1",
     "deactivate_developer_fixture_model_agent_stack_v1",
     "deactivate_developer_provisioned_model_agent_stack_v1",
+    "DeveloperFixtureDistributedCoordinatorV1",
+    "DeveloperFixtureDistributedTransportV1",
+    "DeveloperFixtureDistributedTargetV1",
+    "DeveloperFixtureDistributedAgentStackInputV1",
+    "DeveloperFixtureDistributedNodeV1",
+    "PreparedDeveloperFixtureDistributedAgentStackV1",
+    "DeveloperFixtureDistributedAgentStackOutcomeV1",
+    "DeveloperFixtureDistributedAgentStackError",
+    "prepare_developer_fixture_distributed_agent_stack_v1",
+    "complete_developer_fixture_distributed_agent_stack_v1",
+}
+PUBLIC_DEVELOPER_DEPLOYMENT_SYMBOLS = {
+    "DeveloperDeploymentEnrollmentFactsFieldsV1",
+    "DeveloperDeploymentEnrollmentFactsV1",
+    "DeveloperDeploymentStartFieldsV1",
+    "DeveloperDeploymentStartInputV1",
+    "DeveloperDeploymentStartModeV1",
+    "DeveloperDeploymentOwnerV1",
+    "DeveloperDeploymentReadyV1",
+    "DeveloperDeploymentStartOutcomeV1",
+    "DeveloperDeploymentErrorV1",
+    "start_developer_deployment_v1",
+}
+PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS = {
+    "DeveloperDeploymentAgentBootstrapStartFieldsV1",
+    "DeveloperDeploymentAgentBootstrapStartInputV1",
+    "DeveloperDeploymentAgentBootstrapReadyV1",
+    "DeveloperDeploymentAgentBootstrapStartOutcomeV1",
+    "start_developer_deployment_agent_bootstrap_v1",
 }
 DEVELOPER_LOCAL_ENTRYPOINT = (
     "paraegox_deployment::{DeveloperLocalPeerIdentityV1, "
@@ -89,6 +118,31 @@ DEVELOPER_LOCAL_ENTRYPOINT = (
     "run_developer_provisioned_model_agent_stack_v1, "
     "deactivate_developer_fixture_model_agent_stack_v1, "
     "deactivate_developer_provisioned_model_agent_stack_v1}"
+)
+DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperFixtureDistributedCoordinatorV1, "
+    "DeveloperFixtureDistributedTransportV1, DeveloperFixtureDistributedTargetV1, "
+    "DeveloperFixtureDistributedAgentStackInputV1, DeveloperFixtureDistributedNodeV1, "
+    "PreparedDeveloperFixtureDistributedAgentStackV1, "
+    "DeveloperFixtureDistributedAgentStackOutcomeV1, "
+    "DeveloperFixtureDistributedAgentStackError, "
+    "prepare_developer_fixture_distributed_agent_stack_v1, "
+    "complete_developer_fixture_distributed_agent_stack_v1}"
+)
+DEVELOPER_DEPLOYMENT_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperDeploymentEnrollmentFactsFieldsV1, "
+    "DeveloperDeploymentEnrollmentFactsV1, DeveloperDeploymentStartFieldsV1, "
+    "DeveloperDeploymentStartInputV1, DeveloperDeploymentStartModeV1, "
+    "DeveloperDeploymentOwnerV1, DeveloperDeploymentReadyV1, "
+    "DeveloperDeploymentStartOutcomeV1, DeveloperDeploymentErrorV1, "
+    "start_developer_deployment_v1}"
+)
+DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperDeploymentAgentBootstrapStartFieldsV1, "
+    "DeveloperDeploymentAgentBootstrapStartInputV1, "
+    "DeveloperDeploymentAgentBootstrapReadyV1, "
+    "DeveloperDeploymentAgentBootstrapStartOutcomeV1, "
+    "start_developer_deployment_agent_bootstrap_v1}"
 )
 
 
@@ -162,6 +216,9 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
             "observe-distributed-agent-stack-nodes-once-v1 CLI"
         ),
         DEVELOPER_LOCAL_ENTRYPOINT,
+        DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT,
+        DEVELOPER_DEPLOYMENT_ENTRYPOINT,
+        DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT,
     ]
     assert package["consumers"] == [
         "paraegox-tenure-authority",
@@ -216,7 +273,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         for api in governance["public_apis"]
         if str(api["module"]).replace("-", "_") == "paraegox_deployment"
     ]
-    assert len(public_rows) == 2
+    assert len(public_rows) == 4
     public_rows_by_symbols = {
         frozenset(str(symbol) for symbol in row["symbols"]): row for row in public_rows
     }
@@ -224,6 +281,8 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
     assert set(public_rows_by_symbols) == {
         process_symbols,
         frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS),
+        frozenset(PUBLIC_DEVELOPER_DEPLOYMENT_SYMBOLS),
+        frozenset(PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS),
     }
     compatibility = public_rows_by_symbols[process_symbols]["compatibility"]
     for command in (
@@ -256,9 +315,11 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS)
     ]["compatibility"]
     assert "real durable Controller" in developer_compatibility
-    assert "Explicit PXAR9 EmptyDeactivate is permanent" in developer_compatibility
-    assert "normal launcher exit" in developer_compatibility
-    assert "Runtime joined physical Agent→Model→Fabric shutdown" in developer_compatibility
+    assert "move-only two-phase owner path" in developer_compatibility
+    assert "authentication nonce must equal the challenge query nonce byte-for-byte" in (
+        developer_compatibility
+    )
+    assert "choose no provider or credential" in developer_compatibility
 
     waiver_reasons = {
         waiver["id"]: waiver["reason"] for waiver in governance["waivers"]
@@ -493,8 +554,8 @@ def test_developer_local_restricted_endpoint_injection_is_owned_and_registered()
     )
     assert developer_api["consumers"] == ["paraegox-local"]
     assert "RuntimeDeveloperLocalConfigV1" in developer_api["symbols"]
-    assert "all-or-nothing typed restricted endpoint input" in developer_api["compatibility"]
-    assert "same session/receiver" in developer_api["compatibility"]
-    assert "not distributed Agent-stack ActiveReady" in developer_api["compatibility"]
+    assert "one all-or-nothing restricted endpoint selection" in developer_api["compatibility"]
+    assert "durable one-way cutover on the same listener" in developer_api["compatibility"]
+    assert "not distributed Agent ActiveReady" in developer_api["compatibility"]
     assert "crates/paraegox-runtime/src/runtime_developer_local.rs" in developer_api["tests"]
     assert "crates/paraegox-runtime/src/runtime_control_endpoint.rs" in developer_api["tests"]

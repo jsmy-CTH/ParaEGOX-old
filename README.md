@@ -303,6 +303,45 @@ upgrading Zenoh requires rerunning this matrix. A wrong-CN peer can occupy the s
 ACL denial, so `max_sessions = 1` remains an availability risk rather than an authentication bypass.
 The evidence is a single-Ubuntu-host network test, not proof from a real two-host Mac process.
 
+## T2-C0 durable PXAG/PXAH descriptor evidence
+
+Exact r176 `9eb8e6a7e61d0ba6149d4313dd66bce1b2f2ff3f` adds a crate-private, bounded
+PXDE v1 latest-slot ledger to the existing Runtime store under the same `runtime.lock`. Each slot
+retains the byte-exact authenticated PXAG and PXAH, the whole-PXAH receipt digest, shared-domain
+PXAP payload digest, active PXST digest, target, Runtime store instance, RuntimeHost epoch,
+Fabric/Agent generations, request digest, slot sequence, previous-slot digest, and complete-record
+checksum. It is a single replaceable slot, not an append-only history.
+
+For an authenticated Describe, Runtime exports the current descriptor rooted in the exact active
+PXST, signs the PXAH, constructs PXDE, and publishes a private mode-0600, single-link temporary file.
+It syncs the temporary file, rechecks the directory, held writer lock, Agent-stack authority and old
+slot identity, renames the file, syncs the directory, and reads back the exact strict final bytes.
+Only then does the endpoint perform post-commit live reverification of both retained signatures and
+the independently exported descriptor, PXST, target/store/epoch and generations before returning the
+exact PXAH. Temporary files are never recovery candidates. Pre-publication failure and post-rename
+uncertainty fail-stop the in-memory owner until strict reopen selects the named final state.
+
+The slot sequence and previous digest express only owner-private replacement continuity inside the
+current slot; they prove neither historical authenticity nor anti-rollback, a durable high-water, or
+key-rotation continuity. Once the first PXDE exists, an older binary fails closed on reopen, and
+downgrade compatibility is not guaranteed. Retrying the exact PXAG creates the next sequence and
+repeats the temporary write, file sync, rename, directory sync, and readback even when the signed
+PXAH is byte-identical: there is no idempotent no-write guarantee, bounded write-amplification
+guarantee, or SSD lifetime/performance SLO.
+
+Ubuntu r176 passed formatting, Runtime all-target checking, warnings-denied Clippy, and the exact
+endpoint test 1/1 as `nobody` with a link-count-1 test binary. The r174 mechanism baseline
+`baa64655f1f15c6ec03c6ad170fc3b0bbfd1a3fc` passed all seven focused PXDE/store tests and the full
+Runtime suite with 633 passed, zero failed, and two ignored. Those seven focused tests prove strict
+codec, replacement, temporary-file, and injected pre/post-rename branch semantics; they are not
+process-abort or power-cut certification.
+
+PXDE is not a PXRA dispatcher, not a descriptor or access capability, and not proof of deployed
+remote-Agent reachability. It adds no authorization, live session, remote conversation or Echo,
+connector activation, reconnect/partition recovery, TUI, two-host, or production-platform claim.
+
+## T2-D0 one-Echo owner boundary
+
 T2-D0 now adds only a crate-private PXOJ v1 bounded codec and a fakeable owner for one exact Open
 plus literal `Echo` attempt. Prepared pins the complete attempt and request scope, trusted PXCB proof
 scope, and two distinct preallocated Describe challenges. A verified, non-cloneable bundle binds both
