@@ -58,7 +58,10 @@ mod managed_agent_transport;
 #[expect(dead_code, reason = "Awaiting PXAR-v6 endpoint dispatch consumer")] // GOV-WAIVER-0001
 mod managed_fabric_runtime;
 #[cfg(unix)]
-#[expect(dead_code, reason = "Consumed with the PXAR-v6 Runtime owner")] // GOV-WAIVER-0001
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Consumed with the PXAR-v6 Runtime owner")
+)] // GOV-WAIVER-0001
 mod managed_fabric_state;
 #[cfg(unix)]
 #[expect(dead_code, reason = "Consumed by the PXAR-v9 Runtime endpoint")] // GOV-WAIVER-0001

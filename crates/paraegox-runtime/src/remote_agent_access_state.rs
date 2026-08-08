@@ -1195,9 +1195,7 @@ fn terminal_generation_is_known(
 ) -> bool {
     actual.is_none_or(|actual| {
         actual.value() <= high_water
-            && (candidate == Some(actual)
-                || predecessor == Some(actual)
-                || candidate.is_none() && predecessor.is_none())
+            && (candidate == Some(actual) || predecessor == Some(actual))
     })
 }
 
@@ -1371,11 +1369,32 @@ pub(crate) enum RemoteAgentAccessStateError {
 
 impl fmt::Display for RemoteAgentAccessStateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "remote Agent access state failed: {self:?}")
+        formatter.write_str("remote Agent access state failed: ")?;
+        match self {
+            Self::Fabric(error) => write!(formatter, "managed Fabric snapshot: {error}"),
+            Self::Predecessor(error) => {
+                write!(formatter, "managed Agent-stack predecessor: {error}")
+            }
+            Self::DescriptorEvidence(error) => {
+                write!(formatter, "remote descriptor evidence: {error}")
+            }
+            Self::TerminalContract(error) => write!(formatter, "PXAU contract: {error}"),
+            error => write!(formatter, "{error:?}"),
+        }
     }
 }
 
-impl std::error::Error for RemoteAgentAccessStateError {}
+impl std::error::Error for RemoteAgentAccessStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fabric(error) => Some(error),
+            Self::Predecessor(error) => Some(error),
+            Self::DescriptorEvidence(error) => Some(error),
+            Self::TerminalContract(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2211,6 +2230,60 @@ mod tests {
         snapshot.try_terminal_successor(phase, snapshot.generations(), authenticated)
     }
 
+    #[derive(Clone, Debug)]
+    struct PayloadRanges {
+        request: core::ops::Range<usize>,
+        fabric: core::ops::Range<usize>,
+        predecessor: core::ops::Range<usize>,
+        descriptor: core::ops::Range<usize>,
+        terminal: core::ops::Range<usize>,
+    }
+
+    fn read_u32_at(frame: &[u8], offset: usize) -> usize {
+        u32::from_be_bytes(
+            frame[offset..offset + 4]
+                .try_into()
+                .unwrap_or_else(|_| panic!("fixture length field must be four bytes")),
+        ) as usize
+    }
+
+    fn payload_ranges(frame: &[u8]) -> PayloadRanges {
+        let lengths = [32, 36, 40, 44, 48].map(|offset| read_u32_at(frame, offset));
+        let request_start = SNAPSHOT_HEADER_BYTES;
+        let fabric_start = request_start + lengths[0];
+        let predecessor_start = fabric_start + lengths[1];
+        let descriptor_start = predecessor_start + lengths[2];
+        let terminal_start = descriptor_start + lengths[3];
+        let digest_start = terminal_start + lengths[4];
+        assert_eq!(digest_start + SNAPSHOT_DIGEST_BYTES, frame.len());
+        PayloadRanges {
+            request: request_start..fabric_start,
+            fabric: fabric_start..predecessor_start,
+            predecessor: predecessor_start..descriptor_start,
+            descriptor: descriptor_start..terminal_start,
+            terminal: terminal_start..digest_start,
+        }
+    }
+
+    fn reseal(frame: &mut [u8]) {
+        let digest_start = frame
+            .len()
+            .checked_sub(SNAPSHOT_DIGEST_BYTES)
+            .unwrap_or_else(|| panic!("snapshot fixture must include its digest"));
+        let digest = snapshot_digest(&frame[..digest_start]);
+        frame[digest_start..].copy_from_slice(digest.as_bytes());
+    }
+
+    fn unique_subslice_offset(frame: &[u8], range: core::ops::Range<usize>, needle: &[u8]) -> usize {
+        let offsets = frame[range.clone()]
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(offset, candidate)| (candidate == needle).then_some(range.start + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(offsets.len(), 1, "fixture needle must occur exactly once");
+        offsets[0]
+    }
+
     #[test]
     fn prepared_roundtrips_for_both_modes_and_retains_exact_payload_order() {
         for mode in [
@@ -2528,6 +2601,250 @@ mod tests {
             agent_start
                 .try_effect_successor(RemoteAgentAccessDurablePhaseV1::ReadyObservation, swapped,),
             Err(RemoteAgentAccessStateError::InvalidGenerationSuccessor)
+        ));
+    }
+
+    #[test]
+    fn outer_wire_bounds_flags_lengths_magic_and_checksum_fail_closed() {
+        let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        let wire = snapshot.canonical_wire();
+
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(
+                &wire[..SNAPSHOT_HEADER_BYTES - 1],
+                identity(),
+            ),
+            Err(RemoteAgentAccessStateError::Truncated)
+        ));
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(
+                &vec![0; MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_BYTES + 1],
+                identity(),
+            ),
+            Err(RemoteAgentAccessStateError::FrameTooLarge)
+        ));
+
+        let mut trailing = wire.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&trailing, identity()),
+            Err(RemoteAgentAccessStateError::InvalidLength)
+        ));
+
+        let mut checksum = wire.to_vec();
+        *checksum
+            .last_mut()
+            .unwrap_or_else(|| panic!("snapshot fixture must be nonempty")) ^= 1;
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&checksum, identity()),
+            Err(RemoteAgentAccessStateError::ChecksumMismatch)
+        ));
+
+        let mut flags = wire.to_vec();
+        flags[30..32].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&flags, identity()),
+            Err(RemoteAgentAccessStateError::InvalidFlags)
+        ));
+
+        let mut false_descriptor_flag = wire.to_vec();
+        false_descriptor_flag[30..32]
+            .copy_from_slice(&SNAPSHOT_HAS_DESCRIPTOR_EVIDENCE.to_be_bytes());
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&false_descriptor_flag, identity()),
+            Err(RemoteAgentAccessStateError::InvalidFlags)
+        ));
+
+        let mut invalid_sequence = wire.to_vec();
+        invalid_sequence[30..32].copy_from_slice(&SNAPSHOT_HAS_PREVIOUS.to_be_bytes());
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&invalid_sequence, identity()),
+            Err(RemoteAgentAccessStateError::InvalidSequence)
+        ));
+
+        let mut length = wire.to_vec();
+        length[8..12].copy_from_slice(
+            &u32::try_from(wire.len() + 1)
+                .unwrap_or_else(|_| panic!("fixture length must fit u32"))
+                .to_be_bytes(),
+        );
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&length, identity()),
+            Err(RemoteAgentAccessStateError::InvalidLength)
+        ));
+
+        let mut magic = wire.to_vec();
+        magic[0] = b'Q';
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&magic, identity()),
+            Err(RemoteAgentAccessStateError::UnsupportedWire)
+        ));
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(snapshot.fabric.canonical_wire(), identity()),
+            Err(RemoteAgentAccessStateError::UnsupportedWire)
+        ));
+
+        let ranges = payload_ranges(wire);
+        let mut nested_magic = wire.to_vec();
+        nested_magic[ranges.request.start] = b'Q';
+        reseal(&mut nested_magic);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&nested_magic, identity()),
+            Err(RemoteAgentAccessStateError::InvalidNestedRequest)
+        ));
+    }
+
+    #[test]
+    fn nested_pxms_pxas_pxst_pxde_and_cas_tamper_fail_closed() {
+        let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let wire = snapshot.canonical_wire();
+        let ranges = payload_ranges(wire);
+
+        let mut pxms = wire.to_vec();
+        pxms[ranges.fabric.start + 136] ^= 1;
+        reseal(&mut pxms);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&pxms, identity()),
+            Err(RemoteAgentAccessStateError::Fabric(
+                ManagedFabricStateError::ChecksumMismatch
+            ))
+        ));
+
+        let mut pxas = wire.to_vec();
+        pxas[ranges.predecessor.start + 160] ^= 1;
+        reseal(&mut pxas);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&pxas, identity()),
+            Err(RemoteAgentAccessStateError::Predecessor(
+                ManagedAgentStackStateError::ChecksumMismatch
+            ))
+        ));
+
+        let pxst_offset = unique_subslice_offset(wire, ranges.predecessor.clone(), b"PXST");
+        let mut pxst = wire.to_vec();
+        pxst[pxst_offset + 8] ^= 1;
+        reseal(&mut pxst);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&pxst, identity()),
+            Err(RemoteAgentAccessStateError::Predecessor(
+                ManagedAgentStackStateError::ChecksumMismatch
+            ))
+        ));
+
+        assert!(!ranges.descriptor.is_empty());
+        let mut pxde = wire.to_vec();
+        pxde[ranges.descriptor.end - 1] ^= 1;
+        reseal(&mut pxde);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&pxde, identity()),
+            Err(RemoteAgentAccessStateError::DescriptorEvidence(
+                RemoteAgentDescriptorEvidenceError::ChecksumMismatch
+            ))
+        ));
+
+        let cas = inner_request(&snapshot.request)
+            .unwrap_or_else(|error| panic!("snapshot inner request rejected: {error}"))
+            .target_execution()
+            .bootstrap_cas()
+            .unwrap_or_else(|| panic!("Active fixture must retain bootstrap CAS"));
+        let cas_offset = unique_subslice_offset(
+            wire,
+            ranges.request.clone(),
+            cas.expected_active_pxft_digest().as_bytes(),
+        );
+        let mut cas_tamper = wire.to_vec();
+        cas_tamper[cas_offset] ^= 1;
+        reseal(&mut cas_tamper);
+        assert!(RemoteAgentAccessSnapshotV1::decode(&cas_tamper, identity()).is_err());
+    }
+
+    #[test]
+    fn derived_admission_generation_identity_and_terminal_shape_tamper_fail_closed() {
+        let prepared = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let wire = prepared.canonical_wire();
+
+        let mut deadline = wire.to_vec();
+        let encoded_deadline = u64::from_be_bytes(
+            deadline[324..332]
+                .try_into()
+                .unwrap_or_else(|_| panic!("deadline field must be eight bytes")),
+        );
+        deadline[324..332].copy_from_slice(&(encoded_deadline + 1).to_be_bytes());
+        reseal(&mut deadline);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&deadline, identity()),
+            Err(RemoteAgentAccessStateError::InvalidAdmission)
+        ));
+
+        let mut request_digest = wire.to_vec();
+        request_digest[332] ^= 1;
+        reseal(&mut request_digest);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&request_digest, identity()),
+            Err(RemoteAgentAccessStateError::InvalidAdmission)
+        ));
+
+        let mut generation = wire.to_vec();
+        generation[268..276].copy_from_slice(&(FABRIC_GENERATION - 1).to_be_bytes());
+        reseal(&mut generation);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&generation, identity()),
+            Err(RemoteAgentAccessStateError::InvalidGenerationShape)
+        ));
+
+        let mut wrong_identity = identity();
+        wrong_identity.owner_target_fingerprint = Digest32::from_bytes([0x58; 32]);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(wire, wrong_identity),
+            Err(RemoteAgentAccessStateError::Predecessor(
+                ManagedAgentStackStateError::IdentityMismatch
+            ))
+        ));
+
+        let ready = ready_observation(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let terminal = terminal_successor(
+            &ready,
+            RemoteAgentAccessDurablePhaseV1::ActiveReady,
+            RemoteAgentDataPlaneTerminalOutcomeV1::ActiveReady,
+        )
+        .unwrap_or_else(|error| panic!("terminal fixture rejected: {error}"));
+        let mut nonterminal_with_pxau = terminal.canonical_wire().to_vec();
+        nonterminal_with_pxau[28] = RemoteAgentAccessDurablePhaseV1::ReadyObservation as u8;
+        reseal(&mut nonterminal_with_pxau);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&nonterminal_with_pxau, identity()),
+            Err(RemoteAgentAccessStateError::InvalidTerminalShape)
+        ));
+
+        let terminal_ranges = payload_ranges(terminal.canonical_wire());
+        assert!(!terminal_ranges.terminal.is_empty());
+        let mut cross_terminal = terminal.canonical_wire().to_vec();
+        cross_terminal[terminal_ranges.terminal.start] = b'Q';
+        reseal(&mut cross_terminal);
+        assert!(matches!(
+            RemoteAgentAccessSnapshotV1::decode(&cross_terminal, identity()),
+            Err(RemoteAgentAccessStateError::TerminalContract(_))
+        ));
+    }
+
+    #[test]
+    fn recovery_decode_is_structural_and_never_mints_live_authority() {
+        let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let ranges = payload_ranges(snapshot.canonical_wire());
+        let mut structurally_resigned = snapshot.canonical_wire().to_vec();
+        structurally_resigned[ranges.request.end - 1] ^= 1;
+        reseal(&mut structurally_resigned);
+        let decoded = RemoteAgentAccessSnapshotV1::decode(&structurally_resigned, identity())
+            .unwrap_or_else(|error| panic!("structural recovery rejected: {error}"));
+        assert_ne!(decoded.request.canonical_wire(), snapshot.request.canonical_wire());
+        assert_eq!(decoded.admission, snapshot.admission);
+        assert_eq!(decoded.phase(), RemoteAgentAccessDurablePhaseV1::PreparedNoEffects);
+
+        assert!(!terminal_generation_is_known(
+            Some(generation(1)),
+            None,
+            None,
+            1,
         ));
     }
 }
