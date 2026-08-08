@@ -1266,16 +1266,20 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
     assert!(DATA_PLANE_GOLDEN.contains("\"format\": \"paraegox-t2-remote-agent-data-plane-v1\""));
     assert!(ACCESS_GOLDEN.contains("\"format\": \"paraegox-t2-remote-agent-access-v1\""));
     for fixture in [DATA_PLANE_GOLDEN, ACCESS_GOLDEN] {
-        assert!(fixture.contains("\"source\": \"independent Python struct/hashlib/cryptography T2 oracle\""));
-        assert!(fixture.contains(
-            "57cbe94fcd52b93b1471446c5cdf804a5536768c8f5dc03041794668e91da038"
-        ));
-        assert!(fixture.contains(
-            "d444e7914045fc4f0d914a8483dd5fadbca78e008a00bf27ae1f7fbe233be736"
-        ));
-        assert!(fixture.contains(
-            "9c1dbd62db65ac59612759633d713986d78a8a811f6a1c4629824abee74dcb74"
-        ));
+        assert!(
+            fixture.contains(
+                "\"source\": \"independent Python struct/hashlib/cryptography T2 oracle\""
+            )
+        );
+        assert!(
+            fixture.contains("57cbe94fcd52b93b1471446c5cdf804a5536768c8f5dc03041794668e91da038")
+        );
+        assert!(
+            fixture.contains("d444e7914045fc4f0d914a8483dd5fadbca78e008a00bf27ae1f7fbe233be736")
+        );
+        assert!(
+            fixture.contains("9c1dbd62db65ac59612759633d713986d78a8a811f6a1c4629824abee74dcb74")
+        );
     }
 
     let pxad_wire = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxad_hex\"");
@@ -1316,11 +1320,8 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
         pxar.assignment_digest().value(),
         &fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"assignment_v10_digest_hex\"")
     );
-    let inner_transcript = fixture_hex_after(
-        DATA_PLANE_GOLDEN,
-        data,
-        "\"inner_apply_transcript_hex\"",
-    );
+    let inner_transcript =
+        fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"inner_apply_transcript_hex\"");
     assert_eq!(
         pxar.signing_transcript()
             .expect("golden PXAR transcript")
@@ -1329,11 +1330,7 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
     );
     assert_eq!(
         pxar.authentication().signature(),
-        fixture_hex_after(
-            DATA_PLANE_GOLDEN,
-            data,
-            "\"inner_apply_signature_hex\""
-        )
+        fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"inner_apply_signature_hex\"")
     );
 
     let pxau_wire = fixture_hex_after(DATA_PLANE_GOLDEN, data, "\"pxau_hex\"");
@@ -1362,11 +1359,8 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
         data,
         "\"bootstrap_pxap_shared_digest_hex\"",
     );
-    let fresh_shared = fixture_digest_after(
-        DATA_PLANE_GOLDEN,
-        data,
-        "\"fresh_pxap_shared_digest_hex\"",
-    );
+    let fresh_shared =
+        fixture_digest_after(DATA_PLANE_GOLDEN, data, "\"fresh_pxap_shared_digest_hex\"");
     assert_eq!(
         runtime_agent_control_descriptor_payload_digest_v1(&bootstrap_pxap)
             .expect("golden bootstrap PXAP digest"),
@@ -1437,11 +1431,7 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
     );
     assert_eq!(
         pxra_apply.payload_wire_digest(),
-        fixture_digest_after(
-            ACCESS_GOLDEN,
-            "\"pxra_apply\"",
-            "\"payload_digest_hex\"",
-        )
+        fixture_digest_after(ACCESS_GOLDEN, "\"pxra_apply\"", "\"payload_digest_hex\"",)
     );
     assert_eq!(pxra_apply.carrier(), &pxcb);
     assert_eq!(
@@ -1450,11 +1440,8 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
             .expect("golden embedded PXAR v10"),
         &pxar,
     );
-    let pxra_apply_transcript = fixture_hex_after(
-        ACCESS_GOLDEN,
-        "\"pxra_apply\"",
-        "\"transcript_hex\"",
-    );
+    let pxra_apply_transcript =
+        fixture_hex_after(ACCESS_GOLDEN, "\"pxra_apply\"", "\"transcript_hex\"");
     assert_eq!(
         pxra_apply
             .signing_transcript()
@@ -1467,21 +1454,16 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
         fixture_hex_after(ACCESS_GOLDEN, "\"pxra_apply\"", "\"signature_hex\"")
     );
 
-    let pxra_describe_wire =
-        fixture_hex_after(ACCESS_GOLDEN, access, "\"pxra_describe_hex\"");
-    let pxra_describe = RemoteAgentAccessRequestV1::decode(&pxra_describe_wire)
-        .expect("golden PXRA Describe");
+    let pxra_describe_wire = fixture_hex_after(ACCESS_GOLDEN, access, "\"pxra_describe_hex\"");
+    let pxra_describe =
+        RemoteAgentAccessRequestV1::decode(&pxra_describe_wire).expect("golden PXRA Describe");
     assert_eq!(
         pxra_describe.canonical_wire(),
         pxra_describe_wire.as_slice()
     );
     assert_eq!(
         pxra_describe_wire.len() as u64,
-        fixture_u64_after(
-            ACCESS_GOLDEN,
-            "\"pxra_describe\"",
-            "\"wire_length\""
-        )
+        fixture_u64_after(ACCESS_GOLDEN, "\"pxra_describe\"", "\"wire_length\"")
     );
     assert_eq!(
         pxra_describe.request_digest(),
@@ -1489,11 +1471,8 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
     );
     assert!(pxra_describe.apply_request().is_none());
     assert_eq!(pxra_describe.expected_pxau_digest(), pxau.receipt_digest());
-    let pxra_describe_transcript = fixture_hex_after(
-        ACCESS_GOLDEN,
-        "\"pxra_describe\"",
-        "\"transcript_hex\"",
-    );
+    let pxra_describe_transcript =
+        fixture_hex_after(ACCESS_GOLDEN, "\"pxra_describe\"", "\"transcript_hex\"");
     assert_eq!(
         pxra_describe
             .signing_transcript()
@@ -1516,23 +1495,14 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
     );
     assert_eq!(
         pxrr_apply.payload_wire_digest(),
-        fixture_digest_after(
-            ACCESS_GOLDEN,
-            "\"pxrr_apply\"",
-            "\"payload_digest_hex\"",
-        )
+        fixture_digest_after(ACCESS_GOLDEN, "\"pxrr_apply\"", "\"payload_digest_hex\"",)
     );
     assert_eq!(
-        pxrr_apply
-            .apply_receipt()
-            .expect("golden embedded PXAU"),
+        pxrr_apply.apply_receipt().expect("golden embedded PXAU"),
         &pxau,
     );
-    let pxrr_apply_transcript = fixture_hex_after(
-        ACCESS_GOLDEN,
-        "\"pxrr_apply\"",
-        "\"transcript_hex\"",
-    );
+    let pxrr_apply_transcript =
+        fixture_hex_after(ACCESS_GOLDEN, "\"pxrr_apply\"", "\"transcript_hex\"");
     assert_eq!(
         pxrr_apply
             .signing_transcript()
@@ -1545,21 +1515,16 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
         fixture_hex_after(ACCESS_GOLDEN, "\"pxrr_apply\"", "\"signature_hex\"")
     );
 
-    let pxrr_describe_wire =
-        fixture_hex_after(ACCESS_GOLDEN, access, "\"pxrr_describe_hex\"");
-    let pxrr_describe = RemoteAgentAccessResponseV1::decode(&pxrr_describe_wire)
-        .expect("golden PXRR Describe");
+    let pxrr_describe_wire = fixture_hex_after(ACCESS_GOLDEN, access, "\"pxrr_describe_hex\"");
+    let pxrr_describe =
+        RemoteAgentAccessResponseV1::decode(&pxrr_describe_wire).expect("golden PXRR Describe");
     assert_eq!(
         pxrr_describe.canonical_wire(),
         pxrr_describe_wire.as_slice()
     );
     assert_eq!(
         pxrr_describe_wire.len() as u64,
-        fixture_u64_after(
-            ACCESS_GOLDEN,
-            "\"pxrr_describe\"",
-            "\"wire_length\""
-        )
+        fixture_u64_after(ACCESS_GOLDEN, "\"pxrr_describe\"", "\"wire_length\"")
     );
     assert_eq!(
         pxrr_describe.response_digest(),
@@ -1567,20 +1532,13 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
     );
     assert_eq!(
         pxrr_describe.payload_wire_digest(),
-        fixture_digest_after(
-            ACCESS_GOLDEN,
-            "\"pxrr_describe\"",
-            "\"payload_digest_hex\"",
-        )
+        fixture_digest_after(ACCESS_GOLDEN, "\"pxrr_describe\"", "\"payload_digest_hex\"",)
     );
     assert_eq!(pxrr_describe.profile(), Some(&pxad));
     assert_eq!(pxrr_describe.descriptor(), Some(fresh_pxap.as_slice()));
     assert_eq!(pxrr_describe.descriptor_digest(), fresh_shared);
-    let pxrr_describe_transcript = fixture_hex_after(
-        ACCESS_GOLDEN,
-        "\"pxrr_describe\"",
-        "\"transcript_hex\"",
-    );
+    let pxrr_describe_transcript =
+        fixture_hex_after(ACCESS_GOLDEN, "\"pxrr_describe\"", "\"transcript_hex\"");
     assert_eq!(
         pxrr_describe
             .signing_transcript()
@@ -1590,10 +1548,6 @@ fn shared_pxap_digest_matches_pxah_cas_pxau_and_pxrr_without_domain_aliasing() {
     );
     assert_eq!(
         pxrr_describe.authentication_signature(),
-        fixture_hex_after(
-            ACCESS_GOLDEN,
-            "\"pxrr_describe\"",
-            "\"signature_hex\""
-        )
+        fixture_hex_after(ACCESS_GOLDEN, "\"pxrr_describe\"", "\"signature_hex\"")
     );
 }
