@@ -89,10 +89,11 @@ use paraegox_runtime_contracts::{
         ManagedServingBootstrapFactsV1, ManagedServingBootstrapRequestV1,
         ManagedServingBootstrapResponseAuthClaimV1, ManagedServingBootstrapResponseDraftV1,
         RUNTIME_AGENT_CONTROL_REQUEST_MAGIC, RuntimeAgentControlKindV1,
-        RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlRequestV1,
-        RuntimeAgentControlResponseAuthClaimV1, RuntimeControlCarrierKindV1,
-        RuntimeControlCarrierRequestV1, RuntimeControlDescribeReadyFactsV1,
-        RuntimeControlDescribeReadyPhaseV1, RuntimeControlDescribeReadyResponseDraftV1,
+        RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlReceiptV1,
+        RuntimeAgentControlRequestV1, RuntimeAgentControlResponseAuthClaimV1,
+        RuntimeControlCarrierKindV1, RuntimeControlCarrierRequestV1,
+        RuntimeControlDescribeReadyFactsV1, RuntimeControlDescribeReadyPhaseV1,
+        RuntimeControlDescribeReadyResponseDraftV1,
     },
     provenance::{SourcePlanRevision, TargetSliceDigest},
     reference_control::{
@@ -147,6 +148,11 @@ use crate::{
     },
     managed_model_runtime::{
         RuntimeModelBackendResolverV1, UnavailableRuntimeModelBackendResolver,
+    },
+    remote_agent_descriptor_evidence::{
+        RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
+        RemoteAgentDescriptorLiveFactsV1, RemoteAgentVerifiedDescriptorEvidenceV1,
+        verify_remote_agent_descriptor_evidence_v1,
     },
     runtime_agent_provider::{
         RuntimeAgentProviderResolverV1, UnavailableRuntimeAgentProviderResolver,
@@ -1359,7 +1365,7 @@ fn map_apply_error(error: RuntimeReferenceApplyError) -> RuntimeControlRequestEr
 }
 
 #[derive(Debug)]
-enum RuntimeControlRequestError {
+pub(crate) enum RuntimeControlRequestError {
     Rejected,
     Unavailable,
     Internal(RuntimeBootstrapEndpointError),
@@ -1887,13 +1893,82 @@ impl ManagedFabricControlService {
                     .export_active_conversation_port_v1(request.expected_active_pxst_digest())
                     .await
                     .map_err(map_runtime_agent_port_export_error)?;
-                RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+                if exported.active_pxst_digest != request.expected_active_pxst_digest() {
+                    return Err(RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::InvalidStartedState,
+                    ));
+                }
+                let draft = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
                     authenticated,
                     &exported.descriptor_wire,
                     exported.fabric_generation,
                     exported.agent_generation,
                     auth_claim,
                 )
+                .map_err(|error| {
+                    RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::ManagedServingContract(error),
+                    )
+                })?;
+                let receipt = finalize_runtime_agent_control_receipt(&self.provisioning, draft)?;
+                let verified_receipt = receipt
+                    .verify_runtime_descriptor_receipt(
+                        request,
+                        request.carrier(),
+                        |principal, key, fingerprint, transcript, signature| {
+                            verify_runtime_agent_response_with_provisioning(
+                                &self.provisioning,
+                                principal,
+                                key,
+                                fingerprint,
+                                transcript,
+                                signature,
+                            )
+                        },
+                    )
+                    .map_err(|error| {
+                        RuntimeControlRequestError::Internal(
+                            RuntimeBootstrapEndpointError::ManagedServingContract(error),
+                        )
+                    })?;
+                let evidence = RemoteAgentDescriptorEvidenceV1::try_next(
+                    self.core.latest_remote_agent_descriptor_evidence(),
+                    authenticated,
+                    verified_receipt,
+                )
+                .map_err(|error| {
+                    RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::RemoteAgentDescriptorEvidence(error),
+                    )
+                })?;
+                let expected_record_digest = evidence.record_digest();
+                let expected_receipt_digest = evidence.receipt_digest();
+                let response_wire: Box<[u8]> = receipt.canonical_wire().into();
+                self.core
+                    .commit_remote_agent_descriptor_evidence(evidence)
+                    .map_err(map_managed_fabric_error)?;
+                #[cfg(test)]
+                if self
+                    .core
+                    .take_remote_agent_descriptor_post_commit_reverify_failure_for_test()
+                {
+                    return Err(RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::InvalidStartedState,
+                    ));
+                }
+                let committed = self
+                    .latest_verified_remote_agent_descriptor_evidence_v1(request.carrier())
+                    .await?
+                    .evidence();
+                if committed.record_digest() != expected_record_digest
+                    || committed.receipt_digest() != expected_receipt_digest
+                    || committed.receipt_digest() != receipt.receipt_digest()
+                {
+                    return Err(RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::InvalidStartedState,
+                    ));
+                }
+                return Ok(response_wire);
             }
         }
         .map_err(|error| {
@@ -1902,6 +1977,94 @@ impl ManagedFabricControlService {
             )
         })?;
         runtime_agent_control_receipt_response(&self.provisioning, draft)
+    }
+
+    /// Revalidates the latest durable Describe record for a future PXRA-v10
+    /// caller. This is deliberately not dispatched by the current endpoint.
+    /// The live export independently proves that the retained PXST is still
+    /// brokered and returns the current exact PXAP and physical generations;
+    /// protected provisioning supplies both retained-signature verifiers.
+    pub(crate) async fn latest_verified_remote_agent_descriptor_evidence_v1(
+        &self,
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> Result<RemoteAgentVerifiedDescriptorEvidenceV1<'_>, RuntimeControlRequestError> {
+        validate_restricted_runtime_apply_carrier_pins(&self.provisioning, expected_carrier)
+            .map_err(|error| match error {
+                RuntimeRestrictedRemoteApplyErrorV1::Rejected
+                | RuntimeRestrictedRemoteApplyErrorV1::Unavailable => {
+                    RuntimeControlRequestError::Rejected
+                }
+                RuntimeRestrictedRemoteApplyErrorV1::Internal => {
+                    RuntimeControlRequestError::Internal(
+                        RuntimeBootstrapEndpointError::InvalidProvisioning,
+                    )
+                }
+            })?;
+        let evidence = self
+            .core
+            .latest_remote_agent_descriptor_evidence()
+            .ok_or(RuntimeControlRequestError::Unavailable)?;
+        let request = evidence.request();
+        let claim = request.authentication().claim();
+        if claim.principal() != self.provisioning.controller_principal()
+            || claim.key() != self.provisioning.controller_request_key_ref()
+            || claim.algorithm().value() != ED25519_ALGORITHM
+            || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+            || request.authentication().signature().len() != ED25519_SIGNATURE_BYTES
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let exported = self
+            .stack
+            .as_ref()
+            .ok_or(RuntimeControlRequestError::Unavailable)?
+            .export_active_conversation_port_v1(evidence.active_pxst_digest())
+            .await
+            .map_err(map_runtime_agent_port_export_error)?;
+        verify_remote_agent_descriptor_evidence_v1(
+            evidence,
+            RemoteAgentDescriptorLiveFactsV1 {
+                carrier: expected_carrier,
+                target: self.provisioning.target(),
+                store_instance_id: self.core.store_instance_id(),
+                runtime_host_epoch: self.core.runtime_host_epoch(),
+                active_pxst_digest: exported.active_pxst_digest,
+                descriptor: &exported.descriptor_wire,
+                fabric_generation: exported.fabric_generation,
+                agent_generation: exported.agent_generation,
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                if principal != self.provisioning.controller_principal()
+                    || key != self.provisioning.controller_request_key_ref()
+                    || fingerprint != self.provisioning.controller_key_fingerprint()
+                    || signature.len() != ED25519_SIGNATURE_BYTES
+                {
+                    return false;
+                }
+                let Ok(signature) = Signature::from_slice(signature) else {
+                    return false;
+                };
+                self.provisioning
+                    .controller_key()
+                    .verify_strict(transcript, &signature)
+                    .is_ok()
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                verify_runtime_agent_response_with_provisioning(
+                    &self.provisioning,
+                    principal,
+                    key,
+                    fingerprint,
+                    transcript,
+                    signature,
+                )
+            },
+        )
+        .map_err(|error| {
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::RemoteAgentDescriptorEvidence(error),
+            )
+        })
     }
 
     async fn handle_authenticated_runtime_control_carrier_v1(
@@ -2561,6 +2724,14 @@ fn runtime_agent_control_receipt_response(
     provisioning: &RuntimeProvisioningV1,
     draft: RuntimeAgentControlReceiptDraftV1,
 ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+    let receipt = finalize_runtime_agent_control_receipt(provisioning, draft)?;
+    Ok(receipt.canonical_wire().into())
+}
+
+fn finalize_runtime_agent_control_receipt(
+    provisioning: &RuntimeProvisioningV1,
+    draft: RuntimeAgentControlReceiptDraftV1,
+) -> Result<RuntimeAgentControlReceiptV1, RuntimeControlRequestError> {
     let signature = provisioning
         .response_signer()
         .sign(
@@ -2585,7 +2756,37 @@ fn runtime_agent_control_receipt_response(
             RuntimeBootstrapEndpointError::InvalidStartedState,
         ));
     }
-    Ok(wire.into())
+    Ok(receipt)
+}
+
+fn verify_runtime_agent_response_with_provisioning(
+    provisioning: &RuntimeProvisioningV1,
+    principal: paraegox_kernel::identity::PrincipalRef,
+    key: paraegox_runtime_contracts::wire::ApplyAuthKeyRef,
+    fingerprint: Digest32,
+    transcript: &[u8],
+    signature: &[u8],
+) -> bool {
+    let Ok(expected_fingerprint) =
+        ed25519_control_key_fingerprint(provisioning.response_signer().verifying_key().as_bytes())
+    else {
+        return false;
+    };
+    if principal != provisioning.runtime_principal()
+        || key != provisioning.runtime_response_key_ref()
+        || fingerprint != expected_fingerprint
+        || signature.len() != ED25519_SIGNATURE_BYTES
+    {
+        return false;
+    }
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return false;
+    };
+    provisioning
+        .response_signer()
+        .verifying_key()
+        .verify_strict(transcript, &signature)
+        .is_ok()
 }
 
 fn runtime_control_describe_response(
@@ -5275,6 +5476,7 @@ pub(crate) enum RuntimeBootstrapEndpointError {
     ManagedModelAgentStackContract(ManagedModelAgentStackPlanError),
     DistributedAgentStackContract(DistributedAgentStackPlanError),
     ManagedServingContract(ManagedServingBootstrapError),
+    RemoteAgentDescriptorEvidence(RemoteAgentDescriptorEvidenceError),
     ManagedFabricState(ManagedFabricStateError),
     ManagedFabricStore(ManagedFabricStoreError),
     ManagedFabric(ManagedFabricRuntimeError),
@@ -5449,6 +5651,9 @@ impl fmt::Display for RuntimeBootstrapEndpointError {
             }
             Self::ManagedServingContract(error) => {
                 write!(formatter, "managed serving contract: {error}")
+            }
+            Self::RemoteAgentDescriptorEvidence(error) => {
+                write!(formatter, "remote Agent descriptor evidence: {error}")
             }
             Self::ManagedFabricState(error) => {
                 write!(formatter, "managed Fabric durable state: {error}")
@@ -8944,7 +9149,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pxag_apply_and_describe_use_one_authenticated_owner_chain_and_fail_closed() {
         let socket_directory = TestSocketDirectory::create();
-        let (_state_directory, mut control, stack_request) =
+        let (state_directory, mut control, stack_request) =
             managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
         let profile = restricted_transport_profile(
             RESTRICTED_APPLY_ROUTE,
@@ -8959,6 +9164,16 @@ mod tests {
             .unwrap_or_else(|error| panic!("active PXST replay failed: {error:?}"));
         let active = ManagedAgentStackTerminalReceiptV1::decode(&active_wire)
             .unwrap_or_else(|error| panic!("active PXST decode failed: {error}"));
+        let descriptor_evidence_path = state_directory
+            .path()
+            .join("remote-agent-descriptor-evidence-v1");
+        assert!(
+            control
+                .core
+                .latest_remote_agent_descriptor_evidence()
+                .is_none()
+        );
+        assert!(!descriptor_evidence_path.exists());
         let intended_client = PrincipalRef::from_bytes([0xf8; 16]);
         let describe = signed_runtime_agent_describe(
             carrier.clone(),
@@ -8977,19 +9192,127 @@ mod tests {
             .recovered_observation()
             .unwrap_or_else(|error| panic!("pre-Describe observation failed: {error}"))
             .successor_snapshot_sequence;
+
+        let mut wrong_signature = describe.canonical_wire().to_vec();
+        *wrong_signature
+            .last_mut()
+            .unwrap_or_else(|| panic!("PXAG signature disappeared")) ^= 1;
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(&wrong_signature, &carrier)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert!(
+            control
+                .core
+                .latest_remote_agent_descriptor_evidence()
+                .is_none()
+        );
+        assert!(
+            !descriptor_evidence_path.exists(),
+            "outer authentication failure must not publish PXDE",
+        );
+
+        control
+            .core
+            .fail_next_remote_agent_descriptor_post_commit_reverify_for_test();
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
+                .await,
+            Err(RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::InvalidStartedState
+            ))
+        ));
+        let first_committed_evidence = control
+            .core
+            .latest_remote_agent_descriptor_evidence()
+            .unwrap_or_else(|| panic!("post-commit failure lost durable PXDE"))
+            .clone();
+        assert_eq!(first_committed_evidence.record_sequence(), 1);
+        assert_eq!(first_committed_evidence.previous_record_digest(), None);
+        assert_eq!(
+            first_committed_evidence.request().canonical_wire(),
+            describe.canonical_wire(),
+        );
+        assert_eq!(
+            fs::read(&descriptor_evidence_path)
+                .unwrap_or_else(|error| panic!("committed PXDE read failed: {error}")),
+            first_committed_evidence.canonical_wire(),
+        );
+        let first_verified = control
+            .latest_verified_remote_agent_descriptor_evidence_v1(&carrier)
+            .await
+            .unwrap_or_else(|error| panic!("committed PXDE live reverify failed: {error:?}"));
+        assert_eq!(first_verified.evidence(), &first_committed_evidence);
+
         let response_wire = control
             .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
             .await
             .unwrap_or_else(|error| panic!("authenticated PXAG Describe failed: {error:?}"));
         let receipt = RuntimeAgentControlReceiptV1::decode(&response_wire)
             .unwrap_or_else(|error| panic!("PXAH descriptor decode failed: {error}"));
-        receipt
+        let verified_receipt = receipt
             .verify_runtime_descriptor_receipt(
                 &describe,
                 &carrier,
                 verify_runtime_agent_response_signature,
             )
             .unwrap_or_else(|error| panic!("PXAH descriptor verification failed: {error}"));
+        let authenticated_describe =
+            authenticate_runtime_agent_control_request(&control.provisioning, &describe, &carrier)
+                .unwrap_or_else(|error| {
+                    panic!("PXAG descriptor reauthentication failed: {error:?}")
+                });
+        let expected_evidence = RemoteAgentDescriptorEvidenceV1::try_next(
+            Some(&first_committed_evidence),
+            authenticated_describe,
+            verified_receipt,
+        )
+        .unwrap_or_else(|error| panic!("expected PXDE reconstruction failed: {error}"));
+        let committed_evidence = control
+            .core
+            .latest_remote_agent_descriptor_evidence()
+            .unwrap_or_else(|| panic!("successful Describe lost durable PXDE"));
+        assert_eq!(committed_evidence, &expected_evidence);
+        assert_eq!(committed_evidence.record_sequence(), 2);
+        assert_eq!(
+            committed_evidence.previous_record_digest(),
+            Some(first_committed_evidence.record_digest()),
+        );
+        assert_eq!(committed_evidence.target(), control.provisioning.target());
+        assert_eq!(
+            committed_evidence.runtime_store_instance_id(),
+            control.core.store_instance_id(),
+        );
+        assert_eq!(
+            committed_evidence.runtime_host_epoch(),
+            control.core.runtime_host_epoch(),
+        );
+        assert_eq!(
+            committed_evidence.active_pxst_digest(),
+            active.receipt_digest(),
+        );
+        assert_eq!(
+            committed_evidence.receipt_digest(),
+            receipt.receipt_digest(),
+        );
+        assert_eq!(
+            first_committed_evidence.receipt_digest(),
+            receipt.receipt_digest(),
+            "same exact request must retain the same exact signed PXAH on strict-next retry",
+        );
+        assert_eq!(
+            fs::read(&descriptor_evidence_path)
+                .unwrap_or_else(|error| panic!("successful PXDE read failed: {error}")),
+            expected_evidence.canonical_wire(),
+        );
+        let live_verified = control
+            .latest_verified_remote_agent_descriptor_evidence_v1(&carrier)
+            .await
+            .unwrap_or_else(|error| panic!("successful PXDE live reverify failed: {error:?}"));
+        assert_eq!(live_verified.evidence(), &expected_evidence);
         let descriptor = receipt
             .conversation_port_descriptor()
             .unwrap_or_else(|| panic!("PXAH descriptor payload disappeared"));
@@ -9014,19 +9337,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("post-Describe observation failed: {error}"))
                 .successor_snapshot_sequence,
             before_sequence,
-            "Describe must not mutate either durable owner",
+            "Describe must not advance the Fabric/Agent successor snapshot",
         );
-
-        let mut wrong_signature = describe.canonical_wire().to_vec();
-        *wrong_signature
-            .last_mut()
-            .unwrap_or_else(|| panic!("PXAG signature disappeared")) ^= 1;
-        assert!(matches!(
-            control
-                .handle_restricted_runtime_control_frame_v1(&wrong_signature, &carrier)
-                .await,
-            Err(RuntimeControlRequestError::Rejected)
-        ));
 
         for (request_id_byte, algorithm, algorithm_version, signature_length) in [
             (0xf2, ED25519_ALGORITHM + 1, ED25519_ALGORITHM_VERSION, 64),
@@ -9081,7 +9393,20 @@ mod tests {
                 .unwrap_or_else(|error| panic!("rejected-Describe observation failed: {error}"))
                 .successor_snapshot_sequence,
             before_sequence,
-            "outer-auth and expected-root failures must precede mutation",
+            "rejected Describe must not advance the Fabric/Agent successor snapshot",
+        );
+        assert_eq!(
+            control
+                .core
+                .latest_remote_agent_descriptor_evidence()
+                .unwrap_or_else(|| panic!("rejected Describe lost committed PXDE")),
+            &expected_evidence,
+            "rejected Describe must not replace the latest PXDE",
+        );
+        assert_eq!(
+            fs::read(&descriptor_evidence_path)
+                .unwrap_or_else(|error| panic!("stable PXDE read failed: {error}")),
+            expected_evidence.canonical_wire(),
         );
 
         control
@@ -9113,6 +9438,18 @@ mod tests {
                 )
             ))
         ));
+        assert_eq!(
+            control
+                .core
+                .latest_remote_agent_descriptor_evidence()
+                .unwrap_or_else(|| panic!("failed live export lost committed PXDE")),
+            &expected_evidence,
+        );
+        assert_eq!(
+            fs::read(&descriptor_evidence_path)
+                .unwrap_or_else(|error| panic!("post-failure PXDE read failed: {error}")),
+            expected_evidence.canonical_wire(),
+        );
 
         shutdown_managed_successor_chain(
             &mut control.distributed,

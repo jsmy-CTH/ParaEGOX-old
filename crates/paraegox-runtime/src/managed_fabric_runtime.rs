@@ -51,6 +51,9 @@ use crate::managed_service_assembly::{
     ManagedServiceFuture, ManagedServiceImplementation, ManagedServiceReadiness,
     ManagedServiceStartupOutcome,
 };
+use crate::remote_agent_descriptor_evidence::{
+    RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
+};
 use crate::runtime_clock::RuntimeClock;
 use crate::runtime_store::{ManagedFabricStore, ManagedFabricStoreError, RuntimeStore};
 use crate::task_registry::CancellationSource;
@@ -454,6 +457,9 @@ pub(crate) struct ManagedFabricRuntimeCore {
     cancellation: CancellationSource,
     assembly: Option<ManagedServiceAssembly>,
     fabric_control: Option<ManagedFabricControlHandle>,
+    remote_agent_descriptor_evidence: Option<RemoteAgentDescriptorEvidenceV1>,
+    #[cfg(test)]
+    fail_next_remote_agent_descriptor_post_commit_reverify: bool,
     cleanup_exact_zero: bool,
     recovery_completed: bool,
 }
@@ -563,6 +569,11 @@ impl ManagedFabricRuntimeCore {
             return Err(ManagedFabricRuntimeError::RuntimeEpochRegressed);
         }
         let cleanup_exact_zero = snapshot.phase == ManagedFabricDurablePhase::ExactZero;
+        let remote_agent_descriptor_evidence = load_remote_agent_descriptor_evidence(
+            &store,
+            config.projection.target(),
+            config.store_instance_id,
+        )?;
         Ok(Self {
             store,
             snapshot,
@@ -574,6 +585,9 @@ impl ManagedFabricRuntimeCore {
             cancellation: CancellationSource::root(),
             assembly: None,
             fabric_control: None,
+            remote_agent_descriptor_evidence,
+            #[cfg(test)]
+            fail_next_remote_agent_descriptor_post_commit_reverify: false,
             cleanup_exact_zero,
             recovery_completed: false,
         })
@@ -616,6 +630,11 @@ impl ManagedFabricRuntimeCore {
             return Err(ManagedFabricRuntimeError::RuntimeEpochRegressed);
         }
         let cleanup_exact_zero = snapshot.phase == ManagedFabricDurablePhase::ExactZero;
+        let remote_agent_descriptor_evidence = load_remote_agent_descriptor_evidence(
+            &store,
+            config.projection.target(),
+            config.store_instance_id,
+        )?;
         Ok(Self {
             store,
             snapshot,
@@ -627,6 +646,9 @@ impl ManagedFabricRuntimeCore {
             cancellation: CancellationSource::root(),
             assembly: None,
             fabric_control: None,
+            remote_agent_descriptor_evidence,
+            #[cfg(test)]
+            fail_next_remote_agent_descriptor_post_commit_reverify: false,
             cleanup_exact_zero,
             recovery_completed: false,
         })
@@ -691,6 +713,66 @@ impl ManagedFabricRuntimeCore {
     #[must_use]
     pub(crate) fn owner_target_fingerprint(&self) -> Digest32 {
         self.snapshot.owner_target_fingerprint()
+    }
+
+    /// Returns the strictly decoded latest PXDE slot. It is historical bytes,
+    /// not current access authority; callers must reverify it against live
+    /// stack facts and protected provisioning before use.
+    pub(crate) fn latest_remote_agent_descriptor_evidence(
+        &self,
+    ) -> Option<&RemoteAgentDescriptorEvidenceV1> {
+        self.remote_agent_descriptor_evidence.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_remote_agent_descriptor_post_commit_reverify_for_test(&mut self) {
+        self.fail_next_remote_agent_descriptor_post_commit_reverify = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_remote_agent_descriptor_post_commit_reverify_failure_for_test(
+        &mut self,
+    ) -> bool {
+        core::mem::take(&mut self.fail_next_remote_agent_descriptor_post_commit_reverify)
+    }
+
+    /// Commits exactly the next PXDE record under the same Runtime writer lock
+    /// as the managed Fabric and Agent-stack state. In-memory authority moves
+    /// only after the store has synced and read back byte-identical final data.
+    pub(crate) fn commit_remote_agent_descriptor_evidence(
+        &mut self,
+        evidence: RemoteAgentDescriptorEvidenceV1,
+    ) -> Result<(), ManagedFabricRuntimeError> {
+        let sequence_matches = match self.remote_agent_descriptor_evidence.as_ref() {
+            Some(previous) => {
+                previous
+                    .record_sequence()
+                    .checked_add(1)
+                    .is_some_and(|next| next == evidence.record_sequence())
+                    && evidence.previous_record_digest() == Some(previous.record_digest())
+            }
+            None => evidence.record_sequence() == 1 && evidence.previous_record_digest().is_none(),
+        };
+        if !sequence_matches
+            || evidence.target() != self.projection.target()
+            || evidence.runtime_store_instance_id() != self.store_instance_id()
+            || evidence.runtime_host_epoch() != self.runtime_host_epoch
+        {
+            return Err(ManagedFabricRuntimeError::DescriptorEvidenceConflict);
+        }
+        let expected_record_digest = evidence.record_digest();
+        self.store
+            .commit_remote_agent_descriptor_evidence(evidence.canonical_wire())?;
+        let committed_frame = self
+            .store
+            .remote_agent_descriptor_evidence_bytes()?
+            .ok_or(ManagedFabricRuntimeError::DescriptorEvidenceConflict)?;
+        let committed = RemoteAgentDescriptorEvidenceV1::decode(committed_frame)?;
+        if committed.record_digest() != expected_record_digest {
+            return Err(ManagedFabricRuntimeError::DescriptorEvidenceConflict);
+        }
+        self.remote_agent_descriptor_evidence = Some(committed);
+        Ok(())
     }
 
     pub(crate) fn managed_agent_stack_projection_digest(&self) -> Option<Digest32> {
@@ -2038,6 +2120,23 @@ fn insert_replay(
     }
 }
 
+fn load_remote_agent_descriptor_evidence(
+    store: &ManagedFabricStore,
+    expected_target: RuntimeHostId,
+    expected_store_instance_id: [u8; 32],
+) -> Result<Option<RemoteAgentDescriptorEvidenceV1>, ManagedFabricRuntimeError> {
+    let Some(frame) = store.remote_agent_descriptor_evidence_bytes()? else {
+        return Ok(None);
+    };
+    let evidence = RemoteAgentDescriptorEvidenceV1::decode(frame)?;
+    if evidence.target() != expected_target
+        || evidence.runtime_store_instance_id() != expected_store_instance_id
+    {
+        return Err(ManagedFabricRuntimeError::DescriptorEvidenceConflict);
+    }
+    Ok(Some(evidence))
+}
+
 fn insert_terminal(
     records: &mut Vec<ManagedFabricTerminalRecord>,
     request: &ManagedFabricApplyRequestV1,
@@ -2125,12 +2224,14 @@ pub(crate) enum ManagedFabricRuntimeError {
     GenerationExhausted,
     InvalidDurableState,
     SequenceOverflow,
+    DescriptorEvidenceConflict,
     SignerConfiguration,
     ShutdownUncertain,
     Digest(DigestBuildError),
     Contract(paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricPlanError),
     State(ManagedFabricStateError),
     Store(ManagedFabricStoreError),
+    DescriptorEvidence(RemoteAgentDescriptorEvidenceError),
     Clock(crate::runtime_clock::RuntimeClockError),
 }
 
@@ -2201,6 +2302,9 @@ impl fmt::Display for ManagedFabricRuntimeError {
             Self::GenerationExhausted => formatter.write_str("managed Fabric generation exhausted"),
             Self::InvalidDurableState => formatter.write_str("invalid managed Fabric state"),
             Self::SequenceOverflow => formatter.write_str("managed Fabric sequence overflow"),
+            Self::DescriptorEvidenceConflict => {
+                formatter.write_str("remote Agent descriptor-evidence authority conflict")
+            }
             Self::SignerConfiguration => {
                 formatter.write_str("managed Fabric response signer is invalid")
             }
@@ -2209,6 +2313,10 @@ impl fmt::Display for ManagedFabricRuntimeError {
             Self::Contract(error) => write!(formatter, "managed Fabric contract failed: {error}"),
             Self::State(error) => write!(formatter, "managed Fabric state failed: {error}"),
             Self::Store(error) => write!(formatter, "managed Fabric store failed: {error}"),
+            Self::DescriptorEvidence(error) => write!(
+                formatter,
+                "remote Agent descriptor evidence failed: {error}"
+            ),
             Self::Clock(error) => write!(formatter, "managed Fabric clock failed: {error}"),
         }
     }
@@ -2241,6 +2349,12 @@ impl From<ManagedFabricStateError> for ManagedFabricRuntimeError {
 impl From<ManagedFabricStoreError> for ManagedFabricRuntimeError {
     fn from(value: ManagedFabricStoreError) -> Self {
         Self::Store(value)
+    }
+}
+
+impl From<RemoteAgentDescriptorEvidenceError> for ManagedFabricRuntimeError {
+    fn from(value: RemoteAgentDescriptorEvidenceError) -> Self {
+        Self::DescriptorEvidence(value)
     }
 }
 

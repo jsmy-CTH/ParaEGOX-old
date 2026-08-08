@@ -89,6 +89,12 @@ mod recovery;
 #[cfg(unix)]
 #[cfg_attr(
     not(test),
+    expect(dead_code, reason = "Awaiting T2-C PXRA access activation")
+)] // GOV-WAIVER-0001
+mod remote_agent_descriptor_evidence;
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
     expect(dead_code, reason = "Awaiting T2-D live connector composition")
 )] // GOV-WAIVER-0001
 mod remote_agent_one_echo;

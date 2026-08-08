@@ -29,6 +29,10 @@ use sha2::{Digest as ShaDigest, Sha256};
 use crate::distributed_agent_stack_state::MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES;
 use crate::managed_agent_stack_state::MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES;
 use crate::managed_model_agent_stack_state::MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES;
+use crate::remote_agent_descriptor_evidence::{
+    MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES, RemoteAgentDescriptorEvidenceError,
+    RemoteAgentDescriptorEvidenceV1,
+};
 use crate::runtime_journal::{
     LiveMaterialization, MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, RUNTIME_JOURNAL_PAYLOAD_V4,
     RUNTIME_JOURNAL_PAYLOAD_VERSION, RuntimeJournalError, RuntimeJournalPayloadV3Migration,
@@ -52,6 +56,10 @@ const MANAGED_MODEL_AGENT_STACK_TEMP_FILE_PREFIX: &str =
 const DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME: &str = "distributed-agent-stack.cutover-v1";
 const DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME: &str = "distributed-agent-stack.snapshot-v1";
 const DISTRIBUTED_AGENT_STACK_TEMP_FILE_PREFIX: &str = ".distributed-agent-stack.snapshot-v1.tmp-";
+const REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME: &str =
+    "remote-agent-descriptor-evidence-v1";
+const REMOTE_AGENT_DESCRIPTOR_EVIDENCE_TEMP_FILE_PREFIX: &str =
+    ".remote-agent-descriptor-evidence-v1.tmp-";
 const MANAGED_AGENT_JOURNAL_DIRECTORY_PREFIX: &str = "managed-agent-service-";
 const MANAGED_AGENT_JOURNAL_DIRECTORY_SUFFIX: &str = "-v1";
 const MANAGED_AGENT_JOURNAL_ID_HEX_BYTES: usize = 32;
@@ -1217,6 +1225,7 @@ pub(crate) struct ManagedFabricStore {
     managed_model_agent_stack_active: Option<ManagedFabricActiveSnapshot>,
     distributed_agent_stack_marker: Option<DistributedAgentStackCutoverMarker>,
     distributed_agent_stack_active: Option<ManagedFabricActiveSnapshot>,
+    remote_agent_descriptor_evidence_active: Option<ManagedFabricActiveSnapshot>,
     stopped: bool,
 }
 
@@ -1227,6 +1236,17 @@ enum ManagedFabricCommitFailpoint {
     BeforeTempSync,
     #[cfg(test)]
     AfterRename,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteAgentDescriptorEvidenceCommitFailpoint {
+    None,
+    #[cfg(test)]
+    BeforeTempSync,
+    #[cfg(test)]
+    BeforeRename,
+    #[cfg(test)]
+    AfterRenameBeforeDirectorySync,
 }
 
 impl Drop for ManagedFabricStore {
@@ -1267,6 +1287,10 @@ impl fmt::Debug for ManagedFabricStore {
             .field(
                 "distributed_agent_stack_active",
                 &self.distributed_agent_stack_active.is_some(),
+            )
+            .field(
+                "remote_agent_descriptor_evidence_active",
+                &self.remote_agent_descriptor_evidence_active.is_some(),
             )
             .field("stopped", &self.stopped)
             .finish_non_exhaustive()
@@ -2081,6 +2105,12 @@ impl ManagedFabricStore {
                 return Err(ManagedFabricStoreError::DistributedAgentStackCutoverBindingMismatch);
             }
         }
+        let remote_agent_descriptor_evidence_active =
+            read_optional_remote_agent_descriptor_evidence(&directory)?;
+        if remote_agent_descriptor_evidence_active.is_some() && managed_agent_stack_marker.is_none()
+        {
+            return Err(ManagedFabricStoreError::RemoteAgentDescriptorEvidenceWithoutAgentStack);
+        }
         validate_managed_fabric_directory_entries(
             &directory,
             managed_agent_stack_marker.is_some() || managed_model_agent_stack_marker.is_some(),
@@ -2100,6 +2130,7 @@ impl ManagedFabricStore {
             managed_model_agent_stack_active,
             distributed_agent_stack_marker,
             distributed_agent_stack_active,
+            remote_agent_descriptor_evidence_active,
             stopped: false,
         })
     }
@@ -2190,6 +2221,223 @@ impl ManagedFabricStore {
                 }
             },
         )
+    }
+
+    /// Returns the strict latest PXDE slot selected at open or after an exact
+    /// successful read-back. A temporary file is never a recovery candidate.
+    pub(crate) fn remote_agent_descriptor_evidence_bytes(
+        &self,
+    ) -> Result<Option<&[u8]>, ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        Ok(self
+            .remote_agent_descriptor_evidence_active
+            .as_ref()
+            .map(|active| active.encoded.as_ref()))
+    }
+
+    /// Atomically replaces the single latest descriptor-evidence slot.
+    pub(crate) fn commit_remote_agent_descriptor_evidence(
+        &mut self,
+        encoded: &[u8],
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.publish_remote_agent_descriptor_evidence(
+            encoded,
+            RemoteAgentDescriptorEvidenceCommitFailpoint::None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_remote_agent_descriptor_evidence_with_failpoint(
+        &mut self,
+        encoded: &[u8],
+        failpoint: RemoteAgentDescriptorEvidenceCommitFailpoint,
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.publish_remote_agent_descriptor_evidence(encoded, failpoint)
+    }
+
+    fn publish_remote_agent_descriptor_evidence(
+        &mut self,
+        encoded: &[u8],
+        failpoint: RemoteAgentDescriptorEvidenceCommitFailpoint,
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if encoded.is_empty() || encoded.len() > MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES {
+            return Err(ManagedFabricStoreError::InvalidRemoteAgentDescriptorEvidenceLength);
+        }
+        RemoteAgentDescriptorEvidenceV1::decode(encoded)
+            .map_err(ManagedFabricStoreError::RemoteAgentDescriptorEvidence)?;
+        let expected = self
+            .remote_agent_descriptor_evidence_active
+            .as_ref()
+            .map(|active| active.identity);
+        if let Err(error) = self.revalidate_remote_agent_descriptor_evidence(expected) {
+            self.stopped = true;
+            return Err(error);
+        }
+        let token = system_random_token().map_err(|error| {
+            ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::GenerateTempName,
+                &error,
+            ))
+        })?;
+        let temp_name = remote_agent_descriptor_evidence_temp_name(token);
+        let owned = openat(
+            &self.directory.file,
+            temp_name.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|error| {
+            ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::CreateTemp, error))
+        })?;
+        let mut temp = File::from(owned);
+        let prepared = (|| -> Result<(), ManagedFabricStoreError> {
+            fchmod(&temp, PRIVATE_FILE_MODE).map_err(|error| {
+                ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
+            })?;
+            validate_regular_file(
+                &temp.metadata().map_err(|error| {
+                    ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                        RuntimeFileStage::InspectTemp,
+                        &error,
+                    ))
+                })?,
+                self.directory.owner_uid,
+                self.directory.owner_gid,
+            )
+            .map_err(ManagedFabricStoreError::Open)?;
+            temp.write_all(encoded).map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::WriteTemp,
+                    &error,
+                ))
+            })?;
+            #[cfg(test)]
+            if failpoint == RemoteAgentDescriptorEvidenceCommitFailpoint::BeforeTempSync {
+                return Err(ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::SyncTemp,
+                    &io::Error::other("injected descriptor-evidence temp sync failure"),
+                )));
+            }
+            temp.sync_all().map_err(|error| {
+                ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                    RuntimeFileStage::SyncTemp,
+                    &error,
+                ))
+            })?;
+            self.revalidate_remote_agent_descriptor_evidence(expected)
+        })();
+        if let Err(error) = prepared {
+            self.stopped = true;
+            return Err(error);
+        }
+        #[cfg(test)]
+        if failpoint == RemoteAgentDescriptorEvidenceCommitFailpoint::BeforeRename {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::Io(RuntimeIoFailure::new(
+                RuntimeFileStage::Rename,
+                &io::Error::other("injected descriptor-evidence rename failure"),
+            )));
+        }
+        if let Err(error) = renameat(
+            &self.directory.file,
+            temp_name.as_str(),
+            &self.directory.file,
+            REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME,
+        ) {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::Io(nix_failure(
+                RuntimeFileStage::Rename,
+                error,
+            )));
+        }
+        #[cfg(test)]
+        if failpoint == RemoteAgentDescriptorEvidenceCommitFailpoint::AfterRenameBeforeDirectorySync
+        {
+            self.stopped = true;
+            return Err(
+                ManagedFabricStoreError::RemoteAgentDescriptorEvidenceCommitUncertain(
+                    RuntimeIoFailure::new(
+                        RuntimeFileStage::SyncDirectory,
+                        &io::Error::other("injected descriptor-evidence directory sync failure"),
+                    ),
+                ),
+            );
+        }
+        let _ = failpoint;
+        if let Err(error) = self.directory.file.sync_all() {
+            self.stopped = true;
+            return Err(
+                ManagedFabricStoreError::RemoteAgentDescriptorEvidenceCommitUncertain(
+                    RuntimeIoFailure::new(RuntimeFileStage::SyncDirectory, &error),
+                ),
+            );
+        }
+        let active = match read_optional_remote_agent_descriptor_evidence(&self.directory) {
+            Ok(Some(active)) => active,
+            Ok(None) => {
+                self.stopped = true;
+                return Err(ManagedFabricStoreError::RemoteAgentDescriptorEvidenceMissing);
+            }
+            Err(error) => {
+                self.stopped = true;
+                return Err(error);
+            }
+        };
+        if active.encoded.as_ref() != encoded {
+            self.stopped = true;
+            return Err(ManagedFabricStoreError::RemoteAgentDescriptorEvidenceMismatch);
+        }
+        self.remote_agent_descriptor_evidence_active = Some(active);
+        Ok(())
+    }
+
+    fn revalidate_remote_agent_descriptor_evidence(
+        &mut self,
+        expected_active: Option<FileIdentity>,
+    ) -> Result<(), ManagedFabricStoreError> {
+        self.ensure_operational()?;
+        if validate_runtime_directory_handle(&self.directory).is_err()
+            || validate_held_lock(&self.directory, &self.lock_file, self.lock_identity).is_err()
+        {
+            return Err(ManagedFabricStoreError::LockOrDirectoryIdentityChanged);
+        }
+        if read_managed_fabric_cutover_marker(&self.directory)? != self.marker {
+            return Err(ManagedFabricStoreError::CutoverBindingMismatch);
+        }
+        let stack_marker = read_optional_managed_agent_stack_cutover(&self.directory)?
+            .ok_or(ManagedFabricStoreError::RemoteAgentDescriptorEvidenceWithoutAgentStack)?;
+        if self.managed_agent_stack_marker.as_ref() != Some(&stack_marker) {
+            return Err(ManagedFabricStoreError::ManagedAgentStackCutoverBindingMismatch);
+        }
+        match self.managed_agent_stack_active.as_ref() {
+            Some(active) => validate_named_file_identity(
+                &self.directory,
+                MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+                active.identity,
+                RuntimeFileStage::ValidateActiveIdentity,
+            )
+            .map_err(ManagedFabricStoreError::Open)?,
+            None => ensure_named_file_missing(
+                &self.directory,
+                MANAGED_AGENT_STACK_ACTIVE_FILE_NAME,
+                RuntimeFileStage::RequireMissingActive,
+            )?,
+        }
+        match expected_active {
+            Some(identity) => validate_named_file_identity(
+                &self.directory,
+                REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME,
+                identity,
+                RuntimeFileStage::ValidateActiveIdentity,
+            )
+            .map_err(ManagedFabricStoreError::Open),
+            None => ensure_named_file_missing(
+                &self.directory,
+                REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME,
+                RuntimeFileStage::RequireMissingActive,
+            ),
+        }
     }
 
     /// Atomically transfers apply authority by embedding the first complete
@@ -3117,6 +3365,11 @@ pub(crate) enum ManagedFabricStoreError {
     InvalidDistributedAgentStackSnapshotLength,
     DistributedAgentStackSnapshotMissing,
     DistributedAgentStackSnapshotMismatch,
+    RemoteAgentDescriptorEvidenceWithoutAgentStack,
+    InvalidRemoteAgentDescriptorEvidenceLength,
+    RemoteAgentDescriptorEvidence(RemoteAgentDescriptorEvidenceError),
+    RemoteAgentDescriptorEvidenceMissing,
+    RemoteAgentDescriptorEvidenceMismatch,
     ManagedAgentStackAuthorityActive,
     ManagedModelAgentStackAuthorityActive,
     DistributedAgentStackAuthorityActive,
@@ -3131,6 +3384,7 @@ pub(crate) enum ManagedFabricStoreError {
     LegacyStore(RuntimeStoreError),
     Io(RuntimeIoFailure),
     UncertainAfterPublish(RuntimeIoFailure),
+    RemoteAgentDescriptorEvidenceCommitUncertain(RuntimeIoFailure),
 }
 
 impl fmt::Display for ManagedFabricStoreError {
@@ -3221,6 +3475,24 @@ impl fmt::Display for ManagedFabricStoreError {
             Self::DistributedAgentStackSnapshotMismatch => {
                 formatter.write_str("distributed Agent-stack publish read-back mismatch")
             }
+            Self::RemoteAgentDescriptorEvidenceWithoutAgentStack => formatter.write_str(
+                "remote Agent descriptor evidence exists without managed Agent-stack authority",
+            ),
+            Self::InvalidRemoteAgentDescriptorEvidenceLength => {
+                formatter.write_str("invalid remote Agent descriptor-evidence length")
+            }
+            Self::RemoteAgentDescriptorEvidence(error) => {
+                write!(
+                    formatter,
+                    "invalid remote Agent descriptor evidence: {error}"
+                )
+            }
+            Self::RemoteAgentDescriptorEvidenceMissing => formatter.write_str(
+                "remote Agent descriptor-evidence publish completed but slot is missing",
+            ),
+            Self::RemoteAgentDescriptorEvidenceMismatch => {
+                formatter.write_str("remote Agent descriptor-evidence read-back mismatch")
+            }
             Self::ManagedAgentStackAuthorityActive => {
                 formatter.write_str("managed Agent-stack sibling authority is active")
             }
@@ -3255,6 +3527,10 @@ impl fmt::Display for ManagedFabricStoreError {
             Self::UncertainAfterPublish(error) => {
                 write!(formatter, "managed-fabric publish is uncertain: {error:?}")
             }
+            Self::RemoteAgentDescriptorEvidenceCommitUncertain(error) => write!(
+                formatter,
+                "remote Agent descriptor-evidence publish is uncertain: {error:?}"
+            ),
         }
     }
 }
@@ -5336,6 +5612,37 @@ fn read_optional_distributed_agent_stack_snapshot(
     }
 }
 
+fn read_optional_remote_agent_descriptor_evidence(
+    directory: &RuntimeDirectory,
+) -> Result<Option<ManagedFabricActiveSnapshot>, ManagedFabricStoreError> {
+    match openat(
+        &directory.file,
+        REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            drop(file);
+            let (encoded, identity) = read_bounded_named_file(
+                directory,
+                REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME,
+                MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES,
+            )?;
+            RemoteAgentDescriptorEvidenceV1::decode(&encoded)
+                .map_err(ManagedFabricStoreError::RemoteAgentDescriptorEvidence)?;
+            Ok(Some(ManagedFabricActiveSnapshot {
+                encoded: encoded.into_boxed_slice(),
+                identity,
+            }))
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(error) => Err(ManagedFabricStoreError::Io(nix_failure(
+            RuntimeFileStage::OpenActive,
+            error,
+        ))),
+    }
+}
+
 fn read_bounded_named_file(
     directory: &RuntimeDirectory,
     name: &str,
@@ -5415,6 +5722,7 @@ fn validate_managed_fabric_directory_entries(
                 | MANAGED_MODEL_AGENT_STACK_ACTIVE_FILE_NAME
                 | DISTRIBUTED_AGENT_STACK_CUTOVER_FILE_NAME
                 | DISTRIBUTED_AGENT_STACK_ACTIVE_FILE_NAME
+                | REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME
         ) {
             continue;
         }
@@ -5453,6 +5761,7 @@ fn validate_managed_fabric_directory_entries(
             && !valid_managed_agent_stack_temp_name(name)
             && !valid_managed_model_agent_stack_temp_name(name)
             && !valid_distributed_agent_stack_temp_name(name)
+            && !valid_remote_agent_descriptor_evidence_temp_name(name)
         {
             return Err(ManagedFabricStoreError::UnknownDirectoryEntry);
         }
@@ -5486,6 +5795,7 @@ fn clean_managed_fabric_orphan_temps(
             || valid_managed_agent_stack_temp_name(name)
             || valid_managed_model_agent_stack_temp_name(name)
             || valid_distributed_agent_stack_temp_name(name)
+            || valid_remote_agent_descriptor_evidence_temp_name(name)
         {
             names.push(name.to_owned());
         }
@@ -5960,6 +6270,19 @@ fn distributed_agent_stack_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
     name
 }
 
+fn remote_agent_descriptor_evidence_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(
+        REMOTE_AGENT_DESCRIPTOR_EVIDENCE_TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES,
+    );
+    name.push_str(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_TEMP_FILE_PREFIX);
+    for byte in token {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    name
+}
+
 fn valid_temp_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix(TEMP_FILE_PREFIX) else {
         return false;
@@ -6002,6 +6325,16 @@ fn valid_managed_model_agent_stack_temp_name(name: &str) -> bool {
 
 fn valid_distributed_agent_stack_temp_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix(DISTRIBUTED_AGENT_STACK_TEMP_FILE_PREFIX) else {
+        return false;
+    };
+    suffix.len() == TEMP_HEX_BYTES
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_remote_agent_descriptor_evidence_temp_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_TEMP_FILE_PREFIX) else {
         return false;
     };
     suffix.len() == TEMP_HEX_BYTES
@@ -6655,15 +6988,23 @@ pub(crate) mod tests {
         MAX_MIGRATION_EVIDENCE_ORPHAN_TEMPS, MAX_ORPHAN_TEMP_FILES,
         MAX_RUNTIME_JOURNAL_SNAPSHOT_BYTES, ManagedFabricCommitFailpoint, ManagedFabricStore,
         ManagedFabricStoreError, MigrationEvidenceKind, PRIVATE_FILE_MODE_BITS,
-        PRIVATE_FILE_MODE_MASK, RuntimeCommitFailpoint, RuntimeFileStage, RuntimeFilesystemPolicy,
-        RuntimeInitializerBeginError, RuntimeInitializerGuard, RuntimeInitializerPreflight,
-        RuntimeInitializerPublishError, RuntimeJournalMigrationKind, RuntimeMigrationFailpoints,
-        RuntimeMigrationRequest, RuntimeMigrationTokens, RuntimePublishFailure, RuntimeStore,
-        RuntimeStoreError, RuntimeStoreMigrationDisposition, RuntimeStoreMigrationError,
-        RuntimeStoreMigrationReceipt, RuntimeStoreOpenError, TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES,
-        migration_evidence_temp_name, migration_receipt_file_name, migration_receipt_file_name_for,
-        migration_source_file_name, migration_source_file_name_for, parse_linux_fdinfo_mount_id,
-        parse_linux_mountinfo_exact_ext4, temp_name, validate_runtime_service_identity,
+        PRIVATE_FILE_MODE_MASK, REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME,
+        REMOTE_AGENT_DESCRIPTOR_EVIDENCE_TEMP_FILE_PREFIX,
+        RemoteAgentDescriptorEvidenceCommitFailpoint, RuntimeCommitFailpoint, RuntimeFileStage,
+        RuntimeFilesystemPolicy, RuntimeInitializerBeginError, RuntimeInitializerGuard,
+        RuntimeInitializerPreflight, RuntimeInitializerPublishError, RuntimeJournalMigrationKind,
+        RuntimeMigrationFailpoints, RuntimeMigrationRequest, RuntimeMigrationTokens,
+        RuntimePublishFailure, RuntimeStore, RuntimeStoreError, RuntimeStoreMigrationDisposition,
+        RuntimeStoreMigrationError, RuntimeStoreMigrationReceipt, RuntimeStoreOpenError,
+        TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES, migration_evidence_temp_name,
+        migration_receipt_file_name, migration_receipt_file_name_for, migration_source_file_name,
+        migration_source_file_name_for, parse_linux_fdinfo_mount_id,
+        parse_linux_mountinfo_exact_ext4, remote_agent_descriptor_evidence_temp_name, temp_name,
+        validate_runtime_service_identity,
+    };
+    use crate::remote_agent_descriptor_evidence::{
+        MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES, RemoteAgentDescriptorEvidenceError,
+        tests::descriptor_evidence_fixture,
     };
     use crate::runtime_journal::{
         HostClockAdmissionState, LiveMaterialization, OpaqueCanonicalValue, ReplayLedgerRecord,
@@ -7175,6 +7516,279 @@ pub(crate) mod tests {
                 .expect("reopened store must be live"),
             Some(b"new".as_slice())
         );
+    }
+
+    #[test]
+    fn remote_agent_descriptor_evidence_slot_commits_replaces_and_reopens_exactly() {
+        let fabric_projection = digest(0xc1);
+        let (directory, mut store) = managed_fabric_store_fixture(0xc2, 0xc3, fabric_projection);
+        store
+            .initialize_managed_agent_stack(digest(0xc4), b"agent-stack-initial")
+            .expect("descriptor-evidence fixture needs Agent-stack authority");
+        let (first, _) = descriptor_evidence_fixture(None, 0xc5);
+        store
+            .commit_remote_agent_descriptor_evidence(first.canonical_wire())
+            .expect("first descriptor-evidence slot must commit");
+        assert_eq!(
+            store
+                .remote_agent_descriptor_evidence_bytes()
+                .expect("descriptor-evidence getter must remain live"),
+            Some(first.canonical_wire()),
+        );
+
+        let (next, _) = descriptor_evidence_fixture(Some(&first), 0xc6);
+        store
+            .commit_remote_agent_descriptor_evidence(next.canonical_wire())
+            .expect("next descriptor-evidence slot must replace the first");
+        assert_eq!(
+            store
+                .remote_agent_descriptor_evidence_bytes()
+                .expect("replacement descriptor-evidence getter must remain live"),
+            Some(next.canonical_wire()),
+        );
+        drop(store);
+
+        let reopened = ManagedFabricStore::open_fixture(
+            directory.path(),
+            [0xc2; 32],
+            digest(0xc3),
+            fabric_projection,
+        )
+        .expect("strict descriptor-evidence final must reopen");
+        assert_eq!(
+            reopened
+                .remote_agent_descriptor_evidence_bytes()
+                .expect("reopened descriptor-evidence getter must remain live"),
+            Some(next.canonical_wire()),
+        );
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME),
+            )
+            .expect("descriptor-evidence final must be readable"),
+            next.canonical_wire(),
+        );
+    }
+
+    #[test]
+    fn remote_agent_descriptor_evidence_temps_are_never_recovery_candidates() {
+        let fabric_projection = digest(0xc7);
+        let (directory, mut store) = managed_fabric_store_fixture(0xc8, 0xc9, fabric_projection);
+        store
+            .initialize_managed_agent_stack(digest(0xca), b"agent-stack-initial")
+            .expect("descriptor-evidence fixture needs Agent-stack authority");
+        drop(store);
+
+        let (unpublished, _) = descriptor_evidence_fixture(None, 0xcb);
+        let orphan = directory
+            .path()
+            .join(remote_agent_descriptor_evidence_temp_name(
+                [0xcc; TEMP_TOKEN_BYTES],
+            ));
+        install_private_file(&orphan, unpublished.canonical_wire());
+        let reopened = ManagedFabricStore::open_fixture(
+            directory.path(),
+            [0xc8; 32],
+            digest(0xc9),
+            fabric_projection,
+        )
+        .expect("orphan descriptor-evidence temp must not block reopen");
+        assert_eq!(
+            reopened
+                .remote_agent_descriptor_evidence_bytes()
+                .expect("descriptor-evidence getter must remain live"),
+            None,
+            "an unpublished temp must never become the latest slot",
+        );
+        assert!(
+            !orphan.exists(),
+            "strict reopen must remove the orphan temp"
+        );
+    }
+
+    #[test]
+    fn remote_agent_descriptor_evidence_pre_publish_failures_keep_old_slot_and_require_reopen() {
+        for (index, failpoint) in [
+            RemoteAgentDescriptorEvidenceCommitFailpoint::BeforeTempSync,
+            RemoteAgentDescriptorEvidenceCommitFailpoint::BeforeRename,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store_byte = 0xd0_u8 + u8::try_from(index).expect("bounded fixture index");
+            let target_byte = 0xd2_u8 + u8::try_from(index).expect("bounded fixture index");
+            let fabric_projection = digest(0xd4_u8 + store_byte.wrapping_sub(0xd0));
+            let (directory, mut store) =
+                managed_fabric_store_fixture(store_byte, target_byte, fabric_projection);
+            store
+                .initialize_managed_agent_stack(digest(0xd6), b"agent-stack-initial")
+                .expect("descriptor-evidence fixture needs Agent-stack authority");
+            let (first, _) = descriptor_evidence_fixture(None, 0xd7);
+            store
+                .commit_remote_agent_descriptor_evidence(first.canonical_wire())
+                .expect("old descriptor-evidence slot must commit");
+            let (next, _) = descriptor_evidence_fixture(Some(&first), 0xd8);
+            assert!(matches!(
+                store.commit_remote_agent_descriptor_evidence_with_failpoint(
+                    next.canonical_wire(),
+                    failpoint,
+                ),
+                Err(ManagedFabricStoreError::Io(_))
+            ));
+            assert!(matches!(
+                store.remote_agent_descriptor_evidence_bytes(),
+                Err(ManagedFabricStoreError::Stopped)
+            ));
+            drop(store);
+
+            let mut reopened = ManagedFabricStore::open_fixture(
+                directory.path(),
+                [store_byte; 32],
+                digest(target_byte),
+                fabric_projection,
+            )
+            .expect("pre-publish failure must reopen at the old final");
+            assert_eq!(
+                reopened
+                    .remote_agent_descriptor_evidence_bytes()
+                    .expect("reopened descriptor-evidence getter must remain live"),
+                Some(first.canonical_wire()),
+            );
+            assert!(
+                fs::read_dir(directory.path())
+                    .expect("fixture directory must remain readable")
+                    .all(|entry| {
+                        !entry
+                            .expect("fixture directory entry must remain readable")
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_TEMP_FILE_PREFIX)
+                    }),
+                "reopen must clean the pre-publish orphan temp",
+            );
+            reopened
+                .commit_remote_agent_descriptor_evidence(next.canonical_wire())
+                .expect("reopened store must be able to publish the next exact slot");
+            assert_eq!(
+                reopened
+                    .remote_agent_descriptor_evidence_bytes()
+                    .expect("continued descriptor-evidence getter must remain live"),
+                Some(next.canonical_wire()),
+            );
+        }
+    }
+
+    #[test]
+    fn remote_agent_descriptor_evidence_post_publish_uncertainty_reopens_only_the_new_final() {
+        let fabric_projection = digest(0xda);
+        let (directory, mut store) = managed_fabric_store_fixture(0xdb, 0xdc, fabric_projection);
+        store
+            .initialize_managed_agent_stack(digest(0xdd), b"agent-stack-initial")
+            .expect("descriptor-evidence fixture needs Agent-stack authority");
+        let (first, _) = descriptor_evidence_fixture(None, 0xde);
+        store
+            .commit_remote_agent_descriptor_evidence(first.canonical_wire())
+            .expect("old descriptor-evidence slot must commit");
+        let (next, _) = descriptor_evidence_fixture(Some(&first), 0xdf);
+        assert!(matches!(
+            store.commit_remote_agent_descriptor_evidence_with_failpoint(
+                next.canonical_wire(),
+                RemoteAgentDescriptorEvidenceCommitFailpoint::AfterRenameBeforeDirectorySync,
+            ),
+            Err(ManagedFabricStoreError::RemoteAgentDescriptorEvidenceCommitUncertain(_))
+        ));
+        assert!(matches!(
+            store.remote_agent_descriptor_evidence_bytes(),
+            Err(ManagedFabricStoreError::Stopped)
+        ));
+        drop(store);
+
+        let reopened = ManagedFabricStore::open_fixture(
+            directory.path(),
+            [0xdb; 32],
+            digest(0xdc),
+            fabric_projection,
+        )
+        .expect("post-publish uncertainty must select the strict final on reopen");
+        assert_eq!(
+            reopened
+                .remote_agent_descriptor_evidence_bytes()
+                .expect("reopened descriptor-evidence getter must remain live"),
+            Some(next.canonical_wire()),
+        );
+    }
+
+    #[test]
+    fn remote_agent_descriptor_evidence_requires_agent_authority_and_strict_final_bytes() {
+        let fabric_projection = digest(0xe0);
+        let (directory, mut store) = managed_fabric_store_fixture(0xe1, 0xe2, fabric_projection);
+        let (evidence, _) = descriptor_evidence_fixture(None, 0xe3);
+        assert!(matches!(
+            store.commit_remote_agent_descriptor_evidence(evidence.canonical_wire()),
+            Err(ManagedFabricStoreError::RemoteAgentDescriptorEvidenceWithoutAgentStack)
+        ));
+        drop(store);
+        install_private_file(
+            &directory
+                .path()
+                .join(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME),
+            evidence.canonical_wire(),
+        );
+        assert!(matches!(
+            ManagedFabricStore::open_fixture(
+                directory.path(),
+                [0xe1; 32],
+                digest(0xe2),
+                fabric_projection,
+            ),
+            Err(ManagedFabricStoreError::RemoteAgentDescriptorEvidenceWithoutAgentStack)
+        ));
+
+        let strict_projection = digest(0xe4);
+        let (strict_directory, mut strict_store) =
+            managed_fabric_store_fixture(0xe5, 0xe6, strict_projection);
+        strict_store
+            .initialize_managed_agent_stack(digest(0xe7), b"agent-stack-initial")
+            .expect("descriptor-evidence fixture needs Agent-stack authority");
+        assert!(matches!(
+            strict_store.commit_remote_agent_descriptor_evidence(&[]),
+            Err(ManagedFabricStoreError::InvalidRemoteAgentDescriptorEvidenceLength)
+        ));
+        assert!(matches!(
+            strict_store.commit_remote_agent_descriptor_evidence(&vec![
+                0;
+                MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES
+                    + 1
+            ],),
+            Err(ManagedFabricStoreError::InvalidRemoteAgentDescriptorEvidenceLength)
+        ));
+        strict_store
+            .commit_remote_agent_descriptor_evidence(evidence.canonical_wire())
+            .expect("valid descriptor evidence must remain committable after rejected lengths");
+        drop(strict_store);
+
+        let final_path = strict_directory
+            .path()
+            .join(REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME);
+        let mut corrupted = fs::read(&final_path)
+            .unwrap_or_else(|error| panic!("strict final read failed: {error}"));
+        *corrupted
+            .last_mut()
+            .unwrap_or_else(|| panic!("strict final unexpectedly empty")) ^= 1;
+        install_private_file(&final_path, &corrupted);
+        assert!(matches!(
+            ManagedFabricStore::open_fixture(
+                strict_directory.path(),
+                [0xe5; 32],
+                digest(0xe6),
+                strict_projection,
+            ),
+            Err(ManagedFabricStoreError::RemoteAgentDescriptorEvidence(
+                RemoteAgentDescriptorEvidenceError::ChecksumMismatch
+            ))
+        ));
     }
 
     #[test]

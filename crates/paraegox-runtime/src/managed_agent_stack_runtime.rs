@@ -327,6 +327,7 @@ pub(crate) enum ManagedAgentStackApplyOutcome {
 
 /// One bootstrap-only snapshot of the exact currently published Agent port.
 pub(crate) struct RuntimeAgentConversationPortExportV1 {
+    pub(crate) active_pxst_digest: Digest32,
     pub(crate) descriptor_wire: Box<[u8]>,
     pub(crate) fabric_generation: ManagedServiceGeneration,
     pub(crate) agent_generation: ManagedServiceGeneration,
@@ -496,6 +497,7 @@ impl ManagedAgentStackRuntimeCore {
             .await
             .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
         Ok(RuntimeAgentConversationPortExportV1 {
+            active_pxst_digest: receipt.receipt_digest(),
             descriptor_wire,
             fabric_generation: active.fabric_generation,
             agent_generation: active.agent_generation,
