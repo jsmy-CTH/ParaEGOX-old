@@ -2542,12 +2542,11 @@ mod tests {
         ExperimentalPeerCommonNameV1, ExperimentalRawZenohLink,
         ExperimentalRemoteMtlsConfigErrorV1, ExperimentalRemoteMtlsObservationErrorV1,
         ExperimentalRemoteMtlsPeerBindingV1, FabricConfigError, FabricError, FabricServiceConfig,
-        MAX_EXPERIMENTAL_OBSERVED_LINKS, MAX_KEY_EXPRESSION_BYTES,
-        REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES, PrincipalRef, RemoteTlsEndpoint,
+        MAX_EXPERIMENTAL_OBSERVED_LINKS, MAX_KEY_EXPRESSION_BYTES, PrincipalRef,
+        REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES, RemoteTlsEndpoint,
         ResolvedRemoteMtlsConnectorCredentialFilesV1, ResolvedRemoteMtlsCredentialFiles,
         ResolvedRemoteMtlsIdentityFiles, ResolvedRemoteMtlsListenerCredentialFilesV1,
-        SessionEndpoint,
-        classify_and_advance_experimental_remote_mtls_links,
+        SessionEndpoint, classify_and_advance_experimental_remote_mtls_links,
         classify_experimental_remote_mtls_links, try_fabric_session_epoch_with,
     };
     use crate::restricted_runtime_apply_peer_certificate_common_name_v1;

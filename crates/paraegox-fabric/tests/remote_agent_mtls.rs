@@ -219,7 +219,9 @@ fn run_openssl(arguments: &[String]) {
 }
 
 fn protect_private_key(path: &Path) {
-    let mut permissions = fs::metadata(path).expect("read generated key metadata").permissions();
+    let mut permissions = fs::metadata(path)
+        .expect("read generated key metadata")
+        .permissions();
     permissions.set_mode(0o600);
     fs::set_permissions(path, permissions).expect("restrict generated private key");
 }
@@ -245,9 +247,12 @@ fn actual_non_loopback_ipv4() -> Ipv4Addr {
 }
 
 fn available_port(address: Ipv4Addr) -> u16 {
-    let listener = TcpListener::bind(SocketAddrV4::new(address, 0))
-        .expect("reserve an available TCP port");
-    let port = listener.local_addr().expect("read reserved TCP port").port();
+    let listener =
+        TcpListener::bind(SocketAddrV4::new(address, 0)).expect("reserve an available TCP port");
+    let port = listener
+        .local_addr()
+        .expect("read reserved TCP port")
+        .port();
     drop(listener);
     port
 }
@@ -302,8 +307,7 @@ fn connector_config(
 }
 
 fn schema(marker: u8) -> SchemaRef {
-    SchemaRef::try_new([marker; 16], 1, Digest32::from_bytes([marker; 32]))
-        .expect("test schema")
+    SchemaRef::try_new([marker; 16], 1, Digest32::from_bytes([marker; 32])).expect("test schema")
 }
 
 fn binding_spec(marker: u8, route: &str) -> RequestResponseBindingSpec {
@@ -368,11 +372,7 @@ async fn expect_echo(
     assert_eq!(response.body(), body);
 }
 
-async fn expect_denied(
-    service: &FabricService,
-    binding: &PortBinding,
-    request_marker: u8,
-) {
+async fn expect_denied(service: &FabricService, binding: &PortBinding, request_marker: u8) {
     let result = service
         .request(
             binding,
@@ -462,8 +462,8 @@ async fn remote_agent_listener_and_connector_enforce_two_route_mtls_acl() {
     .expect("correct same-CA client must complete mTLS session open");
     expect_echo(&correct_client, &submit, 0x53, b"remote-submit").await;
     expect_echo(&correct_client, &control, 0x54, b"remote-control").await;
-    let allowed_callbacks = submit_callbacks.load(Ordering::SeqCst)
-        + control_callbacks.load(Ordering::SeqCst);
+    let allowed_callbacks =
+        submit_callbacks.load(Ordering::SeqCst) + control_callbacks.load(Ordering::SeqCst);
     expect_denied(&correct_client, &sentinel, 0x55).await;
     expect_denied(&correct_client, &parent, 0x56).await;
     expect_denied(&correct_client, &child, 0x57).await;
@@ -474,7 +474,10 @@ async fn remote_agent_listener_and_connector_enforce_two_route_mtls_acl() {
         submit_callbacks.load(Ordering::SeqCst) + control_callbacks.load(Ordering::SeqCst),
         allowed_callbacks
     );
-    correct_client.shutdown().await.expect("shutdown correct client");
+    correct_client
+        .shutdown()
+        .await
+        .expect("shutdown correct client");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let plaintext_client = FabricService::start(
@@ -509,7 +512,10 @@ async fn remote_agent_listener_and_connector_enforce_two_route_mtls_acl() {
         submit_callbacks.load(Ordering::SeqCst) + control_callbacks.load(Ordering::SeqCst),
         allowed_callbacks
     );
-    wrong_client.shutdown().await.expect("shutdown wrong client");
+    wrong_client
+        .shutdown()
+        .await
+        .expect("shutdown wrong client");
 
     server.shutdown().await.expect("shutdown listener session");
     for handler in [
