@@ -1194,8 +1194,7 @@ fn terminal_generation_is_known(
     high_water: u64,
 ) -> bool {
     actual.is_none_or(|actual| {
-        actual.value() <= high_water
-            && (candidate == Some(actual) || predecessor == Some(actual))
+        actual.value() <= high_water && (candidate == Some(actual) || predecessor == Some(actual))
     })
 }
 
@@ -2274,7 +2273,11 @@ mod tests {
         frame[digest_start..].copy_from_slice(digest.as_bytes());
     }
 
-    fn unique_subslice_offset(frame: &[u8], range: core::ops::Range<usize>, needle: &[u8]) -> usize {
+    fn unique_subslice_offset(
+        frame: &[u8],
+        range: core::ops::Range<usize>,
+        needle: &[u8],
+    ) -> usize {
         let offsets = frame[range.clone()]
             .windows(needle.len())
             .enumerate()
@@ -2610,10 +2613,7 @@ mod tests {
         let wire = snapshot.canonical_wire();
 
         assert!(matches!(
-            RemoteAgentAccessSnapshotV1::decode(
-                &wire[..SNAPSHOT_HEADER_BYTES - 1],
-                identity(),
-            ),
+            RemoteAgentAccessSnapshotV1::decode(&wire[..SNAPSHOT_HEADER_BYTES - 1], identity(),),
             Err(RemoteAgentAccessStateError::Truncated)
         ));
         assert!(matches!(
@@ -2836,9 +2836,15 @@ mod tests {
         reseal(&mut structurally_resigned);
         let decoded = RemoteAgentAccessSnapshotV1::decode(&structurally_resigned, identity())
             .unwrap_or_else(|error| panic!("structural recovery rejected: {error}"));
-        assert_ne!(decoded.request.canonical_wire(), snapshot.request.canonical_wire());
+        assert_ne!(
+            decoded.request.canonical_wire(),
+            snapshot.request.canonical_wire()
+        );
         assert_eq!(decoded.admission, snapshot.admission);
-        assert_eq!(decoded.phase(), RemoteAgentAccessDurablePhaseV1::PreparedNoEffects);
+        assert_eq!(
+            decoded.phase(),
+            RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
+        );
 
         assert!(!terminal_generation_is_known(
             Some(generation(1)),
