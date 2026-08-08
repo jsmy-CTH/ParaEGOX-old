@@ -11,11 +11,7 @@
 
 use core::fmt;
 
-use paraegox_kernel::{
-    digest::Digest32,
-    identity::RuntimeHostId,
-    time::ClockGeneration,
-};
+use paraegox_kernel::{digest::Digest32, identity::RuntimeHostId, time::ClockGeneration};
 use paraegox_runtime_contracts::{
     managed_fabric_plan::ManagedFabricApplyTerminalOutcomeV1,
     managed_service::ManagedServiceGeneration,
@@ -34,13 +30,13 @@ use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::{
     admission::VerifiedRemoteAgentDataPlaneApplyIngressV1,
-    managed_fabric_state::{
-        MAX_MANAGED_FABRIC_SNAPSHOT_BYTES, ManagedFabricDurablePhase, ManagedFabricSnapshot,
-        ManagedFabricStateError,
-    },
     managed_agent_stack_state::{
         MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES, ManagedAgentStackDurablePhase,
         ManagedAgentStackSnapshot, ManagedAgentStackStateError,
+    },
+    managed_fabric_state::{
+        MAX_MANAGED_FABRIC_SNAPSHOT_BYTES, ManagedFabricDurablePhase, ManagedFabricSnapshot,
+        ManagedFabricStateError,
     },
     remote_agent_descriptor_evidence::{
         MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES, RemoteAgentDescriptorEvidenceError,
@@ -57,8 +53,7 @@ const SNAPSHOT_HAS_DESCRIPTOR_EVIDENCE: u16 = 1 << 1;
 const SNAPSHOT_HAS_TERMINAL: u16 = 1 << 2;
 const SNAPSHOT_KNOWN_FLAGS: u16 =
     SNAPSHOT_HAS_PREVIOUS | SNAPSHOT_HAS_DESCRIPTOR_EVIDENCE | SNAPSHOT_HAS_TERMINAL;
-const SNAPSHOT_DIGEST_DOMAIN: &[u8] =
-    b"paraegox.runtime.remote-agent-access-snapshot.sha256.v1";
+const SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.remote-agent-access-snapshot.sha256.v1";
 
 pub(crate) const MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_BYTES: usize = SNAPSHOT_HEADER_BYTES
     + MAX_REMOTE_AGENT_ACCESS_REQUEST_BYTES
@@ -258,24 +253,20 @@ impl RemoteAgentAccessSnapshotV1 {
             }
             None => (1, None, 0),
         };
-        let inherited_fabric_high_water = previous.map_or(
-            strict_predecessor.fabric_generation_high_water,
-            |prior| {
+        let inherited_fabric_high_water =
+            previous.map_or(strict_predecessor.fabric_generation_high_water, |prior| {
                 prior
                     .generations
                     .fabric_generation_high_water
                     .max(strict_predecessor.fabric_generation_high_water)
-            },
-        );
-        let inherited_agent_high_water = previous.map_or(
-            strict_predecessor.agent_generation_high_water,
-            |prior| {
+            });
+        let inherited_agent_high_water =
+            previous.map_or(strict_predecessor.agent_generation_high_water, |prior| {
                 prior
                     .generations
                     .agent_generation_high_water
                     .max(strict_predecessor.agent_generation_high_water)
-            },
-        );
+            });
         if active.fabric_generation.value() > inherited_fabric_high_water
             || active.agent_generation.value() > inherited_agent_high_water
         {
@@ -475,7 +466,11 @@ impl RemoteAgentAccessSnapshotV1 {
         {
             return Err(RemoteAgentAccessStateError::InvalidLength);
         }
-        validate_presence_flag(flags, SNAPSHOT_HAS_DESCRIPTOR_EVIDENCE, descriptor_length != 0)?;
+        validate_presence_flag(
+            flags,
+            SNAPSHOT_HAS_DESCRIPTOR_EVIDENCE,
+            descriptor_length != 0,
+        )?;
         validate_presence_flag(flags, SNAPSHOT_HAS_TERMINAL, terminal_length != 0)?;
         let previous_snapshot_digest = match (
             flags & SNAPSHOT_HAS_PREVIOUS != 0,
@@ -531,12 +526,12 @@ impl RemoteAgentAccessSnapshotV1 {
             || owner_target_fingerprint != expected_owner_target_fingerprint
             || transition_projection_digest != expected_transition_projection_digest
             || fabric_owner_target_fingerprint != expected_fabric_owner_target_fingerprint
-            || fabric_transition_projection_digest
-                != expected_fabric_transition_projection_digest
+            || fabric_transition_projection_digest != expected_fabric_transition_projection_digest
         {
             return Err(RemoteAgentAccessStateError::IdentityMismatch);
         }
-        let expected_snapshot_digest = snapshot_digest(&frame[..frame.len() - SNAPSHOT_DIGEST_BYTES]);
+        let expected_snapshot_digest =
+            snapshot_digest(&frame[..frame.len() - SNAPSHOT_DIGEST_BYTES]);
         if expected_snapshot_digest != encoded_snapshot_digest {
             return Err(RemoteAgentAccessStateError::ChecksumMismatch);
         }
@@ -659,8 +654,8 @@ impl RemoteAgentAccessSnapshotV1 {
         if total_length > MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_BYTES {
             return Err(RemoteAgentAccessStateError::FrameTooLarge);
         }
-        let total_length = u32::try_from(total_length)
-            .map_err(|_| RemoteAgentAccessStateError::FrameTooLarge)?;
+        let total_length =
+            u32::try_from(total_length).map_err(|_| RemoteAgentAccessStateError::FrameTooLarge)?;
         let mut flags = 0_u16;
         if self.previous_snapshot_digest.is_some() {
             flags |= SNAPSHOT_HAS_PREVIOUS;
@@ -850,11 +845,9 @@ fn validate_descriptor_shape(
                 .receipt
                 .validate_against_request(&fabric_active.request, fabric_active.response_channel)
                 .map_err(|_| RemoteAgentAccessStateError::InvalidFabricTerminal)?;
-            if fabric_terminal_facts.outcome()
-                != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+            if fabric_terminal_facts.outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
                 || fabric_terminal_facts.generation() != Some(fabric_active.generation)
-                || fabric_terminal.receipt.receipt_digest()
-                    != cas.expected_active_pxft_digest()
+                || fabric_terminal.receipt.receipt_digest() != cas.expected_active_pxft_digest()
                 || outer.expected_active_pxst_digest() != cas.expected_active_pxst_digest()
                 || cas.expected_fabric_generation() != fabric_active.generation
                 || cas.expected_agent_generation() != active.agent_generation
@@ -866,8 +859,7 @@ fn validate_descriptor_shape(
                     != outer.expected_runtime_store_instance_id()
                 || evidence.runtime_host_epoch() != outer.expected_runtime_host_epoch()
                 || evidence.active_pxst_digest() != cas.expected_active_pxst_digest()
-                || evidence.receipt_digest()
-                    != cas.expected_bootstrap_descriptor_receipt_digest()
+                || evidence.receipt_digest() != cas.expected_bootstrap_descriptor_receipt_digest()
                 || evidence.descriptor_payload_digest()
                     != cas.expected_bootstrap_descriptor_payload_digest()
                 || evidence.fabric_generation() != cas.expected_fabric_generation()
@@ -1198,7 +1190,9 @@ fn decode_mode(value: u8) -> Result<RemoteAgentDataPlaneTargetModeV1, RemoteAgen
 }
 
 fn encode_optional_generation(value: Option<ManagedServiceGeneration>) -> [u8; 8] {
-    value.map_or(0, ManagedServiceGeneration::value).to_be_bytes()
+    value
+        .map_or(0, ManagedServiceGeneration::value)
+        .to_be_bytes()
 }
 
 fn decode_optional_generation(
