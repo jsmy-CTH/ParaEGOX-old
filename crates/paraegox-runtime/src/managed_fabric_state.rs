@@ -28,7 +28,7 @@ const SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES: usize = 136;
 const SNAPSHOT_CHECKSUM_DOMAIN: &[u8] = b"paraegox.runtime.managed-fabric-snapshot.sha256.v1";
 const MAX_TERMINALS: usize = 256;
 const MAX_REPLAY_ENTRIES: usize = 256;
-const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_MANAGED_FABRIC_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -281,7 +281,7 @@ impl ManagedFabricSnapshot {
         if frame.len() < SNAPSHOT_HEADER_BYTES {
             return Err(ManagedFabricStateError::Truncated);
         }
-        if frame.len() > MAX_SNAPSHOT_BYTES {
+        if frame.len() > MAX_MANAGED_FABRIC_SNAPSHOT_BYTES {
             return Err(ManagedFabricStateError::FrameTooLarge);
         }
         if &frame[..4] != SNAPSHOT_MAGIC
@@ -472,7 +472,7 @@ impl ManagedFabricSnapshot {
         let total = SNAPSHOT_HEADER_BYTES
             .checked_add(payload.len())
             .ok_or(ManagedFabricStateError::FrameTooLarge)?;
-        if total > MAX_SNAPSHOT_BYTES {
+        if total > MAX_MANAGED_FABRIC_SNAPSHOT_BYTES {
             return Err(ManagedFabricStateError::FrameTooLarge);
         }
         let mut frame = vec![0_u8; SNAPSHOT_HEADER_BYTES];

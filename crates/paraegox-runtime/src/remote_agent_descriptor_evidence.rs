@@ -272,8 +272,23 @@ impl RemoteAgentDescriptorEvidenceV1 {
     }
 
     #[must_use]
+    pub(crate) const fn descriptor_payload_digest(&self) -> Digest32 {
+        self.descriptor_payload_digest
+    }
+
+    #[must_use]
     pub(crate) const fn receipt_digest(&self) -> Digest32 {
         self.receipt_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn fabric_generation(&self) -> ManagedServiceGeneration {
+        self.fabric_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn agent_generation(&self) -> ManagedServiceGeneration {
+        self.agent_generation
     }
 
     #[must_use]
