@@ -926,8 +926,7 @@ fn validate_generation_shape(
     if generations.fabric_generation_high_water == 0
         || generations.agent_generation_high_water == 0
         || active.fabric_generation.value() > generations.fabric_generation_high_water
-        || snapshot.fabric.generation_high_water()
-            > generations.fabric_generation_high_water
+        || snapshot.fabric.generation_high_water() > generations.fabric_generation_high_water
         || active.agent_generation.value() > generations.agent_generation_high_water
         || !candidate_matches_high_water(
             generations.access_generation_candidate,
@@ -1392,9 +1391,7 @@ mod tests {
         managed_agent_stack_plan::{
             ManagedAgentStackApplyRequestV1, ManagedAgentStackTerminalReceiptV1,
         },
-        managed_fabric_plan::{
-            ManagedFabricApplyRequestV1, ManagedFabricApplyTerminalReceiptV1,
-        },
+        managed_fabric_plan::{ManagedFabricApplyRequestV1, ManagedFabricApplyTerminalReceiptV1},
         managed_serving_bootstrap::{
             RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlRequestDraftV1,
             RuntimeAgentControlRequestFieldsV1, RuntimeAgentControlRequestIdV1,
@@ -1416,9 +1413,9 @@ mod tests {
 
     use crate::{
         admission::{
-            AdmissionStateLimits, ApplyAdmissionPolicy, TrustedApplyIdentity, TrustedApplyKey,
-            TrustedTenureIdentity, TrustedTenureKey, ED25519_ALGORITHM,
-            ED25519_ALGORITHM_VERSION,
+            AdmissionStateLimits, ApplyAdmissionPolicy, ED25519_ALGORITHM,
+            ED25519_ALGORITHM_VERSION, TrustedApplyIdentity, TrustedApplyKey,
+            TrustedTenureIdentity, TrustedTenureKey,
         },
         managed_agent_stack_state::{
             ManagedAgentStackDurableActive, ManagedAgentStackSnapshot,
@@ -1654,12 +1651,14 @@ mod tests {
     fn active_stack_snapshot(options: PreparedOptions) -> ManagedAgentStackSnapshot {
         let request = stack_request();
         let receipt = stack_terminal();
-        let terminals = options.include_stack_terminal.then(|| ManagedAgentStackTerminalRecord {
-            source_scope: request.provenance().source_scope(),
-            operation_id: request.operation_id(),
-            request_digest: request.envelope_request_digest(),
-            receipt,
-        });
+        let terminals = options
+            .include_stack_terminal
+            .then(|| ManagedAgentStackTerminalRecord {
+                source_scope: request.provenance().source_scope(),
+                operation_id: request.operation_id(),
+                request_digest: request.envelope_request_digest(),
+                receipt,
+            });
         ManagedAgentStackSnapshot::try_initial(
             STORE,
             STACK_OWNER,
@@ -1950,15 +1949,25 @@ mod tests {
             RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
         ] {
             let snapshot = prepared(mode);
-            let decoded = RemoteAgentAccessSnapshotV1::decode(snapshot.canonical_wire(), identity())
-                .unwrap_or_else(|error| panic!("Prepared restart decode rejected: {error}"));
+            let decoded =
+                RemoteAgentAccessSnapshotV1::decode(snapshot.canonical_wire(), identity())
+                    .unwrap_or_else(|error| panic!("Prepared restart decode rejected: {error}"));
             assert_eq!(decoded, snapshot);
-            assert_eq!(decoded.phase(), RemoteAgentAccessDurablePhaseV1::PreparedNoEffects);
+            assert_eq!(
+                decoded.phase(),
+                RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
+            );
             assert_eq!(decoded.sequence(), 1);
             assert_eq!(decoded.previous_snapshot_digest(), None);
             assert_eq!(decoded.mode(), mode);
-            assert_eq!(decoded.request.canonical_wire(), snapshot.request.canonical_wire());
-            assert_eq!(decoded.fabric.canonical_wire(), snapshot.fabric.canonical_wire());
+            assert_eq!(
+                decoded.request.canonical_wire(),
+                snapshot.request.canonical_wire()
+            );
+            assert_eq!(
+                decoded.fabric.canonical_wire(),
+                snapshot.fabric.canonical_wire()
+            );
             assert_eq!(
                 decoded.predecessor.canonical_wire(),
                 snapshot.predecessor.canonical_wire()
@@ -1975,7 +1984,8 @@ mod tests {
 
     #[test]
     fn prepared_shape_requires_exact_mode_specific_descriptor_authority() {
-        let mut active = PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let mut active =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
         active.include_descriptor = false;
         assert!(matches!(
             prepared_result(active),
