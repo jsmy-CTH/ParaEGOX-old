@@ -1407,12 +1407,10 @@ mod tests {
             RemoteAgentBootstrapCasV1, RemoteAgentDataPlaneApplyRequestDraftV1,
             RemoteAgentDataPlaneApplyRequestV1, RemoteAgentDataPlaneProjectionV1,
             RemoteAgentDataPlaneRemoteObservationV1, RemoteAgentDataPlaneTargetExecutionV1,
-            RemoteAgentDataPlaneTerminalAuthClaimV1,
-            RemoteAgentDataPlaneTerminalEvidenceFieldsV1,
+            RemoteAgentDataPlaneTerminalAuthClaimV1, RemoteAgentDataPlaneTerminalEvidenceFieldsV1,
             RemoteAgentDataPlaneTerminalEvidenceV1, RemoteAgentDataPlaneTerminalHeadV1,
-            RemoteAgentDataPlaneTerminalLifecycleEffectV1,
-            RemoteAgentDataPlaneTerminalOutcomeV1, RemoteAgentDataPlaneTerminalReceiptDraftV1,
-            RemoteAgentDataPlaneTerminalStateV1,
+            RemoteAgentDataPlaneTerminalLifecycleEffectV1, RemoteAgentDataPlaneTerminalOutcomeV1,
+            RemoteAgentDataPlaneTerminalReceiptDraftV1, RemoteAgentDataPlaneTerminalStateV1,
         },
         wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim},
     };
@@ -2026,9 +2024,7 @@ mod tests {
         successor
     }
 
-    fn ready_observation(
-        mode: RemoteAgentDataPlaneTargetModeV1,
-    ) -> RemoteAgentAccessSnapshotV1 {
+    fn ready_observation(mode: RemoteAgentDataPlaneTargetModeV1) -> RemoteAgentAccessSnapshotV1 {
         let prepared = prepared(mode);
         let agent_stop = effect_successor(
             &prepared,
@@ -2079,78 +2075,89 @@ mod tests {
         let inner = inner_request(&snapshot.request)
             .unwrap_or_else(|error| panic!("terminal fixture request rejected: {error}"));
         let zero = zero_digest();
-        let (echoed_receipt, echoed_payload) = inner
-            .target_execution()
-            .bootstrap_cas()
-            .map_or((zero, zero), |cas| {
-                (
-                    cas.expected_bootstrap_descriptor_receipt_digest(),
-                    cas.expected_bootstrap_descriptor_payload_digest(),
-                )
-            });
-        let (lifecycle, head, fabric, agent, access, census, base_ready, remote, quarantined, fresh) =
-            match outcome {
-                RemoteAgentDataPlaneTerminalOutcomeV1::ActiveReady => (
-                    RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
-                    RemoteAgentDataPlaneTerminalHeadV1::CommittedIncoming,
-                    snapshot.generations().fabric_generation_candidate,
-                    snapshot.generations().agent_generation_candidate,
-                    snapshot.generations().access_generation_candidate,
-                    2,
-                    true,
-                    RemoteAgentDataPlaneRemoteObservationV1::ListenerAndClientAclReady,
-                    false,
-                    Digest32::from_bytes([0xf1; 32]),
-                ),
-                RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady => (
-                    RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
-                    RemoteAgentDataPlaneTerminalHeadV1::CommittedIncoming,
-                    snapshot.generations().fabric_generation_candidate,
-                    snapshot.generations().agent_generation_candidate,
-                    None,
-                    2,
-                    true,
-                    RemoteAgentDataPlaneRemoteObservationV1::RemoteAbsent,
-                    false,
-                    zero,
-                ),
-                RemoteAgentDataPlaneTerminalOutcomeV1::NoEffectRejected => (
-                    RemoteAgentDataPlaneTerminalLifecycleEffectV1::ProvenNotStarted,
-                    RemoteAgentDataPlaneTerminalHeadV1::PreservedNone,
-                    None,
-                    None,
-                    None,
-                    0,
-                    false,
-                    RemoteAgentDataPlaneRemoteObservationV1::Unknown,
-                    false,
-                    zero,
-                ),
-                RemoteAgentDataPlaneTerminalOutcomeV1::Uncertain => (
-                    RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
-                    RemoteAgentDataPlaneTerminalHeadV1::PreservedNone,
-                    None,
-                    None,
-                    None,
-                    0,
-                    false,
-                    RemoteAgentDataPlaneRemoteObservationV1::Unknown,
-                    false,
-                    zero,
-                ),
-                RemoteAgentDataPlaneTerminalOutcomeV1::Quarantined => (
-                    RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
-                    RemoteAgentDataPlaneTerminalHeadV1::PreservedNone,
-                    None,
-                    None,
-                    None,
-                    0,
-                    false,
-                    RemoteAgentDataPlaneRemoteObservationV1::Unknown,
-                    true,
-                    zero,
-                ),
-            };
+        let (echoed_receipt, echoed_payload) =
+            inner
+                .target_execution()
+                .bootstrap_cas()
+                .map_or((zero, zero), |cas| {
+                    (
+                        cas.expected_bootstrap_descriptor_receipt_digest(),
+                        cas.expected_bootstrap_descriptor_payload_digest(),
+                    )
+                });
+        let (
+            lifecycle,
+            head,
+            fabric,
+            agent,
+            access,
+            census,
+            base_ready,
+            remote,
+            quarantined,
+            fresh,
+        ) = match outcome {
+            RemoteAgentDataPlaneTerminalOutcomeV1::ActiveReady => (
+                RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
+                RemoteAgentDataPlaneTerminalHeadV1::CommittedIncoming,
+                snapshot.generations().fabric_generation_candidate,
+                snapshot.generations().agent_generation_candidate,
+                snapshot.generations().access_generation_candidate,
+                2,
+                true,
+                RemoteAgentDataPlaneRemoteObservationV1::ListenerAndClientAclReady,
+                false,
+                Digest32::from_bytes([0xf1; 32]),
+            ),
+            RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady => (
+                RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
+                RemoteAgentDataPlaneTerminalHeadV1::CommittedIncoming,
+                snapshot.generations().fabric_generation_candidate,
+                snapshot.generations().agent_generation_candidate,
+                None,
+                2,
+                true,
+                RemoteAgentDataPlaneRemoteObservationV1::RemoteAbsent,
+                false,
+                zero,
+            ),
+            RemoteAgentDataPlaneTerminalOutcomeV1::NoEffectRejected => (
+                RemoteAgentDataPlaneTerminalLifecycleEffectV1::ProvenNotStarted,
+                RemoteAgentDataPlaneTerminalHeadV1::PreservedNone,
+                None,
+                None,
+                None,
+                0,
+                false,
+                RemoteAgentDataPlaneRemoteObservationV1::Unknown,
+                false,
+                zero,
+            ),
+            RemoteAgentDataPlaneTerminalOutcomeV1::Uncertain => (
+                RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
+                RemoteAgentDataPlaneTerminalHeadV1::PreservedNone,
+                None,
+                None,
+                None,
+                0,
+                false,
+                RemoteAgentDataPlaneRemoteObservationV1::Unknown,
+                false,
+                zero,
+            ),
+            RemoteAgentDataPlaneTerminalOutcomeV1::Quarantined => (
+                RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
+                RemoteAgentDataPlaneTerminalHeadV1::PreservedNone,
+                None,
+                None,
+                None,
+                0,
+                false,
+                RemoteAgentDataPlaneRemoteObservationV1::Unknown,
+                true,
+                zero,
+            ),
+        };
         let state = RemoteAgentDataPlaneTerminalStateV1::try_new(
             outcome, lifecycle, head, fabric, agent, access,
         )
@@ -2370,7 +2377,10 @@ mod tests {
             ),
         ] {
             let ready = ready_observation(mode);
-            assert_eq!(ready.phase(), RemoteAgentAccessDurablePhaseV1::ReadyObservation);
+            assert_eq!(
+                ready.phase(),
+                RemoteAgentAccessDurablePhaseV1::ReadyObservation
+            );
             assert_eq!(ready.sequence(), 6);
             let terminal = terminal_successor(&ready, phase, outcome)
                 .unwrap_or_else(|error| panic!("ready terminal rejected: {error}"));
@@ -2394,7 +2404,10 @@ mod tests {
             RemoteAgentDataPlaneTerminalOutcomeV1::NoEffectRejected,
         )
         .unwrap_or_else(|error| panic!("NoEffect terminal rejected: {error}"));
-        assert_eq!(no_effect.phase(), RemoteAgentAccessDurablePhaseV1::NoEffectTerminal);
+        assert_eq!(
+            no_effect.phase(),
+            RemoteAgentAccessDurablePhaseV1::NoEffectTerminal
+        );
         decode_roundtrip(&no_effect);
 
         let agent_stop = effect_successor(
@@ -2408,7 +2421,10 @@ mod tests {
             RemoteAgentDataPlaneTerminalOutcomeV1::Uncertain,
         )
         .unwrap_or_else(|error| panic!("Uncertain terminal rejected: {error}"));
-        assert_eq!(uncertain.phase(), RemoteAgentAccessDurablePhaseV1::Uncertain);
+        assert_eq!(
+            uncertain.phase(),
+            RemoteAgentAccessDurablePhaseV1::Uncertain
+        );
         decode_roundtrip(&uncertain);
 
         let quarantine_intent = effect_successor(
@@ -2422,7 +2438,10 @@ mod tests {
             RemoteAgentDataPlaneTerminalOutcomeV1::Quarantined,
         )
         .unwrap_or_else(|error| panic!("Quarantined terminal rejected: {error}"));
-        assert_eq!(quarantined.phase(), RemoteAgentAccessDurablePhaseV1::Quarantined);
+        assert_eq!(
+            quarantined.phase(),
+            RemoteAgentAccessDurablePhaseV1::Quarantined
+        );
         decode_roundtrip(&quarantined);
 
         assert!(matches!(
@@ -2446,15 +2465,14 @@ mod tests {
     fn generation_candidates_allocate_once_at_their_exact_intent() {
         let prepared = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
         let mut early = prepared.generations();
-        early.fabric_generation_candidate = Some(next_generation(early.fabric_generation_high_water));
+        early.fabric_generation_candidate =
+            Some(next_generation(early.fabric_generation_high_water));
         early.fabric_generation_high_water += 1;
-        early.access_generation_candidate = Some(next_generation(early.access_generation_high_water));
+        early.access_generation_candidate =
+            Some(next_generation(early.access_generation_high_water));
         early.access_generation_high_water += 1;
         assert!(matches!(
-            prepared.try_effect_successor(
-                RemoteAgentAccessDurablePhaseV1::AgentStopIntent,
-                early,
-            ),
+            prepared.try_effect_successor(RemoteAgentAccessDurablePhaseV1::AgentStopIntent, early,),
             Err(RemoteAgentAccessStateError::InvalidGenerationSuccessor)
         ));
 
@@ -2503,15 +2521,12 @@ mod tests {
             agent_start_generations(&fabric_start),
         );
         let mut swapped = agent_start.generations();
-        swapped.fabric_generation_candidate = Some(next_generation(
-            swapped.fabric_generation_high_water,
-        ));
+        swapped.fabric_generation_candidate =
+            Some(next_generation(swapped.fabric_generation_high_water));
         swapped.fabric_generation_high_water += 1;
         assert!(matches!(
-            agent_start.try_effect_successor(
-                RemoteAgentAccessDurablePhaseV1::ReadyObservation,
-                swapped,
-            ),
+            agent_start
+                .try_effect_successor(RemoteAgentAccessDurablePhaseV1::ReadyObservation, swapped,),
             Err(RemoteAgentAccessStateError::InvalidGenerationSuccessor)
         ));
     }
