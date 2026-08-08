@@ -1651,6 +1651,7 @@ mod tests {
     fn active_stack_snapshot(options: PreparedOptions) -> ManagedAgentStackSnapshot {
         let request = stack_request();
         let receipt = stack_terminal();
+        let projection = request.target_execution().projection().clone();
         let terminals = options
             .include_stack_terminal
             .then(|| ManagedAgentStackTerminalRecord {
@@ -1659,7 +1660,7 @@ mod tests {
                 request_digest: request.envelope_request_digest(),
                 receipt,
             });
-        ManagedAgentStackSnapshot::try_initial(
+        let mut snapshot = ManagedAgentStackSnapshot::try_initial(
             STORE,
             STACK_OWNER,
             STACK_PROJECTION,
@@ -1680,7 +1681,7 @@ mod tests {
                 tenure_nonces: Vec::new(),
                 request_nonces: Vec::new(),
                 temporal_lineages: Vec::new(),
-                terminals: terminals.into_iter().collect(),
+                terminals: Vec::new(),
                 physical_binding_census: 2,
                 census_complete: true,
                 fabric_ready: true,
@@ -1688,9 +1689,22 @@ mod tests {
                 dependency_satisfied: true,
                 quarantine_reason: None,
             },
-            stack_request().target_execution().projection(),
+            &projection,
         )
-        .unwrap_or_else(|error| panic!("active PXAS rejected: {error}"))
+        .unwrap_or_else(|error| panic!("active PXAS rejected: {error}"));
+        let Some(terminal) = terminals else {
+            return snapshot;
+        };
+        while snapshot.sequence() < 10 {
+            snapshot = snapshot
+                .try_successor(snapshot.transition(), &projection)
+                .unwrap_or_else(|error| panic!("PXAS sequence advance rejected: {error}"));
+        }
+        let mut transition = snapshot.transition();
+        transition.terminals.push(terminal);
+        snapshot
+            .try_successor(transition, &projection)
+            .unwrap_or_else(|error| panic!("PXAS terminal retention rejected: {error}"))
     }
 
     fn descriptor_evidence(
