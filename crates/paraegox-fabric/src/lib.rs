@@ -53,6 +53,7 @@ pub use service::{
     ExperimentalRemoteMtlsPeerBindingV1, ExperimentalRemoteMtlsPeerLinkObservationV1,
     FabricConfigError, FabricError, FabricService, FabricServiceConfig, HandlerResponse,
     InboundRequest, InstalledBinding, PortBinding, RemoteTlsEndpoint, RequestReceiver,
-    RequestResponseBindingSpec, ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles,
-    SessionEndpoint,
+    RequestResponseBindingSpec, ResolvedRemoteMtlsConnectorCredentialFilesV1,
+    ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles,
+    ResolvedRemoteMtlsListenerCredentialFilesV1, SessionEndpoint,
 };

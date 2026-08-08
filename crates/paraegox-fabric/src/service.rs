@@ -12,7 +12,10 @@ use std::{
     },
 };
 
-use paraegox_kernel::digest::Digest32;
+use paraegox_kernel::{
+    digest::Digest32,
+    identity::{PrincipalRef, RuntimeHostId},
+};
 use paraegox_runtime_contracts::{
     assignment::{BindingId, SchemaRef},
     distributed_agent_stack_plan::DistributedFabricSessionEpochV1,
@@ -21,15 +24,20 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
-use zenoh::query::{Query, Queryable};
+use zenoh::{
+    key_expr::OwnedNonWildKeyExpr,
+    query::{Query, Queryable},
+};
 
 use crate::{
     contract::{
         BindingEpoch, BindingRequestEnvelopeV1, BindingResponseEnvelopeV1, FabricContractError,
-        REQUEST_HEADER_BYTES, RequestHeaderDisposition, RequestId, ResponseStatus,
+        MAX_ENVELOPE_BODY_BYTES, REQUEST_HEADER_BYTES, RequestHeaderDisposition, RequestId,
+        ResponseStatus,
         prevalidate_request_header, validate_binding_id,
     },
     ingress::{FabricIngressSnapshot, IngressBudget, IngressLease, IngressLimits},
+    runtime_apply::restricted_runtime_apply_peer_certificate_common_name_v1,
 };
 
 const MAX_ENDPOINT_BYTES: usize = 256;
@@ -42,6 +50,13 @@ const MAX_KEY_EXPRESSION_BYTES: usize = 256;
 const MAX_TLS_FILE_PATH_BYTES: usize = 4_096;
 const LOOPBACK_TCP_PREFIX: &str = "tcp/127.0.0.1:";
 const REMOTE_TLS_PREFIX: &str = "tls/";
+const REMOTE_AGENT_ZENOH_FRAMING_ALLOWANCE_BYTES: usize = 64 * 1_024;
+// PXFQ has a 104-byte header and PXFP adds four bytes. Bound the larger
+// canonical response plus a fixed Zenoh framing allowance.
+const REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES: usize = MAX_ENVELOPE_BODY_BYTES
+    + REQUEST_HEADER_BYTES
+    + 4
+    + REMOTE_AGENT_ZENOH_FRAMING_ALLOWANCE_BYTES;
 
 type OwnedQueryable = Queryable<()>;
 
@@ -57,9 +72,9 @@ fn try_fabric_session_epoch_with(
 /// A validated explicit plaintext endpoint for the host-local profile.
 ///
 /// This type deliberately admits only canonical IPv4 loopback TCP. A
-/// non-loopback endpoint must be represented by [`RemoteTlsEndpoint`] and can
-/// only enter a session through
-/// [`FabricServiceConfig::try_secured_hybrid_peer`].
+/// non-loopback endpoint must be represented by [`RemoteTlsEndpoint`] and may
+/// enter a session only through the secured-hybrid or role-specific remote
+/// Agent constructors on [`FabricServiceConfig`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionEndpoint(String);
 
@@ -103,7 +118,8 @@ impl SessionEndpoint {
 ///
 /// This is the implementation-side counterpart of the P5 distributed Fabric
 /// endpoint contract. It contains no credential, trust, peer identity, or
-/// authorization claim.
+/// authorization claim. It may enter a session only through the secured-hybrid
+/// or role-specific remote Agent constructors on [`FabricServiceConfig`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteTlsEndpoint(String);
 
@@ -275,6 +291,72 @@ impl fmt::Debug for ResolvedRemoteMtlsIdentityFiles {
     }
 }
 
+/// Resolved trust and identity files for one listener-only remote Agent role.
+///
+/// This nominal type cannot carry a connector private key. It is process-local,
+/// has no serializer or path getter, and redacts every path from `Debug`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResolvedRemoteMtlsListenerCredentialFilesV1 {
+    root_ca_certificate_file: Box<str>,
+    listen_identity: ResolvedRemoteMtlsIdentityFiles,
+}
+
+impl ResolvedRemoteMtlsListenerCredentialFilesV1 {
+    /// Creates the exact root/listener file set used by an Ubuntu data plane.
+    pub fn try_new(
+        root_ca_certificate_file: PathBuf,
+        listen_identity: ResolvedRemoteMtlsIdentityFiles,
+    ) -> Result<Self, FabricConfigError> {
+        Ok(Self {
+            root_ca_certificate_file: validate_tls_file_path(&root_ca_certificate_file)?.into(),
+            listen_identity,
+        })
+    }
+}
+
+impl fmt::Debug for ResolvedRemoteMtlsListenerCredentialFilesV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedRemoteMtlsListenerCredentialFilesV1")
+            .field("root_ca_certificate_file", &"<redacted-resolved-path>")
+            .field("listen_identity", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Resolved trust and identity files for one connector-only remote Agent role.
+///
+/// This nominal type cannot carry a listener private key. It is process-local,
+/// has no serializer or path getter, and redacts every path from `Debug`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResolvedRemoteMtlsConnectorCredentialFilesV1 {
+    root_ca_certificate_file: Box<str>,
+    connect_identity: ResolvedRemoteMtlsIdentityFiles,
+}
+
+impl ResolvedRemoteMtlsConnectorCredentialFilesV1 {
+    /// Creates the exact root/connector file set used by a Mac data plane.
+    pub fn try_new(
+        root_ca_certificate_file: PathBuf,
+        connect_identity: ResolvedRemoteMtlsIdentityFiles,
+    ) -> Result<Self, FabricConfigError> {
+        Ok(Self {
+            root_ca_certificate_file: validate_tls_file_path(&root_ca_certificate_file)?.into(),
+            connect_identity,
+        })
+    }
+}
+
+impl fmt::Debug for ResolvedRemoteMtlsConnectorCredentialFilesV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedRemoteMtlsConnectorCredentialFilesV1")
+            .field("root_ca_certificate_file", &"<redacted-resolved-path>")
+            .field("connect_identity", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Owner-resolved trust and role-specific identity file paths for remote mTLS.
 ///
 /// Listening and connecting identities remain distinct because production
@@ -332,6 +414,43 @@ enum FabricTransportConfig {
         credentials: ResolvedRemoteMtlsCredentialFiles,
         experimental_peer_bindings: Option<Box<[ExperimentalRemoteMtlsPeerBindingV1]>>,
     },
+    RemoteAgentListenerMtlsV1 {
+        loopback_listen_endpoint: SessionEndpoint,
+        remote_tls_listen_endpoint: RemoteTlsEndpoint,
+        credentials: ResolvedRemoteMtlsListenerCredentialFilesV1,
+        expected_mac_agent_client_principal: PrincipalRef,
+        routes: RemoteAgentDataPlaneRoutesV1,
+    },
+    RemoteAgentConnectorMtlsV1 {
+        remote_tls_connect_endpoint: RemoteTlsEndpoint,
+        credentials: ResolvedRemoteMtlsConnectorCredentialFilesV1,
+        expected_ubuntu_agent_listener_principal: PrincipalRef,
+        routes: RemoteAgentDataPlaneRoutesV1,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct RemoteAgentDataPlaneRoutesV1 {
+    submit: String,
+    control: String,
+}
+
+impl RemoteAgentDataPlaneRoutesV1 {
+    fn try_new(
+        submit: impl Into<String>,
+        control: impl Into<String>,
+    ) -> Result<Self, FabricConfigError> {
+        let submit = validate_concrete_key_expression(submit.into())?;
+        let control = validate_concrete_key_expression(control.into())?;
+        if submit == control {
+            return Err(FabricConfigError::DuplicateRemoteAgentRoute);
+        }
+        Ok(Self { submit, control })
+    }
+
+    fn as_array(&self) -> [&str; 2] {
+        [&self.submit, &self.control]
+    }
 }
 
 impl FabricServiceConfig {
@@ -350,6 +469,65 @@ impl FabricServiceConfig {
             transport: FabricTransportConfig::LoopbackTcp {
                 listen_endpoints,
                 connect_endpoints,
+            },
+        })
+    }
+
+    /// Creates one Ubuntu remote-Agent listener on the sole Fabric session.
+    ///
+    /// The session retains the exact loopback listener, adds one TLS listener,
+    /// has no connector, and exposes only the two concrete Agent routes to the
+    /// expected Mac certificate principal. This is a data-plane profile and
+    /// carries no Runtime-control channel or apply protocol semantics.
+    pub fn try_remote_agent_listener_v1(
+        loopback_listen_endpoint: SessionEndpoint,
+        remote_tls_listen_endpoint: RemoteTlsEndpoint,
+        credentials: ResolvedRemoteMtlsListenerCredentialFilesV1,
+        expected_mac_agent_client_principal: PrincipalRef,
+        submit_key_expression: impl Into<String>,
+        control_key_expression: impl Into<String>,
+    ) -> Result<Self, FabricConfigError> {
+        if principal_is_zero(expected_mac_agent_client_principal) {
+            return Err(FabricConfigError::ZeroExpectedRemoteAgentPrincipal);
+        }
+        Ok(Self {
+            transport: FabricTransportConfig::RemoteAgentListenerMtlsV1 {
+                loopback_listen_endpoint,
+                remote_tls_listen_endpoint,
+                credentials,
+                expected_mac_agent_client_principal,
+                routes: RemoteAgentDataPlaneRoutesV1::try_new(
+                    submit_key_expression,
+                    control_key_expression,
+                )?,
+            },
+        })
+    }
+
+    /// Creates one Mac remote-Agent connector on its TLS-only Fabric session.
+    ///
+    /// The session has no listener and exactly one TLS connector. Its ACL is
+    /// the role-inverse of [`Self::try_remote_agent_listener_v1`] and is pinned
+    /// to the expected Ubuntu listener certificate principal and same routes.
+    pub fn try_remote_agent_connector_v1(
+        remote_tls_connect_endpoint: RemoteTlsEndpoint,
+        credentials: ResolvedRemoteMtlsConnectorCredentialFilesV1,
+        expected_ubuntu_agent_listener_principal: PrincipalRef,
+        submit_key_expression: impl Into<String>,
+        control_key_expression: impl Into<String>,
+    ) -> Result<Self, FabricConfigError> {
+        if principal_is_zero(expected_ubuntu_agent_listener_principal) {
+            return Err(FabricConfigError::ZeroExpectedRemoteAgentPrincipal);
+        }
+        Ok(Self {
+            transport: FabricTransportConfig::RemoteAgentConnectorMtlsV1 {
+                remote_tls_connect_endpoint,
+                credentials,
+                expected_ubuntu_agent_listener_principal,
+                routes: RemoteAgentDataPlaneRoutesV1::try_new(
+                    submit_key_expression,
+                    control_key_expression,
+                )?,
             },
         })
     }
@@ -444,14 +622,20 @@ impl FabricServiceConfig {
                 experimental_peer_bindings,
                 ..
             } => experimental_peer_bindings.clone(),
-            FabricTransportConfig::LoopbackTcp { .. } => None,
+            FabricTransportConfig::LoopbackTcp { .. }
+            | FabricTransportConfig::RemoteAgentListenerMtlsV1 { .. }
+            | FabricTransportConfig::RemoteAgentConnectorMtlsV1 { .. } => None,
         }
     }
 
     fn build_zenoh_config(&self) -> Result<zenoh::Config, FabricError> {
         let mut config = zenoh::Config::default();
+        let mode = match &self.transport {
+            FabricTransportConfig::RemoteAgentConnectorMtlsV1 { .. } => r#""client""#,
+            _ => r#""peer""#,
+        };
         config
-            .insert_json5("mode", r#""peer""#)
+            .insert_json5("mode", mode)
             .map_err(|_| FabricError::SessionConfigurationFailed)?;
         config
             .insert_json5("scouting/multicast/enabled", "false")
@@ -496,6 +680,62 @@ impl FabricServiceConfig {
                 )?;
                 configure_remote_mtls(&mut config, credentials)?;
             }
+            FabricTransportConfig::RemoteAgentListenerMtlsV1 {
+                loopback_listen_endpoint,
+                remote_tls_listen_endpoint,
+                credentials,
+                expected_mac_agent_client_principal,
+                routes,
+            } => {
+                configure_remote_agent_session(&mut config)?;
+                set_protocols(&mut config, r#"["tcp","tls"]"#)?;
+                set_endpoints(
+                    &mut config,
+                    endpoint_array_json(
+                        core::iter::once(loopback_listen_endpoint.as_str())
+                            .chain(core::iter::once(remote_tls_listen_endpoint.as_str())),
+                    ),
+                    endpoint_array_json(core::iter::empty()),
+                )?;
+                configure_remote_agent_mtls_role(
+                    &mut config,
+                    credentials.root_ca_certificate_file.as_ref(),
+                    &credentials.listen_identity,
+                    RemoteMtlsRole::Listener,
+                )?;
+                configure_remote_agent_acl(
+                    &mut config,
+                    routes,
+                    RemoteAgentSessionRoleV1::Listener,
+                    *expected_mac_agent_client_principal,
+                )?;
+            }
+            FabricTransportConfig::RemoteAgentConnectorMtlsV1 {
+                remote_tls_connect_endpoint,
+                credentials,
+                expected_ubuntu_agent_listener_principal,
+                routes,
+            } => {
+                configure_remote_agent_session(&mut config)?;
+                set_protocols(&mut config, r#"["tls"]"#)?;
+                set_endpoints(
+                    &mut config,
+                    endpoint_array_json(core::iter::empty()),
+                    endpoint_array_json(core::iter::once(remote_tls_connect_endpoint.as_str())),
+                )?;
+                configure_remote_agent_mtls_role(
+                    &mut config,
+                    credentials.root_ca_certificate_file.as_ref(),
+                    &credentials.connect_identity,
+                    RemoteMtlsRole::Connector,
+                )?;
+                configure_remote_agent_acl(
+                    &mut config,
+                    routes,
+                    RemoteAgentSessionRoleV1::Connector,
+                    *expected_ubuntu_agent_listener_principal,
+                )?;
+            }
         }
         Ok(config)
     }
@@ -513,12 +753,48 @@ impl fmt::Debug for FabricServiceConfig {
                 experimental_peer_bindings: None,
                 ..
             } => "secured-hybrid-mtls",
+            FabricTransportConfig::RemoteAgentListenerMtlsV1 { .. } => {
+                "remote-agent-listener-mtls-v1"
+            }
+            FabricTransportConfig::RemoteAgentConnectorMtlsV1 { .. } => {
+                "remote-agent-connector-mtls-v1"
+            }
         };
         formatter
             .debug_struct("FabricServiceConfig")
             .field("transport_profile", &profile)
             .finish_non_exhaustive()
     }
+}
+
+fn validate_concrete_key_expression(
+    key_expression: String,
+) -> Result<String, FabricConfigError> {
+    if key_expression.is_empty() {
+        return Err(FabricConfigError::EmptyKeyExpression);
+    }
+    if key_expression.len() > MAX_KEY_EXPRESSION_BYTES {
+        return Err(FabricConfigError::KeyExpressionTooLong);
+    }
+    if !key_expression.is_ascii()
+        || key_expression
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+        || key_expression.contains('*')
+        || key_expression.contains('$')
+    {
+        return Err(FabricConfigError::NonConcreteKeyExpression);
+    }
+    let parsed = OwnedNonWildKeyExpr::try_from(key_expression.clone())
+        .map_err(|_| FabricConfigError::NonConcreteKeyExpression)?;
+    if parsed.as_str() != key_expression.as_str() {
+        return Err(FabricConfigError::NonConcreteKeyExpression);
+    }
+    Ok(key_expression)
+}
+
+fn principal_is_zero(principal: PrincipalRef) -> bool {
+    principal.as_bytes().iter().all(|byte| *byte == 0)
 }
 
 /// One exact request/response route requested from the Fabric owner.
@@ -543,16 +819,7 @@ impl RequestResponseBindingSpec {
         ingress_limits: IngressLimits,
     ) -> Result<Self, FabricConfigError> {
         validate_binding_id(binding_id).map_err(FabricConfigError::Contract)?;
-        let key_expression = key_expression.into();
-        if key_expression.is_empty() {
-            return Err(FabricConfigError::EmptyKeyExpression);
-        }
-        if key_expression.len() > MAX_KEY_EXPRESSION_BYTES {
-            return Err(FabricConfigError::KeyExpressionTooLong);
-        }
-        if key_expression.contains('*') || key_expression.contains('$') {
-            return Err(FabricConfigError::NonConcreteKeyExpression);
-        }
+        let key_expression = validate_concrete_key_expression(key_expression.into())?;
         if ingress_limits.max_frame_bytes() < REQUEST_HEADER_BYTES {
             return Err(FabricConfigError::FrameCannotHoldEnvelopeHeader);
         }
@@ -1847,6 +2114,115 @@ pub(crate) fn set_endpoints(
         .map_err(|_| FabricError::SessionConfigurationFailed)
 }
 
+#[derive(Clone, Copy)]
+enum RemoteAgentSessionRoleV1 {
+    Listener,
+    Connector,
+}
+
+fn configure_remote_agent_session(config: &mut zenoh::Config) -> Result<(), FabricError> {
+    for (key, value) in [
+        ("scouting/multicast/enabled", "false"),
+        ("scouting/gossip/enabled", "false"),
+        ("connect/timeout_ms", "0"),
+        ("connect/exit_on_failure", "true"),
+        ("listen/timeout_ms", "0"),
+        ("listen/exit_on_failure", "true"),
+        ("open/return_conditions/connect_scouted", "false"),
+        ("open/return_conditions/declares", "true"),
+        ("adminspace/enabled", "false"),
+        ("plugins_loading/enabled", "false"),
+        ("transport/unicast/accept_pending", "1"),
+        ("transport/unicast/max_sessions", "1"),
+        ("transport/unicast/max_links", "1"),
+    ] {
+        config
+            .insert_json5(key, value)
+            .map_err(|_| FabricError::SessionConfigurationFailed)?;
+    }
+    config
+        .insert_json5(
+            "transport/link/rx/max_message_size",
+            &REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES.to_string(),
+        )
+        .map_err(|_| FabricError::SessionConfigurationFailed)
+}
+
+fn configure_remote_agent_mtls_role(
+    config: &mut zenoh::Config,
+    root_ca_certificate_file: &str,
+    identity: &ResolvedRemoteMtlsIdentityFiles,
+    role: RemoteMtlsRole,
+) -> Result<(), FabricError> {
+    configure_remote_mtls_role(config, root_ca_certificate_file, identity, role)?;
+    for (key, value) in [
+        ("transport/link/tls/verify_name_on_connect", "true"),
+        ("transport/link/tls/close_link_on_expiration", "true"),
+    ] {
+        config
+            .insert_json5(key, value)
+            .map_err(|_| FabricError::SessionConfigurationFailed)?;
+    }
+    Ok(())
+}
+
+fn configure_remote_agent_acl(
+    config: &mut zenoh::Config,
+    routes: &RemoteAgentDataPlaneRoutesV1,
+    role: RemoteAgentSessionRoleV1,
+    expected_peer_principal: PrincipalRef,
+) -> Result<(), FabricError> {
+    let [submit, control] = routes.as_array().map(json_string);
+    let expected_peer_common_name = json_string(
+        &restricted_runtime_apply_peer_certificate_common_name_v1(expected_peer_principal),
+    );
+    let (egress_rule, egress_messages, ingress_rule, ingress_messages) = match role {
+        RemoteAgentSessionRoleV1::Listener => (
+            "remote-agent-listener-egress-v1",
+            r#"["reply","declare_queryable"]"#,
+            "remote-agent-listener-ingress-v1",
+            r#"["query"]"#,
+        ),
+        RemoteAgentSessionRoleV1::Connector => (
+            "remote-agent-connector-egress-v1",
+            r#"["query"]"#,
+            "remote-agent-connector-ingress-v1",
+            r#"["reply","declare_queryable"]"#,
+        ),
+    };
+    let acl = format!(
+        r#"{{
+            "enabled": true,
+            "default_permission": "deny",
+            "rules": [{{
+                "id": "{egress_rule}",
+                "permission": "allow",
+                "flows": ["egress"],
+                "messages": {egress_messages},
+                "key_exprs": [{submit},{control}]
+            }}, {{
+                "id": "{ingress_rule}",
+                "permission": "allow",
+                "flows": ["ingress"],
+                "messages": {ingress_messages},
+                "key_exprs": [{submit},{control}]
+            }}],
+            "subjects": [{{
+                "id": "remote-agent-expected-peer-v1",
+                "cert_common_names": [{expected_peer_common_name}],
+                "link_protocols": ["tls"]
+            }}],
+            "policies": [{{
+                "rules": ["{egress_rule}", "{ingress_rule}"],
+                "subjects": ["remote-agent-expected-peer-v1"]
+            }}]
+        }}"#
+    );
+    config
+        .insert_json5("access_control", &acl)
+        .map_err(|_| FabricError::SessionConfigurationFailed)
+}
+
 fn configure_remote_mtls(
     config: &mut zenoh::Config,
     credentials: &ResolvedRemoteMtlsCredentialFiles,
@@ -1961,6 +2337,8 @@ pub enum FabricConfigError {
     EmptyKeyExpression,
     KeyExpressionTooLong,
     NonConcreteKeyExpression,
+    DuplicateRemoteAgentRoute,
+    ZeroExpectedRemoteAgentPrincipal,
     FrameCannotHoldEnvelopeHeader,
     Contract(FabricContractError),
 }
@@ -1997,6 +2375,12 @@ impl fmt::Display for FabricConfigError {
                 Self::EmptyKeyExpression => "binding key expression must not be empty",
                 Self::KeyExpressionTooLong => "binding key expression is too long",
                 Self::NonConcreteKeyExpression => "request binding key expression must be concrete",
+                Self::DuplicateRemoteAgentRoute => {
+                    "remote Agent submit and control routes must be distinct"
+                }
+                Self::ZeroExpectedRemoteAgentPrincipal => {
+                    "remote Agent expected peer principal must be nonzero"
+                }
                 Self::FrameCannotHoldEnvelopeHeader => {
                     "maximum frame size cannot hold the request envelope header"
                 }
