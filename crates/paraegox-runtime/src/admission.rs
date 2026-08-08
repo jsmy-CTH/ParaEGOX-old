@@ -3076,9 +3076,9 @@ mod tests {
         signing_seed: [u8; 32],
         temporal: Option<ApplyTemporalConstraint>,
     ) -> RemoteAgentDataPlaneApplyRequestV1 {
-        let fixture = RemoteAgentDataPlaneApplyRequestV1::decode(
-            &remote_agent_data_plane_golden("pxar_v10_hex"),
-        )
+        let fixture = RemoteAgentDataPlaneApplyRequestV1::decode(&remote_agent_data_plane_golden(
+            "pxar_v10_hex",
+        ))
         .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 fixture must decode: {error}"));
         let draft = RemoteAgentDataPlaneApplyRequestDraftV1::try_new(
             fixture.target_execution().clone(),
@@ -4907,10 +4907,7 @@ mod tests {
         assert_eq!(verified.clock_generation().value(), 3);
 
         for (signature_tag, expected) in [
-            (
-                20,
-                ManagedFabricApplyAdmissionError::InvalidTenureSignature,
-            ),
+            (20, ManagedFabricApplyAdmissionError::InvalidTenureSignature),
             (
                 38,
                 ManagedFabricApplyAdmissionError::InvalidRequestSignature,
@@ -4973,11 +4970,7 @@ mod tests {
                 .policy
                 .verify_remote_agent_data_plane_apply_request(
                     &request,
-                    ClockReading::new(
-                        correct_domain,
-                        generation,
-                        MonotonicInstant::from_ticks(1),
-                    ),
+                    ClockReading::new(correct_domain, generation, MonotonicInstant::from_ticks(1),),
                 )
                 .unwrap_err(),
             ManagedFabricApplyAdmissionError::BudgetExceedsPolicy,
@@ -5005,11 +4998,7 @@ mod tests {
                 .policy
                 .verify_remote_agent_data_plane_apply_request(
                     &expired,
-                    ClockReading::new(
-                        correct_domain,
-                        generation,
-                        MonotonicInstant::from_ticks(1),
-                    ),
+                    ClockReading::new(correct_domain, generation, MonotonicInstant::from_ticks(1),),
                 )
                 .unwrap_err(),
             ManagedFabricApplyAdmissionError::BudgetExpired,
