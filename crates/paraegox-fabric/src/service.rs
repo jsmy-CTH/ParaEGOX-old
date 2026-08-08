@@ -2660,6 +2660,7 @@ mod tests {
         assert_eq!(
             acl["policies"],
             json!([{
+                "id": null,
                 "rules": [rules[0]["id"].as_str().unwrap(), rules[1]["id"].as_str().unwrap()],
                 "subjects": ["remote-agent-expected-peer-v1"]
             }])
