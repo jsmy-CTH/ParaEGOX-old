@@ -8,10 +8,6 @@
 
 #![forbid(unsafe_code)]
 
-use paraegox_agent_contracts::control::{
-    AgentConversationControlV1, AgentConversationOpenOutcomeV1,
-};
-use paraegox_agent_contracts::{AgentConversationRequestV1, AgentConversationTerminalV1};
 use crate::remote_agent_outbox::{
     RemoteAgentAccessSignatureVerifierV1, RemoteAgentDataPlaneBindingV1,
     RemoteAgentDescribeChallengeV1, RemoteAgentDescribeProofBytesV1, RemoteAgentOneEchoScopeV1,
@@ -19,6 +15,10 @@ use crate::remote_agent_outbox::{
     RemoteAgentOutboxMutationErrorV1, RemoteAgentOutboxPhaseV1, RemoteAgentOutboxV1,
     RemoteAgentVerifiedDataPlaneBindingV1, verify_remote_agent_data_plane_binding_v1,
 };
+use paraegox_agent_contracts::control::{
+    AgentConversationControlV1, AgentConversationOpenOutcomeV1,
+};
+use paraegox_agent_contracts::{AgentConversationRequestV1, AgentConversationTerminalV1};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RemoteAgentDescribePurposeV1 {
@@ -959,8 +959,8 @@ mod tests {
         let expected_scope = scope(&request);
         let events = Events::default();
         let mut commit = FakeCommit::fail_on(events.clone(), 2);
-        let mut outbox = RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit)
-            .expect("prepare");
+        let mut outbox =
+            RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit).expect("prepare");
         assert!(matches!(
             outbox.claim_open(
                 &expected_scope,
@@ -1004,8 +1004,8 @@ mod tests {
         let expected_scope = scope(&request);
         let events = Events::default();
         let mut commit = FakeCommit::uncertain_after_commit(events.clone(), 2);
-        let mut outbox = RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit)
-            .expect("prepare");
+        let mut outbox =
+            RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit).expect("prepare");
         let mut describe = FakeDescribe::new(events.clone(), vec![open]);
         let mut verifier = TestVerifier::for_request(&request);
         let mut transport = FakeTransport::new(events.clone());
