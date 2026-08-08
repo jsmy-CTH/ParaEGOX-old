@@ -1055,6 +1055,7 @@ impl ApplyAdmissionPolicy {
             .verify_strict(request_transcript.as_bytes(), &request_signature)
             .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
 
+        let request_digest = request.request_digest();
         let proof_envelope_digest = proof
             .envelope_digest()
             .map_err(ManagedFabricApplyAdmissionError::Digest)?;
@@ -1088,6 +1089,7 @@ impl ApplyAdmissionPolicy {
             ],
         )?;
         Ok(AuthenticatedRemoteAgentDataPlaneApplyV1 {
+            request_digest,
             proof_envelope_digest,
             tenure_nonce_identity,
             request_nonce_identity,
@@ -1462,10 +1464,12 @@ impl VerifiedDistributedAgentStackApplyIngressV1 {
 
 /// Signature-authenticated PXAR v10 facts for owner-private replay lookup.
 ///
-/// This nominal evidence carries no deadline, lifecycle authority, store
-/// ownership, or effect token.
+/// The contract-owned digest binds this nominal evidence to the complete exact
+/// request. It carries no deadline, lifecycle authority, store ownership, or
+/// effect token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedRemoteAgentDataPlaneApplyV1 {
+    request_digest: Digest32,
     proof_envelope_digest: Digest32,
     tenure_nonce_identity: Digest32,
     request_nonce_identity: Digest32,
@@ -1473,6 +1477,11 @@ pub(crate) struct AuthenticatedRemoteAgentDataPlaneApplyV1 {
 }
 
 impl AuthenticatedRemoteAgentDataPlaneApplyV1 {
+    #[must_use]
+    pub(crate) const fn request_digest(self) -> Digest32 {
+        self.request_digest
+    }
+
     #[must_use]
     pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
         self.proof_envelope_digest
@@ -4876,10 +4885,49 @@ mod tests {
             .expect("valid PXAR v10 tenure and request signatures must authenticate");
 
         let zero_digest = Digest32::from_bytes([0; 32]);
+        assert_eq!(authenticated.request_digest(), request.request_digest());
+        assert_ne!(authenticated.request_digest(), zero_digest);
         assert_ne!(authenticated.proof_envelope_digest(), zero_digest);
         assert_ne!(authenticated.tenure_nonce_identity(), zero_digest);
         assert_ne!(authenticated.request_nonce_identity(), zero_digest);
         assert_ne!(authenticated.temporal_lineage_identity(), zero_digest);
+
+        let request_b_temporal = request
+            .temporal()
+            .try_reduce_remaining(BoundedDuration::from_nanos(59))
+            .expect("request B must only attenuate the authenticated remaining budget");
+        let request_b = signed_remote_agent_data_plane_request(
+            PYTHON_FIXTURE_REQUEST_SEED,
+            Some(request_b_temporal),
+            None,
+        );
+        let authenticated_b = admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&request_b)
+            .expect("valid request B must authenticate independently");
+        assert_eq!(
+            authenticated.proof_envelope_digest(),
+            authenticated_b.proof_envelope_digest(),
+        );
+        assert_eq!(
+            authenticated.tenure_nonce_identity(),
+            authenticated_b.tenure_nonce_identity(),
+        );
+        assert_eq!(
+            authenticated.request_nonce_identity(),
+            authenticated_b.request_nonce_identity(),
+        );
+        assert_eq!(
+            authenticated.temporal_lineage_identity(),
+            authenticated_b.temporal_lineage_identity(),
+        );
+        assert_eq!(authenticated_b.request_digest(), request_b.request_digest());
+        assert_ne!(authenticated_b.request_digest(), zero_digest);
+        assert_ne!(
+            authenticated.request_digest(),
+            request_b.request_digest(),
+            "marker A must not pair with the exact bytes of request B",
+        );
 
         let distributed = signed_distributed_request_sharing_remote_ingress(
             &request,
