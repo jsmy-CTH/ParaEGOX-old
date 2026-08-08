@@ -303,8 +303,20 @@ upgrading Zenoh requires rerunning this matrix. A wrong-CN peer can occupy the s
 ACL denial, so `max_sessions = 1` remains an availability risk rather than an authentication bypass.
 The evidence is a single-Ubuntu-host network test, not proof from a real two-host Mac process.
 
-T2-B does not yet provide a Runtime PXTE9 state owner, real Mac connector composition, an APFS
-outbox, a Controller Describe source, a public CLI or marker flow, Echo, reconnect, or TUI.
+T2-D0 now adds only a crate-private PXOJ v1 bounded codec and a fakeable owner for one exact Open
+plus literal `Echo` attempt. Prepared pins the complete attempt and request scope, trusted PXCB proof
+scope, and two distinct preallocated Describe challenges. A verified, non-cloneable bundle binds both
+signatures, strict PXAP projection, signed generations, and the sole action-owned data-plane binding;
+claim is committed before a fake once-send, Uncertain never recreates send authority, and an unknown
+commit outcome forces reload from durable bytes. PXCB is proof scope only, never connector
+configuration. Ubuntu r164 (`03c67bdda436e89a1d06f38706984a6bbf3a0d9c`) passed formatting,
+Runtime all-target check, Clippy with warnings denied, all 21 focused D0 tests, and the full Runtime
+suite with 626 passed, zero failed, and two ignored.
+
+This is still a codec, trait boundary, and deterministic in-memory fake—not a filesystem or APFS
+outbox, atomic durable store, real Controller Describe source, discovery-currentness proof, Mac
+data-plane connector, Zenoh composition, public CLI, deployed remote Agent or Echo, reconnect or
+partition owner, TUI, two-host result, or production-platform claim. Those remain D1 gates.
 
 A Unix-only `paraegox-noded developer-local-reference-v1` process can also reopen one externally
 authorized exact tenure and serve its last committed status through a same-user, token-bound local socket.

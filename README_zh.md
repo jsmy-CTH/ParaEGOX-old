@@ -260,8 +260,20 @@ T1 本地结果依赖精确锁定的 Zenoh 1.9 中 same-session local-face 边�
 该矩阵。错误 CN peer 可在 ACL 拒绝前占用唯一 session，因此 `max_sessions = 1` 仍有可用性风险，
 但这不是认证绕过。现有证据只是单 Ubuntu 主机上的网络测试，并非真实双机 Mac process 证明。
 
-T2-B 仍不包含 Runtime PXTE9 state owner、真实 Mac connector composition、APFS outbox、
-Controller Describe source、公开 CLI 或 marker 流程、Echo、reconnect、TUI。
+T2-D0 现在仅新增 crate-private 的 PXOJ v1 有界 codec，以及一个只处理一次精确 Open 加字面量
+`Echo` 尝试的可 fake owner。Prepared 会固定完整 attempt/request scope、只作为可信 proof scope 的
+PXCB，以及两组不同且预分配的 Describe challenge。不可 clone 的 verified bundle 会把双签名、严格
+PXAP 投影、已签名 generations 与唯一由 action 持有的 data-plane binding 绑定在一起；fake once-send
+之前必须先提交 claim，Uncertain 永不重建 send authority，commit 结果未知时必须从 durable bytes
+重新加载。PXCB 只属于 proof scope，绝不是 connector 配置。Ubuntu r164
+（`03c67bdda436e89a1d06f38706984a6bbf3a0d9c`）已通过 format、Runtime all-target check、
+Clippy `-D warnings`、全部 21 项 D0 focused tests，以及 626 passed、0 failed、2 ignored 的完整
+Runtime suite。
+
+这仍然只是 codec、trait boundary 与确定性内存 fake，不是 filesystem/APFS outbox、原子 durable
+store、真实 Controller Describe source、discovery-currentness 证明、Mac data-plane connector、
+Zenoh composition、公开 CLI、已部署 remote Agent 或 Echo、reconnect/partition owner、TUI、双机结果
+或生产平台声明；这些仍是 D1 gate。
 
 Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，
 并通过 same-user、token-bound 本地 socket 返回最后一次已提交状态。新增的
