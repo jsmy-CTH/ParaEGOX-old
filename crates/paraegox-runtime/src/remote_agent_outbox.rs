@@ -28,7 +28,12 @@ use paraegox_runtime_contracts::remote_agent_access::{
     RemoteAgentAccessKindV1, RemoteAgentAccessRequestIdV1, RemoteAgentAccessRequestV1,
     RemoteAgentAccessResponseV1,
 };
+use paraegox_runtime_contracts::remote_agent_data_plane_plan::RemoteAgentDataPlaneProfileV1;
 use paraegox_runtime_contracts::wire::{ApplyAuthKeyRef, MAX_APPLY_AUTH_NONCE_BYTES};
+
+use crate::managed_agent_transport::{
+    AgentConversationClientPortV1, AgentConversationPortDescriptorV1,
+};
 
 pub(crate) const REMOTE_AGENT_OUTBOX_MAGIC: &[u8; 4] = b"PXOJ";
 pub(crate) const REMOTE_AGENT_OUTBOX_VERSION: u16 = 1;
@@ -309,24 +314,46 @@ pub(crate) trait RemoteAgentAccessSignatureVerifierV1 {
 }
 
 #[derive(Debug)]
-pub(crate) struct RemoteAgentVerifiedDescribeProofV1 {
-    attempt_id: [u8; 16],
-    challenge: RemoteAgentDescribeChallengeV1,
-    proof: RemoteAgentDescribeProofBytesV1,
+pub(crate) struct RemoteAgentDataPlaneBindingV1 {
+    profile: RemoteAgentDataPlaneProfileV1,
+    port: AgentConversationClientPortV1,
+    fabric_generation: u64,
+    agent_generation: u64,
+    access_generation: u64,
 }
 
-impl RemoteAgentVerifiedDescribeProofV1 {
-    pub(crate) const fn proof(&self) -> &RemoteAgentDescribeProofBytesV1 {
-        &self.proof
+impl RemoteAgentDataPlaneBindingV1 {
+    pub(crate) const fn profile(&self) -> &RemoteAgentDataPlaneProfileV1 {
+        &self.profile
+    }
+
+    pub(crate) const fn port(&self) -> &AgentConversationClientPortV1 {
+        &self.port
+    }
+
+    pub(crate) const fn generations(&self) -> (u64, u64, u64) {
+        (
+            self.fabric_generation,
+            self.agent_generation,
+            self.access_generation,
+        )
     }
 }
 
-pub(crate) fn verify_remote_agent_describe_proof_v1<Verify>(
+#[derive(Debug)]
+pub(crate) struct RemoteAgentVerifiedDataPlaneBindingV1 {
+    attempt_id: [u8; 16],
+    challenge: RemoteAgentDescribeChallengeV1,
+    proof: RemoteAgentDescribeProofBytesV1,
+    binding: RemoteAgentDataPlaneBindingV1,
+}
+
+pub(crate) fn verify_remote_agent_data_plane_binding_v1<Verify>(
     scope: &RemoteAgentOneEchoScopeV1,
     challenge: &RemoteAgentDescribeChallengeV1,
     proof: RemoteAgentDescribeProofBytesV1,
     verifier: &mut Verify,
-) -> Result<RemoteAgentVerifiedDescribeProofV1, RemoteAgentOutboxError>
+) -> Result<RemoteAgentVerifiedDataPlaneBindingV1, RemoteAgentOutboxError>
 where
     Verify: RemoteAgentAccessSignatureVerifierV1,
 {
@@ -348,10 +375,44 @@ where
             },
         )
         .map_err(|_| RemoteAgentOutboxError::DescribeAuthenticationFailed)?;
-    Ok(RemoteAgentVerifiedDescribeProofV1 {
+    let profile = response
+        .profile()
+        .ok_or(RemoteAgentOutboxError::InvalidDescribeProof)?
+        .clone();
+    if profile.mac_agent_client_principal() != scope.mac_agent_client_principal()
+        || profile.profile_digest() != scope.profile_digest()
+    {
+        return Err(RemoteAgentOutboxError::DescribeScopeMismatch);
+    }
+    let descriptor = response
+        .descriptor()
+        .ok_or(RemoteAgentOutboxError::InvalidDescribeProof)?;
+    let port = AgentConversationPortDescriptorV1::decode(descriptor)
+        .map_err(|_| RemoteAgentOutboxError::InvalidPortDescriptor)?
+        .into_client_port();
+    let fabric_generation = response
+        .fabric_generation()
+        .ok_or(RemoteAgentOutboxError::InvalidDescribeProof)?
+        .value();
+    let agent_generation = response
+        .agent_generation()
+        .ok_or(RemoteAgentOutboxError::InvalidDescribeProof)?
+        .value();
+    let access_generation = response
+        .access_generation()
+        .ok_or(RemoteAgentOutboxError::InvalidDescribeProof)?
+        .value();
+    Ok(RemoteAgentVerifiedDataPlaneBindingV1 {
         attempt_id: scope.attempt_id,
         challenge: challenge.clone(),
         proof,
+        binding: RemoteAgentDataPlaneBindingV1 {
+            profile,
+            port,
+            fabric_generation,
+            agent_generation,
+            access_generation,
+        },
     })
 }
 
@@ -383,16 +444,26 @@ pub(crate) enum RemoteAgentOutboxPhaseV1 {
 }
 
 pub(crate) trait RemoteAgentOutboxCommitV1 {
+    /// Publishes one exact next-head record.
+    ///
+    /// `Ok(())` means the supplied record is the linearized exact durable head.
+    /// `ProvenNotCommitted` means the durable head is unchanged. An
+    /// `OutcomeUncertain` result makes the caller's in-memory outbox unusable
+    /// until it is reconstructed from the durable bytes.
     fn commit_record(&mut self, record: &[u8]) -> Result<(), RemoteAgentOutboxCommitFailureV1>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RemoteAgentOutboxCommitFailureV1;
+pub(crate) enum RemoteAgentOutboxCommitFailureV1 {
+    ProvenNotCommitted,
+    OutcomeUncertain,
+}
 
 #[derive(Debug)]
 pub(crate) struct RemoteAgentOpenSendActionV1 {
     attempt_id: [u8; 16],
     claim_digest: Digest32,
+    binding: RemoteAgentDataPlaneBindingV1,
     request: AgentConversationControlV1,
 }
 
@@ -402,9 +473,12 @@ impl RemoteAgentOpenSendActionV1 {
         send: Send,
     ) -> Result<RemoteAgentOpenExchangeOutcomeV1, Error>
     where
-        Send: FnOnce(&AgentConversationControlV1) -> Result<AgentConversationOpenOutcomeV1, Error>,
+        Send: FnOnce(
+            &RemoteAgentDataPlaneBindingV1,
+            &AgentConversationControlV1,
+        ) -> Result<AgentConversationOpenOutcomeV1, Error>,
     {
-        let outcome = send(&self.request)?;
+        let outcome = send(&self.binding, &self.request)?;
         Ok(RemoteAgentOpenExchangeOutcomeV1 {
             attempt_id: self.attempt_id,
             claim_digest: self.claim_digest,
@@ -424,6 +498,7 @@ pub(crate) struct RemoteAgentOpenExchangeOutcomeV1 {
 pub(crate) struct RemoteAgentEchoSendActionV1 {
     attempt_id: [u8; 16],
     claim_digest: Digest32,
+    binding: RemoteAgentDataPlaneBindingV1,
     request: AgentConversationRequestV1,
 }
 
@@ -433,9 +508,12 @@ impl RemoteAgentEchoSendActionV1 {
         send: Send,
     ) -> Result<RemoteAgentEchoExchangeOutcomeV1, Error>
     where
-        Send: FnOnce(&AgentConversationRequestV1) -> Result<AgentConversationTerminalV1, Error>,
+        Send: FnOnce(
+            &RemoteAgentDataPlaneBindingV1,
+            &AgentConversationRequestV1,
+        ) -> Result<AgentConversationTerminalV1, Error>,
     {
-        let terminal = send(&self.request)?;
+        let terminal = send(&self.binding, &self.request)?;
         if !terminal.correlates(&self.request) {
             return Ok(RemoteAgentEchoExchangeOutcomeV1 {
                 attempt_id: self.attempt_id,
@@ -474,6 +552,8 @@ pub(crate) struct RemoteAgentOutboxV1 {
     journal_wire: Vec<u8>,
     last_record_digest: Digest32,
     record_count: usize,
+    // Volatile poison only: PXOJ never serializes an unresolved commit outcome.
+    requires_reload: bool,
 }
 
 impl RemoteAgentOutboxV1 {
@@ -502,6 +582,7 @@ impl RemoteAgentOutboxV1 {
             journal_wire: record,
             last_record_digest,
             record_count: 1,
+            requires_reload: false,
         })
     }
 
@@ -531,6 +612,7 @@ impl RemoteAgentOutboxV1 {
                         journal_wire: parsed.wire.to_vec(),
                         last_record_digest: parsed.record_digest,
                         record_count: 1,
+                        requires_reload: false,
                     });
                 }
                 Some(value) => {
@@ -557,12 +639,13 @@ impl RemoteAgentOutboxV1 {
     pub(crate) fn claim_open<Commit>(
         &mut self,
         expected_scope: &RemoteAgentOneEchoScopeV1,
-        verified: RemoteAgentVerifiedDescribeProofV1,
+        verified: RemoteAgentVerifiedDataPlaneBindingV1,
         commit: &mut Commit,
     ) -> Result<RemoteAgentOpenSendActionV1, RemoteAgentOutboxMutationErrorV1>
     where
         Commit: RemoteAgentOutboxCommitV1,
     {
+        self.require_usable()?;
         self.require_scope(expected_scope)?;
         if !matches!(
             self.phase,
@@ -576,7 +659,7 @@ impl RemoteAgentOutboxV1 {
             return Err(RemoteAgentOutboxError::ActionMismatch.into());
         }
         validate_proof_scope_challenge(&self.scope, &self.scope.open_challenge, &verified.proof)?;
-        let proof = verified.proof;
+        let RemoteAgentVerifiedDataPlaneBindingV1 { proof, binding, .. } = verified;
         let payload = encode_proof_payload(&proof)?;
         let claim_digest =
             self.commit_record(RemoteAgentOutboxRecordKindV1::OpenClaimed, payload, commit)?;
@@ -587,6 +670,7 @@ impl RemoteAgentOutboxV1 {
         Ok(RemoteAgentOpenSendActionV1 {
             attempt_id: self.scope.attempt_id,
             claim_digest,
+            binding,
             request: self.scope.open_request(),
         })
     }
@@ -599,6 +683,7 @@ impl RemoteAgentOutboxV1 {
     where
         Commit: RemoteAgentOutboxCommitV1,
     {
+        self.require_usable()?;
         let RemoteAgentOutboxPhaseV1::OpenUncertain {
             open_proof,
             claim_digest,
@@ -645,12 +730,13 @@ impl RemoteAgentOutboxV1 {
     pub(crate) fn claim_echo<Commit>(
         &mut self,
         expected_scope: &RemoteAgentOneEchoScopeV1,
-        verified: RemoteAgentVerifiedDescribeProofV1,
+        verified: RemoteAgentVerifiedDataPlaneBindingV1,
         commit: &mut Commit,
     ) -> Result<RemoteAgentEchoSendActionV1, RemoteAgentOutboxMutationErrorV1>
     where
         Commit: RemoteAgentOutboxCommitV1,
     {
+        self.require_usable()?;
         self.require_scope(expected_scope)?;
         let RemoteAgentOutboxPhaseV1::EchoRequestDurableNotSent {
             open_outcome: AgentConversationOpenOutcomeV1::Opened,
@@ -666,7 +752,7 @@ impl RemoteAgentOutboxV1 {
         }
         validate_proof_scope_challenge(&self.scope, &self.scope.echo_challenge, &verified.proof)?;
         let open_proof = open_proof.clone();
-        let proof = verified.proof;
+        let RemoteAgentVerifiedDataPlaneBindingV1 { proof, binding, .. } = verified;
         let payload = encode_proof_payload(&proof)?;
         let claim_digest =
             self.commit_record(RemoteAgentOutboxRecordKindV1::EchoClaimed, payload, commit)?;
@@ -678,6 +764,7 @@ impl RemoteAgentOutboxV1 {
         Ok(RemoteAgentEchoSendActionV1 {
             attempt_id: self.scope.attempt_id,
             claim_digest,
+            binding,
             request: self.scope.echo_request.clone(),
         })
     }
@@ -690,6 +777,7 @@ impl RemoteAgentOutboxV1 {
     where
         Commit: RemoteAgentOutboxCommitV1,
     {
+        self.require_usable()?;
         let RemoteAgentOutboxPhaseV1::EchoUncertain {
             open_proof,
             echo_proof,
@@ -729,6 +817,10 @@ impl RemoteAgentOutboxV1 {
         &self.phase
     }
 
+    pub(crate) const fn requires_reload(&self) -> bool {
+        self.requires_reload
+    }
+
     pub(crate) fn canonical_wire(&self) -> &[u8] {
         &self.journal_wire
     }
@@ -744,6 +836,14 @@ impl RemoteAgentOutboxV1 {
         }
     }
 
+    fn require_usable(&self) -> Result<(), RemoteAgentOutboxError> {
+        if self.requires_reload {
+            Err(RemoteAgentOutboxError::ReloadRequired)
+        } else {
+            Ok(())
+        }
+    }
+
     fn commit_record<Commit>(
         &mut self,
         kind: RemoteAgentOutboxRecordKindV1,
@@ -753,6 +853,7 @@ impl RemoteAgentOutboxV1 {
     where
         Commit: RemoteAgentOutboxCommitV1,
     {
+        self.require_usable()?;
         let sequence = self
             .record_count
             .checked_add(1)
@@ -767,9 +868,12 @@ impl RemoteAgentOutboxV1 {
             self.last_record_digest,
             &payload,
         )?;
-        commit
-            .commit_record(&record)
-            .map_err(RemoteAgentOutboxMutationErrorV1::Commit)?;
+        if let Err(error) = commit.commit_record(&record) {
+            if error == RemoteAgentOutboxCommitFailureV1::OutcomeUncertain {
+                self.requires_reload = true;
+            }
+            return Err(RemoteAgentOutboxMutationErrorV1::Commit(error));
+        }
         let record_digest = record_digest_from_wire(&record);
         self.last_record_digest = record_digest;
         self.record_count = sequence;
@@ -1290,6 +1394,7 @@ pub(crate) enum RemoteAgentOutboxError {
     InvalidChallenge,
     ScopeMismatch,
     ActionMismatch,
+    ReloadRequired,
     JournalTooLarge,
     TooManyRecords,
     UnsupportedWire,
@@ -1308,6 +1413,7 @@ pub(crate) enum RemoteAgentOutboxError {
     DescribeChallengeMismatch,
     DescribeScopeMismatch,
     DescribeAuthenticationFailed,
+    InvalidPortDescriptor,
     InvalidOpenResult,
     InvalidTerminal,
     TerminalCorrelationMismatch,

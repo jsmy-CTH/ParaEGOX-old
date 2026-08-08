@@ -12,18 +12,12 @@ use paraegox_agent_contracts::control::{
     AgentConversationControlV1, AgentConversationOpenOutcomeV1,
 };
 use paraegox_agent_contracts::{AgentConversationRequestV1, AgentConversationTerminalV1};
-use paraegox_runtime_contracts::remote_agent_access::RemoteAgentAccessResponseV1;
-use paraegox_runtime_contracts::remote_agent_data_plane_plan::RemoteAgentDataPlaneProfileV1;
-
-use crate::managed_agent_transport::{
-    AgentConversationClientPortV1, AgentConversationPortDescriptorV1,
-};
 use crate::remote_agent_outbox::{
-    RemoteAgentAccessSignatureVerifierV1, RemoteAgentDescribeChallengeV1,
-    RemoteAgentDescribeProofBytesV1, RemoteAgentOneEchoScopeV1, RemoteAgentOutboxCommitFailureV1,
-    RemoteAgentOutboxCommitV1, RemoteAgentOutboxError, RemoteAgentOutboxMutationErrorV1,
-    RemoteAgentOutboxPhaseV1, RemoteAgentOutboxV1, RemoteAgentVerifiedDescribeProofV1,
-    verify_remote_agent_describe_proof_v1,
+    RemoteAgentAccessSignatureVerifierV1, RemoteAgentDataPlaneBindingV1,
+    RemoteAgentDescribeChallengeV1, RemoteAgentDescribeProofBytesV1, RemoteAgentOneEchoScopeV1,
+    RemoteAgentOutboxCommitFailureV1, RemoteAgentOutboxCommitV1, RemoteAgentOutboxError,
+    RemoteAgentOutboxMutationErrorV1, RemoteAgentOutboxPhaseV1, RemoteAgentOutboxV1,
+    RemoteAgentVerifiedDataPlaneBindingV1, verify_remote_agent_data_plane_binding_v1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,39 +69,6 @@ pub(crate) trait RemoteAgentOnceTransportV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RemoteAgentOnceTransportErrorV1;
 
-#[derive(Clone, Debug)]
-pub(crate) struct RemoteAgentDataPlaneBindingV1 {
-    profile: RemoteAgentDataPlaneProfileV1,
-    port: AgentConversationClientPortV1,
-    fabric_generation: u64,
-    agent_generation: u64,
-    access_generation: u64,
-}
-
-#[derive(Debug)]
-struct RemoteAgentVerifiedDataPlaneBindingV1 {
-    binding: RemoteAgentDataPlaneBindingV1,
-    proof: RemoteAgentVerifiedDescribeProofV1,
-}
-
-impl RemoteAgentDataPlaneBindingV1 {
-    pub(crate) const fn profile(&self) -> &RemoteAgentDataPlaneProfileV1 {
-        &self.profile
-    }
-
-    pub(crate) const fn port(&self) -> &AgentConversationClientPortV1 {
-        &self.port
-    }
-
-    pub(crate) const fn generations(&self) -> (u64, u64, u64) {
-        (
-            self.fabric_generation,
-            self.agent_generation,
-            self.access_generation,
-        )
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RemoteAgentOneEchoOutcomeV1 {
     OpenNotAdmitted(AgentConversationOpenOutcomeV1),
@@ -128,6 +89,9 @@ where
     Transport: RemoteAgentOnceTransportV1,
     Commit: RemoteAgentOutboxCommitV1,
 {
+    if outbox.requires_reload() {
+        return Err(RemoteAgentOneEchoErrorV1::ReloadRequired);
+    }
     if !outbox.scope_matches(expected_scope) {
         return Err(RemoteAgentOneEchoErrorV1::ScopeMismatch);
     }
@@ -141,10 +105,9 @@ where
                     describe,
                     verifier,
                 )?;
-                let RemoteAgentVerifiedDataPlaneBindingV1 { binding, proof } = verified;
-                let action = outbox.claim_open(expected_scope, proof, commit)?;
+                let action = outbox.claim_open(expected_scope, verified, commit)?;
                 let exchange = action
-                    .exchange(|request| transport.open_once(&binding, request))
+                    .exchange(|binding, request| transport.open_once(binding, request))
                     .map_err(|_| RemoteAgentOneEchoErrorV1::ReconcileRequired)?;
                 outbox.commit_open_result(exchange, commit)?;
             }
@@ -155,12 +118,13 @@ where
                 open_outcome: AgentConversationOpenOutcomeV1::Opened,
                 open_proof,
             } => {
-                let _open = verify_binding(
+                let _open = verify_remote_agent_data_plane_binding_v1(
                     expected_scope,
                     expected_scope.open_challenge(),
                     open_proof,
                     verifier,
-                )?;
+                )
+                .map_err(map_proof_error)?;
                 let verified = challenge_bound_binding(
                     expected_scope,
                     RemoteAgentDescribePurposeV1::Echo,
@@ -168,10 +132,9 @@ where
                     describe,
                     verifier,
                 )?;
-                let RemoteAgentVerifiedDataPlaneBindingV1 { binding, proof } = verified;
-                let action = outbox.claim_echo(expected_scope, proof, commit)?;
+                let action = outbox.claim_echo(expected_scope, verified, commit)?;
                 let exchange = action
-                    .exchange(|request| transport.echo_once(&binding, request))
+                    .exchange(|binding, request| transport.echo_once(binding, request))
                     .map_err(|_| RemoteAgentOneEchoErrorV1::ReconcileRequired)?;
                 if !exchange.is_correlated() {
                     return Err(RemoteAgentOneEchoErrorV1::TerminalCorrelationMismatch);
@@ -185,12 +148,13 @@ where
                 open_outcome,
                 open_proof,
             } => {
-                let _open = verify_binding(
+                let _open = verify_remote_agent_data_plane_binding_v1(
                     expected_scope,
                     expected_scope.open_challenge(),
                     open_proof,
                     verifier,
-                )?;
+                )
+                .map_err(map_proof_error)?;
                 return Ok(RemoteAgentOneEchoOutcomeV1::OpenNotAdmitted(open_outcome));
             }
             RemoteAgentOutboxPhaseV1::EchoUncertain { .. } => {
@@ -201,18 +165,20 @@ where
                 echo_proof,
                 terminal,
             } => {
-                let _open = verify_binding(
+                let _open = verify_remote_agent_data_plane_binding_v1(
                     expected_scope,
                     expected_scope.open_challenge(),
                     open_proof,
                     verifier,
-                )?;
-                let _echo = verify_binding(
+                )
+                .map_err(map_proof_error)?;
+                let _echo = verify_remote_agent_data_plane_binding_v1(
                     expected_scope,
                     expected_scope.echo_challenge(),
                     echo_proof,
                     verifier,
-                )?;
+                )
+                .map_err(map_proof_error)?;
                 if !terminal.correlates(expected_scope.echo_request()) {
                     return Err(RemoteAgentOneEchoErrorV1::TerminalCorrelationMismatch);
                 }
@@ -237,59 +203,8 @@ where
         .fresh_describe(purpose, challenge)
         .map_err(|_| RemoteAgentOneEchoErrorV1::DescribeUnavailable)?;
     let proof = RemoteAgentDescribeProofBytesV1::try_new(&wire.request_wire, &wire.response_wire)?;
-    verify_binding(scope, challenge, proof, verifier)
-}
-
-fn verify_binding<Verify>(
-    scope: &RemoteAgentOneEchoScopeV1,
-    challenge: &RemoteAgentDescribeChallengeV1,
-    proof: RemoteAgentDescribeProofBytesV1,
-    verifier: &mut Verify,
-) -> Result<RemoteAgentVerifiedDataPlaneBindingV1, RemoteAgentOneEchoErrorV1>
-where
-    Verify: RemoteAgentAccessSignatureVerifierV1,
-{
-    let verified = verify_remote_agent_describe_proof_v1(scope, challenge, proof, verifier)
-        .map_err(map_proof_error)?;
-    let response = RemoteAgentAccessResponseV1::decode(verified.proof().response_wire())
-        .map_err(|_| RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?;
-    let profile = response
-        .profile()
-        .ok_or(RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?
-        .clone();
-    if profile.mac_agent_client_principal() != scope.mac_agent_client_principal()
-        || profile.profile_digest() != scope.profile_digest()
-    {
-        return Err(RemoteAgentOneEchoErrorV1::DescribeScopeMismatch);
-    }
-    let descriptor = response
-        .descriptor()
-        .ok_or(RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?;
-    let port = AgentConversationPortDescriptorV1::decode(descriptor)
-        .map_err(|_| RemoteAgentOneEchoErrorV1::InvalidPortDescriptor)?
-        .into_client_port();
-    let fabric_generation = response
-        .fabric_generation()
-        .ok_or(RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?
-        .value();
-    let agent_generation = response
-        .agent_generation()
-        .ok_or(RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?
-        .value();
-    let access_generation = response
-        .access_generation()
-        .ok_or(RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?
-        .value();
-    Ok(RemoteAgentVerifiedDataPlaneBindingV1 {
-        binding: RemoteAgentDataPlaneBindingV1 {
-            profile,
-            port,
-            fabric_generation,
-            agent_generation,
-            access_generation,
-        },
-        proof: verified,
-    })
+    verify_remote_agent_data_plane_binding_v1(scope, challenge, proof, verifier)
+        .map_err(map_proof_error)
 }
 
 fn map_proof_error(error: RemoteAgentOutboxError) -> RemoteAgentOneEchoErrorV1 {
@@ -306,6 +221,9 @@ fn map_proof_error(error: RemoteAgentOutboxError) -> RemoteAgentOneEchoErrorV1 {
         RemoteAgentOutboxError::DescribeAuthenticationFailed => {
             RemoteAgentOneEchoErrorV1::DescribeAuthenticationFailed
         }
+        RemoteAgentOutboxError::InvalidPortDescriptor => {
+            RemoteAgentOneEchoErrorV1::InvalidPortDescriptor
+        }
         other => RemoteAgentOneEchoErrorV1::Outbox(other),
     }
 }
@@ -313,9 +231,9 @@ fn map_proof_error(error: RemoteAgentOutboxError) -> RemoteAgentOneEchoErrorV1 {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RemoteAgentOneEchoErrorV1 {
     ScopeMismatch,
+    ReloadRequired,
     InvalidOutboxState,
     DescribeUnavailable,
-    InvalidDescribeProof,
     DescribeCarrierMismatch,
     DescribeChallengeMismatch,
     DescribeScopeMismatch,
@@ -336,6 +254,9 @@ impl From<RemoteAgentOutboxError> for RemoteAgentOneEchoErrorV1 {
 impl From<RemoteAgentOutboxMutationErrorV1> for RemoteAgentOneEchoErrorV1 {
     fn from(value: RemoteAgentOutboxMutationErrorV1) -> Self {
         match value {
+            RemoteAgentOutboxMutationErrorV1::State(RemoteAgentOutboxError::ReloadRequired) => {
+                Self::ReloadRequired
+            }
             RemoteAgentOutboxMutationErrorV1::State(error) => Self::Outbox(error),
             RemoteAgentOutboxMutationErrorV1::Commit(error) => Self::Commit(error),
         }
@@ -364,7 +285,9 @@ mod tests {
         RemoteAgentAccessRequestDraftV1, RemoteAgentAccessRequestFieldsV1,
         RemoteAgentAccessRequestIdV1, RemoteAgentAccessRequestV1,
         RemoteAgentAccessResponseAuthClaimV1, RemoteAgentAccessResponseDraftV1,
+        RemoteAgentAccessResponseV1,
     };
+    use paraegox_runtime_contracts::remote_agent_data_plane_plan::RemoteAgentDataPlaneProfileV1;
     use paraegox_runtime_contracts::wire::{
         ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
     };
@@ -393,6 +316,8 @@ mod tests {
         records: Vec<Vec<u8>>,
         calls: usize,
         fail_on_call: Option<usize>,
+        failure: RemoteAgentOutboxCommitFailureV1,
+        durable_before_failure: bool,
     }
 
     impl FakeCommit {
@@ -402,6 +327,8 @@ mod tests {
                 records: Vec::new(),
                 calls: 0,
                 fail_on_call: None,
+                failure: RemoteAgentOutboxCommitFailureV1::ProvenNotCommitted,
+                durable_before_failure: false,
             }
         }
 
@@ -411,15 +338,28 @@ mod tests {
                 ..Self::new(events)
             }
         }
+
+        fn uncertain_after_commit(events: Events, call: usize) -> Self {
+            Self {
+                fail_on_call: Some(call),
+                failure: RemoteAgentOutboxCommitFailureV1::OutcomeUncertain,
+                durable_before_failure: true,
+                ..Self::new(events)
+            }
+        }
     }
 
     impl RemoteAgentOutboxCommitV1 for FakeCommit {
         fn commit_record(&mut self, record: &[u8]) -> Result<(), RemoteAgentOutboxCommitFailureV1> {
             self.calls += 1;
-            if self.fail_on_call == Some(self.calls) {
-                return Err(RemoteAgentOutboxCommitFailureV1);
-            }
             let kind = u16::from_be_bytes(record[8..10].try_into().expect("record kind"));
+            if self.fail_on_call == Some(self.calls) {
+                if self.durable_before_failure {
+                    self.events.borrow_mut().push(Event::Commit(kind));
+                    self.records.push(record.to_vec());
+                }
+                return Err(self.failure);
+            }
             self.events.borrow_mut().push(Event::Commit(kind));
             self.records.push(record.to_vec());
             Ok(())
@@ -746,10 +686,10 @@ mod tests {
         scope: &RemoteAgentOneEchoScopeV1,
         challenge: &RemoteAgentDescribeChallengeV1,
         proof: &RemoteAgentDescribeWireProofV1,
-    ) -> RemoteAgentVerifiedDescribeProofV1 {
+    ) -> RemoteAgentVerifiedDataPlaneBindingV1 {
         let request = RemoteAgentAccessRequestV1::decode(&proof.request_wire).expect("PXRA");
         let mut verifier = TestVerifier::for_request(&request);
-        verify_remote_agent_describe_proof_v1(
+        verify_remote_agent_data_plane_binding_v1(
             scope,
             challenge,
             RemoteAgentDescribeProofBytesV1::try_new(&proof.request_wire, &proof.response_wire)
@@ -830,7 +770,7 @@ mod tests {
             )
             .unwrap();
         let open_exchange = open_action
-            .exchange(|_| Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened))
+            .exchange(|_, _| Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened))
             .unwrap();
         outbox.commit_open_result(open_exchange, commit).unwrap();
         let echo_action = outbox
@@ -841,7 +781,7 @@ mod tests {
             )
             .unwrap();
         let echo_exchange = echo_action
-            .exchange(|request| {
+            .exchange(|_, request| {
                 Ok::<_, ()>(AgentConversationTerminalV1::try_success(request, "Echo").unwrap())
             })
             .unwrap();
@@ -1010,6 +950,136 @@ mod tests {
             outbox.phase(),
             RemoteAgentOutboxPhaseV1::OpenRequestDurableNotSent
         ));
+        assert!(!outbox.requires_reload());
+    }
+
+    #[test]
+    fn proven_not_committed_claim_is_retryable_and_action_owns_verified_binding() {
+        let (request, open, _) = valid_proofs();
+        let expected_scope = scope(&request);
+        let events = Events::default();
+        let mut commit = FakeCommit::fail_on(events.clone(), 2);
+        let mut outbox = RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit)
+            .expect("prepare");
+        assert!(matches!(
+            outbox.claim_open(
+                &expected_scope,
+                verified_proof(&expected_scope, expected_scope.open_challenge(), &open),
+                &mut commit,
+            ),
+            Err(RemoteAgentOutboxMutationErrorV1::Commit(
+                RemoteAgentOutboxCommitFailureV1::ProvenNotCommitted
+            ))
+        ));
+        assert!(!outbox.requires_reload());
+        assert!(matches!(
+            outbox.phase(),
+            RemoteAgentOutboxPhaseV1::OpenRequestDurableNotSent
+        ));
+
+        let action = outbox
+            .claim_open(
+                &expected_scope,
+                verified_proof(&expected_scope, expected_scope.open_challenge(), &open),
+                &mut commit,
+            )
+            .expect("clean retry claim");
+        let exchange = action
+            .exchange(|binding, _| {
+                assert_eq!(binding.generations(), (9, 10, 11));
+                assert_eq!(binding.profile().profile_digest(), request.profile_digest());
+                assert_eq!(
+                    binding.port().binding_facts(),
+                    [([0x31; 16], 3), ([0x32; 16], 4)]
+                );
+                Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened)
+            })
+            .unwrap();
+        outbox.commit_open_result(exchange, &mut commit).unwrap();
+    }
+
+    #[test]
+    fn uncertain_claim_poisons_object_and_durable_decode_decides_restart_state() {
+        let (request, open, _) = valid_proofs();
+        let expected_scope = scope(&request);
+        let events = Events::default();
+        let mut commit = FakeCommit::uncertain_after_commit(events.clone(), 2);
+        let mut outbox = RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit)
+            .expect("prepare");
+        let mut describe = FakeDescribe::new(events.clone(), vec![open]);
+        let mut verifier = TestVerifier::for_request(&request);
+        let mut transport = FakeTransport::new(events.clone());
+        assert_eq!(
+            run_remote_agent_one_echo_v1(
+                &expected_scope,
+                &mut outbox,
+                &mut describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::Commit(
+                RemoteAgentOutboxCommitFailureV1::OutcomeUncertain
+            ))
+        );
+        assert!(outbox.requires_reload());
+        assert_eq!((transport.open_calls, transport.echo_calls), (0, 0));
+
+        let before = events.borrow().clone();
+        let mut no_describe = FakeDescribe::new(events.clone(), Vec::new());
+        assert_eq!(
+            run_remote_agent_one_echo_v1(
+                &expected_scope,
+                &mut outbox,
+                &mut no_describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::ReloadRequired)
+        );
+        assert_eq!(*events.borrow(), before);
+        assert_eq!(no_describe.calls, 0);
+
+        let mut recovered = RemoteAgentOutboxV1::decode(&commit.records.concat()).unwrap();
+        assert!(!recovered.requires_reload());
+        assert!(matches!(
+            recovered.phase(),
+            RemoteAgentOutboxPhaseV1::OpenUncertain { .. }
+        ));
+        assert_eq!(
+            run_remote_agent_one_echo_v1(
+                &expected_scope,
+                &mut recovered,
+                &mut no_describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::ReconcileRequired)
+        );
+        assert_eq!(*events.borrow(), before);
+        assert_eq!((transport.open_calls, transport.echo_calls), (0, 0));
+    }
+
+    #[test]
+    fn uncertain_prepare_returns_typed_failure_and_decode_finds_durable_prepared() {
+        let expected_scope = scope(&golden_request());
+        let events = Events::default();
+        let mut commit = FakeCommit::uncertain_after_commit(events, 1);
+        assert!(matches!(
+            RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit),
+            Err(RemoteAgentOutboxMutationErrorV1::Commit(
+                RemoteAgentOutboxCommitFailureV1::OutcomeUncertain
+            ))
+        ));
+        let recovered = RemoteAgentOutboxV1::decode(&commit.records.concat()).unwrap();
+        assert!(recovered.scope_matches(&expected_scope));
+        assert!(!recovered.requires_reload());
+        assert!(matches!(
+            recovered.phase(),
+            RemoteAgentOutboxPhaseV1::OpenRequestDurableNotSent
+        ));
     }
 
     #[test]
@@ -1058,7 +1128,7 @@ mod tests {
             .claim_open(&expected_scope, open_proof, &mut commit)
             .unwrap();
         let open_exchange = open_action
-            .exchange(|_| Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened))
+            .exchange(|_, _| Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened))
             .unwrap();
         outbox
             .commit_open_result(open_exchange, &mut commit)
@@ -1420,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_rejects_request_id_nonce_and_wrong_carrier_before_claim() {
+    fn verified_bundle_rejects_request_id_nonce_and_wrong_carrier_before_claim() {
         let (request, _, _) = valid_proofs();
         let expected_scope = scope(&request);
         let wrong_id = describe_request(
@@ -1448,7 +1518,7 @@ mod tests {
                     .unwrap();
             let mut verifier = TestVerifier::for_request(candidate);
             assert!(
-                verify_remote_agent_describe_proof_v1(
+                verify_remote_agent_data_plane_binding_v1(
                     &expected_scope,
                     expected_scope.open_challenge(),
                     proof,
