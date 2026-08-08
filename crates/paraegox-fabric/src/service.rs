@@ -14,7 +14,7 @@ use std::{
 
 use paraegox_kernel::{
     digest::Digest32,
-    identity::{PrincipalRef, RuntimeHostId},
+    identity::PrincipalRef,
 };
 use paraegox_runtime_contracts::{
     assignment::{BindingId, SchemaRef},
