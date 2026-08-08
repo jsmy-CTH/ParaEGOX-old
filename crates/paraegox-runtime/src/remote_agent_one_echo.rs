@@ -445,10 +445,7 @@ mod tests {
     }
 
     impl RemoteAgentOutboxCommitV1 for FakeCommit {
-        fn commit_record(
-            &mut self,
-            record: &[u8],
-        ) -> Result<(), RemoteAgentOutboxCommitFailureV1> {
+        fn commit_record(&mut self, record: &[u8]) -> Result<(), RemoteAgentOutboxCommitFailureV1> {
             self.calls += 1;
             if self.fail_on_call == Some(self.calls) {
                 return Err(RemoteAgentOutboxCommitFailureV1);
@@ -505,9 +502,7 @@ mod tests {
             Self {
                 controller_principal: request.carrier().controller_principal(),
                 controller_key_ref: request.carrier().controller_request_key(),
-                controller_fingerprint: request
-                    .carrier()
-                    .controller_request_key_fingerprint(),
+                controller_fingerprint: request.carrier().controller_request_key_fingerprint(),
                 runtime_principal: request.carrier().runtime_principal(),
                 runtime_key_ref: request.carrier().runtime_response_key(),
                 runtime_fingerprint: request.carrier().runtime_response_key_fingerprint(),
@@ -516,11 +511,7 @@ mod tests {
             }
         }
 
-        fn verify(
-            seed: &[u8; 32],
-            transcript: &[u8],
-            signature: &[u8],
-        ) -> bool {
+        fn verify(seed: &[u8; 32], transcript: &[u8], signature: &[u8]) -> bool {
             let Ok(signature) = Signature::from_slice(signature) else {
                 return false;
             };
@@ -695,15 +686,12 @@ mod tests {
     ) -> RemoteAgentDescribeWireProofV1 {
         let controller_key = SigningKey::from_bytes(&CONTROLLER_SEED).verifying_key();
         let authenticated = request
-            .verify_controller_request(
-                request.carrier(),
-                |_, _, _, transcript, signature| {
-                    let Ok(signature) = Signature::from_slice(signature) else {
-                        return false;
-                    };
-                    controller_key.verify_strict(transcript, &signature).is_ok()
-                },
-            )
+            .verify_controller_request(request.carrier(), |_, _, _, transcript, signature| {
+                let Ok(signature) = Signature::from_slice(signature) else {
+                    return false;
+                };
+                controller_key.verify_strict(transcript, &signature).is_ok()
+            })
             .expect("Controller-authenticated PXRA");
         let auth = RemoteAgentAccessResponseAuthClaimV1::try_new(
             request.carrier(),
@@ -835,8 +823,14 @@ mod tests {
             &mut commit,
         )
         .expect("one Echo");
-        assert!(matches!(outcome, RemoteAgentOneEchoOutcomeV1::EchoTerminal(_)));
-        assert_eq!(transport.observed_generations, vec![(9, 10, 11), (12, 13, 14)]);
+        assert!(matches!(
+            outcome,
+            RemoteAgentOneEchoOutcomeV1::EchoTerminal(_)
+        ));
+        assert_eq!(
+            transport.observed_generations,
+            vec![(9, 10, 11), (12, 13, 14)]
+        );
         assert_eq!(verifier.controller_calls, 2);
         assert_eq!(verifier.runtime_calls, 2);
         assert_eq!(
@@ -853,7 +847,10 @@ mod tests {
                 Event::Commit(5),
             ]
         );
-        assert_eq!(RemoteAgentOutboxV1::decode(outbox.canonical_wire()).unwrap(), outbox);
+        assert_eq!(
+            RemoteAgentOutboxV1::decode(outbox.canonical_wire()).unwrap(),
+            outbox
+        );
     }
 
     #[test]
@@ -891,11 +888,9 @@ mod tests {
         let events = Events::default();
         let mut commit = FakeCommit::new(events.clone());
         let mut outbox = prepared(events.clone(), &mut commit);
-        let proof = RemoteAgentDescribeProofBytesV1::try_new(
-            &open.request_wire,
-            &open.response_wire,
-        )
-        .unwrap();
+        let proof =
+            RemoteAgentDescribeProofBytesV1::try_new(&open.request_wire, &open.response_wire)
+                .unwrap();
         outbox.claim_open(proof, &mut commit).unwrap();
         let before = events.borrow().clone();
         let mut describe = FakeDescribe::new(events.clone(), Vec::new());
@@ -913,7 +908,10 @@ mod tests {
             Err(RemoteAgentOneEchoErrorV1::ReconcileRequired)
         );
         assert_eq!(*events.borrow(), before);
-        assert_eq!((describe.calls, transport.open_calls, transport.echo_calls), (0, 0, 0));
+        assert_eq!(
+            (describe.calls, transport.open_calls, transport.echo_calls),
+            (0, 0, 0)
+        );
         assert_eq!((verifier.controller_calls, verifier.runtime_calls), (0, 0));
     }
 
@@ -925,11 +923,8 @@ mod tests {
         let mut outbox = prepared(events.clone(), &mut commit);
         outbox
             .claim_open(
-                RemoteAgentDescribeProofBytesV1::try_new(
-                    &open.request_wire,
-                    &open.response_wire,
-                )
-                .unwrap(),
+                RemoteAgentDescribeProofBytesV1::try_new(&open.request_wire, &open.response_wire)
+                    .unwrap(),
                 &mut commit,
             )
             .unwrap();
@@ -938,11 +933,8 @@ mod tests {
             .unwrap();
         outbox
             .claim_echo(
-                RemoteAgentDescribeProofBytesV1::try_new(
-                    &echo.request_wire,
-                    &echo.response_wire,
-                )
-                .unwrap(),
+                RemoteAgentDescribeProofBytesV1::try_new(&echo.request_wire, &echo.response_wire)
+                    .unwrap(),
                 &mut commit,
             )
             .unwrap();
@@ -962,7 +954,10 @@ mod tests {
             Err(RemoteAgentOneEchoErrorV1::ReconcileRequired)
         );
         assert_eq!(*events.borrow(), before);
-        assert_eq!((describe.calls, transport.open_calls, transport.echo_calls), (0, 0, 0));
+        assert_eq!(
+            (describe.calls, transport.open_calls, transport.echo_calls),
+            (0, 0, 0)
+        );
         assert_eq!((verifier.controller_calls, verifier.runtime_calls), (0, 0));
     }
 
@@ -1042,15 +1037,17 @@ mod tests {
         let mut describe = FakeDescribe::new(events.clone(), vec![proof]);
         let mut verifier = TestVerifier::for_request(request);
         let mut transport = FakeTransport::new(events.clone());
-        assert!(run_remote_agent_one_echo_v1(
-            scope(request),
-            &mut outbox,
-            &mut describe,
-            &mut verifier,
-            &mut transport,
-            &mut commit,
-        )
-        .is_err());
+        assert!(
+            run_remote_agent_one_echo_v1(
+                scope(request),
+                &mut outbox,
+                &mut describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            )
+            .is_err()
+        );
         assert_eq!(commit.records.len(), 1);
         assert_eq!((transport.open_calls, transport.echo_calls), (0, 0));
         assert!(matches!(
@@ -1136,9 +1133,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             first,
-            RemoteAgentOneEchoOutcomeV1::OpenNotAdmitted(
-                AgentConversationOpenOutcomeV1::Existing
-            )
+            RemoteAgentOneEchoOutcomeV1::OpenNotAdmitted(AgentConversationOpenOutcomeV1::Existing)
         );
         let before = events.borrow().clone();
         assert_eq!(
@@ -1185,19 +1180,13 @@ mod tests {
 
         let (request, open, _) = valid_proofs();
         let mut claimed_commit = FakeCommit::new(Events::default());
-        let mut claimed = RemoteAgentOutboxV1::try_prepare(
-            [0x61; 16],
-            echo_request(),
-            &mut claimed_commit,
-        )
-        .unwrap();
+        let mut claimed =
+            RemoteAgentOutboxV1::try_prepare([0x61; 16], echo_request(), &mut claimed_commit)
+                .unwrap();
         claimed
             .claim_open(
-                RemoteAgentDescribeProofBytesV1::try_new(
-                    &open.request_wire,
-                    &open.response_wire,
-                )
-                .unwrap(),
+                RemoteAgentDescribeProofBytesV1::try_new(&open.request_wire, &open.response_wire)
+                    .unwrap(),
                 &mut claimed_commit,
             )
             .unwrap();
