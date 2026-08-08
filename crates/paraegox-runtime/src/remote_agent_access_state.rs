@@ -7,12 +7,15 @@
 //! the exact active predecessor PXAS, the live-verified bootstrap PXDE required
 //! by `RemoteAccessActive`, and an authenticated PXAU only in a terminal phase.
 //! Recovery performs strict structural re-decoding; only the authority-bearing
-//! constructors below may create new live state.
+//! constructors below may create new live state.  A later owner may recover
+//! authority only after authenticating the retained PXAR-v10 again and exactly
+//! matching its proof-envelope and three replay identities to this snapshot.
 
 use core::fmt;
 
 use paraegox_kernel::{digest::Digest32, identity::RuntimeHostId, time::ClockGeneration};
 use paraegox_runtime_contracts::{
+    managed_agent_stack_plan::ManagedAgentStackTerminalOutcomeV1,
     managed_fabric_plan::ManagedFabricApplyTerminalOutcomeV1,
     managed_service::ManagedServiceGeneration,
     remote_agent_access::{
@@ -122,6 +125,16 @@ pub(crate) struct RemoteAgentAccessGenerationStateV1 {
     pub(crate) agent_generation_candidate: Option<ManagedServiceGeneration>,
 }
 
+/// Exact store and projection identities required to recover a PXRS slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteAgentAccessSnapshotIdentityPinsV1 {
+    pub(crate) store_instance_id: [u8; 32],
+    pub(crate) owner_target_fingerprint: Digest32,
+    pub(crate) transition_projection_digest: Digest32,
+    pub(crate) fabric_owner_target_fingerprint: Digest32,
+    pub(crate) fabric_transition_projection_digest: Digest32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RemoteAgentAccessAdmissionFactsV1 {
     request_digest: Digest32,
@@ -164,10 +177,7 @@ impl RemoteAgentAccessSnapshotV1 {
     /// the non-cloneable live-verification marker for its exact bootstrap PXDE.
     pub(crate) fn try_prepared(
         previous: Option<&Self>,
-        expected_owner_target_fingerprint: Digest32,
-        expected_transition_projection_digest: Digest32,
-        expected_fabric_owner_target_fingerprint: Digest32,
-        expected_fabric_transition_projection_digest: Digest32,
+        identity: RemoteAgentAccessSnapshotIdentityPinsV1,
         authenticated_request: ControllerAuthenticatedRemoteAgentAccessRequestV1<'_>,
         verified_ingress: VerifiedRemoteAgentDataPlaneApplyIngressV1,
         fabric: ManagedFabricSnapshot,
@@ -178,6 +188,9 @@ impl RemoteAgentAccessSnapshotV1 {
         if authenticated_request.kind() != RemoteAgentAccessKindV1::ApplyRemoteAccess {
             return Err(RemoteAgentAccessStateError::NotApplyRequest);
         }
+        if identity.store_instance_id != outer.expected_runtime_store_instance_id() {
+            return Err(RemoteAgentAccessStateError::IdentityMismatch);
+        }
         let inner = outer
             .apply_request()
             .ok_or(RemoteAgentAccessStateError::NotApplyRequest)?;
@@ -187,18 +200,18 @@ impl RemoteAgentAccessSnapshotV1 {
         }
         let strict_predecessor = ManagedAgentStackSnapshot::decode(
             predecessor.canonical_wire(),
-            outer.expected_runtime_store_instance_id(),
-            expected_owner_target_fingerprint,
-            expected_transition_projection_digest,
+            identity.store_instance_id,
+            identity.owner_target_fingerprint,
+            identity.transition_projection_digest,
             inner.target_execution().predecessor().projection(),
         )
         .map_err(RemoteAgentAccessStateError::Predecessor)?;
         validate_prepared_predecessor(outer, inner, &strict_predecessor)?;
         let strict_fabric = ManagedFabricSnapshot::decode(
             fabric.canonical_wire(),
-            outer.expected_runtime_store_instance_id(),
-            expected_fabric_owner_target_fingerprint,
-            expected_fabric_transition_projection_digest,
+            identity.store_instance_id,
+            identity.fabric_owner_target_fingerprint,
+            identity.fabric_transition_projection_digest,
             inner
                 .target_execution()
                 .predecessor()
@@ -226,14 +239,14 @@ impl RemoteAgentAccessSnapshotV1 {
         let (sequence, previous_snapshot_digest, access_generation_high_water) = match previous {
             Some(previous) => {
                 if !previous.phase.is_terminal()
-                    || previous.store_instance_id != outer.expected_runtime_store_instance_id()
-                    || previous.owner_target_fingerprint != expected_owner_target_fingerprint
+                    || previous.store_instance_id != identity.store_instance_id
+                    || previous.owner_target_fingerprint != identity.owner_target_fingerprint
                     || previous.transition_projection_digest
-                        != expected_transition_projection_digest
+                        != identity.transition_projection_digest
                     || previous.fabric_owner_target_fingerprint
-                        != expected_fabric_owner_target_fingerprint
+                        != identity.fabric_owner_target_fingerprint
                     || previous.fabric_transition_projection_digest
-                        != expected_fabric_transition_projection_digest
+                        != identity.fabric_transition_projection_digest
                     || previous.target != outer.target()
                     || previous
                         .request
@@ -253,13 +266,15 @@ impl RemoteAgentAccessSnapshotV1 {
             }
             None => (1, None, 0),
         };
-        let inherited_fabric_high_water =
-            previous.map_or(strict_predecessor.fabric_generation_high_water, |prior| {
-                prior
-                    .generations
-                    .fabric_generation_high_water
-                    .max(strict_predecessor.fabric_generation_high_water)
-            });
+        let observed_fabric_high_water = strict_predecessor
+            .fabric_generation_high_water
+            .max(strict_fabric.generation_high_water());
+        let inherited_fabric_high_water = previous.map_or(observed_fabric_high_water, |prior| {
+            prior
+                .generations
+                .fabric_generation_high_water
+                .max(observed_fabric_high_water)
+        });
         let inherited_agent_high_water =
             previous.map_or(strict_predecessor.agent_generation_high_water, |prior| {
                 prior
@@ -283,11 +298,11 @@ impl RemoteAgentAccessSnapshotV1 {
             deadline_nanos: verified_ingress.deadline_nanos(),
         };
         Self::try_build(Self {
-            store_instance_id: outer.expected_runtime_store_instance_id(),
-            owner_target_fingerprint: expected_owner_target_fingerprint,
-            transition_projection_digest: expected_transition_projection_digest,
-            fabric_owner_target_fingerprint: expected_fabric_owner_target_fingerprint,
-            fabric_transition_projection_digest: expected_fabric_transition_projection_digest,
+            store_instance_id: identity.store_instance_id,
+            owner_target_fingerprint: identity.owner_target_fingerprint,
+            transition_projection_digest: identity.transition_projection_digest,
+            fabric_owner_target_fingerprint: identity.fabric_owner_target_fingerprint,
+            fabric_transition_projection_digest: identity.fabric_transition_projection_digest,
             sequence,
             previous_snapshot_digest,
             runtime_host_epoch: outer.expected_runtime_host_epoch(),
@@ -386,11 +401,7 @@ impl RemoteAgentAccessSnapshotV1 {
     /// manufacture either live PXDE verification or authenticated PXAU markers.
     pub(crate) fn decode(
         frame: &[u8],
-        expected_store_instance_id: [u8; 32],
-        expected_owner_target_fingerprint: Digest32,
-        expected_transition_projection_digest: Digest32,
-        expected_fabric_owner_target_fingerprint: Digest32,
-        expected_fabric_transition_projection_digest: Digest32,
+        identity: RemoteAgentAccessSnapshotIdentityPinsV1,
     ) -> Result<Self, RemoteAgentAccessStateError> {
         if frame.len() < SNAPSHOT_HEADER_BYTES + SNAPSHOT_DIGEST_BYTES {
             return Err(RemoteAgentAccessStateError::Truncated);
@@ -486,9 +497,9 @@ impl RemoteAgentAccessSnapshotV1 {
         let inner = inner_request(&request)?;
         let fabric = ManagedFabricSnapshot::decode(
             cursor.take(fabric_length)?,
-            expected_store_instance_id,
-            expected_fabric_owner_target_fingerprint,
-            expected_fabric_transition_projection_digest,
+            identity.store_instance_id,
+            identity.fabric_owner_target_fingerprint,
+            identity.fabric_transition_projection_digest,
             inner
                 .target_execution()
                 .predecessor()
@@ -498,9 +509,9 @@ impl RemoteAgentAccessSnapshotV1 {
         .map_err(RemoteAgentAccessStateError::Fabric)?;
         let predecessor = ManagedAgentStackSnapshot::decode(
             cursor.take(predecessor_length)?,
-            expected_store_instance_id,
-            expected_owner_target_fingerprint,
-            expected_transition_projection_digest,
+            identity.store_instance_id,
+            identity.owner_target_fingerprint,
+            identity.transition_projection_digest,
             inner.target_execution().predecessor().projection(),
         )
         .map_err(RemoteAgentAccessStateError::Predecessor)?;
@@ -522,11 +533,11 @@ impl RemoteAgentAccessSnapshotV1 {
         };
         let encoded_snapshot_digest = Digest32::from_bytes(cursor.array()?);
         cursor.finish()?;
-        if store_instance_id != expected_store_instance_id
-            || owner_target_fingerprint != expected_owner_target_fingerprint
-            || transition_projection_digest != expected_transition_projection_digest
-            || fabric_owner_target_fingerprint != expected_fabric_owner_target_fingerprint
-            || fabric_transition_projection_digest != expected_fabric_transition_projection_digest
+        if store_instance_id != identity.store_instance_id
+            || owner_target_fingerprint != identity.owner_target_fingerprint
+            || transition_projection_digest != identity.transition_projection_digest
+            || fabric_owner_target_fingerprint != identity.fabric_owner_target_fingerprint
+            || fabric_transition_projection_digest != identity.fabric_transition_projection_digest
         {
             return Err(RemoteAgentAccessStateError::IdentityMismatch);
         }
@@ -605,9 +616,15 @@ impl RemoteAgentAccessSnapshotV1 {
             _ => return Err(RemoteAgentAccessStateError::InvalidSequence),
         }
         let inner = inner_request(&self.request)?;
+        let expected_deadline = self
+            .admission
+            .admitted_at_nanos
+            .checked_add(inner.temporal().remaining_budget().value())
+            .ok_or(RemoteAgentAccessStateError::InvalidAdmission)?;
         if inner.request_digest() != self.admission.request_digest
             || inner.target_execution().mode() != self.mode
             || inner.temporal().target_clock_generation() != self.admission.clock_generation
+            || self.admission.deadline_nanos != expected_deadline
         {
             return Err(RemoteAgentAccessStateError::InvalidAdmission);
         }
@@ -828,6 +845,19 @@ fn validate_descriptor_shape(
         evidence,
     ) {
         (RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive, Some(cas), Some(evidence)) => {
+            let mut matching_stack_terminals = predecessor.terminals.iter().filter(|record| {
+                record.receipt.receipt_digest() == cas.expected_active_pxst_digest()
+            });
+            let stack_terminal = matching_stack_terminals
+                .next()
+                .ok_or(RemoteAgentAccessStateError::InvalidAgentTerminal)?;
+            if matching_stack_terminals.next().is_some() {
+                return Err(RemoteAgentAccessStateError::InvalidAgentTerminal);
+            }
+            let stack_terminal_facts = stack_terminal
+                .receipt
+                .validate_against_request(&active.request, active.response_channel)
+                .map_err(|_| RemoteAgentAccessStateError::InvalidAgentTerminal)?;
             let fabric_active = fabric
                 .active
                 .as_ref()
@@ -845,7 +875,14 @@ fn validate_descriptor_shape(
                 .receipt
                 .validate_against_request(&fabric_active.request, fabric_active.response_channel)
                 .map_err(|_| RemoteAgentAccessStateError::InvalidFabricTerminal)?;
-            if fabric_terminal_facts.outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+            if stack_terminal_facts.state().outcome()
+                != ManagedAgentStackTerminalOutcomeV1::ActiveReady
+                || stack_terminal_facts.state().fabric_generation()
+                    != Some(active.fabric_generation)
+                || stack_terminal_facts.state().agent_generation() != Some(active.agent_generation)
+                || stack_terminal.receipt.receipt_digest() != cas.expected_active_pxst_digest()
+                || fabric_terminal_facts.outcome()
+                    != ManagedFabricApplyTerminalOutcomeV1::ActiveReady
                 || fabric_terminal_facts.generation() != Some(fabric_active.generation)
                 || fabric_terminal.receipt.receipt_digest() != cas.expected_active_pxft_digest()
                 || outer.expected_active_pxst_digest() != cas.expected_active_pxst_digest()
@@ -889,6 +926,8 @@ fn validate_generation_shape(
     if generations.fabric_generation_high_water == 0
         || generations.agent_generation_high_water == 0
         || active.fabric_generation.value() > generations.fabric_generation_high_water
+        || snapshot.fabric.generation_high_water()
+            > generations.fabric_generation_high_water
         || active.agent_generation.value() > generations.agent_generation_high_water
         || !candidate_matches_high_water(
             generations.access_generation_candidate,
@@ -1313,6 +1352,7 @@ pub(crate) enum RemoteAgentAccessStateError {
     AuthenticationMismatch,
     InvalidAdmission,
     InvalidPredecessor,
+    InvalidAgentTerminal,
     InvalidFabric,
     InvalidFabricTerminal,
     InvalidOperationReplacement,
@@ -1337,3 +1377,644 @@ impl fmt::Display for RemoteAgentAccessStateError {
 }
 
 impl std::error::Error for RemoteAgentAccessStateError {}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::{Signer, SigningKey};
+    use paraegox_kernel::{
+        digest::Digest32,
+        identity::{PrincipalRef, RuntimeHostId},
+        time::{BoundedDuration, ClockReading, MonotonicInstant},
+    };
+    use paraegox_runtime_contracts::{
+        apply::{PlanWriterRef, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm},
+        distributed_agent_stack_plan::RestrictedRuntimeApplyCarrierBindingV1,
+        managed_agent_stack_plan::{
+            ManagedAgentStackApplyRequestV1, ManagedAgentStackTerminalReceiptV1,
+        },
+        managed_fabric_plan::{
+            ManagedFabricApplyRequestV1, ManagedFabricApplyTerminalReceiptV1,
+        },
+        managed_serving_bootstrap::{
+            RuntimeAgentControlReceiptDraftV1, RuntimeAgentControlRequestDraftV1,
+            RuntimeAgentControlRequestFieldsV1, RuntimeAgentControlRequestIdV1,
+            RuntimeAgentControlResponseAuthClaimV1,
+        },
+        provenance::SourceScopeRef,
+        reference_control::ReferenceChannelBindingV1,
+        remote_agent_access::{
+            RemoteAgentAccessRequestDraftV1, RemoteAgentAccessRequestFieldsV1,
+            RemoteAgentAccessRequestIdV1, RemoteAgentAccessRequestV1,
+        },
+        remote_agent_data_plane_plan::{
+            RemoteAgentBootstrapCasV1, RemoteAgentDataPlaneApplyRequestDraftV1,
+            RemoteAgentDataPlaneApplyRequestV1, RemoteAgentDataPlaneProjectionV1,
+            RemoteAgentDataPlaneTargetExecutionV1,
+        },
+        wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim},
+    };
+
+    use crate::{
+        admission::{
+            AdmissionStateLimits, ApplyAdmissionPolicy, TrustedApplyIdentity, TrustedApplyKey,
+            TrustedTenureIdentity, TrustedTenureKey, ED25519_ALGORITHM,
+            ED25519_ALGORITHM_VERSION,
+        },
+        managed_agent_stack_state::{
+            ManagedAgentStackDurableActive, ManagedAgentStackSnapshot,
+            ManagedAgentStackSnapshotTransition, ManagedAgentStackTerminalRecord,
+        },
+        managed_fabric_state::{
+            ManagedFabricDurableActive, ManagedFabricSnapshot, ManagedFabricSnapshotTransition,
+            ManagedFabricTerminalRecord,
+        },
+        remote_agent_descriptor_evidence::{
+            RemoteAgentDescriptorEvidenceV1, RemoteAgentDescriptorLiveFactsV1,
+            verify_remote_agent_descriptor_evidence_v1,
+        },
+    };
+
+    use super::*;
+
+    const FABRIC_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/wire/s7_managed_fabric_successor_v1.json");
+    const STACK_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/wire/s7_managed_agent_stack_successor_v1.json");
+    const DATA_PLANE_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/wire/t2_remote_agent_data_plane_v1.json");
+    const ACCESS_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v1.json");
+    const STORE: [u8; 32] = [0x44; 32];
+    const STACK_OWNER: Digest32 = Digest32::from_bytes([0x55; 32]);
+    const STACK_PROJECTION: Digest32 = Digest32::from_bytes([0x66; 32]);
+    const FABRIC_OWNER: Digest32 = Digest32::from_bytes([0x57; 32]);
+    const FABRIC_PROJECTION: Digest32 = Digest32::from_bytes([0x68; 32]);
+    const RUNTIME_EPOCH: u64 = 23;
+    const FABRIC_GENERATION: u64 = 7;
+    const AGENT_GENERATION: u64 = 8;
+    const INNER_SIGNING_SEED: [u8; 32] = [0x22; 32];
+    const TENURE_SIGNING_SEED: [u8; 32] = [0x11; 32];
+    const OUTER_SIGNATURE: [u8; 64] = [0xe2; 64];
+    const DESCRIPTOR_REQUEST_SIGNATURE: [u8; 64] = [0xd5; 64];
+    const DESCRIPTOR_RECEIPT_SIGNATURE: [u8; 64] = [0xd6; 64];
+    const DESCRIPTOR: &[u8] = b"PXAP\0\x01pxrs-bootstrap-descriptor";
+
+    #[derive(Clone, Copy)]
+    struct PreparedOptions {
+        mode: RemoteAgentDataPlaneTargetModeV1,
+        include_descriptor: bool,
+        include_stack_terminal: bool,
+        fabric_generation_high_water: u64,
+        stack_fabric_generation_high_water: u64,
+        stack_agent_generation_high_water: u64,
+        identity: RemoteAgentAccessSnapshotIdentityPinsV1,
+    }
+
+    impl PreparedOptions {
+        const fn valid(mode: RemoteAgentDataPlaneTargetModeV1) -> Self {
+            Self {
+                mode,
+                include_descriptor: matches!(
+                    mode,
+                    RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive
+                ),
+                include_stack_terminal: true,
+                fabric_generation_high_water: FABRIC_GENERATION,
+                stack_fabric_generation_high_water: FABRIC_GENERATION,
+                stack_agent_generation_high_water: AGENT_GENERATION,
+                identity: identity(),
+            }
+        }
+    }
+
+    const fn identity() -> RemoteAgentAccessSnapshotIdentityPinsV1 {
+        RemoteAgentAccessSnapshotIdentityPinsV1 {
+            store_instance_id: STORE,
+            owner_target_fingerprint: STACK_OWNER,
+            transition_projection_digest: STACK_PROJECTION,
+            fabric_owner_target_fingerprint: FABRIC_OWNER,
+            fabric_transition_projection_digest: FABRIC_PROJECTION,
+        }
+    }
+
+    fn generation(value: u64) -> ManagedServiceGeneration {
+        ManagedServiceGeneration::try_new(value)
+            .unwrap_or_else(|error| panic!("fixture generation rejected: {error}"))
+    }
+
+    fn fixture_hex_after(fixture: &str, section: &str, key: &str) -> Vec<u8> {
+        fn nibble(byte: u8) -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => panic!("fixture contains non-hex byte"),
+            }
+        }
+
+        let section_start = fixture
+            .find(section)
+            .unwrap_or_else(|| panic!("missing fixture section {section}"));
+        let key_start = fixture[section_start..]
+            .find(key)
+            .map(|offset| section_start + offset + key.len())
+            .unwrap_or_else(|| panic!("missing fixture key {section}.{key}"));
+        let quote_start = fixture[key_start..]
+            .find('"')
+            .map(|offset| key_start + offset + 1)
+            .unwrap_or_else(|| panic!("missing fixture opening quote {section}.{key}"));
+        let quote_end = fixture[quote_start..]
+            .find('"')
+            .map(|offset| quote_start + offset)
+            .unwrap_or_else(|| panic!("missing fixture closing quote {section}.{key}"));
+        fixture.as_bytes()[quote_start..quote_end]
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
+    fn stack_request() -> ManagedAgentStackApplyRequestV1 {
+        ManagedAgentStackApplyRequestV1::decode(&fixture_hex_after(
+            STACK_FIXTURE,
+            "\"fabric_and_agent\"",
+            "\"outer_v7_hex\"",
+        ))
+        .unwrap_or_else(|error| panic!("managed Agent-stack fixture rejected: {error}"))
+    }
+
+    fn stack_terminal() -> ManagedAgentStackTerminalReceiptV1 {
+        ManagedAgentStackTerminalReceiptV1::decode(&fixture_hex_after(
+            STACK_FIXTURE,
+            "\"fabric_and_agent\"",
+            "\"wire_hex\"",
+        ))
+        .unwrap_or_else(|error| panic!("managed Agent-stack terminal rejected: {error}"))
+    }
+
+    fn fabric_request() -> ManagedFabricApplyRequestV1 {
+        ManagedFabricApplyRequestV1::decode(&fixture_hex_after(
+            FABRIC_FIXTURE,
+            "\"one_managed_fabric_service\"",
+            "\"outer_v6_hex\"",
+        ))
+        .unwrap_or_else(|error| panic!("managed Fabric fixture rejected: {error}"))
+    }
+
+    fn fabric_terminal() -> ManagedFabricApplyTerminalReceiptV1 {
+        ManagedFabricApplyTerminalReceiptV1::decode(&fixture_hex_after(
+            FABRIC_FIXTURE,
+            "\"active_ready\"",
+            "\"wire_hex\"",
+        ))
+        .unwrap_or_else(|error| panic!("managed Fabric terminal rejected: {error}"))
+    }
+
+    fn data_plane_template() -> RemoteAgentDataPlaneApplyRequestV1 {
+        RemoteAgentDataPlaneApplyRequestV1::decode(&fixture_hex_after(
+            DATA_PLANE_FIXTURE,
+            "\"data_plane\"",
+            "\"pxar_v10_hex\"",
+        ))
+        .unwrap_or_else(|error| panic!("remote Agent data-plane fixture rejected: {error}"))
+    }
+
+    fn access_template() -> RemoteAgentAccessRequestV1 {
+        RemoteAgentAccessRequestV1::decode(&fixture_hex_after(
+            ACCESS_FIXTURE,
+            "\"pxra_apply\"",
+            "\"wire_hex\"",
+        ))
+        .unwrap_or_else(|error| panic!("remote Agent access fixture rejected: {error}"))
+    }
+
+    fn stack_channel(target: RuntimeHostId) -> ReferenceChannelBindingV1 {
+        ReferenceChannelBindingV1::try_new(
+            target,
+            PrincipalRef::from_bytes([0x71; 16]),
+            Digest32::from_bytes([0x72; 32]),
+            Digest32::from_bytes([0x73; 32]),
+        )
+        .unwrap_or_else(|error| panic!("stack channel rejected: {error}"))
+    }
+
+    fn fabric_channel(target: RuntimeHostId) -> ReferenceChannelBindingV1 {
+        ReferenceChannelBindingV1::try_new(
+            target,
+            PrincipalRef::from_bytes([0xe1; 16]),
+            Digest32::from_bytes([0xe3; 32]),
+            Digest32::from_bytes([0xe4; 32]),
+        )
+        .unwrap_or_else(|error| panic!("Fabric channel rejected: {error}"))
+    }
+
+    fn active_fabric_snapshot(generation_high_water: u64) -> ManagedFabricSnapshot {
+        let stack = stack_request();
+        let projection = stack
+            .target_execution()
+            .projection()
+            .managed_fabric_projection();
+        let initial = ManagedFabricSnapshot::try_initial(
+            STORE,
+            FABRIC_OWNER,
+            FABRIC_PROJECTION,
+            RUNTIME_EPOCH,
+            projection,
+        )
+        .unwrap_or_else(|error| panic!("initial PXMS rejected: {error}"));
+        let request = fabric_request();
+        let receipt = fabric_terminal();
+        initial
+            .try_successor(
+                ManagedFabricSnapshotTransition {
+                    generation_high_water,
+                    phase: ManagedFabricDurablePhase::ActiveReady,
+                    writer_fence: None,
+                    revision_high_water: None,
+                    active: Some(ManagedFabricDurableActive {
+                        generation: generation(FABRIC_GENERATION),
+                        response_channel: fabric_channel(request.target()),
+                        request: request.clone(),
+                    }),
+                    pending: None,
+                    tenure_nonces: Vec::new(),
+                    request_nonces: Vec::new(),
+                    temporal_lineages: Vec::new(),
+                    terminals: vec![ManagedFabricTerminalRecord {
+                        source_scope: request.provenance().source_scope(),
+                        operation_id: request.operation_id(),
+                        request_digest: request.envelope_request_digest(),
+                        receipt,
+                    }],
+                    quarantine_reason: None,
+                },
+                projection,
+            )
+            .unwrap_or_else(|error| panic!("active PXMS rejected: {error}"))
+    }
+
+    fn active_stack_snapshot(options: PreparedOptions) -> ManagedAgentStackSnapshot {
+        let request = stack_request();
+        let receipt = stack_terminal();
+        let terminals = options.include_stack_terminal.then(|| ManagedAgentStackTerminalRecord {
+            source_scope: request.provenance().source_scope(),
+            operation_id: request.operation_id(),
+            request_digest: request.envelope_request_digest(),
+            receipt,
+        });
+        ManagedAgentStackSnapshot::try_initial(
+            STORE,
+            STACK_OWNER,
+            STACK_PROJECTION,
+            RUNTIME_EPOCH,
+            ManagedAgentStackSnapshotTransition {
+                fabric_generation_high_water: options.stack_fabric_generation_high_water,
+                agent_generation_high_water: options.stack_agent_generation_high_water,
+                phase: ManagedAgentStackDurablePhase::ActiveReady,
+                writer_fence: None,
+                revision_high_water: None,
+                active: Some(ManagedAgentStackDurableActive {
+                    fabric_generation: generation(FABRIC_GENERATION),
+                    agent_generation: generation(AGENT_GENERATION),
+                    response_channel: stack_channel(request.target()),
+                    request,
+                }),
+                pending: None,
+                tenure_nonces: Vec::new(),
+                request_nonces: Vec::new(),
+                temporal_lineages: Vec::new(),
+                terminals: terminals.into_iter().collect(),
+                physical_binding_census: 2,
+                census_complete: true,
+                fabric_ready: true,
+                agent_ready: true,
+                dependency_satisfied: true,
+                quarantine_reason: None,
+            },
+            stack_request().target_execution().projection(),
+        )
+        .unwrap_or_else(|error| panic!("active PXAS rejected: {error}"))
+    }
+
+    fn descriptor_evidence(
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        active_pxst_digest: Digest32,
+    ) -> RemoteAgentDescriptorEvidenceV1 {
+        let request = RuntimeAgentControlRequestDraftV1::try_describe_conversation_port(
+            RuntimeAgentControlRequestFieldsV1 {
+                request_id: RuntimeAgentControlRequestIdV1::try_from_bytes([0xd1; 16])
+                    .unwrap_or_else(|error| panic!("descriptor request id rejected: {error}")),
+                carrier: carrier.clone(),
+                target: carrier.target(),
+                expected_runtime_store_instance_id: STORE,
+                expected_runtime_host_epoch: RUNTIME_EPOCH,
+                auth_claim: ApplyRequestAuthClaim::try_new(
+                    carrier.controller_principal(),
+                    carrier.controller_request_key(),
+                    ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                        .unwrap_or_else(|error| panic!("descriptor algorithm rejected: {error}")),
+                    ED25519_ALGORITHM_VERSION,
+                    b"pxrs-descriptor-request-nonce",
+                )
+                .unwrap_or_else(|error| panic!("descriptor auth claim rejected: {error}")),
+            },
+            active_pxst_digest,
+            PrincipalRef::from_bytes([0xd2; 16]),
+        )
+        .unwrap_or_else(|error| panic!("descriptor request draft rejected: {error}"))
+        .finalize(&DESCRIPTOR_REQUEST_SIGNATURE)
+        .unwrap_or_else(|error| panic!("descriptor request rejected: {error}"));
+        let authenticated_for_receipt = request
+            .verify_controller_request(carrier, |_, _, _, _, signature| {
+                signature == DESCRIPTOR_REQUEST_SIGNATURE
+            })
+            .unwrap_or_else(|error| panic!("descriptor request auth rejected: {error}"));
+        let response_auth = RuntimeAgentControlResponseAuthClaimV1::try_new(
+            carrier,
+            carrier.runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("descriptor response algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("descriptor response auth rejected: {error}"));
+        let receipt = RuntimeAgentControlReceiptDraftV1::try_conversation_port_descriptor(
+            authenticated_for_receipt,
+            DESCRIPTOR,
+            generation(FABRIC_GENERATION),
+            generation(AGENT_GENERATION),
+            response_auth,
+        )
+        .unwrap_or_else(|error| panic!("descriptor receipt draft rejected: {error}"))
+        .finalize(&DESCRIPTOR_RECEIPT_SIGNATURE)
+        .unwrap_or_else(|error| panic!("descriptor receipt rejected: {error}"));
+        let authenticated_request = request
+            .verify_controller_request(carrier, |_, _, _, _, signature| {
+                signature == DESCRIPTOR_REQUEST_SIGNATURE
+            })
+            .unwrap_or_else(|error| panic!("descriptor request reauth rejected: {error}"));
+        let authenticated_receipt = receipt
+            .verify_runtime_descriptor_receipt(&request, carrier, |_, _, _, _, signature| {
+                signature == DESCRIPTOR_RECEIPT_SIGNATURE
+            })
+            .unwrap_or_else(|error| panic!("descriptor receipt auth rejected: {error}"));
+        RemoteAgentDescriptorEvidenceV1::try_next(
+            None,
+            authenticated_request,
+            authenticated_receipt,
+        )
+        .unwrap_or_else(|error| panic!("PXDE fixture rejected: {error}"))
+    }
+
+    fn rebuilt_inner_request(
+        mode: RemoteAgentDataPlaneTargetModeV1,
+        cas: RemoteAgentBootstrapCasV1,
+    ) -> RemoteAgentDataPlaneApplyRequestV1 {
+        let template = data_plane_template();
+        let predecessor = stack_request();
+        let projection = RemoteAgentDataPlaneProjectionV1::try_from_managed_agent_stack_projection(
+            predecessor.target_execution().projection().clone(),
+        )
+        .unwrap_or_else(|error| panic!("data-plane projection rejected: {error}"));
+        let execution = match mode {
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive => {
+                RemoteAgentDataPlaneTargetExecutionV1::try_remote_access_active(
+                    projection,
+                    predecessor.target_execution().clone(),
+                    cas,
+                    template.target_execution().profile().clone(),
+                )
+            }
+            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate => {
+                RemoteAgentDataPlaneTargetExecutionV1::try_local_agent_only_deactivate(
+                    projection,
+                    predecessor.target_execution().clone(),
+                    template.target_execution().profile().clone(),
+                )
+            }
+        }
+        .unwrap_or_else(|error| panic!("data-plane execution rejected: {error}"));
+        let draft = RemoteAgentDataPlaneApplyRequestDraftV1::try_new(
+            execution,
+            template.provenance(),
+            template.control_commitment().control().clone(),
+            template.temporal(),
+            template.expected_runtime_store_instance_id(),
+            template.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("data-plane request draft rejected: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("data-plane transcript rejected: {error}"));
+        let signature = SigningKey::from_bytes(&INNER_SIGNING_SEED)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("data-plane request rejected: {error}"))
+    }
+
+    fn admission_policy(inner: &RemoteAgentDataPlaneApplyRequestV1) -> ApplyAdmissionPolicy {
+        let tenure_key = TrustedTenureKey::try_new(
+            TrustedTenureIdentity::new(
+                SourceScopeRef::from_bytes([0x01; 16]),
+                PrincipalRef::from_bytes([0x06; 16]),
+                1_001,
+                1_002,
+                TenureAuthorityRef::from_bytes([0x07; 16]),
+            ),
+            TenureKeyRef::from_bytes([0x08; 16]),
+            TenureProofAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("tenure algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+            SigningKey::from_bytes(&TENURE_SIGNING_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("tenure trust rejected: {error}"));
+        let apply_key = TrustedApplyKey::try_new(
+            TrustedApplyIdentity::new(
+                SourceScopeRef::from_bytes([0x01; 16]),
+                inner.target(),
+                PrincipalRef::from_bytes([0x09; 16]),
+                PlanWriterRef::from_bytes([0x09; 16]),
+            ),
+            ApplyAuthKeyRef::from_bytes([0x0c; 16]),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("apply algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+            SigningKey::from_bytes(&INNER_SIGNING_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("apply trust rejected: {error}"));
+        ApplyAdmissionPolicy::try_new(
+            BoundedDuration::from_nanos(inner.temporal().original_budget().value()),
+            AdmissionStateLimits::try_new(4, 4, 4)
+                .unwrap_or_else(|error| panic!("admission limits rejected: {error}")),
+            [tenure_key],
+            [apply_key],
+        )
+        .unwrap_or_else(|error| panic!("admission policy rejected: {error}"))
+    }
+
+    fn outer_request(
+        inner: &RemoteAgentDataPlaneApplyRequestV1,
+        active_pxst_digest: Digest32,
+    ) -> RemoteAgentAccessRequestV1 {
+        let template = access_template();
+        RemoteAgentAccessRequestDraftV1::try_apply_remote_access(
+            RemoteAgentAccessRequestFieldsV1 {
+                request_id: RemoteAgentAccessRequestIdV1::try_from_bytes(
+                    *inner.operation_id().as_bytes(),
+                )
+                .unwrap_or_else(|error| panic!("access request id rejected: {error}")),
+                carrier: template.carrier().clone(),
+                target: inner.target(),
+                expected_runtime_store_instance_id: inner.expected_runtime_store_instance_id(),
+                expected_runtime_host_epoch: RUNTIME_EPOCH,
+                auth_claim: template.authentication().claim().clone(),
+            },
+            active_pxst_digest,
+            inner.clone(),
+        )
+        .unwrap_or_else(|error| panic!("access request draft rejected: {error}"))
+        .finalize(&OUTER_SIGNATURE)
+        .unwrap_or_else(|error| panic!("access request rejected: {error}"))
+    }
+
+    fn prepared_result(
+        options: PreparedOptions,
+    ) -> Result<RemoteAgentAccessSnapshotV1, RemoteAgentAccessStateError> {
+        let stack_terminal = stack_terminal();
+        let fabric_terminal = fabric_terminal();
+        let carrier = access_template().carrier().clone();
+        let evidence = descriptor_evidence(&carrier, stack_terminal.receipt_digest());
+        let cas = RemoteAgentBootstrapCasV1::try_new(
+            fabric_terminal.receipt_digest(),
+            stack_terminal.receipt_digest(),
+            evidence.receipt_digest(),
+            evidence.descriptor_payload_digest(),
+            generation(FABRIC_GENERATION),
+            generation(AGENT_GENERATION),
+        )
+        .unwrap_or_else(|error| panic!("bootstrap CAS rejected: {error}"));
+        let inner = rebuilt_inner_request(options.mode, cas);
+        let outer = outer_request(&inner, stack_terminal.receipt_digest());
+        let authenticated_outer = outer
+            .verify_controller_request(outer.carrier(), |_, _, _, _, signature| {
+                signature == OUTER_SIGNATURE
+            })
+            .unwrap_or_else(|error| panic!("outer authentication rejected: {error}"));
+        let reading = ClockReading::new(
+            inner.temporal().target_clock_domain(),
+            inner.temporal().target_clock_generation(),
+            MonotonicInstant::from_ticks(1),
+        );
+        let verified_ingress = admission_policy(&inner)
+            .verify_remote_agent_data_plane_apply_request(&inner, reading)
+            .unwrap_or_else(|error| panic!("inner admission rejected: {error}"));
+        let verified_descriptor = verify_remote_agent_descriptor_evidence_v1(
+            &evidence,
+            RemoteAgentDescriptorLiveFactsV1 {
+                carrier: &carrier,
+                target: inner.target(),
+                store_instance_id: STORE,
+                runtime_host_epoch: RUNTIME_EPOCH,
+                active_pxst_digest: stack_terminal.receipt_digest(),
+                descriptor: DESCRIPTOR,
+                fabric_generation: generation(FABRIC_GENERATION),
+                agent_generation: generation(AGENT_GENERATION),
+            },
+            |_, _, _, _, signature| signature == DESCRIPTOR_REQUEST_SIGNATURE,
+            |_, _, _, _, signature| signature == DESCRIPTOR_RECEIPT_SIGNATURE,
+        )
+        .unwrap_or_else(|error| panic!("descriptor live verification rejected: {error}"));
+        RemoteAgentAccessSnapshotV1::try_prepared(
+            None,
+            options.identity,
+            authenticated_outer,
+            verified_ingress,
+            active_fabric_snapshot(options.fabric_generation_high_water),
+            active_stack_snapshot(options),
+            options.include_descriptor.then_some(verified_descriptor),
+        )
+    }
+
+    fn prepared(mode: RemoteAgentDataPlaneTargetModeV1) -> RemoteAgentAccessSnapshotV1 {
+        prepared_result(PreparedOptions::valid(mode))
+            .unwrap_or_else(|error| panic!("valid Prepared snapshot rejected: {error}"))
+    }
+
+    #[test]
+    fn prepared_roundtrips_for_both_modes_and_retains_exact_payload_order() {
+        for mode in [
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+        ] {
+            let snapshot = prepared(mode);
+            let decoded = RemoteAgentAccessSnapshotV1::decode(snapshot.canonical_wire(), identity())
+                .unwrap_or_else(|error| panic!("Prepared restart decode rejected: {error}"));
+            assert_eq!(decoded, snapshot);
+            assert_eq!(decoded.phase(), RemoteAgentAccessDurablePhaseV1::PreparedNoEffects);
+            assert_eq!(decoded.sequence(), 1);
+            assert_eq!(decoded.previous_snapshot_digest(), None);
+            assert_eq!(decoded.mode(), mode);
+            assert_eq!(decoded.request.canonical_wire(), snapshot.request.canonical_wire());
+            assert_eq!(decoded.fabric.canonical_wire(), snapshot.fabric.canonical_wire());
+            assert_eq!(
+                decoded.predecessor.canonical_wire(),
+                snapshot.predecessor.canonical_wire()
+            );
+            assert_eq!(
+                decoded.descriptor_evidence.is_some(),
+                mode == RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive
+            );
+            assert!(decoded.terminal.is_none());
+            assert_eq!(decoded.snapshot_digest(), snapshot.snapshot_digest());
+            assert!(decoded.canonical_wire().len() <= MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_BYTES);
+        }
+    }
+
+    #[test]
+    fn prepared_shape_requires_exact_mode_specific_descriptor_authority() {
+        let mut active = PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        active.include_descriptor = false;
+        assert!(matches!(
+            prepared_result(active),
+            Err(RemoteAgentAccessStateError::InvalidDescriptorShape)
+        ));
+
+        let mut local =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        local.include_descriptor = true;
+        assert!(matches!(
+            prepared_result(local),
+            Err(RemoteAgentAccessStateError::InvalidDescriptorShape)
+        ));
+
+        let mut missing_pxst =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        missing_pxst.include_stack_terminal = false;
+        assert!(matches!(
+            prepared_result(missing_pxst),
+            Err(RemoteAgentAccessStateError::InvalidAgentTerminal)
+        ));
+    }
+
+    #[test]
+    fn prepared_pins_store_and_inherits_both_fabric_high_waters() {
+        let mut options =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        options.fabric_generation_high_water = 19;
+        options.stack_fabric_generation_high_water = 17;
+        options.stack_agent_generation_high_water = 21;
+        let snapshot = prepared_result(options)
+            .unwrap_or_else(|error| panic!("high-water Prepared rejected: {error}"));
+        assert_eq!(snapshot.generations().fabric_generation_high_water, 19);
+        assert_eq!(snapshot.generations().agent_generation_high_water, 21);
+
+        options.identity.store_instance_id = [0x45; 32];
+        assert!(matches!(
+            prepared_result(options),
+            Err(RemoteAgentAccessStateError::IdentityMismatch)
+        ));
+    }
+}
