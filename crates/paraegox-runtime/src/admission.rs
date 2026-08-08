@@ -3075,15 +3075,47 @@ mod tests {
     fn signed_remote_agent_data_plane_request(
         signing_seed: [u8; 32],
         temporal: Option<ApplyTemporalConstraint>,
+        tenure_signing_seed: Option<[u8; 32]>,
     ) -> RemoteAgentDataPlaneApplyRequestV1 {
         let fixture = RemoteAgentDataPlaneApplyRequestV1::decode(&remote_agent_data_plane_golden(
             "pxar_v10_hex",
         ))
         .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 fixture must decode: {error}"));
+        let control = if let Some(tenure_signing_seed) = tenure_signing_seed {
+            let fixture_control = fixture.control_commitment().control();
+            let fixture_writer_context = fixture_control.writer_context();
+            let fixture_proof = fixture_writer_context.proof();
+            let transcript = fixture_proof.signing_transcript().unwrap_or_else(|error| {
+                panic!("remote-Agent tenure transcript must build: {error}")
+            });
+            let signature = SigningKey::from_bytes(&tenure_signing_seed)
+                .sign(transcript.as_bytes())
+                .to_bytes();
+            let proof = WriterTenureProof::try_new(
+                fixture_proof.authority(),
+                fixture_proof.claim(),
+                fixture_proof.nonce(),
+                &signature,
+            )
+            .unwrap_or_else(|error| panic!("remote-Agent tenure proof must build: {error}"));
+            let writer_context = PlanWriterContext::try_new(
+                fixture_writer_context.writer(),
+                fixture_writer_context.epoch(),
+                proof,
+            )
+            .unwrap_or_else(|error| panic!("remote-Agent writer context must build: {error}"));
+            RuntimeApplyControl::new(
+                writer_context,
+                fixture_control.expected_active(),
+                fixture_control.operation_id(),
+            )
+        } else {
+            fixture.control_commitment().control().clone()
+        };
         let draft = RemoteAgentDataPlaneApplyRequestDraftV1::try_new(
             fixture.target_execution().clone(),
             fixture.provenance(),
-            fixture.control_commitment().control().clone(),
+            control,
             temporal.unwrap_or(fixture.temporal()),
             fixture.expected_runtime_store_instance_id(),
             fixture.authentication().claim().clone(),
@@ -3098,21 +3130,6 @@ mod tests {
         draft
             .finalize(&signature)
             .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 must finalize: {error}"))
-    }
-
-    fn tampered_remote_agent_data_plane_signature(
-        envelope_signature_tag: u16,
-    ) -> RemoteAgentDataPlaneApplyRequestV1 {
-        let mut wire = remote_agent_data_plane_golden("pxar_v10_hex");
-        let envelope_length = u32::from_be_bytes(
-            wire[6..10]
-                .try_into()
-                .expect("PXAR v10 envelope length must have four bytes"),
-        ) as usize;
-        let envelope_end = 18 + envelope_length;
-        mutate_tlv(&mut wire[18..envelope_end], envelope_signature_tag);
-        RemoteAgentDataPlaneApplyRequestV1::decode(&wire)
-            .unwrap_or_else(|error| panic!("tampered PXAR v10 must remain canonical: {error}"))
     }
 
     fn signed_distributed_request_sharing_remote_ingress(
@@ -4845,7 +4862,8 @@ mod tests {
 
     #[test]
     fn remote_agent_data_plane_pxar10_authenticates_both_signatures_and_separates_replay_domains() {
-        let request = signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None);
+        let request =
+            signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None, None);
         assert_eq!(
             request.canonical_wire(),
             remote_agent_data_plane_golden("pxar_v10_hex"),
@@ -4906,18 +4924,29 @@ mod tests {
         assert_eq!(verified.deadline_nanos(), 61);
         assert_eq!(verified.clock_generation().value(), 3);
 
-        for (signature_tag, expected) in [
-            (20, ManagedFabricApplyAdmissionError::InvalidTenureSignature),
+        for (rejected, expected) in [
             (
-                38,
+                signed_remote_agent_data_plane_request(
+                    PYTHON_FIXTURE_REQUEST_SEED,
+                    None,
+                    Some(WRONG_SEED),
+                ),
+                ManagedFabricApplyAdmissionError::InvalidTenureSignature,
+            ),
+            (
+                signed_remote_agent_data_plane_request(WRONG_SEED, None, None),
                 ManagedFabricApplyAdmissionError::InvalidRequestSignature,
             ),
         ] {
-            let tampered = tampered_remote_agent_data_plane_signature(signature_tag);
+            assert_eq!(
+                RemoteAgentDataPlaneApplyRequestV1::decode(rejected.canonical_wire())
+                    .expect("signature-negative PXAR v10 must remain contract-canonical"),
+                rejected,
+            );
             assert_eq!(
                 admission
                     .policy
-                    .authenticate_remote_agent_data_plane_apply_request(&tampered)
+                    .authenticate_remote_agent_data_plane_apply_request(&rejected)
                     .unwrap_err(),
                 expected,
             );
@@ -4926,7 +4955,8 @@ mod tests {
 
     #[test]
     fn remote_agent_data_plane_pxar10_rejects_temporal_mismatch_budget_and_expiry() {
-        let request = signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None);
+        let request =
+            signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None, None);
         let (admission, _) = python_fixture_admission_and_reading();
         let generation = ClockGeneration::try_new(3).expect("fixture generation must be nonzero");
         let correct_domain = ClockDomainRef::from_bytes([0x0a; 16]);
@@ -4988,6 +5018,7 @@ mod tests {
         let expired = signed_remote_agent_data_plane_request(
             PYTHON_FIXTURE_REQUEST_SEED,
             Some(expired_temporal),
+            None,
         );
         admission
             .policy
