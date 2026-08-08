@@ -86,6 +86,18 @@ mod process_transport;
 mod process_workspace;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod recovery;
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Awaiting T2-D live connector composition")
+)] // GOV-WAIVER-0001
+mod remote_agent_one_echo;
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Awaiting T2-D APFS durable store admission")
+)] // GOV-WAIVER-0001
+mod remote_agent_outbox;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod request;
 #[cfg(unix)]

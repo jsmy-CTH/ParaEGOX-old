@@ -26,12 +26,10 @@ use paraegox_agent_service::{
     AgentConversationModelOutcomeV1, AgentConversationModelProvider, AgentService,
     AgentServiceAcceptOutcomeV1, AgentServiceError, AgentServiceSubmitOutcomeV1,
 };
-#[cfg(test)]
-use paraegox_fabric::ClientPortBindingV1;
 use paraegox_fabric::{
-    FabricConfigError, FabricError, FabricService, HandlerResponse, InboundRequest, IngressLimits,
-    PortBinding, RequestId as FabricRequestId, RequestReceiver, RequestResponseBindingSpec,
-    ResponseStatus,
+    ClientPortBindingV1, FabricConfigError, FabricError, FabricService, HandlerResponse,
+    InboundRequest, IngressLimits, PortBinding, RequestId as FabricRequestId, RequestReceiver,
+    RequestResponseBindingSpec, ResponseStatus,
 };
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
 use paraegox_runtime_contracts::assignment::{BindingId, SchemaRef};
@@ -39,6 +37,7 @@ use paraegox_runtime_contracts::assignment::{BindingId, SchemaRef};
 mod port_descriptor;
 
 pub use port_descriptor::AgentConversationPortDescriptorError;
+pub(crate) use port_descriptor::AgentConversationPortDescriptorV1;
 
 const PXAC_COMMAND_SCHEMA_ID: [u8; 16] = [
     0x50, 0x58, 0x41, 0x43, 0x2d, 0x43, 0x4f, 0x4d, 0x4d, 0x41, 0x4e, 0x44, 0x2d, 0x56, 0x31, 0x00,
@@ -96,8 +95,7 @@ pub struct AgentConversationPort {
 /// exact-CAS replacement, or retirement. It carries no Agent or Fabric
 /// lifecycle authority and exposes no raw route outside this adapter.
 #[derive(Clone, Eq, PartialEq)]
-#[cfg(test)]
-pub struct AgentConversationClientPortV1 {
+pub(crate) struct AgentConversationClientPortV1 {
     submit_binding: ClientPortBindingV1,
     control_binding: ClientPortBindingV1,
 }
@@ -198,7 +196,6 @@ impl fmt::Debug for AgentConversationPort {
     }
 }
 
-#[cfg(test)]
 impl fmt::Debug for AgentConversationClientPortV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AgentConversationClientPortV1 { .. }")
@@ -527,7 +524,6 @@ pub struct AgentConversationClient<'fabric> {
 
 enum AgentConversationClientRouteV1 {
     Owner(AgentConversationPort),
-    #[cfg(test)]
     Recovered(AgentConversationClientPortV1),
 }
 
@@ -543,8 +539,7 @@ impl<'fabric> AgentConversationClient<'fabric> {
 
     /// Binds a Fabric owner reference to a descriptor-recovered request route.
     #[must_use]
-    #[cfg(test)]
-    pub fn from_client_port_v1(
+    pub(crate) fn from_client_port_v1(
         fabric: &'fabric FabricService,
         port: AgentConversationClientPortV1,
     ) -> Self {
@@ -572,7 +567,6 @@ impl<'fabric> AgentConversationClient<'fabric> {
                     .request(&port.submit_binding, fabric_request_id, body, timeout)
                     .await
             }
-            #[cfg(test)]
             AgentConversationClientRouteV1::Recovered(port) => {
                 self.fabric
                     .request_client_v1(&port.submit_binding, fabric_request_id, body, timeout)
@@ -688,7 +682,6 @@ impl<'fabric> AgentConversationClient<'fabric> {
                     .request(&port.control_binding, fabric_request_id, body, timeout)
                     .await
             }
-            #[cfg(test)]
             AgentConversationClientRouteV1::Recovered(port) => {
                 self.fabric
                     .request_client_v1(&port.control_binding, fabric_request_id, body, timeout)

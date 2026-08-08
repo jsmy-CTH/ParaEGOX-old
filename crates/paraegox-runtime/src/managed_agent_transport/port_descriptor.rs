@@ -14,7 +14,6 @@ use paraegox_fabric::{
 };
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
 
-#[cfg(test)]
 use super::AgentConversationClientPortV1;
 use super::{
     AGENT_CONVERSATION_PORT_PHYSICAL_BINDINGS, AgentConversationPort, command_schema, result_schema,
@@ -79,8 +78,7 @@ impl AgentConversationPortDescriptorV1 {
     }
 
     /// Strictly decodes one canonical PXAP frame and both nested PXBD frames.
-    #[cfg(test)]
-    pub fn decode(frame: &[u8]) -> Result<Self, AgentConversationPortDescriptorError> {
+    pub(crate) fn decode(frame: &[u8]) -> Result<Self, AgentConversationPortDescriptorError> {
         if !(AGENT_CONVERSATION_PORT_DESCRIPTOR_HEADER_BYTES
             ..=MAX_AGENT_CONVERSATION_PORT_DESCRIPTOR_BYTES)
             .contains(&frame.len())
@@ -138,8 +136,7 @@ impl AgentConversationPortDescriptorV1 {
 
     /// Returns the complete canonical owner-private bootstrap frame.
     #[must_use]
-    #[cfg(test)]
-    pub fn canonical_wire(&self) -> &[u8] {
+    pub(crate) fn canonical_wire(&self) -> &[u8] {
         &self.canonical_wire
     }
 
@@ -160,8 +157,7 @@ impl AgentConversationPortDescriptorV1 {
     /// Consumes validated route facts into the opaque typed client port.
     /// No Fabric session or server entity is created by this operation.
     #[must_use]
-    #[cfg(test)]
-    pub fn into_client_port(self) -> AgentConversationClientPortV1 {
+    pub(crate) fn into_client_port(self) -> AgentConversationClientPortV1 {
         AgentConversationClientPortV1 {
             submit_binding: self.submit.into_client_binding(),
             control_binding: self.control.into_client_binding(),
@@ -289,12 +285,10 @@ fn descriptor_digest(
     Ok(builder.finish())
 }
 
-#[cfg(test)]
 fn read_u16(bytes: &[u8]) -> u16 {
     u16::from_be_bytes(read_array(bytes))
 }
 
-#[cfg(test)]
 fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(read_array(bytes))
 }
@@ -309,11 +303,8 @@ fn read_array<const N: usize>(bytes: &[u8]) -> [u8; N] {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentConversationPortDescriptorError {
     InvalidFrameLength,
-    #[cfg(test)]
     UnsupportedFrame,
-    #[cfg(test)]
     NonCanonicalEncoding,
-    #[cfg(test)]
     DigestMismatch,
     DigestEncodingFailed,
     DuplicateBindingId,
@@ -329,11 +320,8 @@ impl fmt::Display for AgentConversationPortDescriptorError {
             Self::FabricDescriptor(error) => write!(formatter, "invalid Fabric lane: {error}"),
             other => formatter.write_str(match other {
                 Self::InvalidFrameLength => "PXAP frame length is invalid",
-                #[cfg(test)]
                 Self::UnsupportedFrame => "PXAP frame version or header is unsupported",
-                #[cfg(test)]
                 Self::NonCanonicalEncoding => "PXAP frame is not canonical",
-                #[cfg(test)]
                 Self::DigestMismatch => "PXAP descriptor digest mismatched",
                 Self::DigestEncodingFailed => "PXAP descriptor digest encoding failed",
                 Self::DuplicateBindingId => "PXAP lane BindingIds must differ",
