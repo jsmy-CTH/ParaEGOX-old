@@ -1909,7 +1909,7 @@ mod tests {
         );
         let verified_ingress = admission_policy(&inner)
             .verify_remote_agent_data_plane_apply_request(&inner, reading)
-            .unwrap_or_else(|error| panic!("inner admission rejected: {error}"));
+            .unwrap_or_else(|error| panic!("inner admission rejected: {error:?}"));
         let verified_descriptor = verify_remote_agent_descriptor_evidence_v1(
             &evidence,
             RemoteAgentDescriptorLiveFactsV1 {
