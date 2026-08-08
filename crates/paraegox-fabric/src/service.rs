@@ -2763,15 +2763,17 @@ mod tests {
                 .unwrap(),
             "\"/run/paraegox/tls/listen-private-key.pem\""
         );
-        assert!(
+        assert_eq!(
             listener
                 .get_json("transport/link/tls/connect_certificate")
-                .is_err()
+                .unwrap(),
+            "null"
         );
-        assert!(
+        assert_eq!(
             listener
                 .get_json("transport/link/tls/connect_private_key")
-                .is_err()
+                .unwrap(),
+            "null"
         );
         assert_remote_agent_acl(
             &listener,
@@ -2822,15 +2824,17 @@ mod tests {
                 .unwrap(),
             "\"/run/paraegox/tls/connect-private-key.pem\""
         );
-        assert!(
+        assert_eq!(
             connector
                 .get_json("transport/link/tls/listen_certificate")
-                .is_err()
+                .unwrap(),
+            "null"
         );
-        assert!(
+        assert_eq!(
             connector
                 .get_json("transport/link/tls/listen_private_key")
-                .is_err()
+                .unwrap(),
+            "null"
         );
         assert_remote_agent_acl(
             &connector,
