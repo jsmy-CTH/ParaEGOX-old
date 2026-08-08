@@ -273,8 +273,38 @@ production runs the Deployment root future on its own named bounded 16 MiB execu
 
 The descriptor is bootstrap evidence only. These results do not prove descriptor access or
 authorization, an Agent session, Agent data-plane traffic, Echo or conversation, reconnect, a remote
-TUI, distributed/two-host execution, provider-mismatch handling, or Authority-owner failure. T2 is
-the next stage: an asymmetric remote Agent data plane plus Echo; reconnect and TUI remain later work.
+TUI, distributed/two-host execution, provider-mismatch handling, or Authority-owner failure. T2-A
+defines the remote-Agent contracts and state graph. T2-B now adds the Fabric transport substrate
+described below; Echo, reconnect, and TUI remain later work.
+
+## T2-B asymmetric Fabric transport substrate
+
+Exact ref `0bcc49d03d15cca720021868a08d37912f62128a` adds two role-specific, asymmetric mTLS profiles in
+[`paraegox-fabric`](crates/paraegox-fabric/src/service.rs). A single `FabricService` still owns a
+single private Zenoh 1.9 `Session`. The Ubuntu-side profile keeps the T1 loopback listener, adds one
+non-loopback TLS listener, and has no connectors. The nominal Mac-side profile has one TLS-only
+connector and no listeners.
+
+Both profiles use a default-deny policy keyed by the exact peer certificate CN and allow only the
+exact remote-Agent submit and control query paths, with the corresponding query, reply, and
+queryable directions. The `**` wildcard input is rejected by construction, and the policy has no
+put/subscriber allow rule. This is transport configuration, not Runtime activation or authority.
+
+On Ubuntu, the full Fabric suite passed 50/50 tests, with formatting and Clippy clean. The focused
+[real-network test](crates/paraegox-fabric/tests/remote_agent_mtls.rs) completed in 7.05 seconds: the
+correct CN reached both exact routes; sentinel, parent, and child routes were denied; a same-CA wrong
+CN completed TLS/session establishment but was denied by the ACL; the existing same-session local
+T1 routes still succeeded; an independent plaintext loopback peer was denied; and shutdown released
+both ports. The `**` rejection is constructor/static evidence, not a network case. Likewise, the
+absence of put/subscriber allows is statically checked but was not exercised over the network.
+
+The local T1 result relies on the same-session local-face boundary in exactly pinned Zenoh 1.9;
+upgrading Zenoh requires rerunning this matrix. A wrong-CN peer can occupy the sole session before
+ACL denial, so `max_sessions = 1` remains an availability risk rather than an authentication bypass.
+The evidence is a single-Ubuntu-host network test, not proof from a real two-host Mac process.
+
+T2-B does not yet provide a Runtime PXTE9 state owner, real Mac connector composition, an APFS
+outbox, a Controller Describe source, a public CLI or marker flow, Echo, reconnect, or TUI.
 
 A Unix-only `paraegox-noded developer-local-reference-v1` process can also reopen one externally
 authorized exact tenure and serve its last committed status through a same-user, token-bound local socket.

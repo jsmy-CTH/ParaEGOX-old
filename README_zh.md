@@ -233,8 +233,35 @@ socket cleanup。pytest parent 使用默认 8192 KiB stack；harness 保留 16 M
 
 descriptor 只是 bootstrap evidence。这些结果不证明 descriptor access/authorization、Agent session、
 Agent data-plane traffic、Echo/conversation、reconnect、remote TUI、distributed/two-host、provider
-mismatch 或 Authority-owner failure。下一阶段 T2 是 asymmetric remote Agent data plane + Echo；
-reconnect 与 TUI 继续后置。
+mismatch 或 Authority-owner failure。T2-A 已定义 remote-Agent contract 与状态图；T2-B 现只增加
+下述 Fabric 传输基座，Echo、reconnect 与 TUI 继续后置。
+
+## T2-B 非对称 Fabric 传输基座
+
+精确 ref `0bcc49d03d15cca720021868a08d37912f62128a` 在
+[`paraegox-fabric`](crates/paraegox-fabric/src/service.rs) 中增加两种按角色区分的非对称 mTLS
+profile。单个 `FabricService` 仍只持有一个私有 Zenoh 1.9 `Session`：Ubuntu 侧保留 T1 loopback
+listener，再增加一个 non-loopback TLS listener，并保持零 connector；名义上的 Mac 侧 profile
+则只有一个 TLS connector，且没有 listener。
+
+两种 profile 都使用默认拒绝策略，以对端证书的精确 CN 为主体，只允许 remote-Agent submit
+与 control 两条精确 query 路径及其对应的 query、reply、queryable 方向。构造阶段拒绝 `**` wildcard
+route，策略中也没有 put/subscriber allow rule。这只是传输配置，不代表 Runtime 已激活或取得
+状态所有权。
+
+Ubuntu 上完整 Fabric suite 为 50/50 全绿，format 与 Clippy 均通过。聚焦的
+[真实网络测试](crates/paraegox-fabric/tests/remote_agent_mtls.rs) 用时 7.05 秒：正确 CN 可访问两条
+精确 route；sentinel、parent、child route 均被拒绝；同 CA 的错误 CN 可以完成 TLS/session 建立，
+但随后被 ACL 拒绝；同一 Session 内既有 T1 本地 route 仍成功；独立 plaintext loopback peer
+被拒绝；shutdown 后两个端口均可重新绑定。`**` 拒绝只属于 constructor/static 证据，并非真实
+网络 case；put/subscriber 没有 allow rule 也只做了静态检查，未通过网络实跑。
+
+T1 本地结果依赖精确锁定的 Zenoh 1.9 中 same-session local-face 边界；升级 Zenoh 时必须重跑
+该矩阵。错误 CN peer 可在 ACL 拒绝前占用唯一 session，因此 `max_sessions = 1` 仍有可用性风险，
+但这不是认证绕过。现有证据只是单 Ubuntu 主机上的网络测试，并非真实双机 Mac process 证明。
+
+T2-B 仍不包含 Runtime PXTE9 state owner、真实 Mac connector composition、APFS outbox、
+Controller Describe source、公开 CLI 或 marker 流程、Echo、reconnect、TUI。
 
 Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，
 并通过 same-user、token-bound 本地 socket 返回最后一次已提交状态。新增的
