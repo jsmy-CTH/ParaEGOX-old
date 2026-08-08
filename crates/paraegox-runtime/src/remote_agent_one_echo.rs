@@ -1,9 +1,10 @@
 //! Runtime-private fakeable owner for exactly one remote Open and one Echo.
 //!
-//! The Controller-owned Describe source supplies a fresh authenticated PXRA /
-//! PXRR proof before each operation. PXCB remains nested proof material and is
+//! The Controller-owned Describe source supplies a challenge-bound signed PXRA /
+//! PXRR proof before each operation. PXCB remains durable trusted scope and is
 //! never accepted as connector configuration. This tranche owns no real
-//! connector, filesystem store, retry, reconnect, background task, or UI.
+//! Controller exchange, connector, filesystem store, retry, reconnect,
+//! background task, or UI, and therefore makes no discovery-currentness claim.
 
 #![forbid(unsafe_code)]
 
@@ -11,21 +12,18 @@ use paraegox_agent_contracts::control::{
     AgentConversationControlV1, AgentConversationOpenOutcomeV1,
 };
 use paraegox_agent_contracts::{AgentConversationRequestV1, AgentConversationTerminalV1};
-use paraegox_kernel::digest::Digest32;
-use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
-use paraegox_runtime_contracts::remote_agent_access::{
-    RemoteAgentAccessKindV1, RemoteAgentAccessRequestV1, RemoteAgentAccessResponseV1,
-};
+use paraegox_runtime_contracts::remote_agent_access::RemoteAgentAccessResponseV1;
 use paraegox_runtime_contracts::remote_agent_data_plane_plan::RemoteAgentDataPlaneProfileV1;
-use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
 
 use crate::managed_agent_transport::{
     AgentConversationClientPortV1, AgentConversationPortDescriptorV1,
 };
 use crate::remote_agent_outbox::{
-    RemoteAgentDescribeProofBytesV1, RemoteAgentOutboxCommitFailureV1, RemoteAgentOutboxCommitV1,
-    RemoteAgentOutboxError, RemoteAgentOutboxMutationErrorV1, RemoteAgentOutboxPhaseV1,
-    RemoteAgentOutboxV1,
+    verify_remote_agent_describe_proof_v1, RemoteAgentAccessSignatureVerifierV1,
+    RemoteAgentDescribeChallengeV1, RemoteAgentDescribeProofBytesV1, RemoteAgentOneEchoScopeV1,
+    RemoteAgentOutboxCommitFailureV1, RemoteAgentOutboxCommitV1, RemoteAgentOutboxError,
+    RemoteAgentOutboxMutationErrorV1, RemoteAgentOutboxPhaseV1, RemoteAgentOutboxV1,
+    RemoteAgentVerifiedDescribeProofV1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,31 +51,12 @@ pub(crate) trait RemoteAgentDescribeSourceV1 {
     fn fresh_describe(
         &mut self,
         purpose: RemoteAgentDescribePurposeV1,
+        challenge: &RemoteAgentDescribeChallengeV1,
     ) -> Result<RemoteAgentDescribeWireProofV1, RemoteAgentDescribeSourceErrorV1>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RemoteAgentDescribeSourceErrorV1;
-
-pub(crate) trait RemoteAgentAccessSignatureVerifierV1 {
-    fn verify_controller(
-        &mut self,
-        principal: PrincipalRef,
-        key: ApplyAuthKeyRef,
-        key_fingerprint: Digest32,
-        transcript: &[u8],
-        signature: &[u8],
-    ) -> bool;
-
-    fn verify_runtime(
-        &mut self,
-        principal: PrincipalRef,
-        key: ApplyAuthKeyRef,
-        key_fingerprint: Digest32,
-        transcript: &[u8],
-        signature: &[u8],
-    ) -> bool;
-}
 
 pub(crate) trait RemoteAgentOnceTransportV1 {
     fn open_once(
@@ -96,49 +75,6 @@ pub(crate) trait RemoteAgentOnceTransportV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RemoteAgentOnceTransportErrorV1;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RemoteAgentOneEchoScopeV1 {
-    target: RuntimeHostId,
-    runtime_store_instance_id: [u8; 32],
-    runtime_host_epoch: u64,
-    expected_pxau_digest: Digest32,
-    expected_active_pxst_digest: Digest32,
-    profile_digest: Digest32,
-    mac_agent_client_principal: PrincipalRef,
-}
-
-impl RemoteAgentOneEchoScopeV1 {
-    pub(crate) fn try_new(
-        target: RuntimeHostId,
-        runtime_store_instance_id: [u8; 32],
-        runtime_host_epoch: u64,
-        expected_pxau_digest: Digest32,
-        expected_active_pxst_digest: Digest32,
-        profile_digest: Digest32,
-        mac_agent_client_principal: PrincipalRef,
-    ) -> Result<Self, RemoteAgentOneEchoErrorV1> {
-        if bytes_are_zero(target.as_bytes())
-            || bytes_are_zero(&runtime_store_instance_id)
-            || runtime_host_epoch == 0
-            || digest_is_zero(expected_pxau_digest)
-            || digest_is_zero(expected_active_pxst_digest)
-            || digest_is_zero(profile_digest)
-            || bytes_are_zero(mac_agent_client_principal.as_bytes())
-        {
-            return Err(RemoteAgentOneEchoErrorV1::InvalidScope);
-        }
-        Ok(Self {
-            target,
-            runtime_store_instance_id,
-            runtime_host_epoch,
-            expected_pxau_digest,
-            expected_active_pxst_digest,
-            profile_digest,
-            mac_agent_client_principal,
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteAgentDataPlaneBindingV1 {
     profile: RemoteAgentDataPlaneProfileV1,
@@ -146,7 +82,12 @@ pub(crate) struct RemoteAgentDataPlaneBindingV1 {
     fabric_generation: u64,
     agent_generation: u64,
     access_generation: u64,
-    proof: RemoteAgentDescribeProofBytesV1,
+}
+
+#[derive(Debug)]
+struct RemoteAgentVerifiedDataPlaneBindingV1 {
+    binding: RemoteAgentDataPlaneBindingV1,
+    proof: RemoteAgentVerifiedDescribeProofV1,
 }
 
 impl RemoteAgentDataPlaneBindingV1 {
@@ -174,7 +115,7 @@ pub(crate) enum RemoteAgentOneEchoOutcomeV1 {
 }
 
 pub(crate) fn run_remote_agent_one_echo_v1<Describe, Verify, Transport, Commit>(
-    scope: RemoteAgentOneEchoScopeV1,
+    expected_scope: &RemoteAgentOneEchoScopeV1,
     outbox: &mut RemoteAgentOutboxV1,
     describe: &mut Describe,
     verifier: &mut Verify,
@@ -187,123 +128,138 @@ where
     Transport: RemoteAgentOnceTransportV1,
     Commit: RemoteAgentOutboxCommitV1,
 {
+    if !outbox.scope_matches(expected_scope) {
+        return Err(RemoteAgentOneEchoErrorV1::ScopeMismatch);
+    }
     loop {
         match outbox.phase().clone() {
             RemoteAgentOutboxPhaseV1::OpenRequestDurableNotSent => {
-                let binding = fresh_binding(
-                    scope,
+                let verified = challenge_bound_binding(
+                    expected_scope,
                     RemoteAgentDescribePurposeV1::Open,
-                    None,
+                    expected_scope.open_challenge(),
                     describe,
                     verifier,
                 )?;
-                let proof = binding.proof.clone();
-                outbox.claim_open(proof, commit)?;
-                let outcome = transport
-                    .open_once(&binding, outbox.open_request())
+                let RemoteAgentVerifiedDataPlaneBindingV1 { binding, proof } = verified;
+                let action = outbox.claim_open(expected_scope, proof, commit)?;
+                let exchange = action
+                    .exchange(|request| transport.open_once(&binding, request))
                     .map_err(|_| RemoteAgentOneEchoErrorV1::ReconcileRequired)?;
-                outbox.commit_open_result(outcome, commit)?;
+                outbox.commit_open_result(exchange, commit)?;
             }
-            RemoteAgentOutboxPhaseV1::OpenUncertain(_) => {
+            RemoteAgentOutboxPhaseV1::OpenUncertain { .. } => {
                 return Err(RemoteAgentOneEchoErrorV1::ReconcileRequired);
             }
             RemoteAgentOutboxPhaseV1::EchoRequestDurableNotSent {
                 open_outcome: AgentConversationOpenOutcomeV1::Opened,
                 open_proof,
             } => {
-                let binding = fresh_binding(
-                    scope,
+                let _open = verify_binding(
+                    expected_scope,
+                    expected_scope.open_challenge(),
+                    open_proof,
+                    verifier,
+                )?;
+                let verified = challenge_bound_binding(
+                    expected_scope,
                     RemoteAgentDescribePurposeV1::Echo,
-                    Some(&open_proof),
+                    expected_scope.echo_challenge(),
                     describe,
                     verifier,
                 )?;
-                let proof = binding.proof.clone();
-                outbox.claim_echo(proof, commit)?;
-                let terminal = transport
-                    .echo_once(&binding, outbox.echo_request())
+                let RemoteAgentVerifiedDataPlaneBindingV1 { binding, proof } = verified;
+                let action = outbox.claim_echo(expected_scope, proof, commit)?;
+                let exchange = action
+                    .exchange(|request| transport.echo_once(&binding, request))
                     .map_err(|_| RemoteAgentOneEchoErrorV1::ReconcileRequired)?;
-                if !terminal.correlates(outbox.echo_request()) {
+                if !exchange.is_correlated() {
                     return Err(RemoteAgentOneEchoErrorV1::TerminalCorrelationMismatch);
                 }
-                outbox.commit_terminal(terminal, commit)?;
+                outbox.commit_terminal(exchange, commit)?;
             }
             RemoteAgentOutboxPhaseV1::EchoRequestDurableNotSent { .. } => {
                 return Err(RemoteAgentOneEchoErrorV1::InvalidOutboxState);
             }
-            RemoteAgentOutboxPhaseV1::OpenTerminal(outcome) => {
-                return Ok(RemoteAgentOneEchoOutcomeV1::OpenNotAdmitted(outcome));
+            RemoteAgentOutboxPhaseV1::OpenTerminal {
+                open_outcome,
+                open_proof,
+            } => {
+                let _open = verify_binding(
+                    expected_scope,
+                    expected_scope.open_challenge(),
+                    open_proof,
+                    verifier,
+                )?;
+                return Ok(RemoteAgentOneEchoOutcomeV1::OpenNotAdmitted(open_outcome));
             }
-            RemoteAgentOutboxPhaseV1::EchoUncertain(_) => {
+            RemoteAgentOutboxPhaseV1::EchoUncertain { .. } => {
                 return Err(RemoteAgentOneEchoErrorV1::ReconcileRequired);
             }
-            RemoteAgentOutboxPhaseV1::Terminal(terminal) => {
+            RemoteAgentOutboxPhaseV1::Terminal {
+                open_proof,
+                echo_proof,
+                terminal,
+            } => {
+                let _open = verify_binding(
+                    expected_scope,
+                    expected_scope.open_challenge(),
+                    open_proof,
+                    verifier,
+                )?;
+                let _echo = verify_binding(
+                    expected_scope,
+                    expected_scope.echo_challenge(),
+                    echo_proof,
+                    verifier,
+                )?;
+                if !terminal.correlates(expected_scope.echo_request()) {
+                    return Err(RemoteAgentOneEchoErrorV1::TerminalCorrelationMismatch);
+                }
                 return Ok(RemoteAgentOneEchoOutcomeV1::EchoTerminal(terminal));
             }
         }
     }
 }
 
-fn fresh_binding<Describe, Verify>(
-    scope: RemoteAgentOneEchoScopeV1,
+fn challenge_bound_binding<Describe, Verify>(
+    scope: &RemoteAgentOneEchoScopeV1,
     purpose: RemoteAgentDescribePurposeV1,
-    previous: Option<&RemoteAgentDescribeProofBytesV1>,
+    challenge: &RemoteAgentDescribeChallengeV1,
     describe: &mut Describe,
     verifier: &mut Verify,
-) -> Result<RemoteAgentDataPlaneBindingV1, RemoteAgentOneEchoErrorV1>
+) -> Result<RemoteAgentVerifiedDataPlaneBindingV1, RemoteAgentOneEchoErrorV1>
 where
     Describe: RemoteAgentDescribeSourceV1,
     Verify: RemoteAgentAccessSignatureVerifierV1,
 {
     let wire = describe
-        .fresh_describe(purpose)
+        .fresh_describe(purpose, challenge)
         .map_err(|_| RemoteAgentOneEchoErrorV1::DescribeUnavailable)?;
     let proof = RemoteAgentDescribeProofBytesV1::try_new(&wire.request_wire, &wire.response_wire)?;
-    let request = RemoteAgentAccessRequestV1::decode(proof.request_wire())
+    verify_binding(scope, challenge, proof, verifier)
+}
+
+fn verify_binding<Verify>(
+    scope: &RemoteAgentOneEchoScopeV1,
+    challenge: &RemoteAgentDescribeChallengeV1,
+    proof: RemoteAgentDescribeProofBytesV1,
+    verifier: &mut Verify,
+) -> Result<RemoteAgentVerifiedDataPlaneBindingV1, RemoteAgentOneEchoErrorV1>
+where
+    Verify: RemoteAgentAccessSignatureVerifierV1,
+{
+    let verified = verify_remote_agent_describe_proof_v1(scope, challenge, proof, verifier)
+        .map_err(map_proof_error)?;
+    let response = RemoteAgentAccessResponseV1::decode(verified.proof().response_wire())
         .map_err(|_| RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?;
-    let response = RemoteAgentAccessResponseV1::decode(proof.response_wire())
-        .map_err(|_| RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?;
-    if request.kind() != RemoteAgentAccessKindV1::DescribeRemoteAccess
-        || request.target() != scope.target
-        || request.expected_runtime_store_instance_id() != scope.runtime_store_instance_id
-        || request.expected_runtime_host_epoch() != scope.runtime_host_epoch
-        || request.expected_pxau_digest() != scope.expected_pxau_digest
-        || request.expected_active_pxst_digest() != scope.expected_active_pxst_digest
-        || request.profile_digest() != scope.profile_digest
-        || request.intended_mac_agent_client() != scope.mac_agent_client_principal
-    {
-        return Err(RemoteAgentOneEchoErrorV1::DescribeScopeMismatch);
-    }
-    request
-        .verify_controller_request(
-            request.carrier(),
-            |principal, key, fingerprint, bytes, sig| {
-                verifier.verify_controller(principal, key, fingerprint, bytes, sig)
-            },
-        )
-        .map_err(|_| RemoteAgentOneEchoErrorV1::DescribeAuthenticationFailed)?;
-    response
-        .verify_runtime_describe_response(
-            &request,
-            request.carrier(),
-            |principal, key, fingerprint, bytes, sig| {
-                verifier.verify_runtime(principal, key, fingerprint, bytes, sig)
-            },
-        )
-        .map_err(|_| RemoteAgentOneEchoErrorV1::DescribeAuthenticationFailed)?;
-    if previous.is_some_and(|prior| {
-        RemoteAgentAccessRequestV1::decode(prior.request_wire()).is_ok_and(|old| {
-            old.request_id() == request.request_id()
-                || old.authentication().claim().nonce() == request.authentication().claim().nonce()
-        })
-    }) {
-        return Err(RemoteAgentOneEchoErrorV1::DescribeNotFresh);
-    }
     let profile = response
         .profile()
         .ok_or(RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?
         .clone();
-    if profile.mac_agent_client_principal() != scope.mac_agent_client_principal {
+    if profile.mac_agent_client_principal() != scope.mac_agent_client_principal()
+        || profile.profile_digest() != scope.profile_digest()
+    {
         return Err(RemoteAgentOneEchoErrorV1::DescribeScopeMismatch);
     }
     let descriptor = response
@@ -324,40 +280,46 @@ where
         .access_generation()
         .ok_or(RemoteAgentOneEchoErrorV1::InvalidDescribeProof)?
         .value();
-    Ok(RemoteAgentDataPlaneBindingV1 {
-        profile,
-        port,
-        fabric_generation,
-        agent_generation,
-        access_generation,
-        proof,
+    Ok(RemoteAgentVerifiedDataPlaneBindingV1 {
+        binding: RemoteAgentDataPlaneBindingV1 {
+            profile,
+            port,
+            fabric_generation,
+            agent_generation,
+            access_generation,
+        },
+        proof: verified,
     })
 }
 
-const fn digest_is_zero(value: Digest32) -> bool {
-    bytes_are_zero(value.as_bytes())
-}
-
-const fn bytes_are_zero<const N: usize>(bytes: &[u8; N]) -> bool {
-    let mut index = 0;
-    while index < N {
-        if bytes[index] != 0 {
-            return false;
+fn map_proof_error(error: RemoteAgentOutboxError) -> RemoteAgentOneEchoErrorV1 {
+    match error {
+        RemoteAgentOutboxError::DescribeCarrierMismatch => {
+            RemoteAgentOneEchoErrorV1::DescribeCarrierMismatch
         }
-        index += 1;
+        RemoteAgentOutboxError::DescribeChallengeMismatch => {
+            RemoteAgentOneEchoErrorV1::DescribeChallengeMismatch
+        }
+        RemoteAgentOutboxError::DescribeScopeMismatch => {
+            RemoteAgentOneEchoErrorV1::DescribeScopeMismatch
+        }
+        RemoteAgentOutboxError::DescribeAuthenticationFailed => {
+            RemoteAgentOneEchoErrorV1::DescribeAuthenticationFailed
+        }
+        other => RemoteAgentOneEchoErrorV1::Outbox(other),
     }
-    true
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RemoteAgentOneEchoErrorV1 {
-    InvalidScope,
+    ScopeMismatch,
     InvalidOutboxState,
     DescribeUnavailable,
     InvalidDescribeProof,
+    DescribeCarrierMismatch,
+    DescribeChallengeMismatch,
     DescribeScopeMismatch,
     DescribeAuthenticationFailed,
-    DescribeNotFresh,
     InvalidPortDescriptor,
     TerminalCorrelationMismatch,
     ReconcileRequired,
@@ -392,13 +354,21 @@ mod tests {
         AgentConversationDeckRunId, AgentConversationRequestId, AgentConversationSessionId,
         AgentConversationTurnId,
     };
+    use paraegox_kernel::digest::Digest32;
+    use paraegox_kernel::identity::PrincipalRef;
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+        RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
+    };
     use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
     use paraegox_runtime_contracts::remote_agent_access::{
         RemoteAgentAccessRequestDraftV1, RemoteAgentAccessRequestFieldsV1,
-        RemoteAgentAccessRequestIdV1, RemoteAgentAccessResponseAuthClaimV1,
+        RemoteAgentAccessRequestIdV1, RemoteAgentAccessRequestV1,
+        RemoteAgentAccessResponseAuthClaimV1,
         RemoteAgentAccessResponseDraftV1,
     };
-    use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyRequestAuthClaim};
+    use paraegox_runtime_contracts::wire::{
+        ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
+    };
 
     use super::*;
 
@@ -477,6 +447,7 @@ mod tests {
         fn fresh_describe(
             &mut self,
             purpose: RemoteAgentDescribePurposeV1,
+            _challenge: &RemoteAgentDescribeChallengeV1,
         ) -> Result<RemoteAgentDescribeWireProofV1, RemoteAgentDescribeSourceErrorV1> {
             self.calls += 1;
             self.events.borrow_mut().push(Event::Describe(purpose));
@@ -655,20 +626,33 @@ mod tests {
     }
 
     fn next_request(base: &RemoteAgentAccessRequestV1) -> RemoteAgentAccessRequestV1 {
+        describe_request(
+            base,
+            base.carrier().clone(),
+            RemoteAgentAccessRequestIdV1::try_from_bytes([0x95; 16]).expect("request id"),
+            b"t2-d0-second-fresh-describe",
+        )
+    }
+
+    fn describe_request(
+        base: &RemoteAgentAccessRequestV1,
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        request_id: RemoteAgentAccessRequestIdV1,
+        nonce: &[u8],
+    ) -> RemoteAgentAccessRequestV1 {
         let old_claim = base.authentication().claim();
         let claim = ApplyRequestAuthClaim::try_new(
             old_claim.principal(),
             old_claim.key(),
             old_claim.algorithm(),
             old_claim.algorithm_version(),
-            b"t2-d0-second-fresh-describe",
+            nonce,
         )
-        .expect("second auth claim");
+        .expect("auth claim");
         let draft = RemoteAgentAccessRequestDraftV1::try_describe_remote_access(
             RemoteAgentAccessRequestFieldsV1 {
-                request_id: RemoteAgentAccessRequestIdV1::try_from_bytes([0x95; 16])
-                    .expect("request id"),
-                carrier: base.carrier().clone(),
+                request_id,
+                carrier,
                 target: base.target(),
                 expected_runtime_store_instance_id: base.expected_runtime_store_instance_id(),
                 expected_runtime_host_epoch: base.expected_runtime_host_epoch(),
@@ -679,7 +663,7 @@ mod tests {
             base.profile_digest(),
             base.intended_mac_agent_client(),
         )
-        .expect("second PXRA draft");
+        .expect("PXRA draft");
         let signature = SigningKey::from_bytes(&CONTROLLER_SEED)
             .sign(
                 draft
@@ -688,7 +672,29 @@ mod tests {
                     .as_bytes(),
             )
             .to_bytes();
-        draft.finalize(&signature).expect("second PXRA")
+        draft.finalize(&signature).expect("PXRA")
+    }
+
+    fn other_valid_carrier(
+        base: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: base.target(),
+                runtime_principal: base.runtime_principal(),
+                controller_principal: base.controller_principal(),
+                endpoint_ref: [0xed; 16],
+                endpoint_generation: base.endpoint_generation() + 1,
+                route: "paraegox/runtime-other/apply",
+                controller_request_key: base.controller_request_key(),
+                controller_request_key_fingerprint: base.controller_request_key_fingerprint(),
+                runtime_response_key: base.runtime_response_key(),
+                runtime_response_key_fingerprint: base.runtime_response_key_fingerprint(),
+                control_transport_profile_ref: base.control_transport_profile_ref(),
+                control_transport_profile_digest: base.control_transport_profile_digest(),
+            },
+        )
+        .expect("other valid carrier")
     }
 
     fn proof_for(
@@ -737,6 +743,23 @@ mod tests {
         )
     }
 
+    fn verified_proof(
+        scope: &RemoteAgentOneEchoScopeV1,
+        challenge: &RemoteAgentDescribeChallengeV1,
+        proof: &RemoteAgentDescribeWireProofV1,
+    ) -> RemoteAgentVerifiedDescribeProofV1 {
+        let request = RemoteAgentAccessRequestV1::decode(&proof.request_wire).expect("PXRA");
+        let mut verifier = TestVerifier::for_request(&request);
+        verify_remote_agent_describe_proof_v1(
+            scope,
+            challenge,
+            RemoteAgentDescribeProofBytesV1::try_new(&proof.request_wire, &proof.response_wire)
+                .expect("proof bytes"),
+            &mut verifier,
+        )
+        .expect("verified proof")
+    }
+
     fn valid_proofs() -> (
         RemoteAgentAccessRequestV1,
         RemoteAgentDescribeWireProofV1,
@@ -751,26 +774,81 @@ mod tests {
     }
 
     fn scope(request: &RemoteAgentAccessRequestV1) -> RemoteAgentOneEchoScopeV1 {
+        let echo_describe = next_request(request);
+        scope_for([0x51; 16], echo_request(), request, &echo_describe)
+    }
+
+    fn scope_for(
+        attempt_id: [u8; 16],
+        echo: AgentConversationRequestV1,
+        open_describe: &RemoteAgentAccessRequestV1,
+        echo_describe: &RemoteAgentAccessRequestV1,
+    ) -> RemoteAgentOneEchoScopeV1 {
         RemoteAgentOneEchoScopeV1::try_new(
-            request.target(),
-            request.expected_runtime_store_instance_id(),
-            request.expected_runtime_host_epoch(),
-            request.expected_pxau_digest(),
-            request.expected_active_pxst_digest(),
-            request.profile_digest(),
-            request.intended_mac_agent_client(),
+            crate::remote_agent_outbox::RemoteAgentOneEchoScopeFieldsV1 {
+                attempt_id,
+                echo_request: echo,
+                target: open_describe.target(),
+                runtime_store_instance_id: open_describe.expected_runtime_store_instance_id(),
+                runtime_host_epoch: open_describe.expected_runtime_host_epoch(),
+                expected_pxau_digest: open_describe.expected_pxau_digest(),
+                expected_active_pxst_digest: open_describe.expected_active_pxst_digest(),
+                profile_digest: open_describe.profile_digest(),
+                mac_agent_client_principal: open_describe.intended_mac_agent_client(),
+                carrier: open_describe.carrier().clone(),
+                open_request_id: open_describe.request_id(),
+                open_auth_nonce: open_describe.authentication().claim().nonce(),
+                echo_request_id: echo_describe.request_id(),
+                echo_auth_nonce: echo_describe.authentication().claim().nonce(),
+            },
         )
         .expect("scope")
     }
 
     fn prepared(events: Events, commit: &mut FakeCommit) -> RemoteAgentOutboxV1 {
-        let outbox = RemoteAgentOutboxV1::try_prepare([0x51; 16], echo_request(), commit)
+        let outbox = RemoteAgentOutboxV1::try_prepare(scope(&golden_request()), commit)
             .expect("prepared outbox");
         assert_eq!(
             events.borrow().as_slice(),
             &[Event::Commit(1)],
             "prepare has no source, transport, or entropy callback"
         );
+        outbox
+    }
+
+    fn complete_direct(
+        scope: &RemoteAgentOneEchoScopeV1,
+        open: &RemoteAgentDescribeWireProofV1,
+        echo: &RemoteAgentDescribeWireProofV1,
+        commit: &mut FakeCommit,
+    ) -> RemoteAgentOutboxV1 {
+        let mut outbox = RemoteAgentOutboxV1::try_prepare(scope.clone(), commit).unwrap();
+        let open_action = outbox
+            .claim_open(
+                scope,
+                verified_proof(scope, scope.open_challenge(), open),
+                commit,
+            )
+            .unwrap();
+        let open_exchange = open_action
+            .exchange(|_| Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened))
+            .unwrap();
+        outbox
+            .commit_open_result(open_exchange, commit)
+            .unwrap();
+        let echo_action = outbox
+            .claim_echo(
+                scope,
+                verified_proof(scope, scope.echo_challenge(), echo),
+                commit,
+            )
+            .unwrap();
+        let echo_exchange = echo_action
+            .exchange(|request| {
+                Ok::<_, ()>(AgentConversationTerminalV1::try_success(request, "Echo").unwrap())
+            })
+            .unwrap();
+        outbox.commit_terminal(echo_exchange, commit).unwrap();
         outbox
     }
 
@@ -810,12 +888,43 @@ mod tests {
         assert_eq!(commit.records.len(), 1);
         let recovered = RemoteAgentOutboxV1::decode(&commit.records.concat()).expect("recovery");
         assert_eq!(recovered, outbox);
-        assert_eq!(recovered.attempt_id(), [0x51; 16]);
-        assert_eq!(recovered.echo_request(), &echo_request());
-        assert!(matches!(
-            recovered.open_request().body(),
-            paraegox_agent_contracts::control::AgentConversationControlBodyV1::OpenRequest
-        ));
+        assert!(recovered.scope_matches(&scope(&golden_request())));
+    }
+
+    #[test]
+    fn scope_accepts_only_exact_literal_echo() {
+        let request = golden_request();
+        let second = next_request(&request);
+        let not_echo = AgentConversationRequestV1::try_new(
+            AgentConversationDeckRunId::try_from_bytes([0x31; 16]).unwrap(),
+            AgentConversationSessionId::try_from_bytes([0x32; 16]).unwrap(),
+            AgentConversationTurnId::try_from_bytes([0x33; 16]).unwrap(),
+            AgentConversationRequestId::try_from_bytes([0x34; 16]).unwrap(),
+            5_000_000_000,
+            "echo",
+        )
+        .unwrap();
+        assert_eq!(
+            RemoteAgentOneEchoScopeV1::try_new(
+                crate::remote_agent_outbox::RemoteAgentOneEchoScopeFieldsV1 {
+                    attempt_id: [0x51; 16],
+                    echo_request: not_echo,
+                    target: request.target(),
+                    runtime_store_instance_id: request.expected_runtime_store_instance_id(),
+                    runtime_host_epoch: request.expected_runtime_host_epoch(),
+                    expected_pxau_digest: request.expected_pxau_digest(),
+                    expected_active_pxst_digest: request.expected_active_pxst_digest(),
+                    profile_digest: request.profile_digest(),
+                    mac_agent_client_principal: request.intended_mac_agent_client(),
+                    carrier: request.carrier().clone(),
+                    open_request_id: request.request_id(),
+                    open_auth_nonce: request.authentication().claim().nonce(),
+                    echo_request_id: second.request_id(),
+                    echo_auth_nonce: second.authentication().claim().nonce(),
+                },
+            ),
+            Err(RemoteAgentOutboxError::InvalidScope)
+        );
     }
 
     #[test]
@@ -828,7 +937,7 @@ mod tests {
         let mut verifier = TestVerifier::for_request(&request);
         let mut transport = FakeTransport::new(events.clone());
         let outcome = run_remote_agent_one_echo_v1(
-            scope(&request),
+            &scope(&request),
             &mut outbox,
             &mut describe,
             &mut verifier,
@@ -855,8 +964,8 @@ mod tests {
                 [([0x31; 16], 3), ([0x32; 16], 4)]
             ]
         );
-        assert_eq!(verifier.controller_calls, 2);
-        assert_eq!(verifier.runtime_calls, 2);
+        assert_eq!(verifier.controller_calls, 5);
+        assert_eq!(verifier.runtime_calls, 5);
         assert_eq!(
             events.borrow().as_slice(),
             &[
@@ -889,7 +998,7 @@ mod tests {
         let mut transport = FakeTransport::new(events);
         assert!(matches!(
             run_remote_agent_one_echo_v1(
-                scope(&request),
+                &scope(&request),
                 &mut outbox,
                 &mut describe,
                 &mut verifier,
@@ -912,17 +1021,18 @@ mod tests {
         let events = Events::default();
         let mut commit = FakeCommit::new(events.clone());
         let mut outbox = prepared(events.clone(), &mut commit);
-        let proof =
-            RemoteAgentDescribeProofBytesV1::try_new(&open.request_wire, &open.response_wire)
-                .unwrap();
-        outbox.claim_open(proof, &mut commit).unwrap();
+        let expected_scope = scope(&request);
+        let proof = verified_proof(&expected_scope, expected_scope.open_challenge(), &open);
+        let _send_action = outbox
+            .claim_open(&expected_scope, proof, &mut commit)
+            .unwrap();
         let before = events.borrow().clone();
         let mut describe = FakeDescribe::new(events.clone(), Vec::new());
         let mut verifier = TestVerifier::for_request(&request);
         let mut transport = FakeTransport::new(events.clone());
         assert_eq!(
             run_remote_agent_one_echo_v1(
-                scope(&request),
+                &expected_scope,
                 &mut outbox,
                 &mut describe,
                 &mut verifier,
@@ -945,22 +1055,28 @@ mod tests {
         let events = Events::default();
         let mut commit = FakeCommit::new(events.clone());
         let mut outbox = prepared(events.clone(), &mut commit);
-        outbox
-            .claim_open(
-                RemoteAgentDescribeProofBytesV1::try_new(&open.request_wire, &open.response_wire)
-                    .unwrap(),
-                &mut commit,
-            )
+        let expected_scope = scope(&request);
+        let open_proof = verified_proof(
+            &expected_scope,
+            expected_scope.open_challenge(),
+            &open,
+        );
+        let open_action = outbox
+            .claim_open(&expected_scope, open_proof, &mut commit)
+            .unwrap();
+        let open_exchange = open_action
+            .exchange(|_| Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened))
             .unwrap();
         outbox
-            .commit_open_result(AgentConversationOpenOutcomeV1::Opened, &mut commit)
+            .commit_open_result(open_exchange, &mut commit)
             .unwrap();
-        outbox
-            .claim_echo(
-                RemoteAgentDescribeProofBytesV1::try_new(&echo.request_wire, &echo.response_wire)
-                    .unwrap(),
-                &mut commit,
-            )
+        let echo_proof = verified_proof(
+            &expected_scope,
+            expected_scope.echo_challenge(),
+            &echo,
+        );
+        let _echo_action = outbox
+            .claim_echo(&expected_scope, echo_proof, &mut commit)
             .unwrap();
         let before = events.borrow().clone();
         let mut describe = FakeDescribe::new(events.clone(), Vec::new());
@@ -968,7 +1084,7 @@ mod tests {
         let mut transport = FakeTransport::new(events.clone());
         assert_eq!(
             run_remote_agent_one_echo_v1(
-                scope(&request),
+                &expected_scope,
                 &mut outbox,
                 &mut describe,
                 &mut verifier,
@@ -995,7 +1111,7 @@ mod tests {
         let mut verifier = TestVerifier::for_request(&request);
         let mut transport = FakeTransport::new(events.clone());
         let first = run_remote_agent_one_echo_v1(
-            scope(&request),
+            &scope(&request),
             &mut outbox,
             &mut describe,
             &mut verifier,
@@ -1006,14 +1122,13 @@ mod tests {
         let before = events.borrow().clone();
         let calls = (
             describe.calls,
-            verifier.controller_calls,
-            verifier.runtime_calls,
             transport.open_calls,
             transport.echo_calls,
             commit.calls,
         );
+        let verifier_calls = (verifier.controller_calls, verifier.runtime_calls);
         let resumed = run_remote_agent_one_echo_v1(
-            scope(&request),
+            &scope(&request),
             &mut outbox,
             &mut describe,
             &mut verifier,
@@ -1026,13 +1141,15 @@ mod tests {
         assert_eq!(
             (
                 describe.calls,
-                verifier.controller_calls,
-                verifier.runtime_calls,
                 transport.open_calls,
                 transport.echo_calls,
                 commit.calls,
             ),
             calls
+        );
+        assert_eq!(
+            (verifier.controller_calls, verifier.runtime_calls),
+            (verifier_calls.0 + 2, verifier_calls.1 + 2)
         );
     }
 
@@ -1063,7 +1180,7 @@ mod tests {
         let mut transport = FakeTransport::new(events.clone());
         assert!(
             run_remote_agent_one_echo_v1(
-                scope(request),
+                &scope(request),
                 &mut outbox,
                 &mut describe,
                 &mut verifier,
@@ -1081,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_describe_identity_is_not_fresh_and_echo_is_not_claimed() {
+    fn describe_challenge_request_id_and_nonce_mismatch_is_not_claimed() {
         let (request, open, _) = valid_proofs();
         let events = Events::default();
         let mut commit = FakeCommit::new(events.clone());
@@ -1091,14 +1208,14 @@ mod tests {
         let mut transport = FakeTransport::new(events);
         assert_eq!(
             run_remote_agent_one_echo_v1(
-                scope(&request),
+                &scope(&request),
                 &mut outbox,
                 &mut describe,
                 &mut verifier,
                 &mut transport,
                 &mut commit,
             ),
-            Err(RemoteAgentOneEchoErrorV1::DescribeNotFresh)
+            Err(RemoteAgentOneEchoErrorV1::DescribeChallengeMismatch)
         );
         assert_eq!((transport.open_calls, transport.echo_calls), (1, 0));
         assert_eq!(commit.records.len(), 3);
@@ -1120,7 +1237,7 @@ mod tests {
         transport.mismatched_terminal = true;
         assert_eq!(
             run_remote_agent_one_echo_v1(
-                scope(&request),
+                &scope(&request),
                 &mut outbox,
                 &mut describe,
                 &mut verifier,
@@ -1132,7 +1249,7 @@ mod tests {
         assert_eq!(commit.records.len(), 4);
         assert!(matches!(
             outbox.phase(),
-            RemoteAgentOutboxPhaseV1::EchoUncertain(_)
+            RemoteAgentOutboxPhaseV1::EchoUncertain { .. }
         ));
     }
 
@@ -1147,7 +1264,7 @@ mod tests {
         let mut transport = FakeTransport::new(events.clone());
         transport.open_outcome = AgentConversationOpenOutcomeV1::Existing;
         let first = run_remote_agent_one_echo_v1(
-            scope(&request),
+            &scope(&request),
             &mut outbox,
             &mut describe,
             &mut verifier,
@@ -1162,7 +1279,7 @@ mod tests {
         let before = events.borrow().clone();
         assert_eq!(
             run_remote_agent_one_echo_v1(
-                scope(&request),
+                &scope(&request),
                 &mut outbox,
                 &mut describe,
                 &mut verifier,
@@ -1174,6 +1291,214 @@ mod tests {
         );
         assert_eq!(*events.borrow(), before);
         assert_eq!((transport.open_calls, transport.echo_calls), (1, 0));
+    }
+
+    #[test]
+    fn other_valid_carrier_with_valid_signatures_is_rejected_before_claim() {
+        let (request, _, _) = valid_proofs();
+        let other_request = describe_request(
+            &request,
+            other_valid_carrier(request.carrier()),
+            request.request_id(),
+            request.authentication().claim().nonce(),
+        );
+        let proof = proof_for(
+            &other_request,
+            (9, 10, 11),
+            &decode_hex(PORT_GOLDEN.trim()),
+        );
+        let events = Events::default();
+        let mut commit = FakeCommit::new(events.clone());
+        let mut outbox = prepared(events.clone(), &mut commit);
+        let mut describe = FakeDescribe::new(events.clone(), vec![proof]);
+        let mut verifier = TestVerifier::for_request(&other_request);
+        let mut transport = FakeTransport::new(events);
+        assert_eq!(
+            run_remote_agent_one_echo_v1(
+                &scope(&request),
+                &mut outbox,
+                &mut describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::DescribeCarrierMismatch)
+        );
+        assert_eq!(commit.records.len(), 1);
+        assert_eq!((transport.open_calls, transport.echo_calls), (0, 0));
+        assert_eq!((verifier.controller_calls, verifier.runtime_calls), (0, 0));
+    }
+
+    #[test]
+    fn restart_with_different_exact_scope_is_rejected_without_external_calls() {
+        let (request, _, _) = valid_proofs();
+        let second = next_request(&request);
+        let scope_a = scope_for([0x51; 16], echo_request(), &request, &second);
+        let scope_b = scope_for([0x51; 16], other_echo_request(), &request, &second);
+        let events = Events::default();
+        let mut commit = FakeCommit::new(events.clone());
+        let mut outbox = RemoteAgentOutboxV1::try_prepare(scope_a, &mut commit).unwrap();
+        let before = events.borrow().clone();
+        let mut describe = FakeDescribe::new(events.clone(), Vec::new());
+        let mut verifier = TestVerifier::for_request(&request);
+        let mut transport = FakeTransport::new(events.clone());
+        assert_eq!(
+            run_remote_agent_one_echo_v1(
+                &scope_b,
+                &mut outbox,
+                &mut describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::ScopeMismatch)
+        );
+        assert_eq!(*events.borrow(), before);
+        assert_eq!((describe.calls, transport.open_calls, transport.echo_calls), (0, 0, 0));
+    }
+
+    #[test]
+    fn terminal_commit_failure_consumes_permit_and_resume_never_resends() {
+        let (request, open, echo) = valid_proofs();
+        let expected_scope = scope(&request);
+        let events = Events::default();
+        let mut commit = FakeCommit::fail_on(events.clone(), 5);
+        let mut outbox = RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit)
+            .expect("prepare");
+        let mut describe = FakeDescribe::new(events.clone(), vec![open, echo]);
+        let mut verifier = TestVerifier::for_request(&request);
+        let mut transport = FakeTransport::new(events.clone());
+        assert!(matches!(
+            run_remote_agent_one_echo_v1(
+                &expected_scope,
+                &mut outbox,
+                &mut describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::Commit(_))
+        ));
+        assert!(matches!(
+            outbox.phase(),
+            RemoteAgentOutboxPhaseV1::EchoUncertain { .. }
+        ));
+        let before = events.borrow().clone();
+        assert_eq!(
+            run_remote_agent_one_echo_v1(
+                &expected_scope,
+                &mut outbox,
+                &mut describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::ReconcileRequired)
+        );
+        assert_eq!(*events.borrow(), before);
+        assert_eq!((transport.open_calls, transport.echo_calls), (1, 1));
+    }
+
+    #[test]
+    fn terminal_resume_rejects_invalid_signature_with_zero_external_calls() {
+        let (request, open, echo) = valid_proofs();
+        let expected_scope = scope(&request);
+        let events = Events::default();
+        let mut commit = FakeCommit::new(events.clone());
+        let mut outbox = complete_direct(&expected_scope, &open, &echo, &mut commit);
+        let before = events.borrow().clone();
+        let commit_calls = commit.calls;
+        let mut describe = FakeDescribe::new(events.clone(), Vec::new());
+        let mut verifier = TestVerifier::for_request(&request);
+        verifier.runtime_fingerprint = Digest32::from_bytes([0xfe; 32]);
+        let mut transport = FakeTransport::new(events.clone());
+        assert_eq!(
+            run_remote_agent_one_echo_v1(
+                &expected_scope,
+                &mut outbox,
+                &mut describe,
+                &mut verifier,
+                &mut transport,
+                &mut commit,
+            ),
+            Err(RemoteAgentOneEchoErrorV1::DescribeAuthenticationFailed)
+        );
+        assert_eq!(*events.borrow(), before);
+        assert_eq!(commit.calls, commit_calls);
+        assert_eq!((describe.calls, transport.open_calls, transport.echo_calls), (0, 0, 0));
+    }
+
+    #[test]
+    fn marker_rejects_request_id_nonce_and_wrong_carrier_before_claim() {
+        let (request, _, _) = valid_proofs();
+        let expected_scope = scope(&request);
+        let wrong_id = describe_request(
+            &request,
+            request.carrier().clone(),
+            RemoteAgentAccessRequestIdV1::try_from_bytes([0x96; 16]).unwrap(),
+            request.authentication().claim().nonce(),
+        );
+        let wrong_nonce = describe_request(
+            &request,
+            request.carrier().clone(),
+            request.request_id(),
+            b"t2-d0-wrong-open-challenge",
+        );
+        let wrong_carrier = describe_request(
+            &request,
+            other_valid_carrier(request.carrier()),
+            request.request_id(),
+            request.authentication().claim().nonce(),
+        );
+        for candidate in [&wrong_id, &wrong_nonce, &wrong_carrier] {
+            let wire = proof_for(candidate, (9, 10, 11), &decode_hex(PORT_GOLDEN.trim()));
+            let proof = RemoteAgentDescribeProofBytesV1::try_new(
+                &wire.request_wire,
+                &wire.response_wire,
+            )
+            .unwrap();
+            let mut verifier = TestVerifier::for_request(candidate);
+            assert!(verify_remote_agent_describe_proof_v1(
+                &expected_scope,
+                expected_scope.open_challenge(),
+                proof,
+                &mut verifier,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn cross_attempt_terminal_splice_and_zero_attempt_records_are_rejected() {
+        let (request, open, echo) = valid_proofs();
+        let second = next_request(&request);
+        let scope_a = scope_for([0x51; 16], echo_request(), &request, &second);
+        let scope_b = scope_for([0x52; 16], echo_request(), &request, &second);
+        let mut commit_a = FakeCommit::new(Events::default());
+        let mut commit_b = FakeCommit::new(Events::default());
+        let outbox_a = complete_direct(&scope_a, &open, &echo, &mut commit_a);
+        complete_direct(&scope_b, &open, &echo, &mut commit_b);
+
+        let mut spliced = commit_a.records[..4].concat();
+        spliced.extend_from_slice(&commit_b.records[4]);
+        assert_eq!(
+            RemoteAgentOutboxV1::decode(&spliced),
+            Err(RemoteAgentOutboxError::RecordChainMismatch)
+        );
+
+        let mut zero_single = commit_a.records[0].clone();
+        zero_single[16..32].fill(0);
+        assert_eq!(
+            RemoteAgentOutboxV1::decode(&zero_single),
+            Err(RemoteAgentOutboxError::InvalidAttempt)
+        );
+        let mut zero_later = outbox_a.canonical_wire().to_vec();
+        let second_attempt = commit_a.records[0].len() + 16;
+        zero_later[second_attempt..second_attempt + 16].fill(0);
+        assert_eq!(
+            RemoteAgentOutboxV1::decode(&zero_later),
+            Err(RemoteAgentOutboxError::InvalidAttempt)
+        );
     }
 
     #[test]
@@ -1202,15 +1527,19 @@ mod tests {
             Err(RemoteAgentOutboxError::RecordGap)
         );
 
-        let (_, open, _) = valid_proofs();
+        let (request, open, _) = valid_proofs();
         let mut claimed_commit = FakeCommit::new(Events::default());
-        let mut claimed =
-            RemoteAgentOutboxV1::try_prepare([0x61; 16], echo_request(), &mut claimed_commit)
-                .unwrap();
-        claimed
+        let second = next_request(&request);
+        let expected_scope = scope_for([0x61; 16], echo_request(), &request, &second);
+        let mut claimed = RemoteAgentOutboxV1::try_prepare(
+            expected_scope.clone(),
+            &mut claimed_commit,
+        )
+        .unwrap();
+        let _send_action = claimed
             .claim_open(
-                RemoteAgentDescribeProofBytesV1::try_new(&open.request_wire, &open.response_wire)
-                    .unwrap(),
+                &expected_scope,
+                verified_proof(&expected_scope, expected_scope.open_challenge(), &open),
                 &mut claimed_commit,
             )
             .unwrap();
