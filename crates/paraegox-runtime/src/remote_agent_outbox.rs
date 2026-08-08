@@ -195,10 +195,6 @@ impl RemoteAgentOneEchoScopeV1 {
         })
     }
 
-    pub(crate) const fn attempt_id(&self) -> [u8; 16] {
-        self.attempt_id
-    }
-
     pub(crate) const fn echo_request(&self) -> &AgentConversationRequestV1 {
         &self.echo_request
     }
