@@ -35,6 +35,7 @@ use paraegox_runtime_contracts::reference_control::{
     ReferenceApplyIngressIdentitiesV1, ReferenceApplyRequestV1, ReferenceControlError,
     reference_admission_policy_fingerprint_v1, reference_apply_ingress_identities_v1,
 };
+use paraegox_runtime_contracts::remote_agent_data_plane_plan::RemoteAgentDataPlaneApplyRequestV1;
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
 use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
 use paraegox_runtime_contracts::wire::{
@@ -988,6 +989,144 @@ impl ApplyAdmissionPolicy {
             clock_generation: reading.generation(),
         })
     }
+
+    /// Authenticates one strict PXAR v10 in replay namespaces independent
+    /// from every PXAR-v6 through PXAR-v9 owner.
+    ///
+    /// This auth-only seam is safe for immutable historical replay lookup: it
+    /// proves the exact tenure and request signatures but installs no temporal
+    /// budget and grants no effect authority. Target/store lifecycle
+    /// correlation remains the responsibility of the later data-plane owner.
+    pub(crate) fn authenticate_remote_agent_data_plane_apply_request(
+        &self,
+        request: &RemoteAgentDataPlaneApplyRequestV1,
+    ) -> Result<AuthenticatedRemoteAgentDataPlaneApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.remote-agent-data-plane-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.remote-agent-data-plane-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.remote-agent-data-plane-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedRemoteAgentDataPlaneApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    /// Authenticates and temporally admits one fresh strict PXAR v10.
+    pub(crate) fn verify_remote_agent_data_plane_apply_request(
+        &self,
+        request: &RemoteAgentDataPlaneApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedRemoteAgentDataPlaneApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_remote_agent_data_plane_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedRemoteAgentDataPlaneApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
 }
 
 fn managed_fabric_replay_identity(
@@ -1302,6 +1441,71 @@ pub(crate) struct VerifiedDistributedAgentStackApplyIngressV1 {
 impl VerifiedDistributedAgentStackApplyIngressV1 {
     #[must_use]
     pub(crate) const fn authenticated(self) -> AuthenticatedDistributedAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+/// Signature-authenticated PXAR v10 facts for owner-private replay lookup.
+///
+/// This nominal evidence carries no deadline, lifecycle authority, store
+/// ownership, or effect token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedRemoteAgentDataPlaneApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedRemoteAgentDataPlaneApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+/// Cryptographically and temporally verified fresh PXAR v10 ingress evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedRemoteAgentDataPlaneApplyIngressV1 {
+    authenticated: AuthenticatedRemoteAgentDataPlaneApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedRemoteAgentDataPlaneApplyIngressV1 {
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedRemoteAgentDataPlaneApplyV1 {
         self.authenticated
     }
 
@@ -2261,6 +2465,9 @@ mod tests {
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
     };
+    use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+        RemoteAgentDataPlaneApplyRequestDraftV1, RemoteAgentDataPlaneApplyRequestV1,
+    };
     use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
     use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
     use paraegox_runtime_contracts::wire::{
@@ -2330,6 +2537,8 @@ mod tests {
     const DISTRIBUTED_AGENT_STACK_GOLDEN: &str = include_str!(
         "../../paraegox-runtime-contracts/tests/fixtures/distributed_agent_stack_v1.hex"
     );
+    const REMOTE_AGENT_DATA_PLANE_GOLDEN: &str =
+        include_str!("../../../tests/fixtures/wire/t2_remote_agent_data_plane_v1.json");
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
@@ -2859,8 +3068,89 @@ mod tests {
             .unwrap_or_else(|error| panic!("distributed PXAR v8 must finalize: {error}"))
     }
 
+    fn remote_agent_data_plane_golden(key: &str) -> Vec<u8> {
+        fixture_document_hex_bytes(REMOTE_AGENT_DATA_PLANE_GOLDEN, key)
+    }
+
+    fn signed_remote_agent_data_plane_request(
+        signing_seed: [u8; 32],
+        temporal: Option<ApplyTemporalConstraint>,
+    ) -> RemoteAgentDataPlaneApplyRequestV1 {
+        let fixture = RemoteAgentDataPlaneApplyRequestV1::decode(
+            &remote_agent_data_plane_golden("pxar_v10_hex"),
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 fixture must decode: {error}"));
+        let draft = RemoteAgentDataPlaneApplyRequestDraftV1::try_new(
+            fixture.target_execution().clone(),
+            fixture.provenance(),
+            fixture.control_commitment().control().clone(),
+            temporal.unwrap_or(fixture.temporal()),
+            fixture.expected_runtime_store_instance_id(),
+            fixture.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 draft must build: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 transcript must build: {error}"));
+        let signature = SigningKey::from_bytes(&signing_seed)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 must finalize: {error}"))
+    }
+
+    fn tampered_remote_agent_data_plane_signature(
+        envelope_signature_tag: u16,
+    ) -> RemoteAgentDataPlaneApplyRequestV1 {
+        let mut wire = remote_agent_data_plane_golden("pxar_v10_hex");
+        let envelope_length = u32::from_be_bytes(
+            wire[6..10]
+                .try_into()
+                .expect("PXAR v10 envelope length must have four bytes"),
+        ) as usize;
+        let envelope_end = 18 + envelope_length;
+        mutate_tlv(&mut wire[18..envelope_end], envelope_signature_tag);
+        RemoteAgentDataPlaneApplyRequestV1::decode(&wire)
+            .unwrap_or_else(|error| panic!("tampered PXAR v10 must remain canonical: {error}"))
+    }
+
+    fn signed_distributed_request_sharing_remote_ingress(
+        remote: &RemoteAgentDataPlaneApplyRequestV1,
+        signing_seed: [u8; 32],
+    ) -> DistributedAgentStackApplyRequestV1 {
+        let fixture =
+            DistributedAgentStackApplyRequestV1::decode(&distributed_agent_stack_golden("request"))
+                .unwrap_or_else(|error| panic!("distributed PXAR v8 fixture must decode: {error}"));
+        let draft = DistributedAgentStackApplyRequestDraftV1::try_new(
+            fixture.target_execution().clone(),
+            remote.provenance(),
+            remote.control_commitment().control().clone(),
+            remote.temporal(),
+            remote.expected_runtime_store_instance_id(),
+            remote.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("distributed PXAR v8 comparison draft must build: {error}"));
+        let transcript = draft.signing_transcript().unwrap_or_else(|error| {
+            panic!("distributed PXAR v8 comparison transcript must build: {error}")
+        });
+        let signature = SigningKey::from_bytes(&signing_seed)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("distributed PXAR v8 comparison must finalize: {error}"))
+    }
+
     fn python_fixture_admission_for_target(
         trusted_target_byte: u8,
+    ) -> (ApplyAdmission, ClockReading) {
+        python_fixture_admission_for_target_and_budget(trusted_target_byte, 100)
+    }
+
+    fn python_fixture_admission_for_target_and_budget(
+        trusted_target_byte: u8,
+        maximum_budget_nanos: u64,
     ) -> (ApplyAdmission, ClockReading) {
         let scope = SourceScopeRef::from_bytes([0x01; 16]);
         let target = RuntimeHostId::from_bytes([trusted_target_byte; 16]);
@@ -2898,7 +3188,7 @@ mod tests {
             panic!("Python fixture request trust must be valid");
         };
         let Ok(policy) = ApplyAdmissionPolicy::try_new(
-            BoundedDuration::from_nanos(100),
+            BoundedDuration::from_nanos(maximum_budget_nanos),
             state_limits(4, 4, 4),
             [tenure_trust],
             [request_trust],
@@ -4550,6 +4840,179 @@ mod tests {
                 .unwrap_err(),
             ManagedFabricApplyAdmissionError::InvalidRequestSignature,
             "canonical bytes alone must never bypass the PXAR v8 signature"
+        );
+    }
+
+    #[test]
+    fn remote_agent_data_plane_pxar10_authenticates_both_signatures_and_separates_replay_domains() {
+        let request = signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None);
+        assert_eq!(
+            request.canonical_wire(),
+            remote_agent_data_plane_golden("pxar_v10_hex"),
+            "the admission fixture must remain the exact independent PXAR v10 golden",
+        );
+        let (admission, _) = python_fixture_admission_and_reading();
+        let authenticated = admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&request)
+            .expect("valid PXAR v10 tenure and request signatures must authenticate");
+
+        let zero_digest = Digest32::from_bytes([0; 32]);
+        assert_ne!(authenticated.proof_envelope_digest(), zero_digest);
+        assert_ne!(authenticated.tenure_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.request_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.temporal_lineage_identity(), zero_digest);
+
+        let distributed = signed_distributed_request_sharing_remote_ingress(
+            &request,
+            PYTHON_FIXTURE_REQUEST_SEED,
+        );
+        let distributed_authenticated = admission
+            .policy
+            .authenticate_distributed_agent_stack_apply_request(&distributed)
+            .expect("comparison PXAR v8 must authenticate");
+        assert_eq!(
+            authenticated.proof_envelope_digest(),
+            distributed_authenticated.proof_envelope_digest(),
+            "the comparison must retain the exact same contract-owned tenure proof",
+        );
+        assert_ne!(
+            authenticated.tenure_nonce_identity(),
+            distributed_authenticated.tenure_nonce_identity(),
+            "PXAR v10 tenure replay identity must not alias PXAR v8",
+        );
+        assert_ne!(
+            authenticated.request_nonce_identity(),
+            distributed_authenticated.request_nonce_identity(),
+            "PXAR v10 request replay identity must not alias PXAR v8",
+        );
+        assert_ne!(
+            authenticated.temporal_lineage_identity(),
+            distributed_authenticated.temporal_lineage_identity(),
+            "PXAR v10 temporal replay identity must not alias PXAR v8",
+        );
+
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            ClockGeneration::try_new(3).expect("fixture clock generation must be nonzero"),
+            MonotonicInstant::from_ticks(1),
+        );
+        let verified = admission
+            .policy
+            .verify_remote_agent_data_plane_apply_request(&request, reading)
+            .expect("valid PXAR v10 temporal ingress must verify");
+        assert_eq!(verified.authenticated(), authenticated);
+        assert_eq!(verified.admitted_at_nanos(), 1);
+        assert_eq!(verified.deadline_nanos(), 61);
+        assert_eq!(verified.clock_generation().value(), 3);
+
+        for (signature_tag, expected) in [
+            (
+                20,
+                ManagedFabricApplyAdmissionError::InvalidTenureSignature,
+            ),
+            (
+                38,
+                ManagedFabricApplyAdmissionError::InvalidRequestSignature,
+            ),
+        ] {
+            let tampered = tampered_remote_agent_data_plane_signature(signature_tag);
+            assert_eq!(
+                admission
+                    .policy
+                    .authenticate_remote_agent_data_plane_apply_request(&tampered)
+                    .unwrap_err(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn remote_agent_data_plane_pxar10_rejects_temporal_mismatch_budget_and_expiry() {
+        let request = signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None);
+        let (admission, _) = python_fixture_admission_and_reading();
+        let generation = ClockGeneration::try_new(3).expect("fixture generation must be nonzero");
+        let correct_domain = ClockDomainRef::from_bytes([0x0a; 16]);
+
+        assert_eq!(
+            admission
+                .policy
+                .verify_remote_agent_data_plane_apply_request(
+                    &request,
+                    ClockReading::new(
+                        ClockDomainRef::from_bytes([0x0b; 16]),
+                        generation,
+                        MonotonicInstant::from_ticks(1),
+                    ),
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::ClockDomainMismatch,
+        );
+
+        let historical_reading = ClockReading::new(
+            correct_domain,
+            ClockGeneration::try_new(4).expect("historical successor must be nonzero"),
+            MonotonicInstant::from_ticks(1),
+        );
+        admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&request)
+            .expect("auth-only replay must not consume the current target clock");
+        assert_eq!(
+            admission
+                .policy
+                .verify_remote_agent_data_plane_apply_request(&request, historical_reading)
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::ClockGenerationMismatch,
+            "historical authentication must not grant a fresh temporal effect",
+        );
+
+        let (budget_bounded, _) = python_fixture_admission_for_target_and_budget(0x05, 99);
+        assert_eq!(
+            budget_bounded
+                .policy
+                .verify_remote_agent_data_plane_apply_request(
+                    &request,
+                    ClockReading::new(
+                        correct_domain,
+                        generation,
+                        MonotonicInstant::from_ticks(1),
+                    ),
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::BudgetExceedsPolicy,
+        );
+
+        let temporal = request.temporal();
+        let expired_temporal = ApplyTemporalConstraint::try_new(
+            temporal.constraint_id(),
+            temporal.target_clock_domain(),
+            temporal.target_clock_generation(),
+            temporal.original_budget(),
+            BoundedDuration::from_nanos(0),
+        )
+        .expect("zero remaining budget must remain a valid signed expiry value");
+        let expired = signed_remote_agent_data_plane_request(
+            PYTHON_FIXTURE_REQUEST_SEED,
+            Some(expired_temporal),
+        );
+        admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&expired)
+            .expect("expired request signatures remain valid for historical replay");
+        assert_eq!(
+            admission
+                .policy
+                .verify_remote_agent_data_plane_apply_request(
+                    &expired,
+                    ClockReading::new(
+                        correct_domain,
+                        generation,
+                        MonotonicInstant::from_ticks(1),
+                    ),
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::BudgetExpired,
         );
     }
 }
