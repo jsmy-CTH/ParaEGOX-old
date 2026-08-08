@@ -12,10 +12,7 @@ use std::{
     },
 };
 
-use paraegox_kernel::{
-    digest::Digest32,
-    identity::PrincipalRef,
-};
+use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
 use paraegox_runtime_contracts::{
     assignment::{BindingId, SchemaRef},
     distributed_agent_stack_plan::DistributedFabricSessionEpochV1,
@@ -33,8 +30,7 @@ use crate::{
     contract::{
         BindingEpoch, BindingRequestEnvelopeV1, BindingResponseEnvelopeV1, FabricContractError,
         MAX_ENVELOPE_BODY_BYTES, REQUEST_HEADER_BYTES, RequestHeaderDisposition, RequestId,
-        ResponseStatus,
-        prevalidate_request_header, validate_binding_id,
+        ResponseStatus, prevalidate_request_header, validate_binding_id,
     },
     ingress::{FabricIngressSnapshot, IngressBudget, IngressLease, IngressLimits},
     runtime_apply::restricted_runtime_apply_peer_certificate_common_name_v1,
@@ -53,10 +49,8 @@ const REMOTE_TLS_PREFIX: &str = "tls/";
 const REMOTE_AGENT_ZENOH_FRAMING_ALLOWANCE_BYTES: usize = 64 * 1_024;
 // PXFQ has a 104-byte header and PXFP adds four bytes. Bound the larger
 // canonical response plus a fixed Zenoh framing allowance.
-const REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES: usize = MAX_ENVELOPE_BODY_BYTES
-    + REQUEST_HEADER_BYTES
-    + 4
-    + REMOTE_AGENT_ZENOH_FRAMING_ALLOWANCE_BYTES;
+const REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES: usize =
+    MAX_ENVELOPE_BODY_BYTES + REQUEST_HEADER_BYTES + 4 + REMOTE_AGENT_ZENOH_FRAMING_ALLOWANCE_BYTES;
 
 type OwnedQueryable = Queryable<()>;
 
@@ -767,9 +761,7 @@ impl fmt::Debug for FabricServiceConfig {
     }
 }
 
-fn validate_concrete_key_expression(
-    key_expression: String,
-) -> Result<String, FabricConfigError> {
+fn validate_concrete_key_expression(key_expression: String) -> Result<String, FabricConfigError> {
     if key_expression.is_empty() {
         return Err(FabricConfigError::EmptyKeyExpression);
     }
@@ -777,9 +769,7 @@ fn validate_concrete_key_expression(
         return Err(FabricConfigError::KeyExpressionTooLong);
     }
     if !key_expression.is_ascii()
-        || key_expression
-            .bytes()
-            .any(|byte| byte.is_ascii_control())
+        || key_expression.bytes().any(|byte| byte.is_ascii_control())
         || key_expression.contains('*')
         || key_expression.contains('$')
     {
