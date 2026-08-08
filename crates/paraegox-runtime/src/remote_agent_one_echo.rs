@@ -19,11 +19,11 @@ use crate::managed_agent_transport::{
     AgentConversationClientPortV1, AgentConversationPortDescriptorV1,
 };
 use crate::remote_agent_outbox::{
-    verify_remote_agent_describe_proof_v1, RemoteAgentAccessSignatureVerifierV1,
-    RemoteAgentDescribeChallengeV1, RemoteAgentDescribeProofBytesV1, RemoteAgentOneEchoScopeV1,
-    RemoteAgentOutboxCommitFailureV1, RemoteAgentOutboxCommitV1, RemoteAgentOutboxError,
-    RemoteAgentOutboxMutationErrorV1, RemoteAgentOutboxPhaseV1, RemoteAgentOutboxV1,
-    RemoteAgentVerifiedDescribeProofV1,
+    RemoteAgentAccessSignatureVerifierV1, RemoteAgentDescribeChallengeV1,
+    RemoteAgentDescribeProofBytesV1, RemoteAgentOneEchoScopeV1, RemoteAgentOutboxCommitFailureV1,
+    RemoteAgentOutboxCommitV1, RemoteAgentOutboxError, RemoteAgentOutboxMutationErrorV1,
+    RemoteAgentOutboxPhaseV1, RemoteAgentOutboxV1, RemoteAgentVerifiedDescribeProofV1,
+    verify_remote_agent_describe_proof_v1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,8 +363,7 @@ mod tests {
     use paraegox_runtime_contracts::remote_agent_access::{
         RemoteAgentAccessRequestDraftV1, RemoteAgentAccessRequestFieldsV1,
         RemoteAgentAccessRequestIdV1, RemoteAgentAccessRequestV1,
-        RemoteAgentAccessResponseAuthClaimV1,
-        RemoteAgentAccessResponseDraftV1,
+        RemoteAgentAccessResponseAuthClaimV1, RemoteAgentAccessResponseDraftV1,
     };
     use paraegox_runtime_contracts::wire::{
         ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
@@ -833,9 +832,7 @@ mod tests {
         let open_exchange = open_action
             .exchange(|_| Ok::<_, ()>(AgentConversationOpenOutcomeV1::Opened))
             .unwrap();
-        outbox
-            .commit_open_result(open_exchange, commit)
-            .unwrap();
+        outbox.commit_open_result(open_exchange, commit).unwrap();
         let echo_action = outbox
             .claim_echo(
                 scope,
@@ -1056,11 +1053,7 @@ mod tests {
         let mut commit = FakeCommit::new(events.clone());
         let mut outbox = prepared(events.clone(), &mut commit);
         let expected_scope = scope(&request);
-        let open_proof = verified_proof(
-            &expected_scope,
-            expected_scope.open_challenge(),
-            &open,
-        );
+        let open_proof = verified_proof(&expected_scope, expected_scope.open_challenge(), &open);
         let open_action = outbox
             .claim_open(&expected_scope, open_proof, &mut commit)
             .unwrap();
@@ -1070,11 +1063,7 @@ mod tests {
         outbox
             .commit_open_result(open_exchange, &mut commit)
             .unwrap();
-        let echo_proof = verified_proof(
-            &expected_scope,
-            expected_scope.echo_challenge(),
-            &echo,
-        );
+        let echo_proof = verified_proof(&expected_scope, expected_scope.echo_challenge(), &echo);
         let _echo_action = outbox
             .claim_echo(&expected_scope, echo_proof, &mut commit)
             .unwrap();
@@ -1302,11 +1291,7 @@ mod tests {
             request.request_id(),
             request.authentication().claim().nonce(),
         );
-        let proof = proof_for(
-            &other_request,
-            (9, 10, 11),
-            &decode_hex(PORT_GOLDEN.trim()),
-        );
+        let proof = proof_for(&other_request, (9, 10, 11), &decode_hex(PORT_GOLDEN.trim()));
         let events = Events::default();
         let mut commit = FakeCommit::new(events.clone());
         let mut outbox = prepared(events.clone(), &mut commit);
@@ -1354,7 +1339,10 @@ mod tests {
             Err(RemoteAgentOneEchoErrorV1::ScopeMismatch)
         );
         assert_eq!(*events.borrow(), before);
-        assert_eq!((describe.calls, transport.open_calls, transport.echo_calls), (0, 0, 0));
+        assert_eq!(
+            (describe.calls, transport.open_calls, transport.echo_calls),
+            (0, 0, 0)
+        );
     }
 
     #[test]
@@ -1363,8 +1351,8 @@ mod tests {
         let expected_scope = scope(&request);
         let events = Events::default();
         let mut commit = FakeCommit::fail_on(events.clone(), 5);
-        let mut outbox = RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit)
-            .expect("prepare");
+        let mut outbox =
+            RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut commit).expect("prepare");
         let mut describe = FakeDescribe::new(events.clone(), vec![open, echo]);
         let mut verifier = TestVerifier::for_request(&request);
         let mut transport = FakeTransport::new(events.clone());
@@ -1425,7 +1413,10 @@ mod tests {
         );
         assert_eq!(*events.borrow(), before);
         assert_eq!(commit.calls, commit_calls);
-        assert_eq!((describe.calls, transport.open_calls, transport.echo_calls), (0, 0, 0));
+        assert_eq!(
+            (describe.calls, transport.open_calls, transport.echo_calls),
+            (0, 0, 0)
+        );
     }
 
     #[test]
@@ -1452,19 +1443,19 @@ mod tests {
         );
         for candidate in [&wrong_id, &wrong_nonce, &wrong_carrier] {
             let wire = proof_for(candidate, (9, 10, 11), &decode_hex(PORT_GOLDEN.trim()));
-            let proof = RemoteAgentDescribeProofBytesV1::try_new(
-                &wire.request_wire,
-                &wire.response_wire,
-            )
-            .unwrap();
+            let proof =
+                RemoteAgentDescribeProofBytesV1::try_new(&wire.request_wire, &wire.response_wire)
+                    .unwrap();
             let mut verifier = TestVerifier::for_request(candidate);
-            assert!(verify_remote_agent_describe_proof_v1(
-                &expected_scope,
-                expected_scope.open_challenge(),
-                proof,
-                &mut verifier,
-            )
-            .is_err());
+            assert!(
+                verify_remote_agent_describe_proof_v1(
+                    &expected_scope,
+                    expected_scope.open_challenge(),
+                    proof,
+                    &mut verifier,
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1531,11 +1522,8 @@ mod tests {
         let mut claimed_commit = FakeCommit::new(Events::default());
         let second = next_request(&request);
         let expected_scope = scope_for([0x61; 16], echo_request(), &request, &second);
-        let mut claimed = RemoteAgentOutboxV1::try_prepare(
-            expected_scope.clone(),
-            &mut claimed_commit,
-        )
-        .unwrap();
+        let mut claimed =
+            RemoteAgentOutboxV1::try_prepare(expected_scope.clone(), &mut claimed_commit).unwrap();
         let _send_action = claimed
             .claim_open(
                 &expected_scope,

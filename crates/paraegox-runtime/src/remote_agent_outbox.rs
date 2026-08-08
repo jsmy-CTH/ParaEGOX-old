@@ -406,9 +406,7 @@ impl RemoteAgentOpenSendActionV1 {
         send: Send,
     ) -> Result<RemoteAgentOpenExchangeOutcomeV1, Error>
     where
-        Send: FnOnce(
-            &AgentConversationControlV1,
-        ) -> Result<AgentConversationOpenOutcomeV1, Error>,
+        Send: FnOnce(&AgentConversationControlV1) -> Result<AgentConversationOpenOutcomeV1, Error>,
     {
         let outcome = send(&self.request)?;
         Ok(RemoteAgentOpenExchangeOutcomeV1 {
@@ -581,18 +579,11 @@ impl RemoteAgentOutboxV1 {
         {
             return Err(RemoteAgentOutboxError::ActionMismatch.into());
         }
-        validate_proof_scope_challenge(
-            &self.scope,
-            &self.scope.open_challenge,
-            &verified.proof,
-        )?;
+        validate_proof_scope_challenge(&self.scope, &self.scope.open_challenge, &verified.proof)?;
         let proof = verified.proof;
         let payload = encode_proof_payload(&proof)?;
-        let claim_digest = self.commit_record(
-            RemoteAgentOutboxRecordKindV1::OpenClaimed,
-            payload,
-            commit,
-        )?;
+        let claim_digest =
+            self.commit_record(RemoteAgentOutboxRecordKindV1::OpenClaimed, payload, commit)?;
         self.phase = RemoteAgentOutboxPhaseV1::OpenUncertain {
             open_proof: proof,
             claim_digest,
@@ -677,19 +668,12 @@ impl RemoteAgentOutboxV1 {
         {
             return Err(RemoteAgentOutboxError::ActionMismatch.into());
         }
-        validate_proof_scope_challenge(
-            &self.scope,
-            &self.scope.echo_challenge,
-            &verified.proof,
-        )?;
+        validate_proof_scope_challenge(&self.scope, &self.scope.echo_challenge, &verified.proof)?;
         let open_proof = open_proof.clone();
         let proof = verified.proof;
         let payload = encode_proof_payload(&proof)?;
-        let claim_digest = self.commit_record(
-            RemoteAgentOutboxRecordKindV1::EchoClaimed,
-            payload,
-            commit,
-        )?;
+        let claim_digest =
+            self.commit_record(RemoteAgentOutboxRecordKindV1::EchoClaimed, payload, commit)?;
         self.phase = RemoteAgentOutboxPhaseV1::EchoUncertain {
             open_proof,
             echo_proof: proof,
@@ -994,14 +978,12 @@ fn decode_prepared_payload(
     let expected_active_pxst_digest = Digest32::from_bytes(read_array(&payload[104..136]));
     let profile_digest = Digest32::from_bytes(read_array(&payload[136..168]));
     let mac_agent_client_principal = PrincipalRef::from_bytes(read_array(&payload[168..184]));
-    let open_request_id = RemoteAgentAccessRequestIdV1::try_from_bytes(read_array(
-        &payload[184..200],
-    ))
-    .map_err(|_| RemoteAgentOutboxError::InvalidChallenge)?;
-    let echo_request_id = RemoteAgentAccessRequestIdV1::try_from_bytes(read_array(
-        &payload[200..216],
-    ))
-    .map_err(|_| RemoteAgentOutboxError::InvalidChallenge)?;
+    let open_request_id =
+        RemoteAgentAccessRequestIdV1::try_from_bytes(read_array(&payload[184..200]))
+            .map_err(|_| RemoteAgentOutboxError::InvalidChallenge)?;
+    let echo_request_id =
+        RemoteAgentAccessRequestIdV1::try_from_bytes(read_array(&payload[200..216]))
+            .map_err(|_| RemoteAgentOutboxError::InvalidChallenge)?;
     let open_start = PREPARED_FIXED_BYTES;
     let open_end = open_start + open_length;
     let echo_end = open_end + echo_length;
@@ -1092,10 +1074,7 @@ fn validate_proof_scope_challenge(
     scope: &RemoteAgentOneEchoScopeV1,
     challenge: &RemoteAgentDescribeChallengeV1,
     proof: &RemoteAgentDescribeProofBytesV1,
-) -> Result<
-    (RemoteAgentAccessRequestV1, RemoteAgentAccessResponseV1),
-    RemoteAgentOutboxError,
-> {
+) -> Result<(RemoteAgentAccessRequestV1, RemoteAgentAccessResponseV1), RemoteAgentOutboxError> {
     let request = RemoteAgentAccessRequestV1::decode(proof.request_wire())
         .map_err(|_| RemoteAgentOutboxError::InvalidDescribeProof)?;
     let response = RemoteAgentAccessResponseV1::decode(proof.response_wire())
