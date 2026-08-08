@@ -2536,16 +2536,21 @@ mod tests {
 
     use paraegox_kernel::digest::Digest32;
     use paraegox_runtime_contracts::distributed_agent_stack_plan::DistributedFabricSessionEpochV1;
+    use serde_json::{Value, json};
 
     use super::{
         ExperimentalPeerCommonNameV1, ExperimentalRawZenohLink,
         ExperimentalRemoteMtlsConfigErrorV1, ExperimentalRemoteMtlsObservationErrorV1,
         ExperimentalRemoteMtlsPeerBindingV1, FabricConfigError, FabricError, FabricServiceConfig,
-        MAX_EXPERIMENTAL_OBSERVED_LINKS, RemoteTlsEndpoint, ResolvedRemoteMtlsCredentialFiles,
-        ResolvedRemoteMtlsIdentityFiles, SessionEndpoint,
+        MAX_EXPERIMENTAL_OBSERVED_LINKS, MAX_KEY_EXPRESSION_BYTES,
+        REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES, PrincipalRef, RemoteTlsEndpoint,
+        ResolvedRemoteMtlsConnectorCredentialFilesV1, ResolvedRemoteMtlsCredentialFiles,
+        ResolvedRemoteMtlsIdentityFiles, ResolvedRemoteMtlsListenerCredentialFilesV1,
+        SessionEndpoint,
         classify_and_advance_experimental_remote_mtls_links,
         classify_experimental_remote_mtls_links, try_fabric_session_epoch_with,
     };
+    use crate::restricted_runtime_apply_peer_certificate_common_name_v1;
 
     fn session_epoch(seed: u8) -> DistributedFabricSessionEpochV1 {
         DistributedFabricSessionEpochV1::try_from_bytes([seed; 16]).expect("session epoch")
@@ -2566,6 +2571,100 @@ mod tests {
             role_identity("connect"),
         )
         .unwrap()
+    }
+
+    fn listener_credentials() -> ResolvedRemoteMtlsListenerCredentialFilesV1 {
+        ResolvedRemoteMtlsListenerCredentialFilesV1::try_new(
+            PathBuf::from("/run/paraegox/tls/root-ca.pem"),
+            role_identity("listen"),
+        )
+        .unwrap()
+    }
+
+    fn connector_credentials() -> ResolvedRemoteMtlsConnectorCredentialFilesV1 {
+        ResolvedRemoteMtlsConnectorCredentialFilesV1::try_new(
+            PathBuf::from("/run/paraegox/tls/root-ca.pem"),
+            role_identity("connect"),
+        )
+        .unwrap()
+    }
+
+    const fn principal(marker: u8) -> PrincipalRef {
+        PrincipalRef::from_bytes([marker; 16])
+    }
+
+    fn json_config(config: &zenoh::Config, key: &str) -> Value {
+        serde_json::from_str(&config.get_json(key).unwrap()).unwrap()
+    }
+
+    fn assert_remote_agent_session_hardening(config: &zenoh::Config) {
+        for (key, expected) in [
+            ("scouting/multicast/enabled", "false"),
+            ("scouting/gossip/enabled", "false"),
+            ("connect/timeout_ms", "0"),
+            ("connect/exit_on_failure", "true"),
+            ("listen/timeout_ms", "0"),
+            ("listen/exit_on_failure", "true"),
+            ("open/return_conditions/connect_scouted", "false"),
+            ("open/return_conditions/declares", "true"),
+            ("adminspace/enabled", "false"),
+            ("plugins_loading/enabled", "false"),
+            ("transport/unicast/accept_pending", "1"),
+            ("transport/unicast/max_sessions", "1"),
+            ("transport/unicast/max_links", "1"),
+            ("transport/link/tls/enable_mtls", "true"),
+            ("transport/link/tls/verify_name_on_connect", "true"),
+            ("transport/link/tls/close_link_on_expiration", "true"),
+        ] {
+            assert_eq!(config.get_json(key).unwrap(), expected, "{key}");
+        }
+        assert_eq!(
+            config
+                .get_json("transport/link/rx/max_message_size")
+                .unwrap(),
+            REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES.to_string()
+        );
+    }
+
+    fn assert_remote_agent_acl(
+        config: &zenoh::Config,
+        expected_common_name: &str,
+        expected_egress_messages: Value,
+        expected_ingress_messages: Value,
+    ) {
+        let acl = json_config(config, "access_control");
+        assert_eq!(acl["enabled"], true);
+        assert_eq!(acl["default_permission"], "deny");
+        let rules = acl["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["permission"], "allow");
+        assert_eq!(rules[0]["flows"], json!(["egress"]));
+        assert_eq!(rules[0]["messages"], expected_egress_messages);
+        assert_eq!(
+            rules[0]["key_exprs"],
+            json!(["paraegox/agent/submit", "paraegox/agent/control"])
+        );
+        assert_eq!(rules[1]["permission"], "allow");
+        assert_eq!(rules[1]["flows"], json!(["ingress"]));
+        assert_eq!(rules[1]["messages"], expected_ingress_messages);
+        assert_eq!(
+            rules[1]["key_exprs"],
+            json!(["paraegox/agent/submit", "paraegox/agent/control"])
+        );
+        let subjects = acl["subjects"].as_array().unwrap();
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(
+            subjects[0]["cert_common_names"],
+            json!([expected_common_name])
+        );
+        assert_eq!(subjects[0]["link_protocols"], json!(["tls"]));
+        assert_eq!(
+            acl["policies"],
+            json!([{
+                "rules": [rules[0]["id"].as_str().unwrap(), rules[1]["id"].as_str().unwrap()],
+                "subjects": ["remote-agent-expected-peer-v1"]
+            }])
+        );
     }
 
     fn experimental_peer(
@@ -2615,6 +2714,213 @@ mod tests {
         assert_eq!(
             zenoh.get_json("transport/link/protocols").unwrap(),
             "[\"tcp\"]"
+        );
+    }
+
+    #[test]
+    fn remote_agent_configs_lock_role_specific_transport_and_exact_acl() {
+        let mac_principal = principal(0x51);
+        let ubuntu_principal = principal(0x52);
+        let listener = FabricServiceConfig::try_remote_agent_listener_v1(
+            SessionEndpoint::try_new("tcp/127.0.0.1:7447").unwrap(),
+            RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
+            listener_credentials(),
+            mac_principal,
+            "paraegox/agent/submit",
+            "paraegox/agent/control",
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{listener:?}"),
+            "FabricServiceConfig { transport_profile: \"remote-agent-listener-mtls-v1\", .. }"
+        );
+        let listener = listener.build_zenoh_config().unwrap();
+        assert_remote_agent_session_hardening(&listener);
+        assert_eq!(listener.get_json("mode").unwrap(), "\"peer\"");
+        assert_eq!(
+            listener.get_json("listen/endpoints").unwrap(),
+            "[\"tcp/127.0.0.1:7447\",\"tls/192.0.2.10:7447\"]"
+        );
+        assert_eq!(listener.get_json("connect/endpoints").unwrap(), "[]");
+        assert_eq!(
+            listener.get_json("transport/link/protocols").unwrap(),
+            "[\"tcp\",\"tls\"]"
+        );
+        assert_eq!(
+            listener
+                .get_json("transport/link/tls/root_ca_certificate")
+                .unwrap(),
+            "\"/run/paraegox/tls/root-ca.pem\""
+        );
+        assert_eq!(
+            listener
+                .get_json("transport/link/tls/listen_certificate")
+                .unwrap(),
+            "\"/run/paraegox/tls/listen-certificate.pem\""
+        );
+        assert_eq!(
+            listener
+                .get_json("transport/link/tls/listen_private_key")
+                .unwrap(),
+            "\"/run/paraegox/tls/listen-private-key.pem\""
+        );
+        assert!(
+            listener
+                .get_json("transport/link/tls/connect_certificate")
+                .is_err()
+        );
+        assert!(
+            listener
+                .get_json("transport/link/tls/connect_private_key")
+                .is_err()
+        );
+        assert_remote_agent_acl(
+            &listener,
+            &restricted_runtime_apply_peer_certificate_common_name_v1(mac_principal),
+            json!(["reply", "declare_queryable"]),
+            json!(["query"]),
+        );
+
+        let connector = FabricServiceConfig::try_remote_agent_connector_v1(
+            RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
+            connector_credentials(),
+            ubuntu_principal,
+            "paraegox/agent/submit",
+            "paraegox/agent/control",
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{connector:?}"),
+            "FabricServiceConfig { transport_profile: \"remote-agent-connector-mtls-v1\", .. }"
+        );
+        let connector = connector.build_zenoh_config().unwrap();
+        assert_remote_agent_session_hardening(&connector);
+        assert_eq!(connector.get_json("mode").unwrap(), "\"client\"");
+        assert_eq!(connector.get_json("listen/endpoints").unwrap(), "[]");
+        assert_eq!(
+            connector.get_json("connect/endpoints").unwrap(),
+            "[\"tls/192.0.2.10:7447\"]"
+        );
+        assert_eq!(
+            connector.get_json("transport/link/protocols").unwrap(),
+            "[\"tls\"]"
+        );
+        assert_eq!(
+            connector
+                .get_json("transport/link/tls/root_ca_certificate")
+                .unwrap(),
+            "\"/run/paraegox/tls/root-ca.pem\""
+        );
+        assert_eq!(
+            connector
+                .get_json("transport/link/tls/connect_certificate")
+                .unwrap(),
+            "\"/run/paraegox/tls/connect-certificate.pem\""
+        );
+        assert_eq!(
+            connector
+                .get_json("transport/link/tls/connect_private_key")
+                .unwrap(),
+            "\"/run/paraegox/tls/connect-private-key.pem\""
+        );
+        assert!(
+            connector
+                .get_json("transport/link/tls/listen_certificate")
+                .is_err()
+        );
+        assert!(
+            connector
+                .get_json("transport/link/tls/listen_private_key")
+                .is_err()
+        );
+        assert_remote_agent_acl(
+            &connector,
+            &restricted_runtime_apply_peer_certificate_common_name_v1(ubuntu_principal),
+            json!(["query"]),
+            json!(["reply", "declare_queryable"]),
+        );
+    }
+
+    #[test]
+    fn remote_agent_routes_and_principals_fail_closed_before_session_open() {
+        let build = |peer_principal, submit: String, control: String| {
+            FabricServiceConfig::try_remote_agent_listener_v1(
+                SessionEndpoint::try_new("tcp/127.0.0.1:7447").unwrap(),
+                RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
+                listener_credentials(),
+                peer_principal,
+                submit,
+                control,
+            )
+        };
+        assert_eq!(
+            build(
+                PrincipalRef::from_bytes([0; 16]),
+                "paraegox/agent/submit".to_owned(),
+                "paraegox/agent/control".to_owned(),
+            ),
+            Err(FabricConfigError::ZeroExpectedRemoteAgentPrincipal)
+        );
+        assert_eq!(
+            FabricServiceConfig::try_remote_agent_connector_v1(
+                RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
+                connector_credentials(),
+                PrincipalRef::from_bytes([0; 16]),
+                "paraegox/agent/submit",
+                "paraegox/agent/control",
+            ),
+            Err(FabricConfigError::ZeroExpectedRemoteAgentPrincipal)
+        );
+        assert_eq!(
+            build(
+                principal(0x51),
+                "paraegox/agent/submit".to_owned(),
+                "paraegox/agent/submit".to_owned(),
+            ),
+            Err(FabricConfigError::DuplicateRemoteAgentRoute)
+        );
+        assert_eq!(
+            build(
+                principal(0x51),
+                String::new(),
+                "paraegox/agent/control".to_owned(),
+            ),
+            Err(FabricConfigError::EmptyKeyExpression)
+        );
+        assert_eq!(
+            build(
+                principal(0x51),
+                "a".repeat(MAX_KEY_EXPRESSION_BYTES + 1),
+                "paraegox/agent/control".to_owned(),
+            ),
+            Err(FabricConfigError::KeyExpressionTooLong)
+        );
+        for invalid in [
+            "paraegox/**",
+            "paraegox/$agent",
+            "paraegox/agent\nsubmit",
+            "paraegox/agént",
+            "paraegox//agent",
+            "paraegox/agent/",
+        ] {
+            assert_eq!(
+                build(
+                    principal(0x51),
+                    invalid.to_owned(),
+                    "paraegox/agent/control".to_owned(),
+                ),
+                Err(FabricConfigError::NonConcreteKeyExpression),
+                "{invalid:?} must fail closed"
+            );
+        }
+        assert!(
+            build(
+                principal(0x51),
+                "paraegox/agent".to_owned(),
+                "paraegox/agent/control".to_owned(),
+            )
+            .is_ok(),
+            "distinct exact parent and child routes remain valid key expressions"
         );
     }
 
