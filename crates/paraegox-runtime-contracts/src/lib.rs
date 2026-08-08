@@ -18,6 +18,8 @@ pub mod process_execution;
 pub mod process_protocol;
 pub mod provenance;
 pub mod reference_control;
+pub mod remote_agent_access;
+pub mod remote_agent_data_plane_plan;
 pub mod temporal;
 pub mod thread_execution;
 pub mod wire;

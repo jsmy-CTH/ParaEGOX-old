@@ -1636,10 +1636,7 @@ impl RuntimeAgentControlReceiptDraftV1 {
         agent_generation: Option<ManagedServiceGeneration>,
         auth_claim: RuntimeAgentControlResponseAuthClaimV1,
     ) -> Result<Self, ManagedServingBootstrapError> {
-        let payload_wire_digest = digest(
-            AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN,
-            payload.canonical_wire(),
-        )?;
+        let payload_wire_digest = runtime_agent_control_receipt_payload_digest_v1(&payload)?;
         let draft = Self {
             request_id: request.request_id,
             request_digest: request.request_digest,
@@ -1790,8 +1787,16 @@ impl RuntimeAgentControlReceiptV1 {
             return Err(ManagedServingBootstrapError::InvalidAgentControlBinding);
         }
         let payload_wire = cursor.take(payload_length)?;
-        if digest(AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN, payload_wire)? != payload_wire_digest
-        {
+        let decoded_payload_wire_digest = match kind {
+            RuntimeAgentControlKindV1::DescribeConversationPort => {
+                runtime_agent_control_descriptor_payload_digest_v1(payload_wire)?
+            }
+            RuntimeAgentControlKindV1::ApplyManagedFabric
+            | RuntimeAgentControlKindV1::ApplyManagedAgentStack => {
+                digest(AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN, payload_wire)?
+            }
+        };
+        if decoded_payload_wire_digest != payload_wire_digest {
             return Err(ManagedServingBootstrapError::InvalidAgentControlPayload);
         }
         let payload = match kind {
@@ -1808,7 +1813,6 @@ impl RuntimeAgentControlReceiptV1 {
                 ))
             }
             RuntimeAgentControlKindV1::DescribeConversationPort => {
-                validate_runtime_agent_port_descriptor(payload_wire)?;
                 RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(payload_wire.into())
             }
         };
@@ -3220,6 +3224,37 @@ fn validate_runtime_agent_port_descriptor(
     Ok(())
 }
 
+/// Validates exact PXAP v1 framing and returns the frozen T1 PXAH payload digest.
+///
+/// This is the sole shared digest definition for an old bootstrap PXAP root or
+/// a freshly described PXAP root. A whole PXAH receipt digest remains a
+/// separate value owned by [`RuntimeAgentControlReceiptV1::receipt_digest`].
+pub fn runtime_agent_control_descriptor_payload_digest_v1(
+    descriptor: &[u8],
+) -> Result<Digest32, ManagedServingBootstrapError> {
+    validate_runtime_agent_port_descriptor(descriptor)?;
+    Ok(digest(
+        AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN,
+        descriptor,
+    )?)
+}
+
+fn runtime_agent_control_receipt_payload_digest_v1(
+    payload: &RuntimeAgentControlReceiptPayloadV1,
+) -> Result<Digest32, ManagedServingBootstrapError> {
+    match payload {
+        RuntimeAgentControlReceiptPayloadV1::ConversationPortDescriptor(descriptor) => {
+            runtime_agent_control_descriptor_payload_digest_v1(descriptor)
+                .map_err(|_| ManagedServingBootstrapError::InvalidAgentControlReceipt)
+        }
+        RuntimeAgentControlReceiptPayloadV1::ManagedFabric(_)
+        | RuntimeAgentControlReceiptPayloadV1::ManagedAgentStack(_) => Ok(digest(
+            AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN,
+            payload.canonical_wire(),
+        )?),
+    }
+}
+
 fn validate_historical_managed_agent_stack_receipt(
     request: &ManagedAgentStackApplyRequestV1,
     current_runtime_host_epoch: u64,
@@ -3301,10 +3336,8 @@ fn validate_runtime_agent_control_receipt_draft(
         _ => false,
     };
     if !valid
-        || digest(
-            AGENT_CONTROL_RECEIPT_PAYLOAD_DIGEST_DOMAIN,
-            draft.payload.canonical_wire(),
-        )? != draft.payload_wire_digest
+        || runtime_agent_control_receipt_payload_digest_v1(&draft.payload)?
+            != draft.payload_wire_digest
     {
         return Err(ManagedServingBootstrapError::InvalidAgentControlReceipt);
     }
