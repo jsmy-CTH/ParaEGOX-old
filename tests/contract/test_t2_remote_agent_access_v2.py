@@ -494,7 +494,7 @@ def _parse_inner_pxau(wire: bytes, request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _carrier(target: bytes) -> dict[str, Any]:
-    route = b"paraegox/runtime/t2/remote-agent-access/v2"
+    route = b"paraegox/runtime/t2/remote-agent-access/v2/apply"
     wire = b"".join(
         [
             PXCB_MAGIC,

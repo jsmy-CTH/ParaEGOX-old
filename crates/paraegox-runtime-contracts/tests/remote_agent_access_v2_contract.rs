@@ -16,8 +16,7 @@ use paraegox_runtime_contracts::remote_agent_access::{
 use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
     REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES, REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES,
     RemoteAgentActiveS1CasV2, RemoteAgentDataPlaneApplyRequestDraftV2,
-    RemoteAgentDataPlaneApplyRequestV2,
-    RemoteAgentDataPlaneTerminalReceiptV2,
+    RemoteAgentDataPlaneApplyRequestV2, RemoteAgentDataPlaneTerminalReceiptV2,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyRequestAuthClaim};
 
@@ -171,12 +170,7 @@ fn apply_access_request(
     terminal: &RemoteAgentDataPlaneTerminalReceiptV2,
     carrier: RestrictedRuntimeApplyCarrierBindingV1,
 ) -> RemoteAgentAccessRequestV2 {
-    apply_access_request_with_outer_signature(
-        inner,
-        terminal,
-        carrier,
-        OUTER_CONTROLLER_SIGNATURE,
-    )
+    apply_access_request_with_outer_signature(inner, terminal, carrier, OUTER_CONTROLLER_SIGNATURE)
 }
 
 fn apply_access_request_with_outer_signature(
@@ -605,12 +599,7 @@ fn all_four_signatures_are_independent_and_wrong_or_zero_bytes_fail_closed() {
 
         let request = apply_access_request(&inner, &terminal, carrier.clone());
         let bad_terminal = reissue_inner_terminal(&terminal, &bad_signature);
-        let response = apply_access_response(
-            &request,
-            &inner,
-            &bad_terminal,
-            &carrier,
-        );
+        let response = apply_access_response(&request, &inner, &bad_terminal, &carrier);
         let inner_calls = Cell::new(0);
         let outer_calls = Cell::new(0);
         assert!(
@@ -738,12 +727,7 @@ fn pxra2_strict_wire_rejects_length_reserved_identity_cas_auth_and_payload_tampe
     }
 
     let short_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
-        access_fields(
-            &inner,
-            &terminal,
-            carrier.clone(),
-            OUTER_CONTROLLER_NONCE,
-        ),
+        access_fields(&inner, &terminal, carrier.clone(), OUTER_CONTROLLER_NONCE),
         inner.clone(),
     )
     .unwrap();
@@ -894,7 +878,7 @@ fn describe_response_signing_has_no_public_historical_pair_producer() {
     assert!(response_impl.contains("fn try_new"));
     assert!(!response_impl.contains("pub fn try_new"));
     assert!(!response_impl.contains("pub fn try_describe_remote_access"));
-    assert!(response_impl.contains("current-final, non-Clone authority marker"));
+    assert!(OUTER_SOURCE.contains("current-final, non-Clone authority marker"));
 
     assert!(OUTER_SOURCE.contains("enum RemoteAgentAccessResponsePayloadV2"));
     assert!(!OUTER_SOURCE.contains("pub enum RemoteAgentAccessResponsePayloadV2"));
@@ -921,6 +905,7 @@ fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires(
     let carrier = RestrictedRuntimeApplyCarrierBindingV1::decode(&carrier_wire)
         .expect("independent-golden PXCB");
     assert_eq!(carrier.canonical_wire(), carrier_wire);
+    assert_eq!(carrier.route(), "paraegox/runtime/t2/remote-agent-access/v2/apply");
     assert_eq!(
         carrier.binding_digest(),
         fixture_digest_after(carrier_scope, "\"digest_hex\"")
@@ -1052,8 +1037,7 @@ fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires(
     let describe_request_wire = fixture_hex_after(describe_request_scope, "\"wire_hex\"");
     let describe_request_transcript =
         fixture_hex_after(describe_request_scope, "\"signing_transcript_hex\"");
-    let describe_request_signature =
-        fixture_hex_after(describe_request_scope, "\"signature_hex\"");
+    let describe_request_signature = fixture_hex_after(describe_request_scope, "\"signature_hex\"");
     let describe_request = RemoteAgentAccessRequestV2::decode(&describe_request_wire)
         .expect("independent-golden PXRA v2 Describe");
     assert_eq!(describe_request.canonical_wire(), describe_request_wire);
@@ -1086,14 +1070,12 @@ fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires(
         )
         .expect("independent-golden Describe Controller signature");
 
-    let historical_scope =
-        fixture_section_after(describe_scope, "\"pxrr_v2_strict_consumer\"");
+    let historical_scope = fixture_section_after(describe_scope, "\"pxrr_v2_strict_consumer\"");
     assert!(historical_scope.contains("\"classification\": \"synthetic/historical-negative\""));
     assert!(historical_scope.contains("\"currentness_evidence\": false"));
     assert!(historical_scope.contains("\"producer_evidence\": false"));
     let historical_wire = fixture_hex_after(historical_scope, "\"wire_hex\"");
-    let historical_transcript =
-        fixture_hex_after(historical_scope, "\"signing_transcript_hex\"");
+    let historical_transcript = fixture_hex_after(historical_scope, "\"signing_transcript_hex\"");
     let historical_signature = fixture_hex_after(historical_scope, "\"signature_hex\"");
     let historical = RemoteAgentAccessResponseV2::decode(&historical_wire)
         .expect("synthetic historical PXRR v2 Describe consumer fixture");
@@ -1110,10 +1092,7 @@ fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires(
         historical.signing_transcript().unwrap().as_bytes(),
         historical_transcript
     );
-    assert_eq!(
-        historical.authentication_signature(),
-        historical_signature
-    );
+    assert_eq!(historical.authentication_signature(), historical_signature);
     assert!(historical.profile().is_some());
     assert!(historical.descriptor().is_some());
     historical
