@@ -2538,11 +2538,14 @@ pub const MAX_REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_BYTES: usize = APPLY_REQU
     + MAX_RUNTIME_APPLY_ENVELOPE_V2_BYTES
     + EMPTY_PXTA.len()
     + MAX_REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_BYTES;
-/// Maximum canonical PXAU v2 bytes.
+/// Defensive carrier ceiling accepted before strict PXAU v2 length reconstruction.
 pub const MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES: usize = 2_048;
 /// Maximum Runtime signature retained by PXAU v2.
 pub const MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES: usize =
     MAX_CONTROL_READ_SIGNATURE_BYTES;
+/// Maximum bytes a canonical PXAU v2 producer can emit, including its signature.
+pub const MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES: usize =
+    TERMINAL_V2_FIXED_BYTES + MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES;
 
 /// Exact live S0 facts that the proxy successor is forbidden to mutate.
 #[derive(Clone, Copy, Debug)]
@@ -2891,6 +2894,10 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32,
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNING_V2_VERSION)?;
     builder.field_bytes(&(TERMINAL_V2_FIXED_BYTES as u32).to_be_bytes())?;
     builder.field_u16(MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES as u16)?;
+    builder.field_u16(
+        MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES as u16,
+    )?;
+    builder.field_u16(MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES as u16)?;
     builder.field_bytes(&EMPTY_PXTA)?;
     builder.field_u16(REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES as u16)?;
     builder.field_u16(REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES as u16)?;
@@ -2913,6 +2920,13 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32,
         b"pxau-v2-deadline=admitted-at+pxad-operation-timeout;budget-reset=forbidden",
     )?;
     builder.field_u16(TERMINAL_V2_EVIDENCE_KNOWN_FLAGS)?;
+    builder.field_u16(TERMINAL_V2_RETAINED_S0_CENSUS_COMPLETE)?;
+    builder.field_u16(TERMINAL_V2_RETAINED_S0_READY)?;
+    builder.field_u16(TERMINAL_V2_S1_TLS_READY)?;
+    builder.field_u16(TERMINAL_V2_S1_ACL_READY)?;
+    builder.field_u16(TERMINAL_V2_S1_CLOSED)?;
+    builder.field_u16(TERMINAL_V2_S1_LISTENER_RELEASED)?;
+    builder.field_u16(TERMINAL_V2_QUARANTINED)?;
     for phase in [
         RemoteAgentDataPlaneTerminalPhaseV2::PreparedNoEffects,
         RemoteAgentDataPlaneTerminalPhaseV2::S1OpenIntent,
@@ -4110,7 +4124,9 @@ impl RemoteAgentDataPlaneTerminalReceiptV2 {
         append_terminal_body_v2(&mut canonical_wire, facts, auth_claim);
         canonical_wire.extend_from_slice(&signature_length.to_be_bytes());
         canonical_wire.extend_from_slice(signature);
-        if canonical_wire.len() > MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES {
+        if canonical_wire.len()
+            > MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES
+        {
             return Err(RemoteAgentDataPlanePlanError::FrameTooLarge);
         }
         let receipt_digest = digest_wire(TERMINAL_V2_DIGEST_DOMAIN, &canonical_wire)?;
@@ -4380,6 +4396,21 @@ fn validate_terminal_facts_shape_v2(
             && fields.worker_joined_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
             && fields.submit_admitted_count == fields.submit_terminalized_count
             && fields.control_admitted_count == fields.control_terminalized_count);
+    let uncertain_mode_phase_valid = match facts.request_mode {
+        RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive => matches!(
+            facts.state.phase(),
+            RemoteAgentDataPlaneTerminalPhaseV2::S1OpenIntent
+                | RemoteAgentDataPlaneTerminalPhaseV2::QueryablesDeclareIntent
+                | RemoteAgentDataPlaneTerminalPhaseV2::ReadyObservation
+        ),
+        RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate => matches!(
+            facts.state.phase(),
+            RemoteAgentDataPlaneTerminalPhaseV2::IngressFenceIntent
+                | RemoteAgentDataPlaneTerminalPhaseV2::DrainIntent
+                | RemoteAgentDataPlaneTerminalPhaseV2::S1CloseIntent
+                | RemoteAgentDataPlaneTerminalPhaseV2::LocalOnlyObservation
+        ),
+    };
     use RemoteAgentDataPlaneTerminalOutcomeV2::{
         ActiveReady, LocalOnlyReady, NoEffectRejected, Quarantined, Uncertain,
     };
@@ -4461,6 +4492,7 @@ fn validate_terminal_facts_shape_v2(
         Uncertain => {
             !fields.quarantined
                 && !fields.retained_s0_ready
+                && uncertain_mode_phase_valid
                 && unresolved_s1_observation_consistent
                 && drain_proof_consistent
         }
