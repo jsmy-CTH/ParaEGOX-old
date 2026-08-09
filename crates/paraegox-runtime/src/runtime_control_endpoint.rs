@@ -1733,10 +1733,6 @@ pub(crate) struct ManagedFabricControlService {
     provisioning: RuntimeProvisioningV1,
     channel: ReferenceChannelBindingV1,
     dependencies: RuntimeManagedFabricServiceDependenciesV1,
-    /// Monotonic process-local observation that the store owner structurally
-    /// classified an exact same-epoch PXRS v2 final. The raw snapshot is not
-    /// retained here and cannot authorize replay or any transition.
-    remote_agent_access_same_epoch_frozen: bool,
 }
 
 impl ManagedFabricControlService {
@@ -1916,7 +1912,7 @@ impl ManagedFabricControlService {
                 }
             }
             RuntimeAgentControlKindV1::DescribeConversationPort => {
-                if self.remote_agent_access_same_epoch_frozen {
+                if self.core.remote_agent_access_s0_mutation_frozen_v2() {
                     return self
                         .replay_frozen_runtime_agent_descriptor_v1(authenticated)
                         .await;
@@ -2448,7 +2444,7 @@ impl ManagedFabricControlService {
                 ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen
             )
         ) {
-            self.remote_agent_access_same_epoch_frozen = true;
+            self.core.latch_remote_agent_access_s0_mutation_freeze_v2();
         }
     }
 
@@ -3948,7 +3944,6 @@ async fn recover_managed_control_for_existing_channel(
         provisioning,
         channel,
         dependencies,
-        remote_agent_access_same_epoch_frozen: false,
     })
 }
 
@@ -4512,7 +4507,6 @@ where
         provisioning,
         channel,
         dependencies,
-        remote_agent_access_same_epoch_frozen: false,
     };
     let listener = match UnixListener::from_std(standard) {
         Ok(listener) => listener,
@@ -7609,7 +7603,6 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
-            remote_agent_access_same_epoch_frozen: false,
         };
         let cutover_distributed = control
             .dependencies
@@ -8276,7 +8269,6 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
-            remote_agent_access_same_epoch_frozen: false,
         };
         let profile = restricted_transport_profile(
             RESTRICTED_APPLY_ROUTE,
@@ -9801,7 +9793,7 @@ mod tests {
                 ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen,
             ),
         );
-        assert!(control.remote_agent_access_same_epoch_frozen);
+        assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
         assert_eq!(
             control
                 .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
@@ -12362,7 +12354,6 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
-            remote_agent_access_same_epoch_frozen: false,
         };
         let fabric_wire = control
             .handle_request(fabric_request.canonical_wire(), channel)
@@ -12487,7 +12478,6 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
-            remote_agent_access_same_epoch_frozen: false,
         };
         let fabric_wire = control
             .handle_request(fabric_request.canonical_wire(), channel)
@@ -12662,7 +12652,6 @@ mod tests {
             provisioning,
             channel,
             dependencies,
-            remote_agent_access_same_epoch_frozen: false,
         };
         assert_eq!(
             restarted_control
@@ -12956,6 +12945,21 @@ mod tests {
             )),
             RuntimeControlRequestError::Unavailable
         ));
+    }
+
+    #[test]
+    fn endpoint_has_no_parallel_remote_agent_access_freeze_truth() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        let service = section(
+            source,
+            "pub(crate) struct ManagedFabricControlService",
+            "impl ManagedFabricControlService",
+        );
+        let obsolete_endpoint_field = ["remote_agent_access_", "same_epoch_frozen"].concat();
+        assert!(!source.contains(&obsolete_endpoint_field));
+        assert!(!service.contains("remote_agent_access_s0_mutation_frozen_v2: bool"));
+        assert!(source.contains("self.core.remote_agent_access_s0_mutation_frozen_v2()"));
+        assert!(source.contains(".latch_remote_agent_access_s0_mutation_freeze_v2();"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13577,7 +13581,6 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
-            remote_agent_access_same_epoch_frozen: false,
         };
 
         let mut bad_signature = request.canonical_wire().to_vec();
@@ -13682,7 +13685,6 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
-            remote_agent_access_same_epoch_frozen: false,
         };
         let mut legacy_version = [0_u8; 18];
         legacy_version[..4].copy_from_slice(APPLY_REQUEST_MAGIC);

@@ -51,13 +51,17 @@ use crate::managed_service_assembly::{
     ManagedServiceFuture, ManagedServiceImplementation, ManagedServiceReadiness,
     ManagedServiceStartupOutcome,
 };
-use crate::remote_agent_access_state::RemoteAgentAccessStaticIdentityPinsV2;
+use crate::remote_agent_access_state::{
+    RemoteAgentAccessSnapshotV2, RemoteAgentAccessStaticIdentityPinsV2,
+};
 use crate::remote_agent_descriptor_evidence::{
     RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
 };
 use crate::runtime_clock::RuntimeClock;
 use crate::runtime_store::{
-    ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessStartupSlotV2, RuntimeStore,
+    ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessAbsentLeaseV2,
+    RemoteAgentAccessCommitErrorV2, RemoteAgentAccessInitializeCommitErrorV2,
+    RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2, RuntimeStore,
 };
 use crate::task_registry::CancellationSource;
 
@@ -498,6 +502,7 @@ pub(crate) struct ManagedFabricRuntimeCore {
     fabric_control: Option<ManagedFabricControlHandle>,
     remote_agent_descriptor_evidence: Option<RemoteAgentDescriptorEvidenceV1>,
     remote_agent_access_startup_v2: Option<RemoteAgentAccessStartupSlotV2>,
+    remote_agent_access_s0_mutation_frozen_v2: bool,
     #[cfg(test)]
     fail_next_remote_agent_descriptor_post_commit_reverify: bool,
     cleanup_exact_zero: bool,
@@ -637,6 +642,7 @@ impl ManagedFabricRuntimeCore {
             fabric_control: None,
             remote_agent_descriptor_evidence,
             remote_agent_access_startup_v2: None,
+            remote_agent_access_s0_mutation_frozen_v2: false,
             #[cfg(test)]
             fail_next_remote_agent_descriptor_post_commit_reverify: false,
             cleanup_exact_zero,
@@ -699,6 +705,7 @@ impl ManagedFabricRuntimeCore {
             fabric_control: None,
             remote_agent_descriptor_evidence,
             remote_agent_access_startup_v2: None,
+            remote_agent_access_s0_mutation_frozen_v2: false,
             #[cfg(test)]
             fail_next_remote_agent_descriptor_post_commit_reverify: false,
             cleanup_exact_zero,
@@ -767,6 +774,33 @@ impl ManagedFabricRuntimeCore {
         self.snapshot.owner_target_fingerprint()
     }
 
+    /// Returns the core-owned, process-lifetime S0 mutation freeze. This bit is
+    /// monotonic: historical PXRS bytes remain inert, while an exact
+    /// same-epoch final or an uncertain initialization commit permanently
+    /// closes same-process S0 mutation.
+    #[must_use]
+    pub(crate) const fn remote_agent_access_s0_mutation_frozen_v2(&self) -> bool {
+        self.remote_agent_access_s0_mutation_frozen_v2
+    }
+
+    /// Monotonically closes same-process S0 mutation. Typed-error observers may
+    /// call this defensively, but the Runtime core remains the only truth.
+    pub(crate) fn latch_remote_agent_access_s0_mutation_freeze_v2(&mut self) {
+        self.remote_agent_access_s0_mutation_frozen_v2 = true;
+    }
+
+    /// Rejects an S0 mutation after this process has learned that same-epoch
+    /// PXRS authority exists or that an initialization commit is uncertain.
+    pub(crate) fn require_remote_agent_access_s0_mutation_unfrozen_v2(
+        &self,
+    ) -> Result<(), ManagedFabricRuntimeError> {
+        if self.remote_agent_access_s0_mutation_frozen_v2 {
+            Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Retains the one pre-effect PXRS v2 absent lease produced by this core's
     /// already-open store. Any existing final is rejected by the caller before
     /// core construction and therefore can never enter this owner.
@@ -781,6 +815,76 @@ impl ManagedFabricRuntimeCore {
         }
         self.remote_agent_access_startup_v2 = Some(startup);
         Ok(())
+    }
+
+    /// Consumes the retained absent lease and publishes the sequence-one PXRS
+    /// v2 final through the sole store writer. Exact success latches S0 before
+    /// the same-epoch lease can escape. OutcomeUncertain also latches before
+    /// return because publication may have occurred.
+    ///
+    /// Rejected and ProvenNotCommitted do not claim a commit and therefore do
+    /// not latch. The store API consumes the absent lease on every attempt;
+    /// even when it returns the candidate, retry requires reopening the store
+    /// and obtaining a fresh startup adjudication rather than recreating the
+    /// consumed lease in memory.
+    pub(crate) fn initialize_remote_agent_access_and_latch_v2(
+        &mut self,
+        candidate: RemoteAgentAccessSnapshotV2,
+    ) -> Result<RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessInitializeCommitErrorV2> {
+        let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
+        let result = self
+            .store
+            .initialize_remote_agent_access_v2(absent, candidate);
+        self.finish_remote_agent_access_initialization_v2(result)
+    }
+
+    fn take_remote_agent_access_absent_lease_v2(
+        &mut self,
+        candidate: RemoteAgentAccessSnapshotV2,
+    ) -> Result<
+        (RemoteAgentAccessAbsentLeaseV2, RemoteAgentAccessSnapshotV2),
+        RemoteAgentAccessInitializeCommitErrorV2,
+    > {
+        match self.remote_agent_access_startup_v2.take() {
+            Some(RemoteAgentAccessStartupSlotV2::Absent(absent)) => Ok((absent, candidate)),
+            Some(startup) => {
+                self.remote_agent_access_startup_v2 = Some(startup);
+                Err(RemoteAgentAccessCommitErrorV2::Rejected {
+                    cause: ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
+                    candidate: Box::new(candidate),
+                })
+            }
+            None => Err(RemoteAgentAccessCommitErrorV2::Rejected {
+                cause: ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
+                candidate: Box::new(candidate),
+            }),
+        }
+    }
+
+    fn finish_remote_agent_access_initialization_v2(
+        &mut self,
+        result: Result<RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessInitializeCommitErrorV2>,
+    ) -> Result<RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessInitializeCommitErrorV2> {
+        if matches!(
+            &result,
+            Ok(_) | Err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain(_))
+        ) {
+            self.latch_remote_agent_access_s0_mutation_freeze_v2();
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn initialize_remote_agent_access_and_latch_at_failpoint_v2(
+        &mut self,
+        candidate: RemoteAgentAccessSnapshotV2,
+        failpoint: crate::runtime_store::RemoteAgentAccessCommitFailpointV2,
+    ) -> Result<RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessInitializeCommitErrorV2> {
+        let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
+        let result = self
+            .store
+            .initialize_remote_agent_access_v2_at_failpoint(absent, candidate, failpoint);
+        self.finish_remote_agent_access_initialization_v2(result)
     }
 
     /// After the first PXAR-v7 marker has been durably published and exactly
@@ -812,6 +916,7 @@ impl ManagedFabricRuntimeCore {
             }
             startup @ RemoteAgentAccessStartupSlotV2::SameEpoch(_) => {
                 self.remote_agent_access_startup_v2 = Some(startup);
+                self.latch_remote_agent_access_s0_mutation_freeze_v2();
                 Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
             }
             startup @ RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
@@ -2556,6 +2661,7 @@ mod tests {
     use paraegox_kernel::time::{BoundedDuration, ClockGeneration, ClockReading};
     use paraegox_runtime_contracts::apply::{ExpectedActive, RuntimeApplyControl};
     use paraegox_runtime_contracts::assignment::BindingId;
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::DistributedFabricSessionEpochV1;
     use paraegox_runtime_contracts::managed_agent_stack_plan::{
         ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderProfileV1,
         ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1, ManagedAgentSemanticLimitsV1,
@@ -2572,6 +2678,9 @@ mod tests {
         ManagedServiceSpecV1,
     };
     use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
+    use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+        RemoteAgentActiveS1CasV2, RemoteAgentRetainedS0CasFieldsV2, RemoteAgentRetainedS0CasV2,
+    };
     use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
     use tokio::sync::{Barrier, RwLock};
     use tokio::time::Instant;
@@ -2588,12 +2697,19 @@ mod tests {
         ManagedAgentAssembly, ManagedAgentAssemblyError, RuntimeAgentConversationError,
     };
     use crate::managed_agent_transport::AgentConversationPortDescriptorV1;
+    use crate::remote_agent_access_state::{
+        RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
+        RemoteAgentAccessStaticIdentityPinsV2,
+    };
     use crate::runtime_agent_provider::{
         RuntimeAgentProviderResolveError, RuntimeAgentProviderResolverV1,
         RuntimeResolvedAgentProviderV1,
     };
     use crate::runtime_clock::RuntimeClock;
-    use crate::runtime_store::{ManagedFabricStore, tests::managed_fabric_store_fixture};
+    use crate::runtime_store::{
+        ManagedFabricStore, RemoteAgentAccessCommitErrorV2, RemoteAgentAccessCommitFailpointV2,
+        tests::managed_fabric_store_fixture,
+    };
 
     const FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s7_managed_fabric_successor_v1.json");
@@ -2625,6 +2741,13 @@ mod tests {
         );
         assert!(gate.contains("RemoteAgentAccessSameEpochFrozen"));
         assert!(gate.contains("RemoteAgentAccessReconcileRequired"));
+        assert!(
+            gate.find("self.latch_remote_agent_access_s0_mutation_freeze_v2();")
+                .expect("same-epoch branch must latch the core")
+                < gate
+                    .find("Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)")
+                    .expect("same-epoch typed error disappeared")
+        );
         assert!(!gate.contains("start_agent"));
         assert!(!gate.contains("prepare_agent_provider"));
     }
@@ -2817,6 +2940,186 @@ mod tests {
         )
         .expect("managed-fabric core must initialize");
         (directory, core)
+    }
+
+    fn remote_agent_access_static_identity_v2(
+        projection: &ManagedFabricManifestProjectionV1,
+    ) -> RemoteAgentAccessStaticIdentityPinsV2 {
+        RemoteAgentAccessStaticIdentityPinsV2 {
+            target: projection.target(),
+            store_instance_id: [STORE_BYTE; 32],
+            owner_target_fingerprint: Digest32::from_bytes([TARGET_FINGERPRINT_BYTE; 32]),
+            transition_projection_digest: transition_projection_digest(projection)
+                .expect("PXRS2 transition projection digest must build"),
+        }
+    }
+
+    fn remote_agent_access_initial_snapshot_v2(
+        projection: &ManagedFabricManifestProjectionV1,
+        runtime_host_epoch: u64,
+    ) -> RemoteAgentAccessSnapshotV2 {
+        let generation = ManagedServiceGeneration::try_new(5)
+            .unwrap_or_else(|error| panic!("PXRS2 generation fixture rejected: {error}"));
+        let retained_s0_cas =
+            RemoteAgentRetainedS0CasV2::try_new(RemoteAgentRetainedS0CasFieldsV2 {
+                expected_active_pxft_digest: Digest32::from_bytes([0x41; 32]),
+                expected_active_pxst_digest: Digest32::from_bytes([0x42; 32]),
+                expected_descriptor_evidence_record_digest: Digest32::from_bytes([0x43; 32]),
+                expected_descriptor_evidence_record_sequence: 3,
+                expected_descriptor_receipt_digest: Digest32::from_bytes([0x44; 32]),
+                expected_descriptor_payload_digest: Digest32::from_bytes([0x45; 32]),
+                expected_fabric_session_epoch: DistributedFabricSessionEpochV1::try_from_bytes(
+                    [0x46; 16],
+                )
+                .unwrap_or_else(|error| panic!("PXRS2 Fabric epoch rejected: {error}")),
+                expected_fabric_generation: generation,
+                expected_agent_generation: generation,
+            })
+            .unwrap_or_else(|error| panic!("PXRS2 retained S0 fixture rejected: {error}"));
+        let static_identity = remote_agent_access_static_identity_v2(projection);
+        RemoteAgentAccessSnapshotV2::try_initialize_absent(
+            RemoteAgentAccessSnapshotIdentityPinsV2 {
+                target: static_identity.target,
+                store_instance_id: static_identity.store_instance_id,
+                owner_target_fingerprint: static_identity.owner_target_fingerprint,
+                transition_projection_digest: static_identity.transition_projection_digest,
+                lower_capability_projection_digest: Digest32::from_bytes([0x47; 32]),
+            },
+            runtime_host_epoch,
+            retained_s0_cas,
+            RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                .unwrap_or_else(|error| panic!("PXRS2 absent S1 CAS rejected: {error}")),
+            31,
+            32,
+        )
+        .unwrap_or_else(|error| panic!("initial PXRS2 fixture rejected: {error}"))
+    }
+
+    fn retain_remote_agent_access_absent_startup_v2(core: &mut ManagedFabricRuntimeCore) {
+        core.store
+            .initialize_managed_agent_stack(
+                Digest32::from_bytes([0x48; 32]),
+                b"core-freeze-agent-stack-initial",
+            )
+            .unwrap_or_else(|error| panic!("Agent-stack cutover fixture failed: {error}"));
+        core.adjudicate_remote_agent_access_after_first_stack_marker_v2()
+            .unwrap_or_else(|error| panic!("absent PXRS2 startup rejected: {error}"));
+        assert!(!core.remote_agent_access_s0_mutation_frozen_v2());
+    }
+
+    #[test]
+    fn exact_pxrs2_initialize_latches_core_before_returning_same_epoch_lease() {
+        let (_directory, mut core) = fresh_core(1, 3);
+        retain_remote_agent_access_absent_startup_v2(&mut core);
+        let candidate = remote_agent_access_initial_snapshot_v2(&core.projection, 1);
+        let expected_wire = candidate.canonical_wire().to_vec();
+        let expected_digest = candidate.snapshot_digest();
+
+        let committed = core
+            .initialize_remote_agent_access_and_latch_v2(candidate)
+            .expect("exact PXRS2 initialize/readback must pass");
+
+        assert!(core.remote_agent_access_s0_mutation_frozen_v2());
+        assert!(matches!(
+            core.require_remote_agent_access_s0_mutation_unfrozen_v2(),
+            Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+        ));
+        assert_eq!(committed.canonical_wire(), expected_wire);
+        assert_eq!(committed.snapshot().snapshot_digest(), expected_digest);
+    }
+
+    #[test]
+    fn same_epoch_pxrs2_adjudication_latches_core_before_typed_error() {
+        let projection = projection();
+        let projection_digest = transition_projection_digest(&projection)
+            .expect("PXRS2 transition projection digest must build");
+        let (directory, mut store) =
+            managed_fabric_store_fixture(STORE_BYTE, TARGET_FINGERPRINT_BYTE, projection_digest);
+        store
+            .initialize_managed_agent_stack(
+                Digest32::from_bytes([0x49; 32]),
+                b"same-epoch-agent-stack-initial",
+            )
+            .unwrap_or_else(|error| panic!("Agent-stack cutover fixture failed: {error}"));
+        let absent = match store
+            .adjudicate_remote_agent_access_startup_v2(
+                remote_agent_access_static_identity_v2(&projection),
+                1,
+            )
+            .expect("missing PXRS2 final must adjudicate absent")
+        {
+            crate::runtime_store::RemoteAgentAccessStartupSlotV2::Absent(absent) => absent,
+            crate::runtime_store::RemoteAgentAccessStartupSlotV2::SameEpoch(_)
+            | crate::runtime_store::RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
+                panic!("fresh PXRS2 fixture was not absent")
+            }
+        };
+        store
+            .initialize_remote_agent_access_v2(
+                absent,
+                remote_agent_access_initial_snapshot_v2(&projection, 1),
+            )
+            .expect("same-epoch PXRS2 fixture must commit");
+        drop(store);
+
+        let reopened = ManagedFabricStore::open_fixture(
+            directory.path(),
+            [STORE_BYTE; 32],
+            Digest32::from_bytes([TARGET_FINGERPRINT_BYTE; 32]),
+            projection_digest,
+        )
+        .expect("same-epoch PXRS2 store must reopen");
+        let mut core = ManagedFabricRuntimeCore::from_preopened_store(
+            reopened,
+            config(directory.path(), projection, 1, clock(3, 100)),
+        )
+        .expect("same-epoch PXRS2 core must initialize");
+
+        assert!(matches!(
+            core.adjudicate_remote_agent_access_after_first_stack_marker_v2(),
+            Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+        ));
+        assert!(core.remote_agent_access_s0_mutation_frozen_v2());
+        assert!(matches!(
+            core.require_remote_agent_access_s0_mutation_unfrozen_v2(),
+            Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+        ));
+    }
+
+    #[test]
+    fn uncertain_pxrs2_initialize_latches_but_known_no_commit_does_not() {
+        let (_directory, mut uncertain) = fresh_core(1, 3);
+        retain_remote_agent_access_absent_startup_v2(&mut uncertain);
+        let uncertain_candidate = remote_agent_access_initial_snapshot_v2(&uncertain.projection, 1);
+        assert!(matches!(
+            uncertain.initialize_remote_agent_access_and_latch_at_failpoint_v2(
+                uncertain_candidate,
+                RemoteAgentAccessCommitFailpointV2::AfterRenameBeforeDirectorySync,
+            ),
+            Err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain(_))
+        ));
+        assert!(uncertain.remote_agent_access_s0_mutation_frozen_v2());
+
+        let (_directory, mut proven_not_committed) = fresh_core(1, 3);
+        retain_remote_agent_access_absent_startup_v2(&mut proven_not_committed);
+        let retry_candidate =
+            remote_agent_access_initial_snapshot_v2(&proven_not_committed.projection, 1);
+        assert!(matches!(
+            proven_not_committed.initialize_remote_agent_access_and_latch_at_failpoint_v2(
+                retry_candidate,
+                RemoteAgentAccessCommitFailpointV2::BeforeTempSync,
+            ),
+            Err(RemoteAgentAccessCommitErrorV2::ProvenNotCommitted { .. })
+        ));
+        assert!(!proven_not_committed.remote_agent_access_s0_mutation_frozen_v2());
+
+        let (_directory, mut rejected) = fresh_core(1, 3);
+        let rejected_candidate = remote_agent_access_initial_snapshot_v2(&rejected.projection, 1);
+        assert!(matches!(
+            rejected.initialize_remote_agent_access_and_latch_v2(rejected_candidate),
+            Err(RemoteAgentAccessCommitErrorV2::Rejected { .. })
+        ));
+        assert!(!rejected.remote_agent_access_s0_mutation_frozen_v2());
     }
 
     fn agent_stack_execution(
