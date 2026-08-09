@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    future::{Future, IntoFuture},
+    future::IntoFuture,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -23,12 +23,12 @@ use paraegox_fabric::{
 use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
 use paraegox_runtime_contracts::assignment::{BindingId, SchemaRef};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::Instant,
 };
 use zenoh::{
-    query::{ConsolidationMode, Query, QueryTarget, Queryable, ReplyKeyExpr},
+    query::{ConsolidationMode, Querier, Query, QueryTarget, Queryable, ReplyKeyExpr},
     sample::SampleKind,
     session::LinkEvent,
 };
@@ -43,7 +43,9 @@ const PROXY_QUEUE_CAPACITY: usize = 1;
 const MAX_TEST_FRAME_BYTES: usize = 4_096;
 const REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES: usize = 1_114_220;
 const OPERATION_BUDGET: Duration = Duration::from_secs(5);
+const QUERY_BUDGET: Duration = Duration::from_secs(4);
 const DENIED_QUERY_BUDGET: Duration = Duration::from_millis(750);
+const IN_FLIGHT_STOP_BODY: &[u8] = b"proxy-stop-after-downstream-admission";
 
 struct TestDirectory(PathBuf);
 
@@ -69,11 +71,18 @@ impl TestDirectory {
     fn path(&self) -> &Path {
         &self.0
     }
+
+    fn remove(&mut self) {
+        fs::remove_dir_all(&self.0).expect("remove private proxy test directory");
+        assert!(!self.0.exists());
+    }
 }
 
 impl Drop for TestDirectory {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if self.0.exists() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -434,14 +443,90 @@ async fn install_counting_binding(
     marker: u8,
     route: &str,
 ) -> (PortBinding, Arc<AtomicUsize>, JoinHandle<()>) {
-    let installed = service
-        .install_request_response_binding(binding_spec(marker, route))
-        .await
-        .expect("install proxy target binding");
+    let installed = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        service.install_request_response_binding(binding_spec(marker, route)),
+        "install proxy target binding",
+    )
+    .await
+    .expect("install proxy target binding");
     let (binding, requests) = installed.into_parts();
     let callbacks = Arc::new(AtomicUsize::new(0));
     let handler = spawn_echo_handler(requests, Arc::clone(&callbacks));
     (binding, callbacks, handler)
+}
+
+async fn install_gated_binding(
+    service: &mut FabricService,
+    marker: u8,
+    route: &str,
+) -> (
+    PortBinding,
+    Arc<AtomicUsize>,
+    JoinHandle<()>,
+    oneshot::Receiver<()>,
+    watch::Sender<bool>,
+    oneshot::Receiver<bool>,
+) {
+    let installed = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        service.install_request_response_binding(binding_spec(marker, route)),
+        "install gated proxy target binding",
+    )
+    .await
+    .expect("install gated proxy target binding");
+    let (binding, mut requests) = installed.into_parts();
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let handler_callbacks = Arc::clone(&callbacks);
+    let (entered_sender, entered_receiver) = oneshot::channel();
+    let (release_sender, mut release_receiver) = watch::channel(false);
+    let (completed_sender, completed_receiver) = oneshot::channel();
+    let handler = tokio::spawn(async move {
+        let mut entered_sender = Some(entered_sender);
+        let mut completed_sender = Some(completed_sender);
+        while let Some(request) = requests.recv().await {
+            handler_callbacks.fetch_add(1, Ordering::SeqCst);
+            let body = request.body().to_vec();
+            if body == IN_FLIGHT_STOP_BODY {
+                entered_sender
+                    .take()
+                    .expect("only one gated request is admitted")
+                    .send(())
+                    .expect("in-flight observer remains live");
+                finish_before(
+                    deadline_after(OPERATION_BUDGET),
+                    async {
+                        while !*release_receiver.borrow() {
+                            release_receiver
+                                .changed()
+                                .await
+                                .expect("in-flight release owner remains live");
+                        }
+                    },
+                    "release admitted downstream request",
+                )
+                .await;
+                let responder_was_closed = request.respond(HandlerResponse::Ok(body)).is_err();
+                completed_sender
+                    .take()
+                    .expect("only one gated request completes")
+                    .send(responder_was_closed)
+                    .expect("in-flight completion observer remains live");
+            } else {
+                request
+                    .respond(HandlerResponse::Ok(body))
+                    .expect("ordinary proxy target response receiver remains live");
+            }
+        }
+    });
+    (
+        binding,
+        callbacks,
+        handler,
+        entered_receiver,
+        release_sender,
+        completed_receiver,
+    )
 }
 
 fn spawn_echo_handler(
@@ -461,12 +546,15 @@ fn spawn_echo_handler(
 
 struct ProxyRouteIngress {
     route: Arc<str>,
-    sender: mpsc::Sender<Query>,
+    sender: mpsc::Sender<AdmittedQuery>,
+    observed: Arc<AtomicUsize>,
     admitted: Arc<AtomicUsize>,
+    admission_signal: watch::Sender<usize>,
 }
 
 impl ProxyRouteIngress {
     fn offer(&self, query: Query) {
+        self.observed.fetch_add(1, Ordering::SeqCst);
         let Some(payload) = query.payload() else {
             return;
         };
@@ -478,10 +566,19 @@ impl ProxyRouteIngress {
         {
             return;
         }
-        if self.sender.try_send(query).is_ok() {
-            self.admitted.fetch_add(1, Ordering::SeqCst);
+        let Some(deadline) = Instant::now().checked_add(OPERATION_BUDGET) else {
+            return;
+        };
+        if self.sender.try_send(AdmittedQuery { query, deadline }).is_ok() {
+            let admitted = self.admitted.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.admission_signal.send_replace(admitted);
         }
     }
+}
+
+struct AdmittedQuery {
+    query: Query,
+    deadline: Instant,
 }
 
 struct TestProxyGateway {
@@ -489,6 +586,8 @@ struct TestProxyGateway {
     queryables: [Option<Queryable<()>>; 2],
     cancel: watch::Sender<bool>,
     workers: [Option<JoinHandle<()>>; 2],
+    admission_observers: [watch::Receiver<usize>; 2],
+    observed: [Arc<AtomicUsize>; 2],
     admitted: [Arc<AtomicUsize>; 2],
     forwarded: [Arc<AtomicUsize>; 2],
 }
@@ -505,13 +604,18 @@ impl TestProxyGateway {
             .await
             .expect("raw TLS proxy session must open");
         let (cancel, cancel_receiver) = watch::channel(false);
+        let observed = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
         let admitted = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
         let forwarded = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let (submit_admission_signal, submit_admission_observer) = watch::channel(0);
+        let (control_admission_signal, control_admission_observer) = watch::channel(0);
         let (submit_sender, submit_receiver) = mpsc::channel(PROXY_QUEUE_CAPACITY);
         let submit_ingress = ProxyRouteIngress {
             route: Arc::from(SUBMIT_ROUTE),
             sender: submit_sender,
+            observed: Arc::clone(&observed[0]),
             admitted: Arc::clone(&admitted[0]),
+            admission_signal: submit_admission_signal,
         };
         let submit_queryable = finish_before(
             deadline,
@@ -526,7 +630,9 @@ impl TestProxyGateway {
         let control_ingress = ProxyRouteIngress {
             route: Arc::from(CONTROL_ROUTE),
             sender: control_sender,
+            observed: Arc::clone(&observed[1]),
             admitted: Arc::clone(&admitted[1]),
+            admission_signal: control_admission_signal,
         };
         let control_queryable = finish_before(
             deadline,
@@ -558,6 +664,8 @@ impl TestProxyGateway {
             queryables: [Some(submit_queryable), Some(control_queryable)],
             cancel,
             workers: [Some(submit_worker), Some(control_worker)],
+            admission_observers: [submit_admission_observer, control_admission_observer],
+            observed,
             admitted,
             forwarded,
         }
@@ -573,10 +681,30 @@ impl TestProxyGateway {
             .map(|count| count.load(Ordering::SeqCst))
     }
 
+    fn observed(&self) -> [usize; 2] {
+        self.observed
+            .each_ref()
+            .map(|count| count.load(Ordering::SeqCst))
+    }
+
     fn forwarded(&self) -> [usize; 2] {
         self.forwarded
             .each_ref()
             .map(|count| count.load(Ordering::SeqCst))
+    }
+
+    async fn wait_for_admitted(&mut self, route_index: usize, expected: usize) {
+        let observer = &mut self.admission_observers[route_index];
+        while *observer.borrow() < expected {
+            finish_before(
+                deadline_after(OPERATION_BUDGET),
+                observer.changed(),
+                "wait for proxy admission evidence",
+            )
+            .await
+            .expect("proxy admission observer remains live");
+        }
+        assert_eq!(*observer.borrow(), expected);
     }
 
     async fn shutdown(mut self, deadline: Instant) {
@@ -607,12 +735,12 @@ async fn run_proxy_forwarder(
     fabric: Arc<FabricService>,
     binding: PortBinding,
     route: Arc<str>,
-    mut receiver: mpsc::Receiver<Query>,
+    mut receiver: mpsc::Receiver<AdmittedQuery>,
     mut cancel: watch::Receiver<bool>,
     forwarded: Arc<AtomicUsize>,
 ) {
     loop {
-        let query = tokio::select! {
+        let admitted = tokio::select! {
             biased;
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
@@ -620,12 +748,20 @@ async fn run_proxy_forwarder(
                 }
                 continue;
             }
-            query = receiver.recv() => match query {
-                Some(query) => query,
+            admitted = receiver.recv() => match admitted {
+                Some(admitted) => admitted,
                 None => break,
             }
         };
-        forward_one_query(&fabric, &binding, &route, query, &mut cancel, &forwarded).await;
+        forward_one_query(
+            &fabric,
+            &binding,
+            &route,
+            admitted,
+            &mut cancel,
+            &forwarded,
+        )
+        .await;
     }
 }
 
@@ -633,11 +769,11 @@ async fn forward_one_query(
     fabric: &FabricService,
     binding: &PortBinding,
     route: &str,
-    query: Query,
+    admitted: AdmittedQuery,
     cancel: &mut watch::Receiver<bool>,
     forwarded: &AtomicUsize,
 ) {
-    let deadline = deadline_after(OPERATION_BUDGET);
+    let AdmittedQuery { query, deadline } = admitted;
     let Some(payload) = query.payload() else {
         return;
     };
@@ -705,10 +841,18 @@ fn request_frame(binding: &PortBinding, marker: u8, body: &[u8]) -> Vec<u8> {
     .encode()
 }
 
+#[derive(Debug)]
 enum RawQueryOutcome {
     Response(BindingResponseEnvelopeV1),
     RemoteError,
-    NoReply,
+    DeclareFailed,
+    MatchingFailed,
+    GetFailed,
+    ReplyChannelClosed,
+    TimedOut,
+    DecodeFailed,
+    ResponseRouteMismatch,
+    CleanupFailed,
 }
 
 async fn raw_query_once(
@@ -716,77 +860,156 @@ async fn raw_query_once(
     route: &str,
     payload: Vec<u8>,
     wait_for_match: bool,
-    deadline: Instant,
+    query_deadline: Instant,
+    overall_deadline: Instant,
 ) -> RawQueryOutcome {
-    let timeout = remaining_budget(deadline);
-    let querier = match finish_before(
-        deadline,
+    assert!(query_deadline < overall_deadline);
+    let timeout = remaining_budget(query_deadline);
+    let querier = match tokio::time::timeout_at(
+        query_deadline,
         session
             .declare_querier(route.to_owned())
             .target(QueryTarget::BestMatching)
             .accept_replies(ReplyKeyExpr::MatchingQuery)
             .consolidation(ConsolidationMode::None)
             .timeout(timeout),
-        "declare raw client querier",
     )
     .await
     {
-        Ok(querier) => querier,
-        Err(_) => return RawQueryOutcome::NoReply,
+        Ok(Ok(querier)) => querier,
+        Ok(Err(_)) => return RawQueryOutcome::DeclareFailed,
+        Err(_) => return RawQueryOutcome::TimedOut,
     };
     if wait_for_match {
-        let matching_listener = finish_before(
-            deadline,
+        let matching_listener = match tokio::time::timeout_at(
+            query_deadline,
             querier.matching_listener(),
-            "declare raw matching listener",
         )
         .await
-        .expect("raw matching listener must declare");
-        let mut matching = finish_before(
-            deadline,
+        {
+            Ok(Ok(listener)) => listener,
+            Ok(Err(_)) => {
+                return finish_raw_query(
+                    querier,
+                    RawQueryOutcome::MatchingFailed,
+                    overall_deadline,
+                )
+                .await;
+            }
+            Err(_) => {
+                return finish_raw_query(querier, RawQueryOutcome::TimedOut, overall_deadline)
+                    .await;
+            }
+        };
+        let mut matching = match tokio::time::timeout_at(
+            query_deadline,
             querier.matching_status(),
-            "read raw matching status",
         )
         .await
-        .expect("raw matching status must read")
-        .matching();
+        {
+            Ok(Ok(status)) => status.matching(),
+            Ok(Err(_)) => {
+                drop(matching_listener);
+                return finish_raw_query(
+                    querier,
+                    RawQueryOutcome::MatchingFailed,
+                    overall_deadline,
+                )
+                .await;
+            }
+            Err(_) => {
+                drop(matching_listener);
+                return finish_raw_query(
+                    querier,
+                    RawQueryOutcome::TimedOut,
+                    overall_deadline,
+                )
+                .await;
+            }
+        };
         while !matching {
-            matching = finish_before(
-                deadline,
+            matching = match tokio::time::timeout_at(
+                query_deadline,
                 matching_listener.recv_async(),
-                "wait for exact proxy queryable",
             )
             .await
-            .expect("raw matching listener must remain live")
-            .matching();
+            {
+                Ok(Ok(status)) => status.matching(),
+                Ok(Err(_)) => {
+                    drop(matching_listener);
+                    return finish_raw_query(
+                        querier,
+                        RawQueryOutcome::MatchingFailed,
+                        overall_deadline,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    drop(matching_listener);
+                    return finish_raw_query(
+                        querier,
+                        RawQueryOutcome::TimedOut,
+                        overall_deadline,
+                    )
+                    .await;
+                }
+            };
         }
         drop(matching_listener);
     }
-    let outcome = match tokio::time::timeout_at(deadline, querier.get().payload(payload)).await {
-        Ok(Ok(replies)) => match tokio::time::timeout_at(deadline, replies.recv_async()).await {
+    let outcome = match tokio::time::timeout_at(
+        query_deadline,
+        querier.get().payload(payload),
+    )
+    .await
+    {
+        Ok(Ok(replies)) => match tokio::time::timeout_at(
+            query_deadline,
+            replies.recv_async(),
+        )
+        .await
+        {
             Ok(Ok(reply)) => match reply.into_result() {
                 Ok(sample) => {
-                    let bytes = sample.payload().to_bytes();
-                    match BindingResponseEnvelopeV1::decode(bytes.as_ref(), MAX_TEST_FRAME_BYTES) {
-                        Ok(response) => RawQueryOutcome::Response(response),
-                        Err(_) => RawQueryOutcome::RemoteError,
+                    if sample.key_expr().as_str() != route {
+                        RawQueryOutcome::ResponseRouteMismatch
+                    } else {
+                        let bytes = sample.payload().to_bytes();
+                        match BindingResponseEnvelopeV1::decode(
+                            bytes.as_ref(),
+                            MAX_TEST_FRAME_BYTES,
+                        ) {
+                            Ok(response) => RawQueryOutcome::Response(response),
+                            Err(_) => RawQueryOutcome::DecodeFailed,
+                        }
                     }
                 }
                 Err(_) => RawQueryOutcome::RemoteError,
             },
-            Ok(Err(_)) | Err(_) => RawQueryOutcome::NoReply,
+            Ok(Err(_)) => RawQueryOutcome::ReplyChannelClosed,
+            Err(_) => RawQueryOutcome::TimedOut,
         },
-        Ok(Err(_)) | Err(_) => RawQueryOutcome::NoReply,
+        Ok(Err(_)) => RawQueryOutcome::GetFailed,
+        Err(_) => RawQueryOutcome::TimedOut,
     };
-    let cleanup_deadline = deadline_after(OPERATION_BUDGET);
-    finish_before(
-        cleanup_deadline,
+    finish_raw_query(querier, outcome, overall_deadline).await
+}
+
+async fn finish_raw_query(
+    querier: Querier<'static>,
+    outcome: RawQueryOutcome,
+    overall_deadline: Instant,
+) -> RawQueryOutcome {
+    match finish_before(
+        overall_deadline,
         querier.undeclare(),
         "undeclare raw querier",
     )
     .await
-    .expect("raw querier must undeclare");
-    outcome
+    {
+        Ok(()) => outcome,
+        Err(_) => RawQueryOutcome::CleanupFailed,
+    }
 }
 
 async fn expect_remote_echo(
@@ -800,6 +1023,7 @@ async fn expect_remote_echo(
         binding.key_expression(),
         request_frame(binding, marker, body),
         true,
+        deadline_after(QUERY_BUDGET),
         deadline_after(OPERATION_BUDGET),
     )
     .await;
@@ -824,11 +1048,15 @@ async fn expect_denied_route(
         request_frame(payload_binding, marker, b"must-not-arrive"),
         false,
         deadline_after(DENIED_QUERY_BUDGET),
+        deadline_after(OPERATION_BUDGET),
     )
     .await;
     assert!(
-        !matches!(outcome, RawQueryOutcome::Response(_)),
-        "route {route} unexpectedly crossed the exact proxy ACL"
+        matches!(
+            &outcome,
+            RawQueryOutcome::ReplyChannelClosed | RawQueryOutcome::TimedOut
+        ),
+        "route {route} denial used an unexpected outcome: {outcome:?}"
     );
 }
 
@@ -881,36 +1109,34 @@ fn assert_port_released(address: SocketAddrV4) {
     drop(listener);
 }
 
-fn spawn_link_event_listener(
+async fn spawn_link_event_listener(
     session: &zenoh::Session,
     deadline: Instant,
-) -> impl Future<
-    Output = (
-        zenoh::session::LinkEventsListener<()>,
-        mpsc::Receiver<LinkEvent>,
-    ),
-> + '_ {
-    async move {
-        let (sender, receiver) = mpsc::channel(4);
-        let listener = finish_before(
-            deadline,
-            session
-                .info()
-                .link_events_listener()
-                .history(true)
-                .callback(move |event| {
-                    let _ = sender.try_send(event);
-                }),
-            "declare raw proxy link observer",
-        )
-        .await
-        .expect("raw proxy link observer must declare");
-        (listener, receiver)
-    }
+) -> (
+    zenoh::session::LinkEventsListener<()>,
+    mpsc::UnboundedReceiver<LinkEvent>,
+) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let listener = finish_before(
+        deadline,
+        session
+            .info()
+            .link_events_listener()
+            .history(true)
+            .callback(move |event| {
+                sender
+                    .send(event)
+                    .expect("raw proxy link observer remains live");
+            }),
+        "declare raw proxy link observer",
+    )
+    .await
+    .expect("raw proxy link observer must declare");
+    (listener, receiver)
 }
 
 async fn expect_link_event(
-    receiver: &mut mpsc::Receiver<LinkEvent>,
+    receiver: &mut mpsc::UnboundedReceiver<LinkEvent>,
     kind: SampleKind,
     expected_common_name: &str,
 ) {
@@ -929,6 +1155,85 @@ async fn expect_link_event(
     assert!(!event.link().dst().as_str().starts_with("tcp/"));
 }
 
+fn assert_no_queued_link_event(receiver: &mut mpsc::UnboundedReceiver<LinkEvent>) {
+    assert!(
+        matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ),
+        "unexpected extra raw proxy link event"
+    );
+}
+
+async fn assert_single_live_tls_link(
+    session: &zenoh::Session,
+    expected_common_name: &str,
+) {
+    let links = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        session.info().links(),
+        "observe one live TLS link",
+    )
+    .await
+    .collect::<Vec<_>>();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].auth_identifier(), Some(expected_common_name));
+    assert!(links[0].src().as_str().starts_with("tls/"));
+    assert!(links[0].dst().as_str().starts_with("tls/"));
+    assert!(!links[0].src().as_str().starts_with("tcp/"));
+    assert!(!links[0].dst().as_str().starts_with("tcp/"));
+}
+
+async fn assert_route_has_no_matching_queryable(session: &zenoh::Session, route: &str) {
+    let overall_deadline = deadline_after(OPERATION_BUDGET);
+    let querier = finish_before(
+        overall_deadline,
+        session
+            .declare_querier(route.to_owned())
+            .target(QueryTarget::BestMatching)
+            .accept_replies(ReplyKeyExpr::MatchingQuery)
+            .consolidation(ConsolidationMode::None)
+            .timeout(DENIED_QUERY_BUDGET),
+        "declare forbidden-route matching observer",
+    )
+    .await
+    .expect("forbidden-route matching observer must declare");
+    let matching = finish_before(
+        overall_deadline,
+        querier.matching_status(),
+        "read forbidden-route matching status",
+    )
+    .await
+    .expect("forbidden-route matching status must read")
+    .matching();
+    assert!(!matching, "forbidden route {route} was advertised to S2");
+    finish_before(
+        overall_deadline,
+        querier.undeclare(),
+        "undeclare forbidden-route matching observer",
+    )
+    .await
+    .expect("forbidden-route matching observer must undeclare");
+}
+
+async fn declare_forbidden_canary(
+    session: &zenoh::Session,
+    route: &str,
+    callbacks: Arc<AtomicUsize>,
+) -> Queryable<()> {
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        session
+            .declare_queryable(route.to_owned())
+            .callback(move |_| {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+            }),
+        "declare forbidden route canary",
+    )
+    .await
+    .expect("forbidden route canary must declare locally")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabric_link() {
     let ubuntu_listener_principal = PrincipalRef::from_bytes([0x71; 16]);
@@ -937,7 +1242,7 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     let remote_ip = actual_non_loopback_ipv4();
     let s0_socket = SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_port(Ipv4Addr::LOCALHOST));
     let s1_socket = SocketAddrV4::new(remote_ip, available_port(remote_ip));
-    let directory = TestDirectory::new();
+    let mut directory = TestDirectory::new();
     let listener_common_name =
         restricted_runtime_apply_peer_certificate_common_name_v1(ubuntu_listener_principal);
     let correct_client_common_name =
@@ -954,18 +1259,29 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
 
     let s0_endpoint =
         SessionEndpoint::try_new(format!("tcp/{s0_socket}")).expect("S0 loopback endpoint");
-    let mut s0 = FabricService::start(
-        FabricServiceConfig::try_peer(vec![s0_endpoint], Vec::new()).expect("S0 peer config"),
+    let mut s0 = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        FabricService::start(
+            FabricServiceConfig::try_peer(vec![s0_endpoint], Vec::new())
+                .expect("S0 peer config"),
+        ),
+        "open S0 FabricService",
     )
     .await
     .expect("open S0 FabricService");
-    let (submit, submit_callbacks, submit_handler) =
-        install_counting_binding(&mut s0, 0x31, SUBMIT_ROUTE).await;
+    let (
+        submit,
+        submit_callbacks,
+        submit_handler,
+        in_flight_entered,
+        in_flight_release,
+        in_flight_completed,
+    ) = install_gated_binding(&mut s0, 0x31, SUBMIT_ROUTE).await;
     let (control, control_callbacks, control_handler) =
         install_counting_binding(&mut s0, 0x32, CONTROL_ROUTE).await;
     let s0 = Arc::new(s0);
 
-    let proxy = TestProxyGateway::start(
+    let mut proxy = TestProxyGateway::start(
         raw_remote_agent_config(
             RawRemoteAgentRole::Listener,
             s1_socket,
@@ -981,6 +1297,27 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     .await;
     assert_port_owned(s0_socket);
     assert_port_owned(s1_socket);
+    let forbidden_canary_callbacks = Arc::new(AtomicUsize::new(0));
+    let forbidden_canaries = [
+        declare_forbidden_canary(
+            proxy.session(),
+            SENTINEL_ROUTE,
+            Arc::clone(&forbidden_canary_callbacks),
+        )
+        .await,
+        declare_forbidden_canary(
+            proxy.session(),
+            PARENT_ROUTE,
+            Arc::clone(&forbidden_canary_callbacks),
+        )
+        .await,
+        declare_forbidden_canary(
+            proxy.session(),
+            CHILD_ROUTE,
+            Arc::clone(&forbidden_canary_callbacks),
+        )
+        .await,
+    ];
     let (link_listener, mut link_events) =
         spawn_link_event_listener(proxy.session(), deadline_after(OPERATION_BUDGET)).await;
 
@@ -1003,17 +1340,19 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
         &correct_client_common_name,
     )
     .await;
-    let links = proxy.session().info().links().await.collect::<Vec<_>>();
-    assert_eq!(links.len(), 1);
-    assert!(links[0].src().as_str().starts_with("tls/"));
-    assert!(links[0].dst().as_str().starts_with("tls/"));
+    assert_single_live_tls_link(proxy.session(), &correct_client_common_name).await;
+    assert_single_live_tls_link(&correct_client, &listener_common_name).await;
 
     expect_remote_echo(&correct_client, &submit, 0x51, b"remote-submit").await;
     expect_remote_echo(&correct_client, &control, 0x52, b"remote-control").await;
+    assert_eq!(proxy.observed(), [1, 1]);
     assert_eq!(proxy.admitted(), [1, 1]);
     assert_eq!(proxy.forwarded(), [1, 1]);
     assert_eq!(submit_callbacks.load(Ordering::SeqCst), 1);
     assert_eq!(control_callbacks.load(Ordering::SeqCst), 1);
+    for route in [SENTINEL_ROUTE, PARENT_ROUTE, CHILD_ROUTE] {
+        assert_route_has_no_matching_queryable(&correct_client, route).await;
+    }
 
     for (route, marker) in [
         (SENTINEL_ROUTE, 0x53),
@@ -1023,6 +1362,8 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     ] {
         expect_denied_route(&correct_client, route, &submit, marker).await;
     }
+    assert_eq!(forbidden_canary_callbacks.load(Ordering::SeqCst), 0);
+    assert_eq!(proxy.observed(), [1, 1]);
     assert_eq!(proxy.admitted(), [1, 1]);
     assert_eq!(proxy.forwarded(), [1, 1]);
     assert_eq!(submit_callbacks.load(Ordering::SeqCst), 1);
@@ -1056,8 +1397,15 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     .await
     .expect("same-CA wrong-CN S2 must complete real TLS open");
     expect_link_event(&mut link_events, SampleKind::Put, &wrong_client_common_name).await;
+    assert_single_live_tls_link(proxy.session(), &wrong_client_common_name).await;
+    assert_single_live_tls_link(&wrong_client, &listener_common_name).await;
+    assert_no_queued_link_event(&mut link_events);
     expect_denied_route(&wrong_client, SUBMIT_ROUTE, &submit, 0x57).await;
     expect_denied_route(&wrong_client, CONTROL_ROUTE, &control, 0x58).await;
+    assert_single_live_tls_link(proxy.session(), &wrong_client_common_name).await;
+    assert_single_live_tls_link(&wrong_client, &listener_common_name).await;
+    assert_no_queued_link_event(&mut link_events);
+    assert_eq!(proxy.observed(), [1, 1]);
     assert_eq!(proxy.admitted(), [1, 1]);
     assert_eq!(proxy.forwarded(), [1, 1]);
     finish_before(
@@ -1073,6 +1421,63 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
         &wrong_client_common_name,
     )
     .await;
+
+    let stop_client = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        zenoh::open(raw_remote_agent_config(
+            RawRemoteAgentRole::Connector,
+            s1_socket,
+            &pki,
+            &pki.correct_client,
+            ubuntu_listener_principal,
+        )),
+        "open correct-CN S2 for in-handler stop",
+    )
+    .await
+    .expect("in-handler stop S2 must complete real TLS open");
+    expect_link_event(
+        &mut link_events,
+        SampleKind::Put,
+        &correct_client_common_name,
+    )
+    .await;
+    assert_single_live_tls_link(proxy.session(), &correct_client_common_name).await;
+    let in_flight_session = stop_client.clone();
+    let in_flight_frame = request_frame(&submit, 0x59, IN_FLIGHT_STOP_BODY);
+    let in_flight_query = tokio::spawn(async move {
+        raw_query_once(
+            &in_flight_session,
+            SUBMIT_ROUTE,
+            in_flight_frame,
+            true,
+            deadline_after(QUERY_BUDGET),
+            deadline_after(OPERATION_BUDGET),
+        )
+        .await
+    });
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        in_flight_entered,
+        "observe request inside S0 handler",
+    )
+    .await
+    .expect("gated S0 handler must observe the request");
+    proxy.wait_for_admitted(0, 2).await;
+    assert_eq!(proxy.observed(), [2, 1]);
+    assert_eq!(proxy.admitted(), [2, 1]);
+    assert_eq!(proxy.forwarded(), [2, 1]);
+    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
+    assert_eq!(control_callbacks.load(Ordering::SeqCst), 1);
+
+    for canary in forbidden_canaries {
+        finish_before(
+            deadline_after(OPERATION_BUDGET),
+            canary.undeclare(),
+            "undeclare forbidden route canary",
+        )
+        .await
+        .expect("forbidden route canary must undeclare");
+    }
     finish_before(
         deadline_after(OPERATION_BUDGET),
         link_listener.undeclare(),
@@ -1082,10 +1487,43 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     .expect("raw proxy link observer must undeclare");
 
     proxy.shutdown(deadline_after(OPERATION_BUDGET)).await;
-    assert_port_released(s1_socket);
-    expect_local_echo(&s0, &submit, 0x61, b"local-after-proxy-stop").await;
+    in_flight_release
+        .send(true)
+        .expect("release the admitted S0 effect after proxy stop");
+    let responder_was_closed = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        in_flight_completed,
+        "complete admitted S0 effect after proxy stop",
+    )
+    .await
+    .expect("gated S0 effect must report completion");
+    assert!(
+        responder_was_closed,
+        "proxy stop must drop the downstream response receiver"
+    );
+    let in_flight_outcome = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        in_flight_query,
+        "join in-handler stop caller",
+    )
+    .await
+    .expect("in-handler stop caller task must join");
+    assert!(
+        matches!(&in_flight_outcome, RawQueryOutcome::RemoteError),
+        "in-handler stop caller used unexpected terminal: {in_flight_outcome:?}"
+    );
     assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
-    assert_eq!(control_callbacks.load(Ordering::SeqCst), 1);
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        stop_client.close(),
+        "close in-handler stop S2",
+    )
+    .await
+    .expect("in-handler stop S2 must close");
+    assert_port_released(s1_socket);
+    expect_local_echo(&s0, &control, 0x61, b"local-after-proxy-stop").await;
+    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
+    assert_eq!(control_callbacks.load(Ordering::SeqCst), 2);
 
     let s0 = Arc::try_unwrap(s0).unwrap_or_else(|_| panic!("proxy must release S0 FabricService"));
     finish_before(
@@ -1105,4 +1543,5 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
         .expect("S0 binding handler must join");
     }
     assert_port_released(s0_socket);
+    directory.remove();
 }
