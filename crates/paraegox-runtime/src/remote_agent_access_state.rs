@@ -281,8 +281,7 @@ impl RemoteAgentAuthorizedAccessSnapshotV1 {
                             != identity.fabric_owner_target_fingerprint
                         || previous.fabric_transition_projection_digest
                             != identity.fabric_transition_projection_digest
-                        || previous.runtime_host_epoch
-                            != outer.expected_runtime_host_epoch()
+                        || previous.runtime_host_epoch != outer.expected_runtime_host_epoch()
                         || previous.target != outer.target()
                         || prior_inner.operation_id() == inner.operation_id()
                     {
@@ -2422,11 +2421,10 @@ mod tests {
             RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady => {
                 let (fabric, agent) = local_generations.map_or_else(
                     || {
-                        let active = snapshot
-                            .predecessor
-                            .active
-                            .as_ref()
-                            .unwrap_or_else(|| panic!("LocalOnly predecessor must remain active"));
+                        let active =
+                            snapshot.predecessor.active.as_ref().unwrap_or_else(|| {
+                                panic!("LocalOnly predecessor must remain active")
+                            });
                         (active.fabric_generation, active.agent_generation)
                     },
                     |generations| generations,
@@ -2819,8 +2817,7 @@ mod tests {
             Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
         ));
 
-        let local =
-            prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        let local = prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
         let generations = local.snapshot().generations();
         let reading = clock_at(local.snapshot(), 2);
         assert!(matches!(
@@ -2848,8 +2845,7 @@ mod tests {
             Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
         ));
 
-        let local =
-            prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        let local = prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
         let generations = local.snapshot().generations();
         let remote_stop = effect_successor(
             local,
@@ -2983,8 +2979,8 @@ mod tests {
 
     #[test]
     fn local_only_authority_rejects_every_candidate_and_high_water_change() {
-        let initial = prepared(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate)
-            .generations();
+        let initial =
+            prepared(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate).generations();
         let access = next_generation(initial.access_generation_high_water);
         let fabric = next_generation(initial.fabric_generation_high_water);
         let agent = next_generation(initial.agent_generation_high_water);
@@ -3824,12 +3820,14 @@ mod tests {
             decoded.phase(),
             RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
         );
-        assert!(decoded
-            .request
-            .verify_controller_request(decoded.request.carrier(), |_, _, _, _, signature| {
-                signature == OUTER_SIGNATURE
-            })
-            .is_err());
+        assert!(
+            decoded
+                .request
+                .verify_controller_request(decoded.request.carrier(), |_, _, _, _, signature| {
+                    signature == OUTER_SIGNATURE
+                })
+                .is_err()
+        );
 
         assert!(!terminal_generation_is_known(
             Some(generation(1)),
