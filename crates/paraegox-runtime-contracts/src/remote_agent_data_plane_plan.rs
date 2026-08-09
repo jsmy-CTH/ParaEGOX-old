@@ -2456,6 +2456,8 @@ const TARGET_EXECUTION_V2_PROFILE_PRESENT: u8 = 1;
 const ACTIVE_S1_CAS_V2_PRESENT: u8 = 1;
 const ACTIVE_S1_CAS_V2_ABSENT: u8 = 0;
 const REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP: u8 = 0b11;
+const REMOTE_AGENT_PROXY_HARDENING_FEATURES_V2: u32 = 0b11_1111_1111_1111_1111;
+const REMOTE_AGENT_PROXY_HARDENING_PROFILE_V2: &[u8] = b"tls-listener=1;tls-connector=0;plaintext=0;acl=default-deny;routes=pxap-submit,pxap-control;scouting=0;admin=0;plugins=0;verify-name=1;verify-expiry=1;accept-pending=1;max-sessions=1;max-links=1;queue-per-route=1;workers-per-route=1;retry=0;deadline=single-admission-absolute-pxad-v1;shutdown=fence,drain,join,close";
 const TERMINAL_V2_EVIDENCE_KNOWN_FLAGS: u16 = 0b0111_1111;
 const TERMINAL_V2_RETAINED_S0_CENSUS_COMPLETE: u16 = 1;
 const TERMINAL_V2_RETAINED_S0_READY: u16 = 1 << 1;
@@ -2475,8 +2477,8 @@ const TERMINAL_V2_FIXED_BYTES: usize = 4
     + 8
     + 32
     + (3 * 9)
-    + 17
-    + (5 * 32)
+    + (2 * 17)
+    + (6 * 32)
     + (4 * 8)
     + 8
     + 8
@@ -2697,9 +2699,11 @@ impl RemoteAgentActiveS1CasV2 {
         owner_slot_revision: u64,
         active: Option<RemoteAgentActiveS1FieldsV2>,
     ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        if owner_slot_revision == 0 {
+            return Err(RemoteAgentDataPlanePlanError::InvalidBootstrapCas);
+        }
         if let Some(active) = active {
             if access_generation_high_water == 0
-                || owner_slot_revision == 0
                 || digest_is_zero(active.active_pxau_digest)
                 || digest_is_zero(active.active_request_digest)
                 || digest_is_zero(active.active_snapshot_digest)
@@ -2893,6 +2897,7 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32,
     builder.field_u16(RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive as u16)?;
     builder.field_u16(RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate as u16)?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_PROXY_ROUTE_COUNT_V2)?;
+    builder.field_bytes(&[REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP])?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_PROXY_QUEUE_CAPACITY_V2)?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_PROXY_WORKERS_PER_ROUTE_V2)?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_PROXY_MAX_PENDING_SESSIONS_V2)?;
@@ -2902,12 +2907,43 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32,
     builder.field_bytes(&MAX_MANAGED_AGENT_FRAME_BYTES.to_be_bytes())?;
     builder.field_bytes(&MAX_MANAGED_AGENT_RESPONSE_BODY_BYTES.to_be_bytes())?;
     builder.field_u64(MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS)?;
-    builder.field_bytes(b"s1-listener-only-tls")?;
-    builder.field_bytes(b"retained-pxap-submit-control")?;
-    builder.field_bytes(b"queue-one-worker-one-per-route")?;
-    builder.field_bytes(b"no-request-retry")?;
-    builder.field_bytes(b"admission-absolute-deadline-from-pxad-v1")?;
-    builder.field_bytes(b"fence-drain-join-close")?;
+    builder.field_bytes(&REMOTE_AGENT_PROXY_HARDENING_FEATURES_V2.to_be_bytes())?;
+    builder.field_bytes(REMOTE_AGENT_PROXY_HARDENING_PROFILE_V2)?;
+    builder.field_u16(TERMINAL_V2_EVIDENCE_KNOWN_FLAGS)?;
+    for phase in [
+        RemoteAgentDataPlaneTerminalPhaseV2::PreparedNoEffects,
+        RemoteAgentDataPlaneTerminalPhaseV2::S1OpenIntent,
+        RemoteAgentDataPlaneTerminalPhaseV2::QueryablesDeclareIntent,
+        RemoteAgentDataPlaneTerminalPhaseV2::ReadyObservation,
+        RemoteAgentDataPlaneTerminalPhaseV2::IngressFenceIntent,
+        RemoteAgentDataPlaneTerminalPhaseV2::DrainIntent,
+        RemoteAgentDataPlaneTerminalPhaseV2::S1CloseIntent,
+        RemoteAgentDataPlaneTerminalPhaseV2::LocalOnlyObservation,
+        RemoteAgentDataPlaneTerminalPhaseV2::QuarantineIntent,
+    ] {
+        builder.field_u16(phase as u16)?;
+    }
+    for outcome in [
+        RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady,
+        RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady,
+        RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected,
+        RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain,
+        RemoteAgentDataPlaneTerminalOutcomeV2::Quarantined,
+    ] {
+        builder.field_u16(outcome as u16)?;
+    }
+    builder.field_u16(RemoteAgentDataPlaneTerminalLifecycleEffectV2::ProvenNotStarted as u16)?;
+    builder.field_u16(RemoteAgentDataPlaneTerminalLifecycleEffectV2::MayHaveStarted as u16)?;
+    builder.field_u16(1)?;
+    builder.field_u16(2)?;
+    builder.field_u16(3)?;
+    builder.field_u16(RemoteAgentDataPlaneDrainOutcomeV2::NotStarted as u16)?;
+    builder.field_u16(RemoteAgentDataPlaneDrainOutcomeV2::Drained as u16)?;
+    builder.field_u16(RemoteAgentDataPlaneDrainOutcomeV2::OutcomeUncertain as u16)?;
+    builder.field_u16(RemoteAgentDataPlaneRemoteObservationV2::Unknown as u16)?;
+    builder.field_u16(RemoteAgentDataPlaneRemoteObservationV2::S1Absent as u16)?;
+    builder.field_u16(RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady as u16)?;
+    builder.field_u16(RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting as u16)?;
     builder.field_bytes(TARGET_EXECUTION_V2_DIGEST_DOMAIN)?;
     builder.field_bytes(TARGET_ASSIGNMENTS_V2_DIGEST_DOMAIN)?;
     builder.field_bytes(APPLY_REQUEST_V2_DIGEST_DOMAIN)?;
@@ -2951,7 +2987,9 @@ impl RemoteAgentDataPlaneTargetExecutionV2 {
         expected_s1_cas: RemoteAgentActiveS1CasV2,
         profile: RemoteAgentDataPlaneProfileV1,
     ) -> Result<Self, RemoteAgentDataPlanePlanError> {
-        if expected_s1_cas.active().is_some() {
+        if expected_s1_cas.active().is_some()
+            || expected_s1_cas.access_generation_high_water() == u64::MAX
+        {
             return Err(RemoteAgentDataPlanePlanError::InvalidShape);
         }
         Self::try_new(
@@ -3546,4 +3584,1297 @@ fn build_apply_request_wire_v2(
     wire.extend_from_slice(slice.assignments.bindings.canonical_wire());
     wire.extend_from_slice(slice.assignments.execution.canonical_wire());
     Ok(wire)
+}
+
+/// Runtime lifecycle phase reached by one PXAR v11 operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RemoteAgentDataPlaneTerminalPhaseV2 {
+    PreparedNoEffects = 1,
+    S1OpenIntent = 2,
+    QueryablesDeclareIntent = 3,
+    ReadyObservation = 4,
+    IngressFenceIntent = 5,
+    DrainIntent = 6,
+    S1CloseIntent = 7,
+    LocalOnlyObservation = 8,
+    QuarantineIntent = 9,
+}
+
+/// Runtime terminal classification for one exact PXAR v11 operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RemoteAgentDataPlaneTerminalOutcomeV2 {
+    ActiveReady = 1,
+    LocalOnlyReady = 2,
+    NoEffectRejected = 3,
+    Uncertain = 4,
+    Quarantined = 5,
+}
+
+/// Strongest lifecycle-effect claim made by one PXAU v2 terminal.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RemoteAgentDataPlaneTerminalLifecycleEffectV2 {
+    ProvenNotStarted = 1,
+    MayHaveStarted = 2,
+}
+
+/// Runtime-observed desired head after the exact operation completed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RemoteAgentDataPlaneTerminalHeadV2 {
+    PreservedNone,
+    PreservedExisting(TargetSliceDigest),
+    CommittedIncoming,
+}
+
+/// Drain proof for the two exact route-specific queues and workers.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RemoteAgentDataPlaneDrainOutcomeV2 {
+    NotStarted = 1,
+    Drained = 2,
+    OutcomeUncertain = 3,
+}
+
+/// Explicit S1 observation; unknown never means absent or ready.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum RemoteAgentDataPlaneRemoteObservationV2 {
+    Unknown = 1,
+    S1Absent = 2,
+    S1TlsExactRoutesReady = 3,
+    PartialOrConflicting = 4,
+}
+
+/// Derived nonzero identity of one PXAU v2 result.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RemoteAgentDataPlaneTerminalResultRefV2([u8; 16]);
+
+impl RemoteAgentDataPlaneTerminalResultRefV2 {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// Lifecycle, phase, desired-head, retained-S0, and active-S1 facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalStateFieldsV2 {
+    pub outcome: RemoteAgentDataPlaneTerminalOutcomeV2,
+    pub lifecycle_effect: RemoteAgentDataPlaneTerminalLifecycleEffectV2,
+    pub phase: RemoteAgentDataPlaneTerminalPhaseV2,
+    pub head: RemoteAgentDataPlaneTerminalHeadV2,
+    pub fabric_generation: Option<ManagedServiceGeneration>,
+    pub agent_generation: Option<ManagedServiceGeneration>,
+    pub access_generation: Option<ManagedServiceGeneration>,
+    pub fabric_session_epoch: Option<DistributedFabricSessionEpochV1>,
+    pub proxy_session_epoch: Option<[u8; 16]>,
+}
+
+/// Validated lifecycle state built from bounded PXAU v2 fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalStateV2 {
+    outcome: RemoteAgentDataPlaneTerminalOutcomeV2,
+    lifecycle_effect: RemoteAgentDataPlaneTerminalLifecycleEffectV2,
+    phase: RemoteAgentDataPlaneTerminalPhaseV2,
+    head: RemoteAgentDataPlaneTerminalHeadV2,
+    fabric_generation: Option<ManagedServiceGeneration>,
+    agent_generation: Option<ManagedServiceGeneration>,
+    access_generation: Option<ManagedServiceGeneration>,
+    fabric_session_epoch: Option<DistributedFabricSessionEpochV1>,
+    proxy_session_epoch: Option<[u8; 16]>,
+}
+
+impl RemoteAgentDataPlaneTerminalStateV2 {
+    pub fn try_new(
+        fields: RemoteAgentDataPlaneTerminalStateFieldsV2,
+    ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        if (fields.fabric_generation.is_some() != fields.fabric_session_epoch.is_some())
+            || (fields.agent_generation.is_some() && fields.fabric_generation.is_none())
+            || (fields.access_generation.is_some() != fields.proxy_session_epoch.is_some())
+            || (fields.access_generation.is_some()
+                && (fields.fabric_generation.is_none() || fields.agent_generation.is_none()))
+            || fields
+                .proxy_session_epoch
+                .is_some_and(|epoch| bytes_are_zero(&epoch))
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+        }
+        let state = Self {
+            outcome: fields.outcome,
+            lifecycle_effect: fields.lifecycle_effect,
+            phase: fields.phase,
+            head: fields.head,
+            fabric_generation: fields.fabric_generation,
+            agent_generation: fields.agent_generation,
+            access_generation: fields.access_generation,
+            fabric_session_epoch: fields.fabric_session_epoch,
+            proxy_session_epoch: fields.proxy_session_epoch,
+        };
+        validate_terminal_state_v2(state)?;
+        Ok(state)
+    }
+
+    #[must_use]
+    pub const fn outcome(self) -> RemoteAgentDataPlaneTerminalOutcomeV2 {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn lifecycle_effect(self) -> RemoteAgentDataPlaneTerminalLifecycleEffectV2 {
+        self.lifecycle_effect
+    }
+
+    #[must_use]
+    pub const fn phase(self) -> RemoteAgentDataPlaneTerminalPhaseV2 {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn head(self) -> RemoteAgentDataPlaneTerminalHeadV2 {
+        self.head
+    }
+
+    #[must_use]
+    pub const fn fabric_generation(self) -> Option<ManagedServiceGeneration> {
+        self.fabric_generation
+    }
+
+    #[must_use]
+    pub const fn agent_generation(self) -> Option<ManagedServiceGeneration> {
+        self.agent_generation
+    }
+
+    #[must_use]
+    pub const fn access_generation(self) -> Option<ManagedServiceGeneration> {
+        self.access_generation
+    }
+
+    #[must_use]
+    pub const fn fabric_session_epoch(self) -> Option<DistributedFabricSessionEpochV1> {
+        self.fabric_session_epoch
+    }
+
+    #[must_use]
+    pub const fn proxy_session_epoch(self) -> Option<[u8; 16]> {
+        self.proxy_session_epoch
+    }
+}
+
+/// Runtime observations covered by PXAU v2 and checked against the phase/outcome matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalEvidenceFieldsV2 {
+    pub retained_s0_current_cas_digest: Digest32,
+    pub retained_s0_census_before_digest: Digest32,
+    pub retained_s0_census_after_digest: Digest32,
+    pub proxy_topology_compatibility_digest: Digest32,
+    pub resource_census_digest: Digest32,
+    pub raw_outcome_digest: Digest32,
+    pub submit_admitted_count: u64,
+    pub submit_terminalized_count: u64,
+    pub control_admitted_count: u64,
+    pub control_terminalized_count: u64,
+    pub access_generation_high_water: u64,
+    pub completion_runtime_host_epoch: u64,
+    pub completion_snapshot_sequence: u64,
+    pub completion_owner_slot_revision: u64,
+    pub selection_clock_domain: ClockDomainRef,
+    pub selection_clock_generation: ClockGeneration,
+    pub selection_observed_at_nanos: u64,
+    pub physical_binding_census: u16,
+    pub queryable_declared_bitmap: u8,
+    pub ingress_fenced_bitmap: u8,
+    pub worker_joined_bitmap: u8,
+    pub drain_outcome: RemoteAgentDataPlaneDrainOutcomeV2,
+    pub remote_observation: RemoteAgentDataPlaneRemoteObservationV2,
+    pub retained_s0_census_complete: bool,
+    pub retained_s0_ready: bool,
+    pub s1_tls_ready: bool,
+    pub s1_acl_ready: bool,
+    pub s1_closed: bool,
+    pub s1_listener_released: bool,
+    pub quarantined: bool,
+}
+
+/// Structurally valid bounded terminal observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalEvidenceV2 {
+    fields: RemoteAgentDataPlaneTerminalEvidenceFieldsV2,
+}
+
+impl RemoteAgentDataPlaneTerminalEvidenceV2 {
+    pub fn try_new(
+        fields: RemoteAgentDataPlaneTerminalEvidenceFieldsV2,
+    ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        if digest_is_zero(fields.proxy_topology_compatibility_digest)
+            || digest_is_zero(fields.resource_census_digest)
+            || digest_is_zero(fields.raw_outcome_digest)
+            || fields.submit_terminalized_count > fields.submit_admitted_count
+            || fields.control_terminalized_count > fields.control_admitted_count
+            || fields.completion_runtime_host_epoch == 0
+            || fields.completion_snapshot_sequence == 0
+            || fields.completion_owner_slot_revision == 0
+            || bytes_are_zero(fields.selection_clock_domain.as_bytes())
+            || fields.selection_observed_at_nanos == 0
+            || fields.physical_binding_census > RETAINED_LOCAL_AGENT_BINDING_CENSUS
+            || fields.queryable_declared_bitmap & !REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP != 0
+            || fields.ingress_fenced_bitmap & !REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP != 0
+            || fields.worker_joined_bitmap & !REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP != 0
+            || (fields.s1_acl_ready && !fields.s1_tls_ready)
+            || (fields.s1_listener_released && !fields.s1_closed)
+            || (fields.s1_closed && (fields.s1_tls_ready || fields.s1_acl_ready))
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+        }
+        let before_zero = digest_is_zero(fields.retained_s0_census_before_digest);
+        let after_zero = digest_is_zero(fields.retained_s0_census_after_digest);
+        if !before_zero
+            && !after_zero
+            && fields.retained_s0_census_before_digest
+                != fields.retained_s0_census_after_digest
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+        }
+        Ok(Self { fields })
+    }
+
+    #[must_use]
+    pub const fn fields(self) -> RemoteAgentDataPlaneTerminalEvidenceFieldsV2 {
+        self.fields
+    }
+}
+
+/// Complete request-correlated facts carried by one PXAU v2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalFactsV2 {
+    target: RuntimeHostId,
+    runtime_store_instance_id: [u8; 32],
+    source_scope: SourceScopeRef,
+    operation_id: ApplyOperationId,
+    envelope_request_digest: Digest32,
+    request_digest: Digest32,
+    target_slice_digest: TargetSliceDigest,
+    assignment_digest: TargetAssignmentDigest,
+    terminal_result_ref: RemoteAgentDataPlaneTerminalResultRefV2,
+    request_mode: RemoteAgentDataPlaneTargetModeV2,
+    state: RemoteAgentDataPlaneTerminalStateV2,
+    desired_head_digest: Option<TargetSliceDigest>,
+    evidence: RemoteAgentDataPlaneTerminalEvidenceV2,
+}
+
+impl RemoteAgentDataPlaneTerminalFactsV2 {
+    pub fn try_new(
+        request: &RemoteAgentDataPlaneApplyRequestV2,
+        state: RemoteAgentDataPlaneTerminalStateV2,
+        evidence: RemoteAgentDataPlaneTerminalEvidenceV2,
+    ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        let evidence_fields = evidence.fields();
+        if evidence_fields.selection_clock_domain != request.temporal().target_clock_domain()
+            || evidence_fields.selection_clock_generation.value()
+                < request.temporal().target_clock_generation().value()
+        {
+            return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
+        }
+        let desired_head_digest = resolve_terminal_head_v2(request, state.head())?;
+        let facts = Self {
+            target: request.target(),
+            runtime_store_instance_id: request.expected_runtime_store_instance_id(),
+            source_scope: request.provenance().source_scope(),
+            operation_id: request.operation_id(),
+            envelope_request_digest: request.envelope_request_digest(),
+            request_digest: request.request_digest(),
+            target_slice_digest: request.target_slice_digest(),
+            assignment_digest: request.assignment_digest(),
+            terminal_result_ref: derive_terminal_result_ref_v2(request)?,
+            request_mode: request.target_execution().mode(),
+            state,
+            desired_head_digest,
+            evidence,
+        };
+        validate_terminal_facts_shape_v2(&facts)?;
+        validate_terminal_facts_against_execution_v2(&facts, request.target_execution())?;
+        Ok(facts)
+    }
+
+    #[must_use]
+    pub const fn target(self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn runtime_store_instance_id(self) -> [u8; 32] {
+        self.runtime_store_instance_id
+    }
+
+    #[must_use]
+    pub const fn source_scope(self) -> SourceScopeRef {
+        self.source_scope
+    }
+
+    #[must_use]
+    pub const fn operation_id(self) -> ApplyOperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn envelope_request_digest(self) -> Digest32 {
+        self.envelope_request_digest
+    }
+
+    #[must_use]
+    pub const fn request_digest(self) -> Digest32 {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub const fn target_slice_digest(self) -> TargetSliceDigest {
+        self.target_slice_digest
+    }
+
+    #[must_use]
+    pub const fn assignment_digest(self) -> TargetAssignmentDigest {
+        self.assignment_digest
+    }
+
+    #[must_use]
+    pub const fn terminal_result_ref(self) -> RemoteAgentDataPlaneTerminalResultRefV2 {
+        self.terminal_result_ref
+    }
+
+    #[must_use]
+    pub const fn request_mode(self) -> RemoteAgentDataPlaneTargetModeV2 {
+        self.request_mode
+    }
+
+    #[must_use]
+    pub const fn state(self) -> RemoteAgentDataPlaneTerminalStateV2 {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn desired_head_digest(self) -> Option<TargetSliceDigest> {
+        self.desired_head_digest
+    }
+
+    #[must_use]
+    pub const fn evidence(self) -> RemoteAgentDataPlaneTerminalEvidenceV2 {
+        self.evidence
+    }
+}
+
+/// Runtime signer selected by target/store/epoch authority for PXAU v2.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalAuthClaimV2 {
+    runtime_principal: PrincipalRef,
+    key: ApplyAuthKeyRef,
+    algorithm: ApplyAuthAlgorithm,
+    algorithm_version: u16,
+}
+
+impl RemoteAgentDataPlaneTerminalAuthClaimV2 {
+    pub fn try_new(
+        runtime_principal: PrincipalRef,
+        key: ApplyAuthKeyRef,
+        algorithm: ApplyAuthAlgorithm,
+        algorithm_version: u16,
+    ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        if bytes_are_zero(runtime_principal.as_bytes())
+            || bytes_are_zero(key.as_bytes())
+            || algorithm_version == 0
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidResponseAuthentication);
+        }
+        Ok(Self {
+            runtime_principal,
+            key,
+            algorithm,
+            algorithm_version,
+        })
+    }
+
+    #[must_use]
+    pub const fn runtime_principal(self) -> PrincipalRef {
+        self.runtime_principal
+    }
+
+    #[must_use]
+    pub const fn key(self) -> ApplyAuthKeyRef {
+        self.key
+    }
+
+    #[must_use]
+    pub const fn algorithm(self) -> ApplyAuthAlgorithm {
+        self.algorithm
+    }
+
+    #[must_use]
+    pub const fn algorithm_version(self) -> u16 {
+        self.algorithm_version
+    }
+}
+
+/// Exact Runtime signing bytes for PXAU v2.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalSigningTranscriptV2(Box<[u8]>);
+
+impl RemoteAgentDataPlaneTerminalSigningTranscriptV2 {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Signature-independent Runtime producer for one PXAU v2 terminal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalReceiptDraftV2 {
+    facts: RemoteAgentDataPlaneTerminalFactsV2,
+    auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
+}
+
+impl RemoteAgentDataPlaneTerminalReceiptDraftV2 {
+    pub fn try_new(
+        request: &RemoteAgentDataPlaneApplyRequestV2,
+        state: RemoteAgentDataPlaneTerminalStateV2,
+        evidence: RemoteAgentDataPlaneTerminalEvidenceV2,
+        auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
+    ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        let facts = RemoteAgentDataPlaneTerminalFactsV2::try_new(request, state, evidence)?;
+        Ok(Self { facts, auth_claim })
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<RemoteAgentDataPlaneTerminalSigningTranscriptV2, RemoteAgentDataPlanePlanError>
+    {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(TERMINAL_V2_SIGNING_MAGIC);
+        wire.extend_from_slice(&REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNING_V2_VERSION.to_be_bytes());
+        append_terminal_body_v2(&mut wire, self.facts, self.auth_claim);
+        Ok(RemoteAgentDataPlaneTerminalSigningTranscriptV2(
+            wire.into_boxed_slice(),
+        ))
+    }
+
+    pub fn finalize(
+        self,
+        signature: &[u8],
+    ) -> Result<RemoteAgentDataPlaneTerminalReceiptV2, RemoteAgentDataPlanePlanError> {
+        if signature.is_empty()
+            || signature.len() > MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidResponseAuthentication);
+        }
+        RemoteAgentDataPlaneTerminalReceiptV2::try_new(self.facts, self.auth_claim, signature)
+    }
+}
+
+/// Strict independently Runtime-signed PXAU v2 terminal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteAgentDataPlaneTerminalReceiptV2 {
+    facts: RemoteAgentDataPlaneTerminalFactsV2,
+    auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
+    signature: Box<[u8]>,
+    canonical_wire: Box<[u8]>,
+    receipt_digest: Digest32,
+}
+
+impl RemoteAgentDataPlaneTerminalReceiptV2 {
+    fn try_new(
+        facts: RemoteAgentDataPlaneTerminalFactsV2,
+        auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
+        signature: &[u8],
+    ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        validate_terminal_facts_shape_v2(&facts)?;
+        if signature.is_empty()
+            || signature.len() > MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidResponseAuthentication);
+        }
+        let signature_length = u16::try_from(signature.len())
+            .map_err(|_| RemoteAgentDataPlanePlanError::InvalidLength)?;
+        let mut canonical_wire = Vec::new();
+        canonical_wire.extend_from_slice(TERMINAL_RECEIPT_MAGIC);
+        canonical_wire
+            .extend_from_slice(&REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_VERSION.to_be_bytes());
+        append_terminal_body_v2(&mut canonical_wire, facts, auth_claim);
+        canonical_wire.extend_from_slice(&signature_length.to_be_bytes());
+        canonical_wire.extend_from_slice(signature);
+        if canonical_wire.len() > MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES {
+            return Err(RemoteAgentDataPlanePlanError::FrameTooLarge);
+        }
+        let receipt_digest = digest_wire(TERMINAL_V2_DIGEST_DOMAIN, &canonical_wire)?;
+        Ok(Self {
+            facts,
+            auth_claim,
+            signature: signature.into(),
+            canonical_wire: canonical_wire.into_boxed_slice(),
+            receipt_digest,
+        })
+    }
+
+    /// Strictly decodes only PXAU v2; the v1 decoder remains byte-exact.
+    pub fn decode(frame: &[u8]) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        if frame.len() > MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES {
+            return Err(RemoteAgentDataPlanePlanError::FrameTooLarge);
+        }
+        if frame.len() < TERMINAL_V2_FIXED_BYTES {
+            return Err(RemoteAgentDataPlanePlanError::Truncated);
+        }
+        let mut cursor = Cursor::new(frame);
+        if cursor.take(4)? != TERMINAL_RECEIPT_MAGIC
+            || cursor.u16()? != REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_VERSION
+        {
+            return Err(RemoteAgentDataPlanePlanError::UnsupportedWire);
+        }
+        let facts = decode_terminal_facts_v2(&mut cursor)?;
+        let auth_claim = decode_terminal_auth_claim_v2(&mut cursor)?;
+        let signature_length = cursor.usize_u16()?;
+        if signature_length == 0
+            || signature_length > MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidLength);
+        }
+        let signature = cursor.take(signature_length)?;
+        cursor.finish()?;
+        let decoded = Self::try_new(facts, auth_claim, signature)?;
+        if decoded.canonical_wire() != frame {
+            return Err(RemoteAgentDataPlanePlanError::NonCanonicalFrame);
+        }
+        Ok(decoded)
+    }
+
+    pub fn validate_against_request(
+        &self,
+        request: &RemoteAgentDataPlaneApplyRequestV2,
+    ) -> Result<RemoteAgentDataPlaneTerminalFactsV2, RemoteAgentDataPlanePlanError> {
+        let expected = RemoteAgentDataPlaneTerminalFactsV2::try_new(
+            request,
+            self.facts.state(),
+            self.facts.evidence(),
+        )?;
+        if self.facts != expected {
+            return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
+        }
+        Ok(self.facts)
+    }
+
+    /// Verifies exact request correlation, signer selection, then PXAU v2 signature.
+    pub fn verify_runtime_terminal<'a, Verify>(
+        &'a self,
+        request: &RemoteAgentDataPlaneApplyRequestV2,
+        expected_auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
+        verify: Verify,
+    ) -> Result<RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'a>, RemoteAgentDataPlanePlanError>
+    where
+        Verify:
+            FnOnce(PrincipalRef, ApplyAuthKeyRef, ApplyAuthAlgorithm, u16, &[u8], &[u8]) -> bool,
+    {
+        self.validate_against_request(request)?;
+        if self.auth_claim != expected_auth_claim {
+            return Err(RemoteAgentDataPlanePlanError::InvalidResponseAuthentication);
+        }
+        let transcript = self.signing_transcript()?;
+        if !verify(
+            self.auth_claim.runtime_principal(),
+            self.auth_claim.key(),
+            self.auth_claim.algorithm(),
+            self.auth_claim.algorithm_version(),
+            transcript.as_bytes(),
+            &self.signature,
+        ) {
+            return Err(RemoteAgentDataPlanePlanError::InvalidResponseAuthentication);
+        }
+        Ok(RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2 { receipt: self })
+    }
+
+    #[must_use]
+    pub const fn facts(&self) -> RemoteAgentDataPlaneTerminalFactsV2 {
+        self.facts
+    }
+
+    #[must_use]
+    pub const fn authentication(&self) -> RemoteAgentDataPlaneTerminalAuthClaimV2 {
+        self.auth_claim
+    }
+
+    #[must_use]
+    pub fn authentication_signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    #[must_use]
+    pub fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub const fn receipt_digest(&self) -> Digest32 {
+        self.receipt_digest
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<RemoteAgentDataPlaneTerminalSigningTranscriptV2, RemoteAgentDataPlanePlanError>
+    {
+        RemoteAgentDataPlaneTerminalReceiptDraftV2 {
+            facts: self.facts,
+            auth_claim: self.auth_claim,
+        }
+        .signing_transcript()
+    }
+}
+
+/// Marker issued only after PXAU v2 correlation, signer selection, and signature checks.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'a> {
+    receipt: &'a RemoteAgentDataPlaneTerminalReceiptV2,
+}
+
+impl<'a> RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'a> {
+    #[must_use]
+    pub const fn receipt(self) -> &'a RemoteAgentDataPlaneTerminalReceiptV2 {
+        self.receipt
+    }
+}
+
+fn validate_terminal_state_v2(
+    state: RemoteAgentDataPlaneTerminalStateV2,
+) -> Result<(), RemoteAgentDataPlanePlanError> {
+    use RemoteAgentDataPlaneTerminalLifecycleEffectV2::{MayHaveStarted, ProvenNotStarted};
+    use RemoteAgentDataPlaneTerminalOutcomeV2::{
+        ActiveReady, LocalOnlyReady, NoEffectRejected, Quarantined, Uncertain,
+    };
+    let valid = match state.outcome() {
+        ActiveReady => {
+            state.lifecycle_effect() == MayHaveStarted
+                && state.phase() == RemoteAgentDataPlaneTerminalPhaseV2::ReadyObservation
+                && matches!(
+                    state.head(),
+                    RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming
+                )
+                && state.fabric_generation().is_some()
+                && state.agent_generation().is_some()
+                && state.access_generation().is_some()
+                && state.fabric_session_epoch().is_some()
+                && state.proxy_session_epoch().is_some()
+        }
+        LocalOnlyReady => {
+            state.lifecycle_effect() == MayHaveStarted
+                && state.phase() == RemoteAgentDataPlaneTerminalPhaseV2::LocalOnlyObservation
+                && matches!(
+                    state.head(),
+                    RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming
+                )
+                && state.fabric_generation().is_some()
+                && state.agent_generation().is_some()
+                && state.access_generation().is_none()
+                && state.fabric_session_epoch().is_some()
+                && state.proxy_session_epoch().is_none()
+        }
+        NoEffectRejected => {
+            state.lifecycle_effect() == ProvenNotStarted
+                && state.phase() == RemoteAgentDataPlaneTerminalPhaseV2::PreparedNoEffects
+                && !matches!(
+                    state.head(),
+                    RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming
+                )
+        }
+        Uncertain => {
+            state.lifecycle_effect() == MayHaveStarted
+                && (RemoteAgentDataPlaneTerminalPhaseV2::S1OpenIntent as u8
+                    ..=RemoteAgentDataPlaneTerminalPhaseV2::LocalOnlyObservation as u8)
+                    .contains(&(state.phase() as u8))
+        }
+        Quarantined => {
+            state.lifecycle_effect() == MayHaveStarted
+                && state.phase() == RemoteAgentDataPlaneTerminalPhaseV2::QuarantineIntent
+        }
+    };
+    if !valid {
+        return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+    }
+    Ok(())
+}
+
+fn validate_terminal_facts_shape_v2(
+    facts: &RemoteAgentDataPlaneTerminalFactsV2,
+) -> Result<(), RemoteAgentDataPlanePlanError> {
+    if bytes_are_zero(facts.target.as_bytes())
+        || bytes_are_zero(&facts.runtime_store_instance_id)
+        || bytes_are_zero(facts.source_scope.as_bytes())
+        || bytes_are_zero(facts.operation_id.as_bytes())
+        || digest_is_zero(facts.envelope_request_digest)
+        || digest_is_zero(facts.request_digest)
+        || digest_is_zero(*facts.target_slice_digest.value())
+        || digest_is_zero(*facts.assignment_digest.value())
+        || bytes_are_zero(facts.terminal_result_ref.as_bytes())
+    {
+        return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+    }
+    match (facts.state.head(), facts.desired_head_digest) {
+        (RemoteAgentDataPlaneTerminalHeadV2::PreservedNone, None) => {}
+        (RemoteAgentDataPlaneTerminalHeadV2::PreservedExisting(expected), Some(actual))
+            if expected == actual && !digest_is_zero(*actual.value()) => {}
+        (RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming, Some(actual))
+            if actual == facts.target_slice_digest => {}
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    }
+    validate_terminal_state_v2(facts.state)?;
+    let fields = facts.evidence.fields();
+    if fields.retained_s0_ready
+        && (!fields.retained_s0_census_complete
+            || fields.physical_binding_census != RETAINED_LOCAL_AGENT_BINDING_CENSUS
+            || facts.state.fabric_generation().is_none()
+            || facts.state.agent_generation().is_none()
+            || facts.state.fabric_session_epoch().is_none())
+    {
+        return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+    }
+    let exact_retained_census = !digest_is_zero(fields.retained_s0_census_before_digest)
+        && fields.retained_s0_census_before_digest == fields.retained_s0_census_after_digest;
+    let current_s0_cas_known = !digest_is_zero(fields.retained_s0_current_cas_digest);
+    let no_admitted_work = fields.submit_admitted_count == 0
+        && fields.submit_terminalized_count == 0
+        && fields.control_admitted_count == 0
+        && fields.control_terminalized_count == 0;
+    use RemoteAgentDataPlaneTerminalOutcomeV2::{
+        ActiveReady, LocalOnlyReady, NoEffectRejected, Quarantined, Uncertain,
+    };
+    let valid = match facts.state.outcome() {
+        ActiveReady => {
+            facts.request_mode == RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive
+                && current_s0_cas_known
+                && exact_retained_census
+                && fields.retained_s0_ready
+                && fields.remote_observation
+                    == RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady
+                && fields.queryable_declared_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+                && fields.ingress_fenced_bitmap == 0
+                && fields.worker_joined_bitmap == 0
+                && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::NotStarted
+                && fields.s1_tls_ready
+                && fields.s1_acl_ready
+                && !fields.s1_closed
+                && !fields.s1_listener_released
+                && !fields.quarantined
+        }
+        LocalOnlyReady => {
+            facts.request_mode == RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate
+                && current_s0_cas_known
+                && exact_retained_census
+                && fields.retained_s0_ready
+                && fields.remote_observation
+                    == RemoteAgentDataPlaneRemoteObservationV2::S1Absent
+                && fields.queryable_declared_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+                && fields.ingress_fenced_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+                && fields.worker_joined_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+                && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::Drained
+                && fields.submit_admitted_count == fields.submit_terminalized_count
+                && fields.control_admitted_count == fields.control_terminalized_count
+                && !fields.s1_tls_ready
+                && !fields.s1_acl_ready
+                && fields.s1_closed
+                && fields.s1_listener_released
+                && !fields.quarantined
+        }
+        NoEffectRejected => {
+            no_admitted_work
+                && fields.ingress_fenced_bitmap == 0
+                && fields.worker_joined_bitmap == 0
+                && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::NotStarted
+                && !fields.s1_closed
+                && !fields.s1_listener_released
+                && !fields.quarantined
+                && match fields.remote_observation {
+                    RemoteAgentDataPlaneRemoteObservationV2::Unknown => {
+                        fields.queryable_declared_bitmap == 0
+                            && !fields.s1_tls_ready
+                            && !fields.s1_acl_ready
+                    }
+                    RemoteAgentDataPlaneRemoteObservationV2::S1Absent => {
+                        current_s0_cas_known
+                            && exact_retained_census
+                            && fields.retained_s0_ready
+                            && fields.queryable_declared_bitmap == 0
+                            && !fields.s1_tls_ready
+                            && !fields.s1_acl_ready
+                            && facts.state.access_generation().is_none()
+                    }
+                    RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady => {
+                        current_s0_cas_known
+                            && exact_retained_census
+                            && fields.retained_s0_ready
+                            && fields.queryable_declared_bitmap
+                                == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+                            && fields.s1_tls_ready
+                            && fields.s1_acl_ready
+                            && facts.state.access_generation().is_some()
+                    }
+                    RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting => false,
+                }
+        }
+        Uncertain => {
+            !fields.quarantined
+                && fields.drain_outcome != RemoteAgentDataPlaneDrainOutcomeV2::Drained
+                && matches!(
+                    fields.remote_observation,
+                    RemoteAgentDataPlaneRemoteObservationV2::Unknown
+                        | RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting
+                )
+        }
+        Quarantined => {
+            fields.quarantined
+                && fields.drain_outcome != RemoteAgentDataPlaneDrainOutcomeV2::Drained
+                && matches!(
+                    fields.remote_observation,
+                    RemoteAgentDataPlaneRemoteObservationV2::Unknown
+                        | RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting
+                )
+        }
+    };
+    if !valid {
+        return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+    }
+    Ok(())
+}
+
+fn validate_terminal_facts_against_execution_v2(
+    facts: &RemoteAgentDataPlaneTerminalFactsV2,
+    execution: &RemoteAgentDataPlaneTargetExecutionV2,
+) -> Result<(), RemoteAgentDataPlanePlanError> {
+    if facts.request_mode != execution.mode() {
+        return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
+    }
+    let retained = execution.retained_s0_cas().fields();
+    let state = facts.state;
+    if state
+        .fabric_generation()
+        .is_some_and(|value| value != retained.expected_fabric_generation)
+        || state
+            .agent_generation()
+            .is_some_and(|value| value != retained.expected_agent_generation)
+        || state
+            .fabric_session_epoch()
+            .is_some_and(|value| value != retained.expected_fabric_session_epoch)
+    {
+        return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
+    }
+    let fields = facts.evidence.fields();
+    if fields.proxy_topology_compatibility_digest
+        != execution.proxy_topology_compatibility_digest()
+        || (!digest_is_zero(fields.retained_s0_current_cas_digest)
+            && fields.retained_s0_current_cas_digest != execution.retained_s0_cas().cas_digest())
+    {
+        return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
+    }
+    let expected_s1 = execution.expected_s1_cas();
+    let prior_high_water = expected_s1.access_generation_high_water();
+    let prior_slot_revision = expected_s1.owner_slot_revision();
+    use RemoteAgentDataPlaneTerminalOutcomeV2::{
+        ActiveReady, LocalOnlyReady, NoEffectRejected, Quarantined, Uncertain,
+    };
+    let valid = match state.outcome() {
+        ActiveReady => {
+            let next_high_water = prior_high_water.checked_add(1);
+            let next_slot_revision = prior_slot_revision.checked_add(1);
+            execution.mode() == RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive
+                && expected_s1.active().is_none()
+                && next_high_water == Some(fields.access_generation_high_water)
+                && next_slot_revision == Some(fields.completion_owner_slot_revision)
+                && state.access_generation().map(ManagedServiceGeneration::value)
+                    == next_high_water
+        }
+        LocalOnlyReady => {
+            execution.mode() == RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate
+                && expected_s1.active().is_some()
+                && fields.access_generation_high_water == prior_high_water
+                && prior_slot_revision
+                    .checked_add(1)
+                    .is_some_and(|value| value == fields.completion_owner_slot_revision)
+                && state.access_generation().is_none()
+                && state.proxy_session_epoch().is_none()
+        }
+        NoEffectRejected => {
+            fields.access_generation_high_water == prior_high_water
+                && fields.completion_owner_slot_revision == prior_slot_revision
+                && match fields.remote_observation {
+                    RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady => {
+                        expected_s1.active().is_some_and(|active| {
+                            state.access_generation() == Some(active.active_access_generation)
+                                && state.proxy_session_epoch()
+                                    == Some(active.active_proxy_session_epoch)
+                        })
+                    }
+                    RemoteAgentDataPlaneRemoteObservationV2::S1Absent => {
+                        state.access_generation().is_none()
+                            && state.proxy_session_epoch().is_none()
+                    }
+                    RemoteAgentDataPlaneRemoteObservationV2::Unknown => {
+                        match (state.access_generation(), expected_s1.active()) {
+                            (None, _) => true,
+                            (Some(actual), Some(expected)) => {
+                                actual == expected.active_access_generation
+                                    && state.proxy_session_epoch()
+                                        == Some(expected.active_proxy_session_epoch)
+                            }
+                            (Some(_), None) => false,
+                        }
+                    }
+                    RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting => false,
+                }
+        }
+        Uncertain | Quarantined => {
+            fields.access_generation_high_water >= prior_high_water
+                && fields.completion_owner_slot_revision >= prior_slot_revision
+                && state.access_generation().is_none_or(|value| {
+                    value.value() == fields.access_generation_high_water
+                })
+        }
+    };
+    if !valid {
+        return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
+    }
+    Ok(())
+}
+
+fn resolve_terminal_head_v2(
+    request: &RemoteAgentDataPlaneApplyRequestV2,
+    head: RemoteAgentDataPlaneTerminalHeadV2,
+) -> Result<Option<TargetSliceDigest>, RemoteAgentDataPlanePlanError> {
+    match head {
+        RemoteAgentDataPlaneTerminalHeadV2::PreservedNone => Ok(None),
+        RemoteAgentDataPlaneTerminalHeadV2::PreservedExisting(value)
+            if !digest_is_zero(*value.value()) =>
+        {
+            Ok(Some(value))
+        }
+        RemoteAgentDataPlaneTerminalHeadV2::PreservedExisting(_) => {
+            Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts)
+        }
+        RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming => {
+            Ok(Some(request.target_slice_digest()))
+        }
+    }
+}
+
+fn derive_terminal_result_ref_v2(
+    request: &RemoteAgentDataPlaneApplyRequestV2,
+) -> Result<RemoteAgentDataPlaneTerminalResultRefV2, RemoteAgentDataPlanePlanError> {
+    let mut builder = Digest32Builder::try_new(TERMINAL_V2_RESULT_REF_DOMAIN)?;
+    builder.field_bytes(TERMINAL_RECEIPT_MAGIC)?;
+    builder.field_u16(REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_VERSION)?;
+    builder.field_bytes(request.target().as_bytes())?;
+    builder.field_bytes(&request.expected_runtime_store_instance_id())?;
+    builder.field_bytes(request.provenance().source_scope().as_bytes())?;
+    builder.field_bytes(request.operation_id().as_bytes())?;
+    builder.field_digest(&request.envelope_request_digest())?;
+    builder.field_digest(&request.request_digest())?;
+    let digest = builder.finish();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    if bytes_are_zero(&bytes) {
+        return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+    }
+    Ok(RemoteAgentDataPlaneTerminalResultRefV2(bytes))
+}
+
+fn append_terminal_body_v2(
+    wire: &mut Vec<u8>,
+    facts: RemoteAgentDataPlaneTerminalFactsV2,
+    auth: RemoteAgentDataPlaneTerminalAuthClaimV2,
+) {
+    wire.extend_from_slice(facts.target().as_bytes());
+    wire.extend_from_slice(&facts.runtime_store_instance_id());
+    wire.extend_from_slice(facts.source_scope().as_bytes());
+    wire.extend_from_slice(facts.operation_id().as_bytes());
+    wire.extend_from_slice(facts.envelope_request_digest().as_bytes());
+    wire.extend_from_slice(facts.request_digest().as_bytes());
+    wire.extend_from_slice(facts.target_slice_digest().value().as_bytes());
+    wire.extend_from_slice(facts.assignment_digest().value().as_bytes());
+    wire.extend_from_slice(facts.terminal_result_ref().as_bytes());
+    wire.push(facts.request_mode() as u8);
+    wire.push(facts.state().outcome() as u8);
+    wire.push(facts.state().lifecycle_effect() as u8);
+    wire.push(facts.state().phase() as u8);
+    wire.push(match facts.state().head() {
+        RemoteAgentDataPlaneTerminalHeadV2::PreservedNone => 1,
+        RemoteAgentDataPlaneTerminalHeadV2::PreservedExisting(_) => 2,
+        RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming => 3,
+    });
+    wire.push(u8::from(facts.desired_head_digest().is_some()));
+    wire.extend_from_slice(&0_u16.to_be_bytes());
+    wire.extend_from_slice(
+        &facts
+            .desired_head_digest()
+            .map_or([0; 32], |value| *value.value().as_bytes()),
+    );
+    encode_generation(wire, facts.state().fabric_generation());
+    encode_generation(wire, facts.state().agent_generation());
+    encode_generation(wire, facts.state().access_generation());
+    encode_fabric_session_epoch_v2(wire, facts.state().fabric_session_epoch());
+    encode_proxy_session_epoch_v2(wire, facts.state().proxy_session_epoch());
+    let evidence = facts.evidence().fields();
+    wire.extend_from_slice(evidence.retained_s0_current_cas_digest.as_bytes());
+    wire.extend_from_slice(evidence.retained_s0_census_before_digest.as_bytes());
+    wire.extend_from_slice(evidence.retained_s0_census_after_digest.as_bytes());
+    wire.extend_from_slice(evidence.proxy_topology_compatibility_digest.as_bytes());
+    wire.extend_from_slice(evidence.resource_census_digest.as_bytes());
+    wire.extend_from_slice(evidence.raw_outcome_digest.as_bytes());
+    wire.extend_from_slice(&evidence.submit_admitted_count.to_be_bytes());
+    wire.extend_from_slice(&evidence.submit_terminalized_count.to_be_bytes());
+    wire.extend_from_slice(&evidence.control_admitted_count.to_be_bytes());
+    wire.extend_from_slice(&evidence.control_terminalized_count.to_be_bytes());
+    wire.extend_from_slice(&evidence.access_generation_high_water.to_be_bytes());
+    wire.extend_from_slice(&evidence.completion_runtime_host_epoch.to_be_bytes());
+    wire.extend_from_slice(&evidence.completion_snapshot_sequence.to_be_bytes());
+    wire.extend_from_slice(&evidence.completion_owner_slot_revision.to_be_bytes());
+    wire.extend_from_slice(evidence.selection_clock_domain.as_bytes());
+    wire.extend_from_slice(&evidence.selection_clock_generation.value().to_be_bytes());
+    wire.extend_from_slice(&evidence.selection_observed_at_nanos.to_be_bytes());
+    wire.extend_from_slice(&evidence.physical_binding_census.to_be_bytes());
+    wire.push(evidence.queryable_declared_bitmap);
+    wire.push(evidence.ingress_fenced_bitmap);
+    wire.push(evidence.worker_joined_bitmap);
+    wire.push(evidence.drain_outcome as u8);
+    wire.push(evidence.remote_observation as u8);
+    wire.push(0);
+    wire.extend_from_slice(&terminal_evidence_flags_v2(evidence).to_be_bytes());
+    wire.extend_from_slice(auth.runtime_principal().as_bytes());
+    wire.extend_from_slice(auth.key().as_bytes());
+    wire.extend_from_slice(&auth.algorithm().value().to_be_bytes());
+    wire.extend_from_slice(&auth.algorithm_version().to_be_bytes());
+}
+
+fn terminal_evidence_flags_v2(fields: RemoteAgentDataPlaneTerminalEvidenceFieldsV2) -> u16 {
+    (u16::from(fields.retained_s0_census_complete)
+        * TERMINAL_V2_RETAINED_S0_CENSUS_COMPLETE)
+        | (u16::from(fields.retained_s0_ready) * TERMINAL_V2_RETAINED_S0_READY)
+        | (u16::from(fields.s1_tls_ready) * TERMINAL_V2_S1_TLS_READY)
+        | (u16::from(fields.s1_acl_ready) * TERMINAL_V2_S1_ACL_READY)
+        | (u16::from(fields.s1_closed) * TERMINAL_V2_S1_CLOSED)
+        | (u16::from(fields.s1_listener_released) * TERMINAL_V2_S1_LISTENER_RELEASED)
+        | (u16::from(fields.quarantined) * TERMINAL_V2_QUARANTINED)
+}
+
+fn encode_fabric_session_epoch_v2(
+    wire: &mut Vec<u8>,
+    epoch: Option<DistributedFabricSessionEpochV1>,
+) {
+    wire.push(u8::from(epoch.is_some()));
+    wire.extend_from_slice(&epoch.map_or([0; 16], |value| *value.as_bytes()));
+}
+
+fn encode_proxy_session_epoch_v2(wire: &mut Vec<u8>, epoch: Option<[u8; 16]>) {
+    wire.push(u8::from(epoch.is_some()));
+    wire.extend_from_slice(&epoch.unwrap_or([0; 16]));
+}
+
+fn decode_terminal_facts_v2(
+    cursor: &mut Cursor<'_>,
+) -> Result<RemoteAgentDataPlaneTerminalFactsV2, RemoteAgentDataPlanePlanError> {
+    let target = RuntimeHostId::from_bytes(cursor.array()?);
+    let runtime_store_instance_id = cursor.array()?;
+    let source_scope = SourceScopeRef::from_bytes(cursor.array()?);
+    let operation_id = ApplyOperationId::from_bytes(cursor.array()?);
+    let envelope_request_digest = Digest32::from_bytes(cursor.array()?);
+    let request_digest = Digest32::from_bytes(cursor.array()?);
+    let target_slice_digest = TargetSliceDigest::new(Digest32::from_bytes(cursor.array()?));
+    let assignment_digest = TargetAssignmentDigest::new(Digest32::from_bytes(cursor.array()?));
+    let terminal_result_ref = RemoteAgentDataPlaneTerminalResultRefV2(cursor.array()?);
+    let request_mode = match cursor.u8()? {
+        1 => RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive,
+        2 => RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate,
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    let outcome = match cursor.u8()? {
+        1 => RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady,
+        2 => RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady,
+        3 => RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected,
+        4 => RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain,
+        5 => RemoteAgentDataPlaneTerminalOutcomeV2::Quarantined,
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    let lifecycle_effect = match cursor.u8()? {
+        1 => RemoteAgentDataPlaneTerminalLifecycleEffectV2::ProvenNotStarted,
+        2 => RemoteAgentDataPlaneTerminalLifecycleEffectV2::MayHaveStarted,
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    let phase = match cursor.u8()? {
+        1 => RemoteAgentDataPlaneTerminalPhaseV2::PreparedNoEffects,
+        2 => RemoteAgentDataPlaneTerminalPhaseV2::S1OpenIntent,
+        3 => RemoteAgentDataPlaneTerminalPhaseV2::QueryablesDeclareIntent,
+        4 => RemoteAgentDataPlaneTerminalPhaseV2::ReadyObservation,
+        5 => RemoteAgentDataPlaneTerminalPhaseV2::IngressFenceIntent,
+        6 => RemoteAgentDataPlaneTerminalPhaseV2::DrainIntent,
+        7 => RemoteAgentDataPlaneTerminalPhaseV2::S1CloseIntent,
+        8 => RemoteAgentDataPlaneTerminalPhaseV2::LocalOnlyObservation,
+        9 => RemoteAgentDataPlaneTerminalPhaseV2::QuarantineIntent,
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    let head_tag = cursor.u8()?;
+    let desired_present = cursor.u8()?;
+    if cursor.u16()? != 0 {
+        return Err(RemoteAgentDataPlanePlanError::NonCanonicalFrame);
+    }
+    let desired_bytes: [u8; 32] = cursor.array()?;
+    let desired_head_digest = match (desired_present, bytes_are_zero(&desired_bytes)) {
+        (0, true) => None,
+        (1, false) => Some(TargetSliceDigest::new(Digest32::from_bytes(desired_bytes))),
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    let head = match (head_tag, desired_head_digest) {
+        (1, None) => RemoteAgentDataPlaneTerminalHeadV2::PreservedNone,
+        (2, Some(value)) => RemoteAgentDataPlaneTerminalHeadV2::PreservedExisting(value),
+        (3, Some(_)) => RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming,
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    let state = RemoteAgentDataPlaneTerminalStateV2::try_new(
+        RemoteAgentDataPlaneTerminalStateFieldsV2 {
+            outcome,
+            lifecycle_effect,
+            phase,
+            head,
+            fabric_generation: decode_generation(cursor)?,
+            agent_generation: decode_generation(cursor)?,
+            access_generation: decode_generation(cursor)?,
+            fabric_session_epoch: decode_fabric_session_epoch_v2(cursor)?,
+            proxy_session_epoch: decode_proxy_session_epoch_v2(cursor)?,
+        },
+    )?;
+    let retained_s0_current_cas_digest = Digest32::from_bytes(cursor.array()?);
+    let retained_s0_census_before_digest = Digest32::from_bytes(cursor.array()?);
+    let retained_s0_census_after_digest = Digest32::from_bytes(cursor.array()?);
+    let proxy_topology_compatibility_digest = Digest32::from_bytes(cursor.array()?);
+    let resource_census_digest = Digest32::from_bytes(cursor.array()?);
+    let raw_outcome_digest = Digest32::from_bytes(cursor.array()?);
+    let submit_admitted_count = cursor.u64()?;
+    let submit_terminalized_count = cursor.u64()?;
+    let control_admitted_count = cursor.u64()?;
+    let control_terminalized_count = cursor.u64()?;
+    let access_generation_high_water = cursor.u64()?;
+    let completion_runtime_host_epoch = cursor.u64()?;
+    let completion_snapshot_sequence = cursor.u64()?;
+    let completion_owner_slot_revision = cursor.u64()?;
+    let selection_clock_domain = ClockDomainRef::from_bytes(cursor.array()?);
+    let selection_clock_generation = ClockGeneration::try_new(cursor.u64()?)
+        .map_err(|_| RemoteAgentDataPlanePlanError::InvalidTerminalFacts)?;
+    let selection_observed_at_nanos = cursor.u64()?;
+    let physical_binding_census = cursor.u16()?;
+    let queryable_declared_bitmap = cursor.u8()?;
+    let ingress_fenced_bitmap = cursor.u8()?;
+    let worker_joined_bitmap = cursor.u8()?;
+    let drain_outcome = match cursor.u8()? {
+        1 => RemoteAgentDataPlaneDrainOutcomeV2::NotStarted,
+        2 => RemoteAgentDataPlaneDrainOutcomeV2::Drained,
+        3 => RemoteAgentDataPlaneDrainOutcomeV2::OutcomeUncertain,
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    let remote_observation = match cursor.u8()? {
+        1 => RemoteAgentDataPlaneRemoteObservationV2::Unknown,
+        2 => RemoteAgentDataPlaneRemoteObservationV2::S1Absent,
+        3 => RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady,
+        4 => RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting,
+        _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    };
+    if cursor.u8()? != 0 {
+        return Err(RemoteAgentDataPlanePlanError::NonCanonicalFrame);
+    }
+    let flags = cursor.u16()?;
+    if flags & !TERMINAL_V2_EVIDENCE_KNOWN_FLAGS != 0 {
+        return Err(RemoteAgentDataPlanePlanError::NonCanonicalFrame);
+    }
+    let evidence = RemoteAgentDataPlaneTerminalEvidenceV2::try_new(
+        RemoteAgentDataPlaneTerminalEvidenceFieldsV2 {
+            retained_s0_current_cas_digest,
+            retained_s0_census_before_digest,
+            retained_s0_census_after_digest,
+            proxy_topology_compatibility_digest,
+            resource_census_digest,
+            raw_outcome_digest,
+            submit_admitted_count,
+            submit_terminalized_count,
+            control_admitted_count,
+            control_terminalized_count,
+            access_generation_high_water,
+            completion_runtime_host_epoch,
+            completion_snapshot_sequence,
+            completion_owner_slot_revision,
+            selection_clock_domain,
+            selection_clock_generation,
+            selection_observed_at_nanos,
+            physical_binding_census,
+            queryable_declared_bitmap,
+            ingress_fenced_bitmap,
+            worker_joined_bitmap,
+            drain_outcome,
+            remote_observation,
+            retained_s0_census_complete: flags & TERMINAL_V2_RETAINED_S0_CENSUS_COMPLETE != 0,
+            retained_s0_ready: flags & TERMINAL_V2_RETAINED_S0_READY != 0,
+            s1_tls_ready: flags & TERMINAL_V2_S1_TLS_READY != 0,
+            s1_acl_ready: flags & TERMINAL_V2_S1_ACL_READY != 0,
+            s1_closed: flags & TERMINAL_V2_S1_CLOSED != 0,
+            s1_listener_released: flags & TERMINAL_V2_S1_LISTENER_RELEASED != 0,
+            quarantined: flags & TERMINAL_V2_QUARANTINED != 0,
+        },
+    )?;
+    let facts = RemoteAgentDataPlaneTerminalFactsV2 {
+        target,
+        runtime_store_instance_id,
+        source_scope,
+        operation_id,
+        envelope_request_digest,
+        request_digest,
+        target_slice_digest,
+        assignment_digest,
+        terminal_result_ref,
+        request_mode,
+        state,
+        desired_head_digest,
+        evidence,
+    };
+    validate_terminal_facts_shape_v2(&facts)?;
+    Ok(facts)
+}
+
+fn decode_fabric_session_epoch_v2(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<DistributedFabricSessionEpochV1>, RemoteAgentDataPlanePlanError> {
+    let present = cursor.u8()?;
+    let bytes: [u8; 16] = cursor.array()?;
+    match (present, bytes_are_zero(&bytes)) {
+        (0, true) => Ok(None),
+        (1, false) => DistributedFabricSessionEpochV1::try_from_bytes(bytes)
+            .map(Some)
+            .map_err(Into::into),
+        _ => Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    }
+}
+
+fn decode_proxy_session_epoch_v2(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<[u8; 16]>, RemoteAgentDataPlanePlanError> {
+    let present = cursor.u8()?;
+    let bytes: [u8; 16] = cursor.array()?;
+    match (present, bytes_are_zero(&bytes)) {
+        (0, true) => Ok(None),
+        (1, false) => Ok(Some(bytes)),
+        _ => Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
+    }
+}
+
+fn decode_terminal_auth_claim_v2(
+    cursor: &mut Cursor<'_>,
+) -> Result<RemoteAgentDataPlaneTerminalAuthClaimV2, RemoteAgentDataPlanePlanError> {
+    let runtime_principal = PrincipalRef::from_bytes(cursor.array()?);
+    let key = ApplyAuthKeyRef::from_bytes(cursor.array()?);
+    let algorithm = ApplyAuthAlgorithm::try_new(cursor.u16()?)
+        .map_err(|_| RemoteAgentDataPlanePlanError::InvalidResponseAuthentication)?;
+    let algorithm_version = cursor.u16()?;
+    RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+        runtime_principal,
+        key,
+        algorithm,
+        algorithm_version,
+    )
 }
