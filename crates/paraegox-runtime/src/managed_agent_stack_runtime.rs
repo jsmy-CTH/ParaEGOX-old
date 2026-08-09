@@ -511,7 +511,6 @@ impl ManagedAgentStackRuntimeCore {
             .request
             .target_execution()
             .fabric()
-            .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?
             .execution_digest();
         Ok(RuntimeAgentConversationPortExportV1 {
             active_pxst_digest: receipt.receipt_digest(),
