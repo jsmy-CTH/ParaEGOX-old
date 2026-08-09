@@ -5809,10 +5809,6 @@ mod tests {
             ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
             ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
         },
-        remote_agent_data_plane_plan::{
-            RemoteAgentActiveS1CasV2, RemoteAgentRetainedS0CasFieldsV2,
-            RemoteAgentRetainedS0CasV2,
-        },
         managed_service::{
             ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
             ManagedServiceSpecV1,
@@ -5832,6 +5828,9 @@ mod tests {
             ReferenceQueryResponseV1, ReferenceQuerySelectorV1, ReferenceTargetExecutionPlanV4,
             ValidatedReferenceLifecycleBudgetsV1,
         },
+        remote_agent_data_plane_plan::{
+            RemoteAgentActiveS1CasV2, RemoteAgentRetainedS0CasFieldsV2, RemoteAgentRetainedS0CasV2,
+        },
         temporal::{ApplyTemporalConstraint, TemporalConstraintId},
         wire::ApplyRequestAuthClaim,
     };
@@ -5844,11 +5843,11 @@ mod tests {
     use crate::managed_model_runtime::{
         RuntimeModelBackendResolveError, RuntimeResolvedModelBackendV1,
     };
-    use crate::runtime_agent_provider::{
-        RuntimeAgentProviderResolveError, RuntimeResolvedAgentProviderV1,
-    };
     use crate::remote_agent_access_state::{
         RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
+    };
+    use crate::runtime_agent_provider::{
+        RuntimeAgentProviderResolveError, RuntimeResolvedAgentProviderV1,
     };
     use crate::runtime_control_state::runtime_reference_apply::{
         RuntimeEmptyRetireOwnerPlan, RuntimeOneSourceOwnerPlan, RuntimeReferenceApplyStoreError,
@@ -8480,10 +8479,10 @@ mod tests {
                 expected_descriptor_evidence_record_sequence: 1,
                 expected_descriptor_receipt_digest: digest(0xdb),
                 expected_descriptor_payload_digest: digest(0xdc),
-                expected_fabric_session_epoch:
-                    DistributedFabricSessionEpochV1::try_from_bytes([0xdd; 16]).unwrap_or_else(
-                        |error| panic!("PXRS v2 Fabric session epoch rejected: {error}"),
-                    ),
+                expected_fabric_session_epoch: DistributedFabricSessionEpochV1::try_from_bytes(
+                    [0xdd; 16],
+                )
+                .unwrap_or_else(|error| panic!("PXRS v2 Fabric session epoch rejected: {error}")),
                 expected_fabric_generation: ManagedServiceGeneration::try_new(1)
                     .unwrap_or_else(|error| panic!("PXRS v2 Fabric generation rejected: {error}")),
                 expected_agent_generation: ManagedServiceGeneration::try_new(1)
