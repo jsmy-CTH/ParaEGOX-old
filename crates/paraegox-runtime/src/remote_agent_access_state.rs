@@ -6,14 +6,22 @@
 //! executor.  It retains the byte-exact outer PXRA, the sole embedded PXAR-v10,
 //! the exact active predecessor PXAS, the live-verified bootstrap PXDE required
 //! by `RemoteAccessActive`, and an authenticated PXAU only in a terminal phase.
-//! Recovery performs strict structural re-decoding; only the authority-bearing
-//! constructors below may create new live state.  A later owner may recover
-//! authority only after authenticating the retained PXAR-v10 again and exactly
-//! matching its proof-envelope and three replay identities to this snapshot.
+//! Recovery returns inert structural state only.  A later owner may recover
+//! transition authority only after independently authenticating the retained
+//! outer PXRA and inner PXAR-v10 again, exactly matching the proof-envelope and
+//! three replay identities, and revalidating every mode/phase-specific live
+//! PXDE or PXAU marker.  Local-only recovery authorizes removal of a distinct
+//! remote overlay only.  That overlay owner is not implemented yet, and the
+//! current same-session Fabric shutdown path must not be used to simulate hot
+//! removal because it would also disturb the retained local bindings.
 
 use core::fmt;
 
-use paraegox_kernel::{digest::Digest32, identity::RuntimeHostId, time::ClockGeneration};
+use paraegox_kernel::{
+    digest::Digest32,
+    identity::RuntimeHostId,
+    time::{ClockGeneration, ClockReading},
+};
 use paraegox_runtime_contracts::{
     managed_agent_stack_plan::ManagedAgentStackTerminalOutcomeV1,
     managed_fabric_plan::ManagedFabricApplyTerminalOutcomeV1,
@@ -32,7 +40,9 @@ use paraegox_runtime_contracts::{
 use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::{
-    admission::VerifiedRemoteAgentDataPlaneApplyIngressV1,
+    admission::{
+        AuthenticatedRemoteAgentDataPlaneApplyV1, VerifiedRemoteAgentDataPlaneApplyIngressV1,
+    },
     managed_agent_stack_state::{
         MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES, ManagedAgentStackDurablePhase,
         ManagedAgentStackSnapshot, ManagedAgentStackStateError,
@@ -81,6 +91,7 @@ pub(crate) enum RemoteAgentAccessDurablePhaseV1 {
     Uncertain = 10,
     QuarantineIntent = 11,
     Quarantined = 12,
+    RemoteAccessStopIntent = 13,
 }
 
 impl RemoteAgentAccessDurablePhaseV1 {
@@ -98,6 +109,7 @@ impl RemoteAgentAccessDurablePhaseV1 {
             10 => Ok(Self::Uncertain),
             11 => Ok(Self::QuarantineIntent),
             12 => Ok(Self::Quarantined),
+            13 => Ok(Self::RemoteAccessStopIntent),
             _ => Err(RemoteAgentAccessStateError::UnknownPhase),
         }
     }
@@ -133,6 +145,13 @@ pub(crate) struct RemoteAgentAccessSnapshotIdentityPinsV1 {
     pub(crate) transition_projection_digest: Digest32,
     pub(crate) fabric_owner_target_fingerprint: Digest32,
     pub(crate) fabric_transition_projection_digest: Digest32,
+}
+
+/// Strict current owner state and clock sample consumed by fresh preparation.
+pub(crate) struct RemoteAgentAccessPreparedInputsV1 {
+    pub(crate) fresh_clock: ClockReading,
+    pub(crate) fabric: ManagedFabricSnapshot,
+    pub(crate) predecessor: ManagedAgentStackSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,19 +190,29 @@ pub(crate) struct RemoteAgentAccessSnapshotV1 {
     snapshot_digest: Digest32,
 }
 
-impl RemoteAgentAccessSnapshotV1 {
+/// Non-cloneable authority to advance one already authenticated PXRS value.
+pub(crate) struct RemoteAgentAuthorizedAccessSnapshotV1 {
+    snapshot: RemoteAgentAccessSnapshotV1,
+}
+
+impl RemoteAgentAuthorizedAccessSnapshotV1 {
     /// Creates `PreparedNoEffects` only from both authentication markers and a
     /// strictly re-decoded ActiveReady PXAS.  Active mode additionally consumes
     /// the non-cloneable live-verification marker for its exact bootstrap PXDE.
     pub(crate) fn try_prepared(
-        previous: Option<&Self>,
+        previous: Option<Self>,
         identity: RemoteAgentAccessSnapshotIdentityPinsV1,
         authenticated_request: ControllerAuthenticatedRemoteAgentAccessRequestV1<'_>,
         verified_ingress: VerifiedRemoteAgentDataPlaneApplyIngressV1,
-        fabric: ManagedFabricSnapshot,
-        predecessor: ManagedAgentStackSnapshot,
+        inputs: RemoteAgentAccessPreparedInputsV1,
         verified_descriptor: Option<RemoteAgentVerifiedDescriptorEvidenceV1<'_>>,
     ) -> Result<Self, RemoteAgentAccessStateError> {
+        let RemoteAgentAccessPreparedInputsV1 {
+            fresh_clock,
+            fabric,
+            predecessor,
+        } = inputs;
+        let previous = previous.map(|authorized| authorized.snapshot);
         let outer = authenticated_request.request();
         if authenticated_request.kind() != RemoteAgentAccessKindV1::ApplyRemoteAccess {
             return Err(RemoteAgentAccessStateError::NotApplyRequest);
@@ -236,9 +265,16 @@ impl RemoteAgentAccessSnapshotV1 {
             .active
             .as_ref()
             .ok_or(RemoteAgentAccessStateError::InvalidPredecessor)?;
-        let (sequence, previous_snapshot_digest, access_generation_high_water) = match previous {
+        let (sequence, previous_snapshot_digest, access_generation_high_water) =
+            match previous.as_ref() {
             Some(previous) => {
-                if !previous.phase.is_terminal()
+                let prior_inner = inner_request(&previous.request)?;
+                if !matches!(
+                    previous.phase,
+                    RemoteAgentAccessDurablePhaseV1::NoEffectTerminal
+                        | RemoteAgentAccessDurablePhaseV1::ActiveReady
+                        | RemoteAgentAccessDurablePhaseV1::LocalOnlyReady
+                )
                     || previous.store_instance_id != identity.store_instance_id
                     || previous.owner_target_fingerprint != identity.owner_target_fingerprint
                     || previous.transition_projection_digest
@@ -248,10 +284,7 @@ impl RemoteAgentAccessSnapshotV1 {
                     || previous.fabric_transition_projection_digest
                         != identity.fabric_transition_projection_digest
                     || previous.target != outer.target()
-                    || previous
-                        .request
-                        .apply_request()
-                        .is_some_and(|prior| prior.request_digest() == inner.request_digest())
+                    || prior_inner.operation_id() == inner.operation_id()
                 {
                     return Err(RemoteAgentAccessStateError::InvalidOperationReplacement);
                 }
@@ -269,19 +302,24 @@ impl RemoteAgentAccessSnapshotV1 {
         let observed_fabric_high_water = strict_predecessor
             .fabric_generation_high_water
             .max(strict_fabric.generation_high_water());
-        let inherited_fabric_high_water = previous.map_or(observed_fabric_high_water, |prior| {
-            prior
-                .generations
-                .fabric_generation_high_water
-                .max(observed_fabric_high_water)
-        });
-        let inherited_agent_high_water =
-            previous.map_or(strict_predecessor.agent_generation_high_water, |prior| {
+        let inherited_fabric_high_water =
+            previous
+                .as_ref()
+                .map_or(observed_fabric_high_water, |prior| {
+                    prior
+                        .generations
+                        .fabric_generation_high_water
+                        .max(observed_fabric_high_water)
+                });
+        let inherited_agent_high_water = previous.as_ref().map_or(
+            strict_predecessor.agent_generation_high_water,
+            |prior| {
                 prior
                     .generations
                     .agent_generation_high_water
                     .max(strict_predecessor.agent_generation_high_water)
-            });
+            },
+        );
         if active.fabric_generation.value() > inherited_fabric_high_water
             || active.agent_generation.value() > inherited_agent_high_water
         {
@@ -297,7 +335,8 @@ impl RemoteAgentAccessSnapshotV1 {
             admitted_at_nanos: verified_ingress.admitted_at_nanos(),
             deadline_nanos: verified_ingress.deadline_nanos(),
         };
-        Self::try_build(Self {
+        validate_clock_window(inner, admission, fresh_clock)?;
+        let snapshot = RemoteAgentAccessSnapshotV1::try_build(RemoteAgentAccessSnapshotV1 {
             store_instance_id: identity.store_instance_id,
             owner_target_fingerprint: identity.owner_target_fingerprint,
             transition_projection_digest: identity.transition_projection_digest,
@@ -325,20 +364,43 @@ impl RemoteAgentAccessSnapshotV1 {
             terminal: None,
             canonical_wire: Box::new([]),
             snapshot_digest: zero_digest(),
-        })
+        })?;
+        Ok(Self { snapshot })
     }
 
-    /// Advances only a nonterminal effect or observation phase.  It cannot
-    /// create a PXAU and therefore cannot enter a terminal phase.
+    /// Begins the first effect only while the admitted temporal window remains fresh.
+    pub(crate) fn try_begin_effect_successor(
+        self,
+        phase: RemoteAgentAccessDurablePhaseV1,
+        generations: RemoteAgentAccessGenerationStateV1,
+        fresh_clock: ClockReading,
+    ) -> Result<Self, RemoteAgentAccessStateError> {
+        let snapshot = &self.snapshot;
+        if snapshot.phase != RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
+            || phase.is_terminal()
+            || !valid_phase_successor(snapshot.phase, phase, snapshot.mode)
+        {
+            return Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor);
+        }
+        validate_clock_window(inner_request(&snapshot.request)?, snapshot.admission, fresh_clock)?;
+        validate_generation_successor(snapshot, phase, generations)?;
+        self.try_successor(phase, generations, None)
+    }
+
+    /// Advances cleanup or observation after an effect has already begun.
     pub(crate) fn try_effect_successor(
-        &self,
+        self,
         phase: RemoteAgentAccessDurablePhaseV1,
         generations: RemoteAgentAccessGenerationStateV1,
     ) -> Result<Self, RemoteAgentAccessStateError> {
-        if phase.is_terminal() || !valid_phase_successor(self.phase, phase, self.mode) {
+        let snapshot = &self.snapshot;
+        if snapshot.phase == RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
+            || phase.is_terminal()
+            || !valid_phase_successor(snapshot.phase, phase, snapshot.mode)
+        {
             return Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor);
         }
-        validate_generation_successor(self, phase, generations)?;
+        validate_generation_successor(snapshot, phase, generations)?;
         self.try_successor(phase, generations, None)
     }
 
@@ -346,17 +408,20 @@ impl RemoteAgentAccessSnapshotV1 {
     /// marker. The exact receipt is correlated with the sole PXAR-v10 embedded
     /// inside the retained outer PXRA before any successor exists.
     pub(crate) fn try_terminal_successor(
-        &self,
+        self,
         phase: RemoteAgentAccessDurablePhaseV1,
         generations: RemoteAgentAccessGenerationStateV1,
         authenticated_terminal: RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1<'_>,
     ) -> Result<Self, RemoteAgentAccessStateError> {
-        if !phase.is_terminal() || !valid_phase_successor(self.phase, phase, self.mode) {
+        let snapshot = &self.snapshot;
+        if !phase.is_terminal()
+            || !valid_phase_successor(snapshot.phase, phase, snapshot.mode)
+        {
             return Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor);
         }
-        validate_generation_successor(self, phase, generations)?;
+        validate_generation_successor(snapshot, phase, generations)?;
         let terminal = authenticated_terminal.receipt().clone();
-        let inner = inner_request(&self.request)?;
+        let inner = inner_request(&snapshot.request)?;
         terminal
             .validate_against_request(inner)
             .map_err(RemoteAgentAccessStateError::TerminalContract)?;
@@ -364,39 +429,48 @@ impl RemoteAgentAccessSnapshotV1 {
     }
 
     fn try_successor(
-        &self,
+        self,
         phase: RemoteAgentAccessDurablePhaseV1,
         generations: RemoteAgentAccessGenerationStateV1,
         terminal: Option<RemoteAgentDataPlaneTerminalReceiptV1>,
     ) -> Result<Self, RemoteAgentAccessStateError> {
-        let sequence = self
+        let current = &self.snapshot;
+        let sequence = current
             .sequence
             .checked_add(1)
             .ok_or(RemoteAgentAccessStateError::SequenceExhausted)?;
-        Self::try_build(Self {
-            store_instance_id: self.store_instance_id,
-            owner_target_fingerprint: self.owner_target_fingerprint,
-            transition_projection_digest: self.transition_projection_digest,
-            fabric_owner_target_fingerprint: self.fabric_owner_target_fingerprint,
-            fabric_transition_projection_digest: self.fabric_transition_projection_digest,
+        let snapshot = RemoteAgentAccessSnapshotV1::try_build(RemoteAgentAccessSnapshotV1 {
+            store_instance_id: current.store_instance_id,
+            owner_target_fingerprint: current.owner_target_fingerprint,
+            transition_projection_digest: current.transition_projection_digest,
+            fabric_owner_target_fingerprint: current.fabric_owner_target_fingerprint,
+            fabric_transition_projection_digest: current.fabric_transition_projection_digest,
             sequence,
-            previous_snapshot_digest: Some(self.snapshot_digest),
-            runtime_host_epoch: self.runtime_host_epoch,
-            target: self.target,
-            mode: self.mode,
+            previous_snapshot_digest: Some(current.snapshot_digest),
+            runtime_host_epoch: current.runtime_host_epoch,
+            target: current.target,
+            mode: current.mode,
             phase,
             generations,
-            admission: self.admission,
-            request: self.request.clone(),
-            fabric: self.fabric.clone(),
-            predecessor: self.predecessor.clone(),
-            descriptor_evidence: self.descriptor_evidence.clone(),
+            admission: current.admission,
+            request: current.request.clone(),
+            fabric: current.fabric.clone(),
+            predecessor: current.predecessor.clone(),
+            descriptor_evidence: current.descriptor_evidence.clone(),
             terminal,
             canonical_wire: Box::new([]),
             snapshot_digest: zero_digest(),
-        })
+        })?;
+        Ok(Self { snapshot })
     }
 
+    #[must_use]
+    pub(crate) const fn snapshot(&self) -> &RemoteAgentAccessSnapshotV1 {
+        &self.snapshot
+    }
+}
+
+impl RemoteAgentAccessSnapshotV1 {
     /// Strict recovery decode. This restores structural state only and cannot
     /// manufacture either live PXDE verification or authenticated PXAU markers.
     pub(crate) fn decode(
@@ -573,6 +647,80 @@ impl RemoteAgentAccessSnapshotV1 {
             return Err(RemoteAgentAccessStateError::NonCanonical);
         }
         Ok(snapshot)
+    }
+
+    /// Reauthorizes one inert recovery value only from independently verified
+    /// outer/inner authentication and every exact mode/phase-specific marker.
+    pub(crate) fn try_reauthorize(
+        &self,
+        authenticated_request: ControllerAuthenticatedRemoteAgentAccessRequestV1<'_>,
+        authenticated_inner: AuthenticatedRemoteAgentDataPlaneApplyV1,
+        verified_descriptor: Option<RemoteAgentVerifiedDescriptorEvidenceV1<'_>>,
+        authenticated_terminal: Option<RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1<'_>>,
+    ) -> Result<RemoteAgentAuthorizedAccessSnapshotV1, RemoteAgentAccessStateError> {
+        let outer = authenticated_request.request();
+        if authenticated_request.kind() != RemoteAgentAccessKindV1::ApplyRemoteAccess
+            || outer.canonical_wire() != self.request.canonical_wire()
+            || outer.carrier() != self.request.carrier()
+            || outer.target() != self.target
+            || outer.expected_runtime_store_instance_id() != self.store_instance_id
+            || outer.expected_runtime_host_epoch() != self.runtime_host_epoch
+        {
+            return Err(RemoteAgentAccessStateError::AuthenticationMismatch);
+        }
+        let inner = inner_request(&self.request)?;
+        if authenticated_inner.request_digest() != self.admission.request_digest
+            || authenticated_inner.request_digest() != inner.request_digest()
+            || authenticated_inner.proof_envelope_digest()
+                != self.admission.proof_envelope_digest
+            || authenticated_inner.tenure_nonce_identity()
+                != self.admission.tenure_nonce_identity
+            || authenticated_inner.request_nonce_identity()
+                != self.admission.request_nonce_identity
+            || authenticated_inner.temporal_lineage_identity()
+                != self.admission.temporal_lineage_identity
+        {
+            return Err(RemoteAgentAccessStateError::AuthenticationMismatch);
+        }
+        match (self.mode, self.phase, self.descriptor_evidence.as_ref(), verified_descriptor) {
+            (
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                RemoteAgentAccessDurablePhaseV1::PreparedNoEffects,
+                Some(retained),
+                Some(verified),
+            ) if retained.canonical_wire() == verified.evidence().canonical_wire() => {
+                validate_descriptor_authority_scope(&self.request, inner, retained)?;
+            }
+            (
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                phase,
+                Some(_),
+                None,
+            ) if phase != RemoteAgentAccessDurablePhaseV1::PreparedNoEffects => {}
+            (
+                RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+                _,
+                None,
+                None,
+            ) => {}
+            _ => return Err(RemoteAgentAccessStateError::InvalidDescriptorShape),
+        }
+        match (self.terminal.as_ref(), authenticated_terminal) {
+            (None, None) if !self.phase.is_terminal() => {}
+            (Some(retained), Some(authenticated))
+                if self.phase.is_terminal()
+                    && retained.canonical_wire()
+                        == authenticated.receipt().canonical_wire() =>
+            {
+                retained
+                    .validate_against_request(inner)
+                    .map_err(RemoteAgentAccessStateError::TerminalContract)?;
+            }
+            _ => return Err(RemoteAgentAccessStateError::InvalidTerminalShape),
+        }
+        Ok(RemoteAgentAuthorizedAccessSnapshotV1 {
+            snapshot: self.clone(),
+        })
     }
 
     fn try_build(mut snapshot: Self) -> Result<Self, RemoteAgentAccessStateError> {
@@ -776,6 +924,24 @@ impl RemoteAgentAccessSnapshotV1 {
         self.generations
     }
 
+    /// Exact retained outer request; authentication must still be rerun.
+    #[must_use]
+    pub(crate) const fn request(&self) -> &RemoteAgentAccessRequestV1 {
+        &self.request
+    }
+
+    /// Exact retained PXDE; live verification must still be rerun when required.
+    #[must_use]
+    pub(crate) const fn descriptor_evidence(&self) -> Option<&RemoteAgentDescriptorEvidenceV1> {
+        self.descriptor_evidence.as_ref()
+    }
+
+    /// Exact retained PXAU; Runtime authentication must still be rerun.
+    #[must_use]
+    pub(crate) const fn terminal(&self) -> Option<&RemoteAgentDataPlaneTerminalReceiptV1> {
+        self.terminal.as_ref()
+    }
+
     #[must_use]
     pub(crate) fn canonical_wire(&self) -> &[u8] {
         &self.canonical_wire
@@ -845,6 +1011,7 @@ fn validate_descriptor_shape(
         evidence,
     ) {
         (RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive, Some(cas), Some(evidence)) => {
+            validate_descriptor_authority_scope(outer, inner, evidence)?;
             let mut matching_stack_terminals = predecessor.terminals.iter().filter(|record| {
                 record.receipt.receipt_digest() == cas.expected_active_pxst_digest()
             });
@@ -914,6 +1081,23 @@ fn validate_descriptor_shape(
     }
 }
 
+fn validate_descriptor_authority_scope(
+    outer: &RemoteAgentAccessRequestV1,
+    inner: &RemoteAgentDataPlaneApplyRequestV1,
+    evidence: &RemoteAgentDescriptorEvidenceV1,
+) -> Result<(), RemoteAgentAccessStateError> {
+    if evidence.request().carrier() != outer.carrier()
+        || evidence.intended_client()
+            != inner
+                .target_execution()
+                .profile()
+                .mac_agent_client_principal()
+    {
+        return Err(RemoteAgentAccessStateError::InvalidDescriptorShape);
+    }
+    Ok(())
+}
+
 fn validate_generation_shape(
     snapshot: &RemoteAgentAccessSnapshotV1,
 ) -> Result<(), RemoteAgentAccessStateError> {
@@ -945,18 +1129,6 @@ fn validate_generation_shape(
     {
         return Err(RemoteAgentAccessStateError::InvalidGenerationShape);
     }
-    let access_matches_mode = match snapshot.mode {
-        RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive => {
-            generations.access_generation_candidate.is_some()
-                == generations.fabric_generation_candidate.is_some()
-        }
-        RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate => {
-            generations.access_generation_candidate.is_none()
-        }
-    };
-    if !access_matches_mode {
-        return Err(RemoteAgentAccessStateError::InvalidGenerationShape);
-    }
     let no_candidates = generations.access_generation_candidate.is_none()
         && generations.fabric_generation_candidate.is_none()
         && generations.agent_generation_candidate.is_none();
@@ -964,26 +1136,43 @@ fn validate_generation_shape(
         && generations.agent_generation_candidate.is_none();
     let ready_candidates = generations.fabric_generation_candidate.is_some()
         && generations.agent_generation_candidate.is_some();
-    let valid = match snapshot.phase {
-        RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
-        | RemoteAgentAccessDurablePhaseV1::AgentStopIntent
-        | RemoteAgentAccessDurablePhaseV1::FabricStopIntent
-        | RemoteAgentAccessDurablePhaseV1::NoEffectTerminal => no_candidates,
-        RemoteAgentAccessDurablePhaseV1::FabricStartIntent => fabric_only,
-        RemoteAgentAccessDurablePhaseV1::AgentStartIntent
-        | RemoteAgentAccessDurablePhaseV1::ReadyObservation => ready_candidates,
-        RemoteAgentAccessDurablePhaseV1::ActiveReady => {
-            snapshot.mode == RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive
-                && ready_candidates
-        }
-        RemoteAgentAccessDurablePhaseV1::LocalOnlyReady => {
-            snapshot.mode == RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate
-                && ready_candidates
-        }
-        RemoteAgentAccessDurablePhaseV1::Uncertain
-        | RemoteAgentAccessDurablePhaseV1::QuarantineIntent
-        | RemoteAgentAccessDurablePhaseV1::Quarantined => {
-            no_candidates || fabric_only || ready_candidates
+    if snapshot.mode == RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive
+        && generations.access_generation_candidate.is_some()
+            != generations.fabric_generation_candidate.is_some()
+    {
+        return Err(RemoteAgentAccessStateError::InvalidGenerationShape);
+    }
+    let valid = match snapshot.mode {
+        RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive => match snapshot.phase {
+            RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
+            | RemoteAgentAccessDurablePhaseV1::AgentStopIntent
+            | RemoteAgentAccessDurablePhaseV1::FabricStopIntent
+            | RemoteAgentAccessDurablePhaseV1::NoEffectTerminal => no_candidates,
+            RemoteAgentAccessDurablePhaseV1::FabricStartIntent => fabric_only,
+            RemoteAgentAccessDurablePhaseV1::AgentStartIntent
+            | RemoteAgentAccessDurablePhaseV1::ReadyObservation
+            | RemoteAgentAccessDurablePhaseV1::ActiveReady => ready_candidates,
+            RemoteAgentAccessDurablePhaseV1::Uncertain
+            | RemoteAgentAccessDurablePhaseV1::QuarantineIntent
+            | RemoteAgentAccessDurablePhaseV1::Quarantined => {
+                no_candidates || fabric_only || ready_candidates
+            }
+            RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent
+            | RemoteAgentAccessDurablePhaseV1::LocalOnlyReady => false,
+        },
+        RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate => {
+            no_candidates
+                && matches!(
+                    snapshot.phase,
+                    RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
+                        | RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent
+                        | RemoteAgentAccessDurablePhaseV1::ReadyObservation
+                        | RemoteAgentAccessDurablePhaseV1::NoEffectTerminal
+                        | RemoteAgentAccessDurablePhaseV1::LocalOnlyReady
+                        | RemoteAgentAccessDurablePhaseV1::Uncertain
+                        | RemoteAgentAccessDurablePhaseV1::QuarantineIntent
+                        | RemoteAgentAccessDurablePhaseV1::Quarantined
+                )
         }
     };
     if !valid {
@@ -1007,6 +1196,11 @@ fn validate_generation_successor(
     next_phase: RemoteAgentAccessDurablePhaseV1,
     next: RemoteAgentAccessGenerationStateV1,
 ) -> Result<(), RemoteAgentAccessStateError> {
+    if current.mode == RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate
+        && next != current.generations
+    {
+        return Err(RemoteAgentAccessStateError::InvalidGenerationSuccessor);
+    }
     validate_one_generation_successor(
         current.generations.access_generation_high_water,
         current.generations.access_generation_candidate,
@@ -1075,26 +1269,56 @@ fn valid_phase_successor(
     use RemoteAgentAccessDurablePhaseV1::{
         ActiveReady, AgentStartIntent, AgentStopIntent, FabricStartIntent, FabricStopIntent,
         LocalOnlyReady, NoEffectTerminal, PreparedNoEffects, QuarantineIntent, Quarantined,
-        ReadyObservation, Uncertain,
+        ReadyObservation, RemoteAccessStopIntent, Uncertain,
     };
-    match (current, next) {
-        (PreparedNoEffects, AgentStopIntent | NoEffectTerminal) => true,
-        (AgentStopIntent, FabricStopIntent | Uncertain | QuarantineIntent)
-        | (FabricStopIntent, FabricStartIntent | Uncertain | QuarantineIntent)
-        | (FabricStartIntent, AgentStartIntent | Uncertain | QuarantineIntent)
-        | (AgentStartIntent, ReadyObservation | Uncertain | QuarantineIntent) => true,
-        (ReadyObservation, ActiveReady)
-            if mode == RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive =>
-        {
-            true
-        }
-        (ReadyObservation, LocalOnlyReady)
-            if mode == RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate =>
-        {
-            true
-        }
-        (ReadyObservation, Uncertain | QuarantineIntent) => true,
-        (QuarantineIntent, Quarantined) => true,
+    match (mode, current, next) {
+        (_, PreparedNoEffects, NoEffectTerminal) => true,
+        (
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+            PreparedNoEffects,
+            AgentStopIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+            AgentStopIntent,
+            FabricStopIntent | Uncertain | QuarantineIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+            FabricStopIntent,
+            FabricStartIntent | Uncertain | QuarantineIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+            FabricStartIntent,
+            AgentStartIntent | Uncertain | QuarantineIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+            AgentStartIntent,
+            ReadyObservation | Uncertain | QuarantineIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+            ReadyObservation,
+            ActiveReady | Uncertain | QuarantineIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+            PreparedNoEffects,
+            RemoteAccessStopIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+            RemoteAccessStopIntent,
+            ReadyObservation | Uncertain | QuarantineIntent,
+        )
+        | (
+            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+            ReadyObservation,
+            LocalOnlyReady | Uncertain | QuarantineIntent,
+        ) => true,
+        (_, QuarantineIntent, Quarantined) => true,
         _ => false,
     }
 }
@@ -1145,8 +1369,13 @@ fn validate_terminal_shape(
             }
         }
         RemoteAgentAccessDurablePhaseV1::LocalOnlyReady => {
-            if state.fabric_generation() != snapshot.generations.fabric_generation_candidate
-                || state.agent_generation() != snapshot.generations.agent_generation_candidate
+            let active = snapshot
+                .predecessor
+                .active
+                .as_ref()
+                .ok_or(RemoteAgentAccessStateError::InvalidPredecessor)?;
+            if state.fabric_generation() != Some(active.fabric_generation)
+                || state.agent_generation() != Some(active.agent_generation)
                 || state.access_generation().is_some()
             {
                 return Err(RemoteAgentAccessStateError::InvalidTerminalShape);
@@ -1214,6 +1443,23 @@ fn inner_request(
     request
         .apply_request()
         .ok_or(RemoteAgentAccessStateError::NotApplyRequest)
+}
+
+fn validate_clock_window(
+    inner: &RemoteAgentDataPlaneApplyRequestV1,
+    admission: RemoteAgentAccessAdmissionFactsV1,
+    reading: ClockReading,
+) -> Result<(), RemoteAgentAccessStateError> {
+    let now = reading.now().value();
+    if reading.domain() != inner.temporal().target_clock_domain()
+        || reading.generation() != inner.temporal().target_clock_generation()
+        || reading.generation() != admission.clock_generation
+        || now < admission.admitted_at_nanos
+        || now >= admission.deadline_nanos
+    {
+        return Err(RemoteAgentAccessStateError::InvalidTemporalWindow);
+    }
+    Ok(())
 }
 
 fn decode_mode(value: u8) -> Result<RemoteAgentDataPlaneTargetModeV1, RemoteAgentAccessStateError> {
@@ -1347,6 +1593,7 @@ pub(crate) enum RemoteAgentAccessStateError {
     NotApplyRequest,
     AuthenticationMismatch,
     InvalidAdmission,
+    InvalidTemporalWindow,
     InvalidPredecessor,
     InvalidAgentTerminal,
     InvalidFabric,

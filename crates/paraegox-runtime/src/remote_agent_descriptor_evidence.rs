@@ -292,6 +292,11 @@ impl RemoteAgentDescriptorEvidenceV1 {
     }
 
     #[must_use]
+    pub(crate) const fn intended_client(&self) -> PrincipalRef {
+        self.receipt.intended_client()
+    }
+
+    #[must_use]
     pub(crate) const fn request(&self) -> &RuntimeAgentControlRequestV1 {
         &self.request
     }
