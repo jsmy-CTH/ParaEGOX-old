@@ -1153,13 +1153,13 @@ impl ApplyAdmissionPolicy {
     /// Closes the PXRA-v2 Apply ingress authority gap left by the public
     /// Controller-authenticated outer marker.
     ///
-    /// The outer marker proves that its caller accepted the independent inner
-    /// and outer Controller signatures. This policy additionally proves the
-    /// writer-tenure signature, re-verifies the inner signature against the
-    /// exact admission key, binds that key to the exact restricted carrier,
-    /// and installs the target-clock operation deadline. The returned marker
-    /// remains Runtime-private, move-only evidence and grants no state effect
-    /// by itself.
+    /// The public outer marker supplies only canonical structural pairing; its
+    /// caller-provided signature callbacks are not trusted by this policy.
+    /// This policy independently proves the writer-tenure signature and both
+    /// Controller signatures against the exact admission key, binds that key
+    /// to the exact restricted carrier, and installs the target-clock
+    /// operation deadline. The returned marker remains Runtime-private,
+    /// move-only evidence and grants no state effect by itself.
     pub(crate) fn verify_remote_agent_access_apply_ingress_v2<'request>(
         &self,
         authenticated_outer: ControllerAuthenticatedRemoteAgentAccessRequestV2<'request>,
@@ -1272,6 +1272,14 @@ impl ApplyAdmissionPolicy {
         apply_key
             .verify_strict(inner_transcript.as_bytes(), &inner_signature)
             .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let outer_signature = parse_reference_signature(request.authentication().signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let outer_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(outer_transcript.as_bytes(), &outer_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
 
         let temporal = inner.temporal();
         if temporal.target_clock_domain() != reading.domain() {
@@ -1296,9 +1304,6 @@ impl ApplyAdmissionPolicy {
             .filter(|deadline| admitted_at_nanos != 0 && *deadline > admitted_at_nanos)
             .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
 
-        let outer_transcript = request
-            .signing_transcript()
-            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
         let proof_envelope_digest = proof
             .envelope_digest()
             .map_err(ManagedFabricApplyAdmissionError::Digest)?;
@@ -5743,6 +5748,75 @@ mod tests {
                     temporal.constraint_id().as_bytes(),
                 ],
             ),
+        );
+    }
+
+    #[test]
+    fn remote_agent_access_v2_public_marker_cannot_substitute_for_outer_signature_policy() {
+        let (valid_request, carrier) = signed_remote_agent_access_request_v2(
+            PYTHON_FIXTURE_TENURE_SEED,
+            PYTHON_FIXTURE_REQUEST_SEED,
+            None,
+        );
+        let altered_runtime_host_epoch = valid_request
+            .expected_runtime_host_epoch()
+            .checked_add(1)
+            .expect("PXRA v2 fixture RuntimeHost epoch must have a successor");
+        let forged_outer_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+            RemoteAgentAccessRequestFieldsV2 {
+                request_id: valid_request.request_id(),
+                carrier: carrier.clone(),
+                target: valid_request.target(),
+                expected_runtime_store_instance_id: valid_request
+                    .expected_runtime_store_instance_id(),
+                expected_runtime_host_epoch: altered_runtime_host_epoch,
+                auth_claim: valid_request.authentication().claim().clone(),
+            },
+            valid_request
+                .apply_request()
+                .unwrap_or_else(|| panic!("PXRA v2 Apply fixture must carry PXAR v11"))
+                .clone(),
+        )
+        .unwrap_or_else(|error| panic!("altered outer-only PXRA v2 draft rejected: {error}"));
+        let forged_outer = forged_outer_draft
+            .finalize(&[0xf6; ED25519_SIGNATURE_BYTES])
+            .unwrap_or_else(|error| panic!("forged outer PXRA v2 must remain canonical: {error}"));
+        assert_ne!(
+            forged_outer.expected_runtime_host_epoch(),
+            valid_request.expected_runtime_host_epoch(),
+            "the negative must alter an outer-only authority field",
+        );
+        assert_eq!(
+            forged_outer.apply_request(),
+            valid_request.apply_request(),
+            "tenure and inner Controller signatures must remain exactly valid",
+        );
+
+        let permissive_public_marker = forged_outer
+            .verify_controller_apply_request(
+                &carrier,
+                |_, _, _, _, _, _| true,
+                |_, _, _, _, _| true,
+            )
+            .unwrap_or_else(|error| panic!("permissive public marker rejected: {error}"));
+        let (admission, _) =
+            python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero"),
+            MonotonicInstant::from_ticks(1_000_000_000),
+        );
+        assert_eq!(
+            admission
+                .policy
+                .verify_remote_agent_access_apply_ingress_v2(
+                    permissive_public_marker,
+                    &carrier,
+                    reading,
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::InvalidRequestSignature,
+            "Runtime admission must independently reject the forged outer signature",
         );
     }
 
