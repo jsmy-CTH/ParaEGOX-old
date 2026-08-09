@@ -9414,7 +9414,10 @@ mod tests {
         );
         assert_eq!(current.snapshot_for_test().sequence(), 1);
         assert_eq!(current.snapshot_for_test().previous_snapshot_digest(), None);
-        assert_eq!(current.snapshot_for_test().access_generation_high_water(), 0);
+        assert_eq!(
+            current.snapshot_for_test().access_generation_high_water(),
+            0
+        );
         assert_eq!(current.snapshot_for_test().owner_slot_revision(), 1);
         assert_eq!(current.current_identity_for_test().target, TARGET);
         assert_eq!(
@@ -9604,9 +9607,10 @@ mod tests {
             .unwrap_or_else(|| panic!("CurrentFinal binder composition disappeared"));
         assert!(post_bundle < current_final);
         assert!(final_orchestrator.contains("RemoteAgentAccessCurrentFinalLeaseBundleV2"));
-        assert!(!final_orchestrator.contains(
-            "Result<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2"
-        ));
+        assert!(
+            !final_orchestrator
+                .contains("Result<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2")
+        );
 
         let compile_boundary = section(
             source,
@@ -9625,9 +9629,11 @@ mod tests {
             );
         }
         assert!(compile_boundary.contains("const _: () = {"));
-        assert!(compile_boundary.contains(
-            "let _ = typecheck_remote_agent_access_current_final_genesis_boundary_v2;"
-        ));
+        assert!(
+            compile_boundary.contains(
+                "let _ = typecheck_remote_agent_access_current_final_genesis_boundary_v2;"
+            )
+        );
         assert!(!compile_boundary.contains(".await"));
         assert!(!compile_boundary.contains("RuntimeRestrictedApplyCarrierPinV1::"));
     }

@@ -52,11 +52,11 @@ use crate::{
         VerifiedRemoteAgentAccessApplyIngressV2, VerifiedRemoteAgentDataPlaneApplyIngressV1,
         VerifiedRemoteAgentDataPlaneTerminalIngressV2,
     },
-    managed_fabric_runtime::RemoteAgentAccessRevalidatedCurrentFinalGenesisV2,
     managed_agent_stack_state::{
         MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES, ManagedAgentStackDurablePhase,
         ManagedAgentStackSnapshot, ManagedAgentStackStateError,
     },
+    managed_fabric_runtime::RemoteAgentAccessRevalidatedCurrentFinalGenesisV2,
     managed_fabric_state::{
         MAX_MANAGED_FABRIC_SNAPSHOT_BYTES, ManagedFabricDurablePhase, ManagedFabricSnapshot,
         ManagedFabricStateError,
@@ -2714,7 +2714,10 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
             || request.expected_runtime_store_instance_id() != current.identity.store_instance_id
             || request.expected_runtime_host_epoch() != self.current_runtime_host_epoch
             || request.retained_s0_cas() != self.current_retained_s0_cas
-            || inner.target_execution().profile().mac_agent_client_principal()
+            || inner
+                .target_execution()
+                .profile()
+                .mac_agent_client_principal()
                 != self.current_intended_client
             || request.expected_s1_cas() != self.current_s1_cas
             || inner.target_execution().expected_s1_cas() != self.current_s1_cas
@@ -8799,9 +8802,7 @@ mod tests {
             ] {
                 assert!(constructor.contains(&format!("parts.{field}")));
             }
-            assert!(source.contains(
-                "#[cfg(test)]\n    fn from_exact_readback_for_test("
-            ));
+            assert!(source.contains("#[cfg(test)]\n    fn from_exact_readback_for_test("));
         }
 
         #[test]

@@ -772,11 +772,7 @@ pub(crate) struct RemoteAgentAccessCurrentFinalLeaseBundleV2 {
 
 impl fmt::Debug for RemoteAgentAccessCurrentFinalLeaseBundleV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _retained_authority = (
-            &self.same_epoch,
-            &self.current_final,
-            &self.exact_pxap,
-        );
+        let _retained_authority = (&self.same_epoch, &self.current_final, &self.exact_pxap);
         formatter
             .debug_struct("RemoteAgentAccessCurrentFinalLeaseBundleV2")
             .finish_non_exhaustive()
@@ -792,9 +788,7 @@ impl RemoteAgentAccessCurrentFinalLeaseBundleV2 {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn current_final_for_test(
-        &self,
-    ) -> &RemoteAgentCurrentFinalAccessSnapshotV2 {
+    pub(crate) const fn current_final_for_test(&self) -> &RemoteAgentCurrentFinalAccessSnapshotV2 {
         &self.current_final
     }
 
