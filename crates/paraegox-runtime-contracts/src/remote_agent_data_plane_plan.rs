@@ -3321,10 +3321,7 @@ impl RemoteAgentDataPlaneApplyRequestDraftV2 {
         expected_runtime_store_instance_id: [u8; 32],
         auth_claim: ApplyRequestAuthClaim,
     ) -> Result<Self, RemoteAgentDataPlanePlanError> {
-        validate_apply_temporal_budget_v2(
-            temporal,
-            execution.profile().operation_timeout_nanos(),
-        )?;
+        validate_apply_temporal_budget_v2(temporal, execution.profile().operation_timeout_nanos())?;
         let assignments = RemoteAgentDataPlaneAssignmentsV2::try_from_execution(execution)?;
         let header = RuntimeSliceHeader::new(
             assignments.execution.projection().target(),
@@ -5152,9 +5149,7 @@ mod temporal_authority_v2_tests {
             Uncertain,
             Quarantined,
         ] {
-            assert!(!terminal_selection_time_is_valid_v2(
-                outcome, 100, 200, 99
-            ));
+            assert!(!terminal_selection_time_is_valid_v2(outcome, 100, 200, 99));
         }
 
         assert!(terminal_selection_time_is_valid_v2(
@@ -5182,15 +5177,8 @@ mod temporal_authority_v2_tests {
             200
         ));
 
-        for outcome in [
-            LocalOnlyReady,
-            NoEffectRejected,
-            Uncertain,
-            Quarantined,
-        ] {
-            assert!(terminal_selection_time_is_valid_v2(
-                outcome, 100, 200, 250
-            ));
+        for outcome in [LocalOnlyReady, NoEffectRejected, Uncertain, Quarantined] {
+            assert!(terminal_selection_time_is_valid_v2(outcome, 100, 200, 250));
         }
     }
 
