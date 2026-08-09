@@ -1264,9 +1264,10 @@ fn valid_phase_successor(
         LocalOnlyReady, NoEffectTerminal, PreparedNoEffects, QuarantineIntent, Quarantined,
         ReadyObservation, RemoteAccessStopIntent, Uncertain,
     };
-    match (mode, current, next) {
-        (_, PreparedNoEffects, NoEffectTerminal) => true,
-        (
+    matches!(
+        (mode, current, next),
+        (_, PreparedNoEffects, NoEffectTerminal)
+            | (
             RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
             PreparedNoEffects,
             AgentStopIntent,
@@ -1310,10 +1311,9 @@ fn valid_phase_successor(
             RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
             ReadyObservation,
             LocalOnlyReady | Uncertain | QuarantineIntent,
-        ) => true,
-        (_, QuarantineIntent, Quarantined) => true,
-        _ => false,
-    }
+        )
+            | (_, QuarantineIntent, Quarantined)
+    )
 }
 
 fn validate_terminal_shape(
