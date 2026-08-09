@@ -80,8 +80,7 @@ fn active_inner_terminal() -> RemoteAgentDataPlaneTerminalReceiptV2 {
 }
 
 fn current_active_s1_cas() -> RemoteAgentActiveS1CasV2 {
-    let local_only =
-        fixture_section_after(PROXY_DATA_PLANE_V2_GOLDEN, "\"local_only_ready\"");
+    let local_only = fixture_section_after(PROXY_DATA_PLANE_V2_GOLDEN, "\"local_only_ready\"");
     let expected_s1 = fixture_section_after(local_only, "\"expected_s1_cas\"");
     RemoteAgentActiveS1CasV2::decode(&fixture_hex_after(expected_s1, "\"wire_hex\""))
         .expect("shared-golden active S1 CAS")
@@ -93,22 +92,20 @@ fn carrier_for(
 ) -> RestrictedRuntimeApplyCarrierBindingV1 {
     let request_auth = request.authentication().claim();
     let terminal_auth = terminal.authentication();
-    RestrictedRuntimeApplyCarrierBindingV1::try_new(
-        RestrictedRuntimeApplyCarrierBindingFieldsV1 {
-            target: request.target(),
-            runtime_principal: terminal_auth.runtime_principal(),
-            controller_principal: request_auth.principal(),
-            endpoint_ref: [0xb5; 16],
-            endpoint_generation: 11,
-            route: "paraegox/runtime/control/v1/apply",
-            controller_request_key: request_auth.key(),
-            controller_request_key_fingerprint: Digest32::from_bytes([0xb6; 32]),
-            runtime_response_key: terminal_auth.key(),
-            runtime_response_key_fingerprint: Digest32::from_bytes([0xb8; 32]),
-            control_transport_profile_ref: [0xb9; 16],
-            control_transport_profile_digest: Digest32::from_bytes([0xba; 32]),
-        },
-    )
+    RestrictedRuntimeApplyCarrierBindingV1::try_new(RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+        target: request.target(),
+        runtime_principal: terminal_auth.runtime_principal(),
+        controller_principal: request_auth.principal(),
+        endpoint_ref: [0xb5; 16],
+        endpoint_generation: 11,
+        route: "paraegox/runtime/control/v1/apply",
+        controller_request_key: request_auth.key(),
+        controller_request_key_fingerprint: Digest32::from_bytes([0xb6; 32]),
+        runtime_response_key: terminal_auth.key(),
+        runtime_response_key_fingerprint: Digest32::from_bytes([0xb8; 32]),
+        control_transport_profile_ref: [0xb9; 16],
+        control_transport_profile_digest: Digest32::from_bytes([0xba; 32]),
+    })
     .expect("restricted PXCB")
 }
 
@@ -217,10 +214,16 @@ fn pxra2_apply_and_describe_freeze_fixed_header_offsets_bounds_and_controller_or
     let payload_length = inner.canonical_wire().len();
     let nonce_length = OUTER_CONTROLLER_NONCE.len();
 
-    assert_eq!(wire.len(), 544 + nonce_length + carrier_length + payload_length + 64);
+    assert_eq!(
+        wire.len(),
+        544 + nonce_length + carrier_length + payload_length + 64
+    );
     assert_eq!(&wire[0..4], REMOTE_AGENT_ACCESS_REQUEST_MAGIC);
     assert_eq!(read_u16(&wire[4..6]), REMOTE_AGENT_ACCESS_V2_VERSION);
-    assert_eq!(read_u16(&wire[6..8]), RemoteAgentAccessKindV2::ApplyRemoteAccess as u16);
+    assert_eq!(
+        read_u16(&wire[6..8]),
+        RemoteAgentAccessKindV2::ApplyRemoteAccess as u16
+    );
     assert_eq!(&wire[8..10], &[0, 0]);
     assert_eq!(read_u16(&wire[10..12]) as usize, carrier_length);
     assert_eq!(read_u32(&wire[12..16]) as usize, payload_length);
@@ -307,10 +310,16 @@ fn pxra2_apply_and_describe_freeze_fixed_header_offsets_bounds_and_controller_or
     );
     assert_eq!(read_u16(&describe_wire[6..8]), 2);
     assert_eq!(read_u32(&describe_wire[12..16]), 0);
-    assert_eq!(&describe_wire[320..472], current_active_s1_cas().canonical_wire());
+    assert_eq!(
+        &describe_wire[320..472],
+        current_active_s1_cas().canonical_wire()
+    );
     assert_eq!(&describe_wire[472..504], &[0; 32]);
     assert!(describe.apply_request().is_none());
-    assert_eq!(RemoteAgentAccessRequestV2::decode(describe_wire).unwrap(), describe);
+    assert_eq!(
+        RemoteAgentAccessRequestV2::decode(describe_wire).unwrap(),
+        describe
+    );
     let describe_transcript = describe.signing_transcript().unwrap();
     describe
         .verify_controller_describe_request(
@@ -340,20 +349,34 @@ fn pxrr2_apply_freezes_fixed_header_offsets_and_runtime_verification_order() {
     let carrier_length = carrier.canonical_wire().len();
     let payload_length = terminal.canonical_wire().len();
 
-    assert_eq!(wire.len(), 646 + nonce_length + carrier_length + payload_length + 64);
+    assert_eq!(
+        wire.len(),
+        646 + nonce_length + carrier_length + payload_length + 64
+    );
     assert_eq!(&wire[0..4], REMOTE_AGENT_ACCESS_RESPONSE_MAGIC);
     assert_eq!(read_u16(&wire[4..6]), REMOTE_AGENT_ACCESS_V2_VERSION);
-    assert_eq!(read_u16(&wire[6..8]), RemoteAgentAccessKindV2::ApplyRemoteAccess as u16);
+    assert_eq!(
+        read_u16(&wire[6..8]),
+        RemoteAgentAccessKindV2::ApplyRemoteAccess as u16
+    );
     assert_eq!(&wire[8..10], &[0, 0]);
     assert_eq!(read_u16(&wire[10..12]) as usize, carrier_length);
     assert_eq!(read_u32(&wire[12..16]) as usize, payload_length);
-    assert_eq!(&wire[16..24], &[0; 8]);
+    assert_eq!(read_u16(&wire[16..18]), 0);
+    assert_eq!(read_u32(&wire[18..22]), 0);
+    assert_eq!(read_u16(&wire[22..24]) as usize, nonce_length);
     assert_eq!(&wire[24..40], request.request_id().as_bytes());
     assert_eq!(&wire[40..72], request.request_digest().as_bytes());
     assert_eq!(&wire[72..104], carrier.binding_digest().as_bytes());
     assert_eq!(&wire[104..120], request.target().as_bytes());
-    assert_eq!(&wire[120..152], &request.expected_runtime_store_instance_id());
-    assert_eq!(read_u64(&wire[152..160]), request.expected_runtime_host_epoch());
+    assert_eq!(
+        &wire[120..152],
+        &request.expected_runtime_store_instance_id()
+    );
+    assert_eq!(
+        read_u64(&wire[152..160]),
+        request.expected_runtime_host_epoch()
+    );
     assert_eq!(&wire[160..360], request.retained_s0_cas().canonical_wire());
     assert_eq!(&wire[360..512], request.expected_s1_cas().canonical_wire());
     assert_eq!(&wire[512..544], response.payload_wire_digest().as_bytes());
