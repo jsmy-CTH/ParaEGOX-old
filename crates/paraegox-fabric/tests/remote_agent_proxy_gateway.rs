@@ -778,7 +778,12 @@ async fn forward_one_query(
     forwarded.fetch_add(1, Ordering::SeqCst);
     let response = tokio::time::timeout_at(
         deadline,
-        fabric.request(binding, request.request_id(), request.body().to_vec(), remaining),
+        fabric.request(
+            binding,
+            request.request_id(),
+            request.body().to_vec(),
+            remaining,
+        ),
     )
     .await
     .ok()
@@ -787,11 +792,8 @@ async fn forward_one_query(
         reply_proxy_error(&query, "proxy downstream outcome uncertain").await;
         return;
     };
-    let reply = tokio::time::timeout_at(
-        deadline,
-        query.reply(route.to_owned(), response.encode()),
-    )
-    .await;
+    let reply =
+        tokio::time::timeout_at(deadline, query.reply(route.to_owned(), response.encode())).await;
     if !matches!(reply, Ok(Ok(()))) {
         reply_proxy_error(&query, "proxy response deadline expired").await;
     }
