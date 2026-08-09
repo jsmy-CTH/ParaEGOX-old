@@ -15,8 +15,8 @@ use std::{
 };
 
 use paraegox_fabric::{
-    BindingRequestEnvelopeV1, BindingResponseEnvelopeV1, FabricService, FabricServiceConfig,
-    HandlerResponse, IngressLimits, PortBinding, RequestId, RequestReceiver,
+    BindingRequestEnvelopeV1, BindingResponseEnvelopeV1, FabricError, FabricService,
+    FabricServiceConfig, HandlerResponse, IngressLimits, PortBinding, RequestId, RequestReceiver,
     RequestResponseBindingSpec, ResponseStatus, SessionEndpoint,
     restricted_runtime_apply_peer_certificate_common_name_v1,
 };
@@ -573,10 +573,37 @@ struct AdmittedQuery {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardTerminal {
+    NoEffect,
+    EffectCompleted,
+    OutcomeUncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyDrainOutcome {
+    Drained,
+    OutcomeUncertain,
+}
+
+impl ProxyDrainOutcome {
+    fn include(&mut self, terminal: ForwardTerminal) {
+        if terminal == ForwardTerminal::OutcomeUncertain {
+            *self = Self::OutcomeUncertain;
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if other == Self::OutcomeUncertain {
+            *self = Self::OutcomeUncertain;
+        }
+    }
+}
+
 struct TestProxyGateway {
     session: Option<zenoh::Session>,
     queryables: [Option<Queryable<()>>; 2],
-    workers: [Option<JoinHandle<()>>; 2],
+    workers: [Option<JoinHandle<ProxyDrainOutcome>>; 2],
     admission_observers: [watch::Receiver<usize>; 2],
     observed: [Arc<AtomicUsize>; 2],
     admitted: [Arc<AtomicUsize>; 2],
@@ -694,19 +721,32 @@ impl TestProxyGateway {
         assert_eq!(*observer.borrow(), expected);
     }
 
-    async fn shutdown(mut self, deadline: Instant) {
+    async fn shutdown(
+        mut self,
+        deadline: Instant,
+        admission_closed: oneshot::Sender<()>,
+    ) -> ProxyDrainOutcome {
         for queryable in &mut self.queryables {
             if let Some(queryable) = queryable.take() {
-                finish_before(deadline, queryable.undeclare(), "undeclare proxy queryable")
-                    .await
-                    .expect("proxy queryable must undeclare");
+                finish_before(
+                    deadline,
+                    queryable.undeclare().wait_callbacks(),
+                    "undeclare proxy queryable and finish callbacks",
+                )
+                .await
+                .expect("proxy queryable must undeclare after its callbacks finish");
             }
         }
+        admission_closed
+            .send(())
+            .expect("proxy admission-closed observer remains live");
+        let mut outcome = ProxyDrainOutcome::Drained;
         for worker in &mut self.workers {
             if let Some(worker) = worker.take() {
-                finish_before(deadline, worker, "join proxy forwarder")
+                let worker_outcome = finish_before(deadline, worker, "join proxy forwarder")
                     .await
                     .expect("proxy forwarder must join");
+                outcome.merge(worker_outcome);
             }
         }
         if let Some(session) = self.session.take() {
@@ -714,6 +754,7 @@ impl TestProxyGateway {
                 .await
                 .expect("raw TLS proxy session must close");
         }
+        outcome
     }
 }
 
@@ -723,10 +764,13 @@ async fn run_proxy_forwarder(
     route: Arc<str>,
     mut receiver: mpsc::Receiver<AdmittedQuery>,
     forwarded: Arc<AtomicUsize>,
-) {
+) -> ProxyDrainOutcome {
+    let mut outcome = ProxyDrainOutcome::Drained;
     while let Some(admitted) = receiver.recv().await {
-        forward_one_query(&fabric, &binding, &route, admitted, &forwarded).await;
+        let terminal = forward_one_query(&fabric, &binding, &route, admitted, &forwarded).await;
+        outcome.include(terminal);
     }
+    outcome
 }
 
 async fn forward_one_query(
@@ -735,33 +779,33 @@ async fn forward_one_query(
     route: &str,
     admitted: AdmittedQuery,
     forwarded: &AtomicUsize,
-) {
+) -> ForwardTerminal {
     let AdmittedQuery { query, deadline } = admitted;
     if Instant::now() >= deadline {
-        reply_proxy_error(&query, "proxy admission deadline expired").await;
-        return;
+        reply_proxy_error(&query, "proxy admission deadline expired", deadline).await;
+        return ForwardTerminal::NoEffect;
     }
     let Some(payload) = query.payload() else {
-        return;
+        return ForwardTerminal::NoEffect;
     };
     let bytes = payload.to_bytes();
     let Ok(request) = BindingRequestEnvelopeV1::decode(bytes.as_ref(), MAX_TEST_FRAME_BYTES) else {
-        reply_proxy_error(&query, "proxy malformed request").await;
-        return;
+        reply_proxy_error(&query, "proxy malformed request", deadline).await;
+        return ForwardTerminal::NoEffect;
     };
     if request.binding_id() != binding.binding_id()
         || request.binding_epoch() != binding.binding_epoch()
         || request.schema() != binding.request_schema()
     {
-        reply_proxy_error(&query, "proxy route mismatch").await;
-        return;
+        reply_proxy_error(&query, "proxy route mismatch", deadline).await;
+        return ForwardTerminal::NoEffect;
     }
     let Some(remaining) = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
     else {
-        reply_proxy_error(&query, "proxy admission deadline expired").await;
-        return;
+        reply_proxy_error(&query, "proxy admission deadline expired", deadline).await;
+        return ForwardTerminal::NoEffect;
     };
     forwarded.fetch_add(1, Ordering::SeqCst);
     let response = tokio::time::timeout_at(
@@ -773,23 +817,58 @@ async fn forward_one_query(
             remaining,
         ),
     )
-    .await
-    .ok()
-    .and_then(Result::ok);
-    let Some(response) = response else {
-        reply_proxy_error(&query, "proxy downstream outcome uncertain").await;
-        return;
+    .await;
+    let response = match response {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let terminal = classify_fabric_error(error);
+            reply_proxy_error(&query, "proxy downstream request failed", deadline).await;
+            return terminal;
+        }
+        Err(_) => {
+            reply_proxy_error(&query, "proxy downstream outcome uncertain", deadline).await;
+            return ForwardTerminal::OutcomeUncertain;
+        }
     };
+    let terminal = classify_response_status(response.status());
     let reply =
         tokio::time::timeout_at(deadline, query.reply(route.to_owned(), response.encode())).await;
-    if !matches!(reply, Ok(Ok(()))) {
-        reply_proxy_error(&query, "proxy response deadline expired").await;
+    if matches!(reply, Ok(Ok(()))) {
+        terminal
+    } else {
+        ForwardTerminal::OutcomeUncertain
     }
 }
 
-async fn reply_proxy_error(query: &Query, message: &'static str) {
-    let terminal_deadline = deadline_after(Duration::from_secs(1));
-    let _ = tokio::time::timeout_at(terminal_deadline, query.reply_err(message)).await;
+fn classify_fabric_error(error: FabricError) -> ForwardTerminal {
+    match error {
+        FabricError::ZeroRequestTimeout
+        | FabricError::RequestBodyTooLarge
+        | FabricError::QuerierDeclarationFailed
+        | FabricError::MatchingObservationFailed
+        | FabricError::QueryStartFailed => ForwardTerminal::NoEffect,
+        _ => ForwardTerminal::OutcomeUncertain,
+    }
+}
+
+fn classify_response_status(status: ResponseStatus) -> ForwardTerminal {
+    match status {
+        ResponseStatus::MalformedRequest
+        | ResponseStatus::StaleBinding
+        | ResponseStatus::IngressOverloaded => ForwardTerminal::NoEffect,
+        ResponseStatus::Ok
+        | ResponseStatus::HandlerRejected
+        | ResponseStatus::ResponseTooLarge => ForwardTerminal::EffectCompleted,
+        ResponseStatus::HandlerUnavailable | ResponseStatus::HandlerTimeout => {
+            ForwardTerminal::OutcomeUncertain
+        }
+    }
+}
+
+async fn reply_proxy_error(query: &Query, message: &'static str, deadline: Instant) {
+    if Instant::now() < deadline {
+        let _ = tokio::time::timeout_at(deadline, query.reply_err(message)).await;
+    }
 }
 
 fn request_frame(binding: &PortBinding, marker: u8, body: &[u8]) -> Vec<u8> {
@@ -1366,6 +1445,24 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     )
     .await;
     assert_single_live_tls_link(proxy.session(), &correct_client_common_name).await;
+
+    for canary in forbidden_canaries {
+        finish_before(
+            deadline_after(OPERATION_BUDGET),
+            canary.undeclare(),
+            "undeclare forbidden route canary",
+        )
+        .await
+        .expect("forbidden route canary must undeclare");
+    }
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        link_listener.undeclare(),
+        "undeclare raw proxy link observer",
+    )
+    .await
+    .expect("raw proxy link observer must undeclare");
+
     let in_flight_session = stop_client.clone();
     let in_flight_frame = request_frame(&submit, 0x59, IN_FLIGHT_STOP_BODY);
     let in_flight_query = tokio::spawn(async move {
@@ -1414,32 +1511,29 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
     assert_eq!(control_callbacks.load(Ordering::SeqCst), 1);
 
-    for canary in forbidden_canaries {
-        finish_before(
-            deadline_after(OPERATION_BUDGET),
-            canary.undeclare(),
-            "undeclare forbidden route canary",
-        )
-        .await
-        .expect("forbidden route canary must undeclare");
-    }
-    finish_before(
-        deadline_after(OPERATION_BUDGET),
-        link_listener.undeclare(),
-        "undeclare raw proxy link observer",
-    )
-    .await
-    .expect("raw proxy link observer must undeclare");
-
     let stop_observed = Arc::clone(&proxy.observed[0]);
     let stop_admitted = Arc::clone(&proxy.admitted[0]);
     let stop_forwarded = Arc::clone(&proxy.forwarded[0]);
-    let proxy_shutdown = tokio::spawn(proxy.shutdown(deadline_after(OPERATION_BUDGET)));
-    tokio::task::yield_now().await;
+    let (admission_closed_sender, admission_closed_receiver) = oneshot::channel();
+    let proxy_shutdown = tokio::spawn(proxy.shutdown(
+        deadline_after(OPERATION_BUDGET),
+        admission_closed_sender,
+    ));
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        admission_closed_receiver,
+        "observe proxy admission fence",
+    )
+    .await
+    .expect("proxy admission fence observer remains live");
     assert!(
         !proxy_shutdown.is_finished(),
         "graceful proxy shutdown must wait for the in-handler and queued S0 effects"
     );
+    assert_eq!(stop_observed.load(Ordering::SeqCst), 3);
+    assert_eq!(stop_admitted.load(Ordering::SeqCst), 3);
+    assert_eq!(stop_forwarded.load(Ordering::SeqCst), 2);
+    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
     in_flight_effect
         .release
         .send(())
@@ -1485,13 +1579,14 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     assert_eq!(queued_response.binding_epoch(), submit.binding_epoch());
     assert_eq!(queued_response.status(), ResponseStatus::Ok);
     assert_eq!(queued_response.body(), queued_body);
-    finish_before(
+    let drain_outcome = finish_before(
         deadline_after(OPERATION_BUDGET),
         proxy_shutdown,
         "join graceful proxy shutdown",
     )
     .await
     .expect("graceful proxy shutdown task must join");
+    assert_eq!(drain_outcome, ProxyDrainOutcome::Drained);
     assert_eq!(stop_observed.load(Ordering::SeqCst), 3);
     assert_eq!(stop_admitted.load(Ordering::SeqCst), 3);
     assert_eq!(stop_forwarded.load(Ordering::SeqCst), 3);
@@ -1514,6 +1609,173 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     assert_eq!(stop_forwarded.load(Ordering::SeqCst), 3);
     assert_eq!(submit_callbacks.load(Ordering::SeqCst), 3);
     assert_eq!(control_callbacks.load(Ordering::SeqCst), 2);
+
+    let uncertain_submit_baseline = submit_callbacks.load(Ordering::SeqCst);
+    let uncertain_control_baseline = control_callbacks.load(Ordering::SeqCst);
+    let mut uncertain_proxy = TestProxyGateway::start(
+        raw_remote_agent_config(
+            RawRemoteAgentRole::Listener,
+            s1_socket,
+            &pki,
+            &pki.listener,
+            mac_client_principal,
+        ),
+        Arc::clone(&s0),
+        submit.clone(),
+        control.clone(),
+        deadline_after(OPERATION_BUDGET),
+    )
+    .await;
+    assert_port_owned(s1_socket);
+    let uncertain_client = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        zenoh::open(raw_remote_agent_config(
+            RawRemoteAgentRole::Connector,
+            s1_socket,
+            &pki,
+            &pki.correct_client,
+            ubuntu_listener_principal,
+        )),
+        "open correct-CN S2 for uncertain drain",
+    )
+    .await
+    .expect("uncertain-drain S2 must complete real TLS open");
+    assert_single_live_tls_link(uncertain_proxy.session(), &correct_client_common_name).await;
+    assert_single_live_tls_link(&uncertain_client, &listener_common_name).await;
+
+    let uncertain_session = uncertain_client.clone();
+    let uncertain_frame = request_frame(&submit, 0x5b, IN_FLIGHT_STOP_BODY);
+    let uncertain_query = tokio::spawn(async move {
+        raw_query_once(
+            &uncertain_session,
+            SUBMIT_ROUTE,
+            uncertain_frame,
+            true,
+            deadline_after(QUERY_BUDGET),
+            deadline_after(OPERATION_BUDGET),
+        )
+        .await
+    });
+    let uncertain_effect = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        gated_effects.recv(),
+        "observe request that crosses the S0 handler timeout",
+    )
+    .await
+    .expect("gated S0 handler must report the uncertain request");
+    uncertain_proxy.wait_for_admitted(0, 1).await;
+    assert_eq!(uncertain_proxy.observed(), [1, 0]);
+    assert_eq!(uncertain_proxy.admitted(), [1, 0]);
+    assert_eq!(uncertain_proxy.forwarded(), [1, 0]);
+    assert_eq!(
+        submit_callbacks.load(Ordering::SeqCst),
+        uncertain_submit_baseline + 1
+    );
+    let uncertain_observed = Arc::clone(&uncertain_proxy.observed[0]);
+    let uncertain_admitted = Arc::clone(&uncertain_proxy.admitted[0]);
+    let uncertain_forwarded = Arc::clone(&uncertain_proxy.forwarded[0]);
+    let (uncertain_admission_closed_sender, uncertain_admission_closed_receiver) =
+        oneshot::channel();
+    let uncertain_shutdown = tokio::spawn(uncertain_proxy.shutdown(
+        deadline_after(OPERATION_BUDGET),
+        uncertain_admission_closed_sender,
+    ));
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        uncertain_admission_closed_receiver,
+        "observe uncertain proxy admission fence",
+    )
+    .await
+    .expect("uncertain proxy admission fence observer remains live");
+    assert!(
+        !uncertain_shutdown.is_finished(),
+        "proxy shutdown must wait for the S0 handler timeout terminal"
+    );
+    assert_eq!(uncertain_observed.load(Ordering::SeqCst), 1);
+    assert_eq!(uncertain_admitted.load(Ordering::SeqCst), 1);
+    assert_eq!(uncertain_forwarded.load(Ordering::SeqCst), 1);
+
+    let uncertain_drain = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        uncertain_shutdown,
+        "join outcome-uncertain proxy shutdown",
+    )
+    .await
+    .expect("outcome-uncertain proxy shutdown task must join");
+    assert_eq!(uncertain_drain, ProxyDrainOutcome::OutcomeUncertain);
+    let uncertain_outcome = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        uncertain_query,
+        "join handler-timeout caller",
+    )
+    .await
+    .expect("handler-timeout caller task must join");
+    let uncertain_response = match uncertain_outcome {
+        RawQueryOutcome::Response(response) => response,
+        outcome => panic!("handler-timeout caller used unexpected terminal: {outcome:?}"),
+    };
+    assert_eq!(uncertain_response.binding_id(), submit.binding_id());
+    assert_eq!(uncertain_response.binding_epoch(), submit.binding_epoch());
+    assert_eq!(uncertain_response.status(), ResponseStatus::HandlerTimeout);
+    assert!(uncertain_response.body().is_empty());
+    let GatedEffectObservation {
+        release: uncertain_release,
+        completed: mut uncertain_completed,
+    } = uncertain_effect;
+    assert!(matches!(
+        uncertain_completed.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        submit_callbacks.load(Ordering::SeqCst),
+        uncertain_submit_baseline + 1
+    );
+    assert!(matches!(
+        gated_effects.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    uncertain_release
+        .send(())
+        .expect("release S0 effect after uncertain proxy shutdown");
+    let responder_was_closed = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        uncertain_completed,
+        "complete S0 effect after uncertain proxy shutdown",
+    )
+    .await
+    .expect("uncertain S0 effect must report completion");
+    assert!(
+        responder_was_closed,
+        "handler-timeout terminal must close its downstream response receiver"
+    );
+    assert_eq!(uncertain_observed.load(Ordering::SeqCst), 1);
+    assert_eq!(uncertain_admitted.load(Ordering::SeqCst), 1);
+    assert_eq!(uncertain_forwarded.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        submit_callbacks.load(Ordering::SeqCst),
+        uncertain_submit_baseline + 1
+    );
+    assert!(matches!(
+        gated_effects.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        uncertain_client.close(),
+        "close uncertain-drain S2",
+    )
+    .await
+    .expect("uncertain-drain S2 must close");
+    assert_port_released(s1_socket);
+    expect_local_echo(&s0, &control, 0x62, b"local-after-uncertain-stop").await;
+    assert_eq!(
+        submit_callbacks.load(Ordering::SeqCst),
+        uncertain_submit_baseline + 1
+    );
+    assert_eq!(
+        control_callbacks.load(Ordering::SeqCst),
+        uncertain_control_baseline + 1
+    );
 
     let s0 = Arc::try_unwrap(s0).unwrap_or_else(|_| panic!("proxy must release S0 FabricService"));
     finish_before(
