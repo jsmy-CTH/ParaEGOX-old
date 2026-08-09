@@ -5779,7 +5779,7 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("altered outer-only PXRA v2 draft rejected: {error}"));
         let forged_outer = forged_outer_draft
-            .finalize(&[0xf6; ED25519_SIGNATURE_BYTES])
+            .finalize(&[0xf6; 64])
             .unwrap_or_else(|error| panic!("forged outer PXRA v2 must remain canonical: {error}"));
         assert_ne!(
             forged_outer.expected_runtime_host_epoch(),
