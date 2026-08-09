@@ -569,7 +569,11 @@ impl ProxyRouteIngress {
         let Some(deadline) = Instant::now().checked_add(OPERATION_BUDGET) else {
             return;
         };
-        if self.sender.try_send(AdmittedQuery { query, deadline }).is_ok() {
+        if self
+            .sender
+            .try_send(AdmittedQuery { query, deadline })
+            .is_ok()
+        {
             let admitted = self.admitted.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = self.admission_signal.send_replace(admitted);
         }
@@ -753,15 +757,7 @@ async fn run_proxy_forwarder(
                 None => break,
             }
         };
-        forward_one_query(
-            &fabric,
-            &binding,
-            &route,
-            admitted,
-            &mut cancel,
-            &forwarded,
-        )
-        .await;
+        forward_one_query(&fabric, &binding, &route, admitted, &mut cancel, &forwarded).await;
     }
 }
 
@@ -881,58 +877,43 @@ async fn raw_query_once(
         Err(_) => return RawQueryOutcome::TimedOut,
     };
     if wait_for_match {
-        let matching_listener = match tokio::time::timeout_at(
-            query_deadline,
-            querier.matching_listener(),
-        )
-        .await
-        {
-            Ok(Ok(listener)) => listener,
-            Ok(Err(_)) => {
-                return finish_raw_query(
-                    querier,
-                    RawQueryOutcome::MatchingFailed,
-                    overall_deadline,
-                )
-                .await;
-            }
-            Err(_) => {
-                return finish_raw_query(querier, RawQueryOutcome::TimedOut, overall_deadline)
+        let matching_listener =
+            match tokio::time::timeout_at(query_deadline, querier.matching_listener()).await {
+                Ok(Ok(listener)) => listener,
+                Ok(Err(_)) => {
+                    return finish_raw_query(
+                        querier,
+                        RawQueryOutcome::MatchingFailed,
+                        overall_deadline,
+                    )
                     .await;
-            }
-        };
-        let mut matching = match tokio::time::timeout_at(
-            query_deadline,
-            querier.matching_status(),
-        )
-        .await
-        {
-            Ok(Ok(status)) => status.matching(),
-            Ok(Err(_)) => {
-                drop(matching_listener);
-                return finish_raw_query(
-                    querier,
-                    RawQueryOutcome::MatchingFailed,
-                    overall_deadline,
-                )
-                .await;
-            }
-            Err(_) => {
-                drop(matching_listener);
-                return finish_raw_query(
-                    querier,
-                    RawQueryOutcome::TimedOut,
-                    overall_deadline,
-                )
-                .await;
-            }
-        };
+                }
+                Err(_) => {
+                    return finish_raw_query(querier, RawQueryOutcome::TimedOut, overall_deadline)
+                        .await;
+                }
+            };
+        let mut matching =
+            match tokio::time::timeout_at(query_deadline, querier.matching_status()).await {
+                Ok(Ok(status)) => status.matching(),
+                Ok(Err(_)) => {
+                    drop(matching_listener);
+                    return finish_raw_query(
+                        querier,
+                        RawQueryOutcome::MatchingFailed,
+                        overall_deadline,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    drop(matching_listener);
+                    return finish_raw_query(querier, RawQueryOutcome::TimedOut, overall_deadline)
+                        .await;
+                }
+            };
         while !matching {
-            matching = match tokio::time::timeout_at(
-                query_deadline,
-                matching_listener.recv_async(),
-            )
-            .await
+            matching = match tokio::time::timeout_at(query_deadline, matching_listener.recv_async())
+                .await
             {
                 Ok(Ok(status)) => status.matching(),
                 Ok(Err(_)) => {
@@ -946,52 +927,41 @@ async fn raw_query_once(
                 }
                 Err(_) => {
                     drop(matching_listener);
-                    return finish_raw_query(
-                        querier,
-                        RawQueryOutcome::TimedOut,
-                        overall_deadline,
-                    )
-                    .await;
+                    return finish_raw_query(querier, RawQueryOutcome::TimedOut, overall_deadline)
+                        .await;
                 }
             };
         }
         drop(matching_listener);
     }
-    let outcome = match tokio::time::timeout_at(
-        query_deadline,
-        querier.get().payload(payload),
-    )
-    .await
-    {
-        Ok(Ok(replies)) => match tokio::time::timeout_at(
-            query_deadline,
-            replies.recv_async(),
-        )
-        .await
-        {
-            Ok(Ok(reply)) => match reply.into_result() {
-                Ok(sample) => {
-                    if sample.key_expr().as_str() != route {
-                        RawQueryOutcome::ResponseRouteMismatch
-                    } else {
-                        let bytes = sample.payload().to_bytes();
-                        match BindingResponseEnvelopeV1::decode(
-                            bytes.as_ref(),
-                            MAX_TEST_FRAME_BYTES,
-                        ) {
-                            Ok(response) => RawQueryOutcome::Response(response),
-                            Err(_) => RawQueryOutcome::DecodeFailed,
+    let outcome =
+        match tokio::time::timeout_at(query_deadline, querier.get().payload(payload)).await {
+            Ok(Ok(replies)) => {
+                match tokio::time::timeout_at(query_deadline, replies.recv_async()).await {
+                    Ok(Ok(reply)) => match reply.into_result() {
+                        Ok(sample) => {
+                            if sample.key_expr().as_str() != route {
+                                RawQueryOutcome::ResponseRouteMismatch
+                            } else {
+                                let bytes = sample.payload().to_bytes();
+                                match BindingResponseEnvelopeV1::decode(
+                                    bytes.as_ref(),
+                                    MAX_TEST_FRAME_BYTES,
+                                ) {
+                                    Ok(response) => RawQueryOutcome::Response(response),
+                                    Err(_) => RawQueryOutcome::DecodeFailed,
+                                }
+                            }
                         }
-                    }
+                        Err(_) => RawQueryOutcome::RemoteError,
+                    },
+                    Ok(Err(_)) => RawQueryOutcome::ReplyChannelClosed,
+                    Err(_) => RawQueryOutcome::TimedOut,
                 }
-                Err(_) => RawQueryOutcome::RemoteError,
-            },
-            Ok(Err(_)) => RawQueryOutcome::ReplyChannelClosed,
+            }
+            Ok(Err(_)) => RawQueryOutcome::GetFailed,
             Err(_) => RawQueryOutcome::TimedOut,
-        },
-        Ok(Err(_)) => RawQueryOutcome::GetFailed,
-        Err(_) => RawQueryOutcome::TimedOut,
-    };
+        };
     finish_raw_query(querier, outcome, overall_deadline).await
 }
 
@@ -1157,18 +1127,12 @@ async fn expect_link_event(
 
 fn assert_no_queued_link_event(receiver: &mut mpsc::UnboundedReceiver<LinkEvent>) {
     assert!(
-        matches!(
-            receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ),
+        matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "unexpected extra raw proxy link event"
     );
 }
 
-async fn assert_single_live_tls_link(
-    session: &zenoh::Session,
-    expected_common_name: &str,
-) {
+async fn assert_single_live_tls_link(session: &zenoh::Session, expected_common_name: &str) {
     let links = finish_before(
         deadline_after(OPERATION_BUDGET),
         session.info().links(),
@@ -1262,8 +1226,7 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     let mut s0 = finish_before(
         deadline_after(OPERATION_BUDGET),
         FabricService::start(
-            FabricServiceConfig::try_peer(vec![s0_endpoint], Vec::new())
-                .expect("S0 peer config"),
+            FabricServiceConfig::try_peer(vec![s0_endpoint], Vec::new()).expect("S0 peer config"),
         ),
         "open S0 FabricService",
     )
