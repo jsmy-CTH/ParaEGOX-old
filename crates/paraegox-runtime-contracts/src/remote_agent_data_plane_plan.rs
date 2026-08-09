@@ -2917,6 +2917,9 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32,
     builder.field_bytes(
         b"pxau-v2-deadline=admitted-at+pxad-operation-timeout;budget-reset=forbidden",
     )?;
+    builder.field_bytes(
+        b"temporal-remaining>=operation-timeout;selection>=admitted;active-ready<deadline;local-cleanup-may-complete-after-deadline",
+    )?;
     builder.field_u16(TERMINAL_V2_EVIDENCE_KNOWN_FLAGS)?;
     builder.field_u16(TERMINAL_V2_RETAINED_S0_CENSUS_COMPLETE)?;
     builder.field_u16(TERMINAL_V2_RETAINED_S0_READY)?;
@@ -3318,6 +3321,10 @@ impl RemoteAgentDataPlaneApplyRequestDraftV2 {
         expected_runtime_store_instance_id: [u8; 32],
         auth_claim: ApplyRequestAuthClaim,
     ) -> Result<Self, RemoteAgentDataPlanePlanError> {
+        validate_apply_temporal_budget_v2(
+            temporal,
+            execution.profile().operation_timeout_nanos(),
+        )?;
         let assignments = RemoteAgentDataPlaneAssignmentsV2::try_from_execution(execution)?;
         let header = RuntimeSliceHeader::new(
             assignments.execution.projection().target(),
@@ -3367,6 +3374,14 @@ impl RemoteAgentDataPlaneApplyRequestV2 {
         if envelope.control_commitment().slice() != slice.commitment {
             return Err(RemoteAgentDataPlanePlanError::CommitmentMismatch);
         }
+        validate_apply_temporal_budget_v2(
+            envelope.temporal(),
+            slice
+                .assignments
+                .execution
+                .profile()
+                .operation_timeout_nanos(),
+        )?;
         let canonical_wire = build_apply_request_wire_v2(&envelope, &slice)?;
         if canonical_wire.len() > MAX_REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_BYTES {
             return Err(RemoteAgentDataPlanePlanError::FrameTooLarge);
@@ -3623,7 +3638,11 @@ pub enum RemoteAgentDataPlaneTerminalPhaseV2 {
 pub enum RemoteAgentDataPlaneTerminalOutcomeV2 {
     ActiveReady = 1,
     LocalOnlyReady = 2,
-    /// Rejected after all CAS checks but before any effect; CAS mismatch has no PXAU v2.
+    /// Rejected before any effect with `ProvenNotStarted` authority.
+    ///
+    /// When retained-S0 readiness is false, a zero current-CAS observation
+    /// means currentness is unknown; it does not claim every CAS remains current.
+    /// An admission-time CAS mismatch still has no PXAU v2.
     NoEffectRejected = 3,
     Uncertain = 4,
     Quarantined = 5,
@@ -3838,6 +3857,7 @@ impl RemoteAgentDataPlaneTerminalEvidenceV2 {
             || fields.admitted_at_nanos == 0
             || fields.absolute_deadline_nanos <= fields.admitted_at_nanos
             || fields.selection_observed_at_nanos == 0
+            || fields.selection_observed_at_nanos < fields.admitted_at_nanos
             || fields.physical_binding_census > RETAINED_LOCAL_AGENT_BINDING_CENSUS
             || fields.queryable_declared_bitmap & !REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP != 0
             || fields.ingress_fenced_bitmap & !REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP != 0
@@ -3892,10 +3912,11 @@ impl RemoteAgentDataPlaneTerminalFactsV2 {
         evidence: RemoteAgentDataPlaneTerminalEvidenceV2,
     ) -> Result<Self, RemoteAgentDataPlanePlanError> {
         let evidence_fields = evidence.fields();
-        if evidence_fields.selection_clock_domain != request.temporal().target_clock_domain()
-            || evidence_fields.selection_clock_generation.value()
-                < request.temporal().target_clock_generation().value()
-        {
+        if !selection_clock_authority_matches_v2(
+            evidence_fields.selection_clock_domain,
+            evidence_fields.selection_clock_generation,
+            request.temporal(),
+        ) {
             return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
         }
         let desired_head_digest = resolve_terminal_head_v2(request, state.head())?;
@@ -4344,6 +4365,14 @@ fn validate_terminal_facts_shape_v2(
     }
     validate_terminal_state_v2(facts.state)?;
     let fields = facts.evidence.fields();
+    if !terminal_selection_time_is_valid_v2(
+        facts.state.outcome(),
+        fields.admitted_at_nanos,
+        fields.absolute_deadline_nanos,
+        fields.selection_observed_at_nanos,
+    ) {
+        return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+    }
     if fields.retained_s0_ready
         && (!fields.retained_s0_census_complete
             || fields.physical_binding_census != RETAINED_LOCAL_AGENT_BINDING_CENSUS
@@ -4356,6 +4385,15 @@ fn validate_terminal_facts_shape_v2(
     let exact_retained_census = !digest_is_zero(fields.retained_s0_census_before_digest)
         && fields.retained_s0_census_before_digest == fields.retained_s0_census_after_digest;
     let current_s0_cas_known = !digest_is_zero(fields.retained_s0_current_cas_digest);
+    if !retained_s0_currentness_is_valid_v2(
+        facts.state.outcome(),
+        fields.remote_observation,
+        fields.retained_s0_ready,
+        current_s0_cas_known,
+        exact_retained_census,
+    ) {
+        return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
+    }
     let no_admitted_work = fields.submit_admitted_count == 0
         && fields.submit_terminalized_count == 0
         && fields.control_admitted_count == 0
@@ -4422,7 +4460,6 @@ fn validate_terminal_facts_shape_v2(
                 && fields.ingress_fenced_bitmap == 0
                 && fields.worker_joined_bitmap == 0
                 && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::NotStarted
-                && fields.selection_observed_at_nanos <= fields.absolute_deadline_nanos
                 && fields.s1_tls_ready
                 && fields.s1_acl_ready
                 && !fields.s1_closed
@@ -4439,7 +4476,6 @@ fn validate_terminal_facts_shape_v2(
                 && fields.ingress_fenced_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
                 && fields.worker_joined_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
                 && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::Drained
-                && fields.selection_observed_at_nanos <= fields.absolute_deadline_nanos
                 && fields.submit_admitted_count == fields.submit_terminalized_count
                 && fields.control_admitted_count == fields.control_terminalized_count
                 && !fields.s1_tls_ready
@@ -4974,4 +5010,224 @@ fn decode_terminal_auth_claim_v2(
         algorithm,
         algorithm_version,
     )
+}
+
+fn validate_apply_temporal_budget_v2(
+    temporal: ApplyTemporalConstraint,
+    operation_timeout_nanos: u64,
+) -> Result<(), RemoteAgentDataPlanePlanError> {
+    if temporal.remaining_budget().value() < operation_timeout_nanos {
+        return Err(RemoteAgentDataPlanePlanError::InvalidShape);
+    }
+    Ok(())
+}
+
+fn selection_clock_authority_matches_v2(
+    selection_clock_domain: ClockDomainRef,
+    selection_clock_generation: ClockGeneration,
+    temporal: ApplyTemporalConstraint,
+) -> bool {
+    selection_clock_domain == temporal.target_clock_domain()
+        && selection_clock_generation == temporal.target_clock_generation()
+}
+
+fn terminal_selection_time_is_valid_v2(
+    outcome: RemoteAgentDataPlaneTerminalOutcomeV2,
+    admitted_at_nanos: u64,
+    absolute_deadline_nanos: u64,
+    selection_observed_at_nanos: u64,
+) -> bool {
+    selection_observed_at_nanos >= admitted_at_nanos
+        && match outcome {
+            RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady => {
+                selection_observed_at_nanos < absolute_deadline_nanos
+            }
+            RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady
+            | RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected
+            | RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain
+            | RemoteAgentDataPlaneTerminalOutcomeV2::Quarantined => true,
+        }
+}
+
+fn retained_s0_currentness_is_valid_v2(
+    outcome: RemoteAgentDataPlaneTerminalOutcomeV2,
+    remote_observation: RemoteAgentDataPlaneRemoteObservationV2,
+    retained_s0_ready: bool,
+    current_s0_cas_known: bool,
+    exact_retained_census: bool,
+) -> bool {
+    match outcome {
+        RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady
+        | RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady => {
+            retained_s0_ready && current_s0_cas_known && exact_retained_census
+        }
+        RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected => match remote_observation {
+            RemoteAgentDataPlaneRemoteObservationV2::Unknown => {
+                !retained_s0_ready || (current_s0_cas_known && exact_retained_census)
+            }
+            RemoteAgentDataPlaneRemoteObservationV2::S1Absent
+            | RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady => {
+                retained_s0_ready && current_s0_cas_known && exact_retained_census
+            }
+            RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting => false,
+        },
+        RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain
+        | RemoteAgentDataPlaneTerminalOutcomeV2::Quarantined => !retained_s0_ready,
+    }
+}
+
+#[cfg(test)]
+mod temporal_authority_v2_tests {
+    use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
+
+    use crate::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
+
+    use super::{
+        RemoteAgentDataPlanePlanError, RemoteAgentDataPlaneRemoteObservationV2,
+        RemoteAgentDataPlaneTerminalOutcomeV2, retained_s0_currentness_is_valid_v2,
+        selection_clock_authority_matches_v2, terminal_selection_time_is_valid_v2,
+        validate_apply_temporal_budget_v2,
+    };
+
+    fn temporal(
+        domain: u8,
+        generation: u64,
+        remaining_budget_nanos: u64,
+    ) -> ApplyTemporalConstraint {
+        ApplyTemporalConstraint::try_new(
+            TemporalConstraintId::from_bytes([1; 16]),
+            ClockDomainRef::from_bytes([domain; 16]),
+            ClockGeneration::try_new(generation).expect("test clock generation must be nonzero"),
+            BoundedDuration::from_nanos(1_000),
+            BoundedDuration::from_nanos(remaining_budget_nanos),
+        )
+        .expect("test temporal constraint must be valid")
+    }
+
+    #[test]
+    fn pxar_v11_temporal_budget_must_cover_operation_timeout() {
+        assert!(matches!(
+            validate_apply_temporal_budget_v2(temporal(2, 3, 99), 100),
+            Err(RemoteAgentDataPlanePlanError::InvalidShape)
+        ));
+        assert!(validate_apply_temporal_budget_v2(temporal(2, 3, 100), 100).is_ok());
+        assert!(validate_apply_temporal_budget_v2(temporal(2, 3, 101), 100).is_ok());
+    }
+
+    #[test]
+    fn pxau_v2_selection_clock_authority_is_exact() {
+        let request_temporal = temporal(2, 3, 100);
+        assert!(selection_clock_authority_matches_v2(
+            ClockDomainRef::from_bytes([2; 16]),
+            ClockGeneration::try_new(3).expect("test generation"),
+            request_temporal,
+        ));
+        assert!(!selection_clock_authority_matches_v2(
+            ClockDomainRef::from_bytes([4; 16]),
+            ClockGeneration::try_new(3).expect("test generation"),
+            request_temporal,
+        ));
+        assert!(!selection_clock_authority_matches_v2(
+            ClockDomainRef::from_bytes([2; 16]),
+            ClockGeneration::try_new(2).expect("test generation"),
+            request_temporal,
+        ));
+        assert!(!selection_clock_authority_matches_v2(
+            ClockDomainRef::from_bytes([2; 16]),
+            ClockGeneration::try_new(4).expect("test generation"),
+            request_temporal,
+        ));
+    }
+
+    #[test]
+    fn pxau_v2_selection_time_matrix_keeps_local_cleanup_unbounded() {
+        use RemoteAgentDataPlaneTerminalOutcomeV2::{
+            ActiveReady, LocalOnlyReady, NoEffectRejected, Quarantined, Uncertain,
+        };
+
+        for outcome in [
+            ActiveReady,
+            LocalOnlyReady,
+            NoEffectRejected,
+            Uncertain,
+            Quarantined,
+        ] {
+            assert!(!terminal_selection_time_is_valid_v2(
+                outcome, 100, 200, 99
+            ));
+        }
+
+        assert!(terminal_selection_time_is_valid_v2(
+            ActiveReady,
+            100,
+            200,
+            199
+        ));
+        assert!(!terminal_selection_time_is_valid_v2(
+            ActiveReady,
+            100,
+            200,
+            200
+        ));
+        assert!(!terminal_selection_time_is_valid_v2(
+            ActiveReady,
+            100,
+            200,
+            201
+        ));
+        assert!(terminal_selection_time_is_valid_v2(
+            LocalOnlyReady,
+            100,
+            200,
+            200
+        ));
+
+        for outcome in [
+            LocalOnlyReady,
+            NoEffectRejected,
+            Uncertain,
+            Quarantined,
+        ] {
+            assert!(terminal_selection_time_is_valid_v2(
+                outcome, 100, 200, 250
+            ));
+        }
+    }
+
+    #[test]
+    fn no_effect_unknown_may_leave_retained_s0_currentness_unproven() {
+        use RemoteAgentDataPlaneRemoteObservationV2::Unknown;
+        use RemoteAgentDataPlaneTerminalOutcomeV2::{
+            ActiveReady, LocalOnlyReady, NoEffectRejected,
+        };
+
+        assert!(retained_s0_currentness_is_valid_v2(
+            NoEffectRejected,
+            Unknown,
+            false,
+            false,
+            false,
+        ));
+        assert!(!retained_s0_currentness_is_valid_v2(
+            ActiveReady,
+            RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady,
+            true,
+            false,
+            true,
+        ));
+        assert!(!retained_s0_currentness_is_valid_v2(
+            LocalOnlyReady,
+            RemoteAgentDataPlaneRemoteObservationV2::S1Absent,
+            true,
+            true,
+            false,
+        ));
+        assert!(retained_s0_currentness_is_valid_v2(
+            ActiveReady,
+            RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady,
+            true,
+            true,
+            true,
+        ));
+    }
 }
