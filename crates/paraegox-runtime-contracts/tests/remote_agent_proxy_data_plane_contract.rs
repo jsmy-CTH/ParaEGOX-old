@@ -40,6 +40,8 @@ const AGENT_STACK_FIXTURE: &str =
     include_str!("../../../tests/fixtures/wire/s7_managed_agent_stack_successor_v1.json");
 const DATA_PLANE_V1_FIXTURE: &str =
     include_str!("../../../tests/fixtures/wire/t2_remote_agent_data_plane_v1.json");
+const PROXY_DATA_PLANE_V2_GOLDEN: &str =
+    include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
 const EMPTY_PXTA: &[u8; 10] = b"PXTA\0\x01\0\0\0\0";
 const OPERATION_TIMEOUT_NANOS: u64 = 5_000_000_000;
 const ADMITTED_AT_NANOS: u64 = 1_000;
@@ -61,7 +63,7 @@ fn hex_nibble(byte: u8) -> u8 {
     }
 }
 
-fn fixture_hex_after(fixture: &str, section: &str, key: &str) -> Vec<u8> {
+fn fixture_string_after<'a>(fixture: &'a str, section: &str, key: &str) -> &'a str {
     let section_start = fixture.find(section).expect("fixture section");
     let key_start = fixture[section_start..]
         .find(key)
@@ -75,10 +77,42 @@ fn fixture_hex_after(fixture: &str, section: &str, key: &str) -> Vec<u8> {
         .find('"')
         .map(|offset| quote_start + offset)
         .expect("fixture quote end");
-    fixture.as_bytes()[quote_start..quote_end]
+    &fixture[quote_start..quote_end]
+}
+
+fn fixture_hex_after(fixture: &str, section: &str, key: &str) -> Vec<u8> {
+    fixture_string_after(fixture, section, key)
+        .as_bytes()
         .chunks_exact(2)
         .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect()
+}
+
+fn fixture_digest_after(fixture: &str, section: &str, key: &str) -> Digest32 {
+    Digest32::from_bytes(
+        fixture_hex_after(fixture, section, key)
+            .try_into()
+            .expect("32-byte fixture digest"),
+    )
+}
+
+fn fixture_u64_after(fixture: &str, section: &str, key: &str) -> u64 {
+    let section_start = fixture.find(section).expect("fixture section");
+    let key_start = fixture[section_start..]
+        .find(key)
+        .map(|offset| section_start + offset + key.len())
+        .expect("fixture key");
+    let value = fixture[key_start..]
+        .trim_start_matches(|character: char| character == ':' || character.is_whitespace());
+    let end = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    value[..end].parse().expect("fixture integer")
+}
+
+fn fixture_section_after<'a>(fixture: &'a str, section: &str) -> &'a str {
+    let section_start = fixture.find(section).expect("fixture section");
+    &fixture[section_start..]
 }
 
 fn managed_agent_request() -> ManagedAgentStackApplyRequestV1 {
@@ -1186,6 +1220,239 @@ fn pxau2_hwm_revision_mode_drain_counts_and_observation_are_orthogonal_authority
         ClockGeneration::try_new(active.temporal().target_clock_generation().value() + 1)
             .expect("later clock generation");
     assert!(terminal_draft(&active, active_ready_state(), later_clock_generation).is_ok());
+}
+
+#[test]
+fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures() {
+    let golden = PROXY_DATA_PLANE_V2_GOLDEN;
+    assert!(golden.contains("\"format\": \"paraegox-t2-remote-agent-proxy-data-plane-v2\""));
+    assert!(
+        golden.contains(
+            "\"source\": \"independent Python struct/hashlib/cryptography T2-B2 oracle\""
+        )
+    );
+    assert_eq!(
+        fixture_string_after(
+            golden,
+            "\"rust_source_freeze\"",
+            "\"remote_agent_data_plane_plan.rs_sha256\"",
+        ),
+        "8597f75ec6bb6b41a97fb3ebd2d8cdefcde431ceb0d32d6b125ed17f0a1a64e7"
+    );
+
+    let semantic_constants = fixture_section_after(golden, "\"semantic_constants\"");
+    assert_eq!(
+        fixture_u64_after(semantic_constants, "", "\"retained_s0_cas_bytes\""),
+        REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES as u64
+    );
+    assert_eq!(
+        fixture_u64_after(semantic_constants, "", "\"active_s1_cas_bytes\""),
+        REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES as u64
+    );
+    assert_eq!(
+        fixture_u64_after(semantic_constants, "", "\"pxau_v2_fixed_bytes\""),
+        683
+    );
+    assert_eq!(
+        fixture_u64_after(semantic_constants, "", "\"pxau_v2_signature_bytes\""),
+        64
+    );
+    assert_eq!(
+        fixture_u64_after(semantic_constants, "", "\"pxau_v2_canonical_bytes\""),
+        747
+    );
+    assert_eq!(
+        fixture_u64_after(semantic_constants, "", "\"terminal_transcript_bytes\""),
+        732
+    );
+
+    let retained_scope = fixture_section_after(golden, "\"retained_s0_cas\"");
+    let retained_wire = fixture_hex_after(retained_scope, "", "\"wire_hex\"");
+    let retained =
+        RemoteAgentRetainedS0CasV2::decode(&retained_wire).expect("shared golden retained-S0 CAS");
+    assert_eq!(retained.canonical_wire(), retained_wire.as_slice());
+    assert_eq!(
+        retained_wire.len() as u64,
+        fixture_u64_after(retained_scope, "", "\"wire_length\"")
+    );
+    assert_eq!(retained_wire.len(), REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES);
+    assert_eq!(
+        retained.cas_digest(),
+        fixture_digest_after(retained_scope, "", "\"digest_hex\"")
+    );
+
+    let topology_digest = fixture_digest_after(golden, "", "\"topology_compatibility_digest_hex\"");
+    assert_eq!(
+        topology_digest,
+        remote_agent_proxy_topology_compatibility_digest_v2().unwrap()
+    );
+    let runtime_public_key = fixture_hex_after(golden, "", "\"runtime_signing_public_key_hex\"");
+    assert_eq!(runtime_public_key.len(), 32);
+
+    for (ready_key, expected_mode, expected_outcome) in [
+        (
+            "\"active_ready\"",
+            RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive,
+            RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady,
+        ),
+        (
+            "\"local_only_ready\"",
+            RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate,
+            RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady,
+        ),
+    ] {
+        let ready = fixture_section_after(golden, ready_key);
+        let expected_s1_scope = fixture_section_after(ready, "\"expected_s1_cas\"");
+        let expected_s1_wire = fixture_hex_after(expected_s1_scope, "", "\"wire_hex\"");
+        let expected_s1 = RemoteAgentActiveS1CasV2::decode(&expected_s1_wire)
+            .expect("shared golden expected-S1 CAS");
+        assert_eq!(expected_s1.canonical_wire(), expected_s1_wire.as_slice());
+        assert_eq!(
+            expected_s1_wire.len() as u64,
+            fixture_u64_after(expected_s1_scope, "", "\"wire_length\"")
+        );
+        assert_eq!(expected_s1_wire.len(), REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES);
+        assert_eq!(
+            expected_s1.cas_digest(),
+            fixture_digest_after(expected_s1_scope, "", "\"digest_hex\"")
+        );
+        assert_eq!(
+            expected_s1.active().is_some(),
+            expected_mode == RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate
+        );
+
+        let pxte_scope = fixture_section_after(ready, "\"pxte_v10\"");
+        let pxte_wire = fixture_hex_after(pxte_scope, "", "\"wire_hex\"");
+        let pxte = RemoteAgentDataPlaneTargetExecutionV2::decode(&pxte_wire)
+            .expect("shared golden PXTE v10");
+        assert_eq!(pxte.canonical_wire(), pxte_wire.as_slice());
+        assert_eq!(
+            pxte_wire.len() as u64,
+            fixture_u64_after(pxte_scope, "", "\"wire_length\"")
+        );
+        assert_eq!(
+            pxte.execution_digest(),
+            fixture_digest_after(pxte_scope, "", "\"digest_hex\"")
+        );
+        assert_eq!(pxte.mode(), expected_mode);
+        assert_eq!(pxte.retained_s0_cas(), retained);
+        assert_eq!(pxte.expected_s1_cas(), expected_s1);
+        assert_eq!(pxte.proxy_topology_compatibility_digest(), topology_digest);
+
+        let pxar_scope = fixture_section_after(ready, "\"pxar_v11\"");
+        let pxar_wire = fixture_hex_after(pxar_scope, "", "\"wire_hex\"");
+        let pxar =
+            RemoteAgentDataPlaneApplyRequestV2::decode(&pxar_wire).expect("shared golden PXAR v11");
+        assert_eq!(pxar.canonical_wire(), pxar_wire.as_slice());
+        assert_eq!(
+            pxar_wire.len() as u64,
+            fixture_u64_after(pxar_scope, "", "\"wire_length\"")
+        );
+        assert_eq!(
+            pxar.request_digest(),
+            fixture_digest_after(pxar_scope, "", "\"digest_hex\"")
+        );
+        assert_eq!(pxar.target_execution(), &pxte);
+        assert_eq!(
+            pxar.assignment_digest().value(),
+            &fixture_digest_after(ready, "", "\"assignment_v11_digest_hex\"")
+        );
+
+        let envelope_scope = fixture_section_after(ready, "\"envelope_v2\"");
+        assert_eq!(
+            u32::from_be_bytes(
+                pxar_wire[6..10]
+                    .try_into()
+                    .expect("PXAR v11 envelope length"),
+            ) as u64,
+            fixture_u64_after(envelope_scope, "", "\"wire_length\"")
+        );
+        assert_eq!(
+            pxar.envelope_request_digest(),
+            fixture_digest_after(envelope_scope, "", "\"request_digest_hex\"")
+        );
+        assert_eq!(
+            pxar.target_slice_digest().value(),
+            &fixture_digest_after(envelope_scope, "", "\"target_slice_digest_hex\"")
+        );
+        let envelope_transcript =
+            fixture_hex_after(envelope_scope, "", "\"signing_transcript_hex\"");
+        let envelope_signature = fixture_hex_after(envelope_scope, "", "\"signature_hex\"");
+        assert_eq!(
+            pxar.signing_transcript()
+                .expect("shared golden PXAR v11 transcript")
+                .as_bytes(),
+            envelope_transcript.as_slice()
+        );
+        assert_eq!(pxar.authentication().signature(), envelope_signature);
+        assert_eq!(
+            fixture_hex_after(envelope_scope, "", "\"public_key_hex\"").len(),
+            32
+        );
+        assert_eq!(envelope_signature.len(), 64);
+
+        let pxau_scope = fixture_section_after(ready, "\"pxau_v2\"");
+        let pxau_wire = fixture_hex_after(pxau_scope, "", "\"wire_hex\"");
+        let pxau = RemoteAgentDataPlaneTerminalReceiptV2::decode(&pxau_wire)
+            .expect("shared golden PXAU v2");
+        assert_eq!(pxau.canonical_wire(), pxau_wire.as_slice());
+        assert_eq!(
+            pxau_wire.len() as u64,
+            fixture_u64_after(pxau_scope, "", "\"wire_length\"")
+        );
+        assert_eq!(pxau_wire.len(), 747);
+        assert_eq!(
+            pxau.receipt_digest(),
+            fixture_digest_after(pxau_scope, "", "\"digest_hex\"")
+        );
+        assert_eq!(
+            pxau.validate_against_request(&pxar)
+                .expect("shared golden PXAU v2 correlation")
+                .state()
+                .outcome(),
+            expected_outcome
+        );
+        let terminal_transcript = fixture_hex_after(pxau_scope, "", "\"signing_transcript_hex\"");
+        let terminal_signature = fixture_hex_after(pxau_scope, "", "\"signature_hex\"");
+        assert_eq!(
+            terminal_transcript.len() as u64,
+            fixture_u64_after(pxau_scope, "", "\"signing_transcript_length\"")
+        );
+        assert_eq!(terminal_transcript.len(), 732);
+        assert_eq!(
+            pxau.signing_transcript()
+                .expect("shared golden PXAU v2 transcript")
+                .as_bytes(),
+            terminal_transcript.as_slice()
+        );
+        assert_eq!(pxau.authentication_signature(), terminal_signature);
+        assert_eq!(terminal_signature.len(), 64);
+        assert_eq!(
+            fixture_hex_after(pxau_scope, "", "\"public_key_hex\""),
+            runtime_public_key
+        );
+        assert_eq!(
+            pxau.canonical_wire().len() - pxau.authentication_signature().len(),
+            683
+        );
+
+        let expected_auth = pxau.authentication();
+        let authenticated = pxau
+            .verify_runtime_terminal(
+                &pxar,
+                expected_auth,
+                |principal, key, algorithm, version, transcript, signature| {
+                    principal == expected_auth.runtime_principal()
+                        && key == expected_auth.key()
+                        && algorithm == expected_auth.algorithm()
+                        && version == expected_auth.algorithm_version()
+                        && transcript == terminal_transcript.as_slice()
+                        && signature == terminal_signature.as_slice()
+                },
+            )
+            .expect("shared golden Runtime-authenticated PXAU v2");
+        assert_eq!(authenticated.receipt(), &pxau);
+    }
 }
 
 #[test]
