@@ -2475,12 +2475,12 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
     /// has no state write and PXAU v2 has no producer input on that path.
     pub(crate) fn try_authorize_fresh(
         self,
-        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'_>,
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'_, '_>,
         durable_replay_checked: RemoteAgentDurableReplayCheckedV2,
     ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
         self.validate_marker()?;
         let current = self.snapshot;
-        let fresh = bind_fresh_request_v2(verified_ingress, self.current_runtime_host_epoch)?;
+        let fresh = bind_fresh_request_v2(&verified_ingress, self.current_runtime_host_epoch)?;
         let request = fresh.request;
         if request.kind() != RemoteAgentAccessKindV2::ApplyRemoteAccess
             || request.target() != current.identity.target
@@ -2575,7 +2575,9 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
             canonical_wire: Box::new([]),
             snapshot_digest: zero_digest(),
         })?;
-        Ok(RemoteAgentPendingAccessSnapshotV2 { snapshot })
+        let pending = RemoteAgentPendingAccessSnapshotV2 { snapshot };
+        drop(verified_ingress);
+        Ok(pending)
     }
 
     /// Re-mints one-edge authority only after D2 has committed and exactly read
@@ -2771,7 +2773,7 @@ impl RemoteAgentAuthorizedTransitionV2 {
     /// phase. A raw or merely decoded receipt cannot enter this seam.
     pub(crate) fn try_terminal_successor(
         self,
-        verified_terminal: VerifiedRemoteAgentDataPlaneTerminalIngressV2<'_>,
+        verified_terminal: VerifiedRemoteAgentDataPlaneTerminalIngressV2<'_, '_>,
     ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
         let current = &self.snapshot;
         let terminal = verified_terminal.receipt().clone();
@@ -2781,7 +2783,7 @@ impl RemoteAgentAuthorizedTransitionV2 {
             .ok_or(RemoteAgentAccessStateErrorV2::InvalidOperationRequest)?;
         let request = inner_request_v2(outer)?;
         if verified_terminal.outer_request_digest() != outer.request_digest()
-            || verified_terminal.carrier_binding_digest() != outer.carrier().binding_digest()
+            || verified_terminal.carrier_binding_digest() != Some(outer.carrier().binding_digest())
             || verified_terminal.target() != current.identity.target
             || verified_terminal.target() != outer.target()
             || verified_terminal.runtime_store_instance_id() != current.identity.store_instance_id
@@ -2899,7 +2901,9 @@ impl RemoteAgentAuthorizedTransitionV2 {
             canonical_wire: Box::new([]),
             snapshot_digest: zero_digest(),
         })?;
-        Ok(RemoteAgentPendingAccessSnapshotV2 { snapshot })
+        let pending = RemoteAgentPendingAccessSnapshotV2 { snapshot };
+        drop(verified_terminal);
+        Ok(pending)
     }
 }
 
@@ -2994,8 +2998,8 @@ fn validate_fresh_replay_fence_v2(
     Ok(())
 }
 
-fn bind_fresh_request_v2<'request>(
-    verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request>,
+fn bind_fresh_request_v2<'request, 'running>(
+    verified_ingress: &VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
     current_runtime_host_epoch: u64,
 ) -> Result<RemoteAgentFreshAccessRequestV2<'request>, RemoteAgentAccessStateErrorV2> {
     let request = verified_ingress.request();
@@ -3029,7 +3033,9 @@ fn bind_fresh_request_v2<'request>(
         tenure_nonce_identity: verified_ingress.tenure_nonce_identity(),
         request_nonce_identity: verified_ingress.request_nonce_identity(),
         temporal_lineage_identity: verified_ingress.temporal_lineage_identity(),
-        carrier_binding_digest: verified_ingress.carrier_binding_digest(),
+        carrier_binding_digest: verified_ingress
+            .carrier_binding_digest()
+            .ok_or(RemoteAgentAccessStateErrorV2::InvalidFreshRequest)?,
     };
     if admission != verified_admission {
         return Err(RemoteAgentAccessStateErrorV2::InvalidFreshRequest);
@@ -6672,8 +6678,20 @@ mod tests {
 
     pub(crate) mod v2 {
         use super::*;
+        use crate::runtime_control_endpoint::{
+            RuntimeRestrictedApplyEndpointDependenciesV1,
+            runtime_restricted_apply_carrier_pin_for_test,
+        };
+        use paraegox_fabric::{
+            ResolvedRemoteMtlsIdentityFiles, RestrictedRuntimeApplyEndpointConfigV1,
+        };
         use paraegox_runtime_contracts::{
             apply::{PlanWriterContext, WriterTenureProof},
+            distributed_agent_stack_plan::{
+                DistributedFabricCredentialRefV1, DistributedFabricTrustAnchorRefV1,
+                DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
+                RestrictedRuntimeApplyTransportProfileV1,
+            },
             reference_control::ed25519_control_key_fingerprint,
             remote_agent_access::{
                 ControllerAuthenticatedRemoteAgentAccessRequestV2, RemoteAgentAccessRequestDraftV2,
@@ -6689,12 +6707,13 @@ mod tests {
             },
             temporal::ApplyTemporalConstraint,
         };
-
         const PROXY_DATA_PLANE_V2_FIXTURE: &str =
             include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
         const ACCESS_V2_FIXTURE: &str =
             include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v2.json");
         const TERMINAL_SIGNING_SEED_V2: [u8; 32] = [0xa6; 32];
+        const TERMINAL_TLS_LISTENER_V2: &str = "tls/192.0.2.61:7461";
+        const TERMINAL_OPERATION_TIMEOUT_NANOS_V2: u64 = 5_000_000_000;
         const ACTIVE_PROXY_SESSION_EPOCH_V2: [u8; 16] = [0xa7; 16];
         const OBSERVED_RESOURCE_CENSUS_V2: Digest32 = Digest32::from_bytes([0xa8; 32]);
         const OBSERVED_RAW_OUTCOME_V2: Digest32 = Digest32::from_bytes([0xa9; 32]);
@@ -6743,11 +6762,42 @@ mod tests {
             fixture_hex_after(item, "", "\"wire_hex\"")
         }
 
+        fn terminal_transport_profile_v2(
+            template: &RestrictedRuntimeApplyCarrierBindingV1,
+        ) -> RestrictedRuntimeApplyTransportProfileV1 {
+            RestrictedRuntimeApplyTransportProfileV1::try_new(
+                RestrictedRuntimeApplyTransportProfileFieldsV1 {
+                    target: template.target(),
+                    endpoint_ref: template.endpoint_ref(),
+                    endpoint_generation: template.endpoint_generation(),
+                    tls_listener_locator: TERMINAL_TLS_LISTENER_V2,
+                    route: template.route(),
+                    trust_domain_ref: DistributedFabricTrustDomainRefV1::try_from_bytes([0xc1; 16])
+                        .unwrap_or_else(|error| panic!("terminal trust domain rejected: {error}")),
+                    trust_anchor_ref: DistributedFabricTrustAnchorRefV1::try_from_bytes([0xc2; 16])
+                        .unwrap_or_else(|error| panic!("terminal trust anchor rejected: {error}")),
+                    controller_connector_credential_ref:
+                        DistributedFabricCredentialRefV1::try_from_bytes([0xc3; 16]).unwrap_or_else(
+                            |error| panic!("terminal Controller credential rejected: {error}"),
+                        ),
+                    runtime_listener_credential_ref:
+                        DistributedFabricCredentialRefV1::try_from_bytes([0xc4; 16]).unwrap_or_else(
+                            |error| panic!("terminal Runtime credential rejected: {error}"),
+                        ),
+                    controller_principal: template.controller_principal(),
+                    runtime_principal: template.runtime_principal(),
+                    operation_timeout_nanos: TERMINAL_OPERATION_TIMEOUT_NANOS_V2,
+                },
+            )
+            .unwrap_or_else(|error| panic!("terminal transport profile rejected: {error}"))
+        }
+
         fn controller_carrier_v2(
             template: &RestrictedRuntimeApplyCarrierBindingV1,
         ) -> RestrictedRuntimeApplyCarrierBindingV1 {
             let controller_key = SigningKey::from_bytes(&INNER_SIGNING_SEED).verifying_key();
             let runtime_key = SigningKey::from_bytes(&TERMINAL_SIGNING_SEED_V2).verifying_key();
+            let profile = terminal_transport_profile_v2(template);
             RestrictedRuntimeApplyCarrierBindingV1::try_new(
                 RestrictedRuntimeApplyCarrierBindingFieldsV1 {
                     target: template.target(),
@@ -6771,10 +6821,37 @@ mod tests {
                         panic!("Runtime response key fingerprint rejected: {error}")
                     }),
                     control_transport_profile_ref: template.control_transport_profile_ref(),
-                    control_transport_profile_digest: template.control_transport_profile_digest(),
+                    control_transport_profile_digest: profile.profile_digest(),
                 },
             )
             .unwrap_or_else(|error| panic!("Controller carrier rejected: {error}"))
+        }
+
+        fn terminal_endpoint_dependencies_v2(
+            carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        ) -> RuntimeRestrictedApplyEndpointDependenciesV1 {
+            let profile = terminal_transport_profile_v2(carrier);
+            assert_eq!(
+                profile.profile_digest(),
+                carrier.control_transport_profile_digest(),
+                "terminal carrier must retain the exact composition profile",
+            );
+            let endpoint_config =
+                RestrictedRuntimeApplyEndpointConfigV1::try_from_transport_profile(
+                    &profile,
+                    carrier.control_transport_profile_ref(),
+                    carrier,
+                    std::path::PathBuf::from("/tmp/paraegox-pxrs2-terminal-root-ca.pem"),
+                    ResolvedRemoteMtlsIdentityFiles::try_new(
+                        std::path::PathBuf::from("/tmp/paraegox-pxrs2-terminal-runtime.pem"),
+                        std::path::PathBuf::from("/tmp/paraegox-pxrs2-terminal-runtime.key"),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("terminal endpoint identity files rejected: {error}")
+                    }),
+                )
+                .unwrap_or_else(|error| panic!("terminal endpoint config rejected: {error}"));
+            RuntimeRestrictedApplyEndpointDependenciesV1::new(endpoint_config, carrier.clone())
         }
 
         fn signed_tenure_proof_v2(template: &WriterTenureProof, nonce: &[u8]) -> WriterTenureProof {
@@ -7188,15 +7265,22 @@ mod tests {
             .unwrap_or_else(|error| panic!("PXAR v11 admission policy rejected: {error}"))
         }
 
-        fn verified_ingress_v2<'request>(
+        fn verified_ingress_v2<'request, 'dependencies>(
             request: &'request RemoteAgentAccessRequestV2,
             clock: ClockReading,
-        ) -> Result<VerifiedRemoteAgentAccessApplyIngressV2<'request>, RemoteAgentAccessStateErrorV2>
-        {
+            dependencies: &'dependencies RuntimeRestrictedApplyEndpointDependenciesV1,
+            provisioning: &RuntimeProvisioningV1,
+        ) -> Result<
+            VerifiedRemoteAgentAccessApplyIngressV2<'request, 'dependencies>,
+            RemoteAgentAccessStateErrorV2,
+        > {
+            let carrier_pin =
+                runtime_restricted_apply_carrier_pin_for_test(dependencies, provisioning)
+                    .map_err(|_| RemoteAgentAccessStateErrorV2::InvalidFreshRequest)?;
             admission_policy_v2(request)
                 .verify_remote_agent_access_apply_ingress_v2(
                     authenticate_request_v2(request),
-                    request.carrier(),
+                    carrier_pin,
                     clock,
                 )
                 .map_err(|error| match error {
@@ -7270,7 +7354,10 @@ mod tests {
             seen_request_nonce_identities: &[Digest32],
             mutate: impl FnOnce(&mut CurrentFinalFactsV2),
         ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
-            let verified_ingress = verified_ingress_v2(request, clock)?;
+            let provisioning = terminal_provisioning_v2(request);
+            let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
+            let verified_ingress =
+                verified_ingress_v2(request, clock, &dependencies, &provisioning)?;
             let durable_replay_checked =
                 RemoteAgentDurableReplayCheckedV2::from_durable_replay_ledger_for_test(
                     &snapshot,
@@ -7726,9 +7813,13 @@ mod tests {
                 .verify_runtime_terminal(request, receipt.authentication(), |_, _, _, _, _, _| true)
                 .unwrap_or_else(|error| panic!("PXAU v2 authentication rejected: {error}"));
             let provisioning = terminal_provisioning_v2(outer);
+            let dependencies = terminal_endpoint_dependencies_v2(outer.carrier());
+            let carrier_pin =
+                runtime_restricted_apply_carrier_pin_for_test(&dependencies, &provisioning)
+                    .map_err(|_| RemoteAgentAccessStateErrorV2::InvalidTerminalAuthentication)?;
             let trust = RemoteAgentDataPlaneTerminalRuntimeTrustV2::try_from_provisioning(
                 &provisioning,
-                outer.carrier(),
+                carrier_pin,
             )
             .map_err(|_| RemoteAgentAccessStateErrorV2::InvalidTerminalAuthentication)?;
             let verified = trust
@@ -8371,25 +8462,109 @@ mod tests {
                 .find(") -> Result<RemoteAgentPendingAccessSnapshotV2")
                 .unwrap_or_else(|| panic!("PXRS2 fresh authority signature must terminate"));
             let signature = &signature_tail[..signature_end];
-            assert!(signature.contains("VerifiedRemoteAgentAccessApplyIngressV2<'_>"));
+            assert!(signature.contains("VerifiedRemoteAgentAccessApplyIngressV2<'_, '_>"));
             assert!(signature.contains("RemoteAgentDurableReplayCheckedV2"));
             assert!(!signature.contains("ControllerAuthenticatedRemoteAgentAccessRequestV2"));
             assert!(!signature.contains("ClockReading"));
 
-            let historical = outer_request_template_v2();
-            let public_outer = historical
+            let admission_source = include_str!("admission.rs");
+            let verifier_signature = admission_source
+                .split_once(
+                    "pub(crate) fn verify_remote_agent_access_apply_ingress_v2<'request, 'running>(",
+                )
+                .and_then(|(_, tail)| {
+                    tail.split_once(") -> Result<")
+                        .map(|(signature, _)| signature)
+                })
+                .unwrap_or_else(|| panic!("protected fresh verifier signature missing"));
+            assert!(
+                verifier_signature
+                    .contains("carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>")
+            );
+            assert!(
+                !verifier_signature
+                    .contains("expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1")
+            );
+            let fresh_marker_declaration = admission_source
+                .split_once(
+                    "pub(crate) struct VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>",
+                )
+                .map(|(prefix, _)| prefix)
+                .and_then(|prefix| {
+                    prefix
+                        .rsplit_once("\n\n")
+                        .map(|(_, declaration)| declaration)
+                })
+                .unwrap_or_else(|| panic!("fresh marker declaration missing"));
+            assert!(!fresh_marker_declaration.contains("#[derive(Clone"));
+            assert!(!fresh_marker_declaration.contains("#[derive(Copy"));
+            let fresh_marker = admission_source
+                .split_once(
+                    "pub(crate) struct VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>",
+                )
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl<'request, 'running>")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("live fresh marker body missing"));
+            assert!(
+                fresh_marker.contains("carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>")
+            );
+            let fresh_transition = source
+                .split_once("pub(crate) fn try_authorize_fresh(")
+                .and_then(|(_, tail)| {
+                    tail.split_once("/// Re-mints one-edge authority")
+                        .map(|(implementation, _)| implementation)
+                })
+                .unwrap_or_else(|| panic!("fresh transition implementation missing"));
+            let build = fresh_transition
+                .find("let snapshot = RemoteAgentAccessSnapshotV2::try_build")
+                .unwrap_or_else(|| panic!("fresh Pending build missing"));
+            let release = fresh_transition
+                .find("drop(verified_ingress);")
+                .unwrap_or_else(|| panic!("fresh live carrier Pin release missing"));
+            assert!(
+                build < release,
+                "fresh marker must retain the live carrier Pin through the complete Pending build",
+            );
+
+            let valid = active_request_v2();
+            let forged_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+                RemoteAgentAccessRequestFieldsV2 {
+                    request_id: valid.request_id(),
+                    carrier: valid.carrier().clone(),
+                    target: valid.target(),
+                    expected_runtime_store_instance_id: valid.expected_runtime_store_instance_id(),
+                    expected_runtime_host_epoch: valid.expected_runtime_host_epoch(),
+                    auth_claim: valid.authentication().claim().clone(),
+                },
+                valid
+                    .apply_request()
+                    .unwrap_or_else(|| panic!("PXRA v2 Apply fixture must carry PXAR v11"))
+                    .clone(),
+            )
+            .unwrap_or_else(|error| panic!("forged PXRA v2 draft rejected: {error}"));
+            let forged = forged_draft
+                .finalize(&[0xf6; 64])
+                .unwrap_or_else(|error| panic!("forged PXRA v2 rejected: {error}"));
+            let public_outer = forged
                 .verify_controller_apply_request(
-                    historical.carrier(),
+                    forged.carrier(),
                     |_, _, _, _, _, _| true,
                     |_, _, _, _, _| true,
                 )
                 .unwrap_or_else(|error| panic!("public outer marker rejected: {error}"));
-            let reading = clock_for_request_v2(&historical, 1);
+            let reading = clock_for_request_v2(&forged, 1);
+            let provisioning = terminal_provisioning_v2(&forged);
+            let dependencies = terminal_endpoint_dependencies_v2(forged.carrier());
+            let carrier_pin =
+                runtime_restricted_apply_carrier_pin_for_test(&dependencies, &provisioning)
+                    .unwrap_or_else(|error| panic!("protected carrier pin rejected: {error}"));
             assert!(
-                admission_policy_v2(&historical)
+                admission_policy_v2(&forged)
                     .verify_remote_agent_access_apply_ingress_v2(
                         public_outer,
-                        historical.carrier(),
+                        carrier_pin,
                         reading,
                     )
                     .is_err(),
@@ -8401,11 +8576,13 @@ mod tests {
         fn pxrs2_real_apply_admission_facts_equal_state_framing_before_pending() {
             let request = active_request_v2();
             let clock = clock_for_request_v2(&request, 9);
-            let marker = verified_ingress_v2(&request, clock)
+            let provisioning = terminal_provisioning_v2(&request);
+            let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
+            let marker = verified_ingress_v2(&request, clock, &dependencies, &provisioning)
                 .unwrap_or_else(|error| panic!("real PXAR11 admission rejected: {error}"));
             let expected = derive_admission_facts_v2(&request, clock.now().value())
                 .unwrap_or_else(|error| panic!("state admission framing rejected: {error}"));
-            let fresh = bind_fresh_request_v2(marker, RUNTIME_EPOCH)
+            let fresh = bind_fresh_request_v2(&marker, RUNTIME_EPOCH)
                 .unwrap_or_else(|error| panic!("exact admission/state pairing rejected: {error}"));
             assert_eq!(fresh.request, &request);
             assert_eq!(fresh.admission, expected);
@@ -8419,8 +8596,15 @@ mod tests {
                 &[0xe6; 16],
             );
             let other_clock = clock_for_request_v2(&other_request, 9);
-            let other_marker = verified_ingress_v2(&other_request, other_clock)
-                .unwrap_or_else(|error| panic!("other PXAR11 admission rejected: {error}"));
+            let other_provisioning = terminal_provisioning_v2(&other_request);
+            let other_dependencies = terminal_endpoint_dependencies_v2(other_request.carrier());
+            let other_marker = verified_ingress_v2(
+                &other_request,
+                other_clock,
+                &other_dependencies,
+                &other_provisioning,
+            )
+            .unwrap_or_else(|error| panic!("other PXAR11 admission rejected: {error}"));
             let initial = initial_snapshot_v2();
             let mismatched_replay =
                 RemoteAgentDurableReplayCheckedV2::from_durable_replay_ledger_for_test(
@@ -8807,7 +8991,7 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("terminal successor API missing"));
             assert!(
-                terminal_api.contains("VerifiedRemoteAgentDataPlaneTerminalIngressV2<'_>"),
+                terminal_api.contains("VerifiedRemoteAgentDataPlaneTerminalIngressV2<'_, '_>"),
                 "state must consume only the private protected-key marker",
             );
             assert!(
@@ -8817,7 +9001,7 @@ mod tests {
 
             let admission_source = include_str!("admission.rs");
             let trust_impl = admission_source
-                .split_once("impl RemoteAgentDataPlaneTerminalRuntimeTrustV2 {")
+                .split_once("impl<'running> RemoteAgentDataPlaneTerminalRuntimeTrustV2<'running> {")
                 .and_then(|(_, tail)| {
                     tail.split_once("/// Complete Runtime-private authority")
                         .map(|(implementation, _)| implementation)
@@ -8825,9 +9009,35 @@ mod tests {
                 .unwrap_or_else(|| panic!("terminal Runtime trust implementation missing"));
             assert!(trust_impl.contains("try_from_provisioning("));
             assert!(trust_impl.contains("provisioning: &RuntimeProvisioningV1"));
+            assert!(
+                trust_impl.contains("carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>")
+            );
+            let trust_constructor = trust_impl
+                .split_once("pub(crate) fn try_from_provisioning(")
+                .and_then(|(_, tail)| {
+                    tail.split_once("/// Independently authenticates")
+                        .map(|(constructor, _)| constructor)
+                })
+                .unwrap_or_else(|| panic!("terminal Runtime trust constructor missing"));
+            assert!(
+                !trust_constructor
+                    .contains("expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1")
+            );
+            assert!(trust_constructor.contains("carrier_pin"));
+            assert!(trust_constructor.contains(".exact_carrier()"));
             assert!(trust_impl.contains(
                 "validate_restricted_runtime_apply_carrier_pins(provisioning, expected_carrier)"
             ));
+            let verify_signature = trust_impl
+                .split_once("pub(crate) fn verify_terminal_ingress<'terminal>(")
+                .and_then(|(_, tail)| {
+                    tail.split_once(") -> Result<")
+                        .map(|(signature, _)| signature)
+                })
+                .unwrap_or_else(|| panic!("terminal protected verifier missing"));
+            assert!(verify_signature.contains("self,"));
+            assert!(!verify_signature.contains("&self"));
+            assert!(trust_impl.contains("carrier_pin: self.carrier_pin"));
             assert_eq!(
                 trust_impl.matches("pub(crate) fn ").count(),
                 2,
@@ -8856,6 +9066,113 @@ mod tests {
                 .unwrap_or_else(|| panic!("private terminal marker declaration missing"));
             assert!(!marker_declaration.contains("#[derive(Clone"));
             assert!(!marker_declaration.contains("#[derive(Copy"));
+            let marker_body = admission_source
+                .split_once(
+                    "pub(crate) struct VerifiedRemoteAgentDataPlaneTerminalIngressV2<'terminal, 'running>",
+                )
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl<'terminal, 'running>")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("live terminal marker body missing"));
+            assert!(
+                marker_body.contains("carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>")
+            );
+
+            let transition_impl = state_source
+                .split_once("impl RemoteAgentAuthorizedTransitionV2 {")
+                .map(|(_, implementation)| implementation)
+                .unwrap_or_else(|| panic!("terminal transition implementation missing"));
+            let build = transition_impl
+                .find("let snapshot = RemoteAgentAccessSnapshotV2::try_build")
+                .unwrap_or_else(|| panic!("terminal successor build missing"));
+            let release = transition_impl
+                .find("drop(verified_terminal);")
+                .unwrap_or_else(|| panic!("live endpoint pin release missing"));
+            assert!(
+                build < release,
+                "live endpoint pin must survive the complete terminal successor build",
+            );
+
+            let endpoint_source = include_str!("runtime_control_endpoint.rs");
+            let pin_declaration = endpoint_source
+                .split_once("pub(crate) struct RuntimeRestrictedApplyCarrierPinV1")
+                .map(|(prefix, _)| prefix)
+                .and_then(|prefix| {
+                    prefix
+                        .rsplit_once("\n\n")
+                        .map(|(_, declaration)| declaration)
+                })
+                .unwrap_or_else(|| panic!("restricted carrier pin declaration missing"));
+            assert!(!pin_declaration.contains("#[derive(Clone"));
+            assert!(!pin_declaration.contains("#[derive(Copy"));
+            assert!(
+                endpoint_source.contains("impl Drop for RuntimeRestrictedApplyCarrierPinV1<'_>")
+            );
+            let pin_owner = endpoint_source
+                .split_once("enum RuntimeRestrictedApplyCarrierPinOwnerV1<'running> {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl<'running> RuntimeRestrictedApplyCarrierPinV1<'running>")
+                        .map(|(owner, _)| owner)
+                })
+                .unwrap_or_else(|| panic!("restricted carrier Pin owner missing"));
+            assert!(pin_owner.contains("Live(&'running RunningRestrictedRuntimeApplyEndpointV1)"));
+            assert!(pin_owner.contains("#[cfg(test)]"));
+            assert!(
+                pin_owner
+                    .contains("Fixture(&'running RuntimeRestrictedApplyEndpointDependenciesV1)")
+            );
+            let running_impl = endpoint_source
+                .split_once("impl RunningRestrictedRuntimeApplyEndpointV1 {")
+                .map(|(_, implementation)| implementation)
+                .unwrap_or_else(|| panic!("running restricted endpoint implementation missing"));
+            assert!(running_impl.contains("fn terminal_carrier_pin("));
+            assert!(!running_impl.contains("pub(crate) fn terminal_carrier_pin("));
+            assert!(running_impl.contains(
+                "RuntimeRestrictedApplyCarrierPinV1::try_from_live_endpoint(self, provisioning)"
+            ));
+            assert_eq!(
+                endpoint_source
+                    .matches("RuntimeRestrictedApplyCarrierPinV1::try_from_live_endpoint(")
+                    .count(),
+                1,
+                "only the complete live Running owner may mint a production Pin",
+            );
+            assert_eq!(
+                endpoint_source
+                    .matches("RuntimeRestrictedApplyCarrierPinV1::try_from_fixture(")
+                    .count(),
+                1,
+                "only the cfg(test) dependency helper may mint a fixture Pin",
+            );
+            let fixture_constructor = endpoint_source
+                .split_once("fn try_from_fixture(")
+                .and_then(|(_, tail)| {
+                    tail.split_once("/// Returns the exact carrier")
+                        .map(|(constructor, _)| constructor)
+                })
+                .unwrap_or_else(|| panic!("fixture Pin constructor missing"));
+            assert!(
+                fixture_constructor.contains("validate_restricted_runtime_apply_endpoint_pair(")
+            );
+            assert!(fixture_constructor.contains("&dependencies.endpoint_config"));
+            assert!(fixture_constructor.contains("&dependencies.expected_carrier"));
+            assert!(endpoint_source.contains(
+                "#[cfg(test)]\npub(crate) fn runtime_restricted_apply_carrier_pin_for_test"
+            ));
+            let test_pin_helper = endpoint_source
+                .split_once(
+                    "pub(crate) fn runtime_restricted_apply_carrier_pin_for_test<'dependencies>(",
+                )
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl RunningRestrictedRuntimeApplyEndpointV1")
+                })
+                .map(|(helper, _)| helper)
+                .unwrap_or_else(|| panic!("test-only restricted carrier pin helper missing"));
+            assert!(test_pin_helper.contains(
+                "dependencies: &'dependencies RuntimeRestrictedApplyEndpointDependenciesV1"
+            ));
+            assert!(test_pin_helper.contains("try_from_fixture(dependencies, provisioning)"));
         }
 
         #[test]

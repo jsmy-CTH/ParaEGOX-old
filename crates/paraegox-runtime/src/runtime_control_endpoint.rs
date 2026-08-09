@@ -328,6 +328,80 @@ impl RestrictedRuntimeEndpointConfigV1 {
     }
 }
 
+/// Move-only proof that one exact PXCB is owned by one live restricted
+/// Runtime endpoint generation and the protected Runtime provisioning.
+///
+/// The private owner borrow covers the complete live endpoint, including its
+/// lifecycle handle, exact configuration, and carrier. No raw carrier,
+/// decoded request, or recovered PXRS value can construct this pin.
+pub(crate) struct RuntimeRestrictedApplyCarrierPinV1<'running> {
+    owner: RuntimeRestrictedApplyCarrierPinOwnerV1<'running>,
+}
+
+enum RuntimeRestrictedApplyCarrierPinOwnerV1<'running> {
+    Live(&'running RunningRestrictedRuntimeApplyEndpointV1),
+    #[cfg(test)]
+    Fixture(&'running RuntimeRestrictedApplyEndpointDependenciesV1),
+}
+
+impl<'running> RuntimeRestrictedApplyCarrierPinV1<'running> {
+    fn try_from_live_endpoint(
+        running: &'running RunningRestrictedRuntimeApplyEndpointV1,
+        provisioning: &RuntimeProvisioningV1,
+    ) -> Result<Self, RuntimeBootstrapEndpointError> {
+        validate_restricted_runtime_apply_endpoint_pair(
+            &running.endpoint_config,
+            &running.expected_carrier,
+            provisioning,
+        )?;
+        Ok(Self {
+            owner: RuntimeRestrictedApplyCarrierPinOwnerV1::Live(running),
+        })
+    }
+
+    #[cfg(test)]
+    fn try_from_fixture(
+        dependencies: &'running RuntimeRestrictedApplyEndpointDependenciesV1,
+        provisioning: &RuntimeProvisioningV1,
+    ) -> Result<Self, RuntimeBootstrapEndpointError> {
+        validate_restricted_runtime_apply_endpoint_pair(
+            &dependencies.endpoint_config,
+            &dependencies.expected_carrier,
+            provisioning,
+        )?;
+        Ok(Self {
+            owner: RuntimeRestrictedApplyCarrierPinOwnerV1::Fixture(dependencies),
+        })
+    }
+
+    /// Returns the exact carrier only while its live composition still
+    /// matches. The immutable owner borrow makes a successful result stable
+    /// until this move-only pin is consumed.
+    pub(crate) fn exact_carrier(&self) -> Option<&RestrictedRuntimeApplyCarrierBindingV1> {
+        let (endpoint_config, expected_carrier) = match &self.owner {
+            RuntimeRestrictedApplyCarrierPinOwnerV1::Live(running) => {
+                (&running.endpoint_config, &running.expected_carrier)
+            }
+            #[cfg(test)]
+            RuntimeRestrictedApplyCarrierPinOwnerV1::Fixture(dependencies) => (
+                &dependencies.endpoint_config,
+                &dependencies.expected_carrier,
+            ),
+        };
+        endpoint_config
+            .matches_restricted_carrier(expected_carrier)
+            .then_some(expected_carrier)
+    }
+}
+
+/// The destructor is intentionally present even though it has no cleanup
+/// work: it makes this move-only value a real lifetime guard. Rust therefore
+/// keeps the complete live endpoint borrow until the Pin is explicitly
+/// consumed at the state transition boundary.
+impl Drop for RuntimeRestrictedApplyCarrierPinV1<'_> {
+    fn drop(&mut self) {}
+}
+
 impl RuntimeRestrictedApplyEndpointDependenciesV1 {
     pub(crate) fn new(
         endpoint_config: RestrictedRuntimeApplyEndpointConfigV1,
@@ -4258,6 +4332,7 @@ where
 struct RunningRestrictedRuntimeApplyEndpointV1 {
     endpoint: RunningRestrictedRuntimeEndpointLifecycleV1,
     receiver: RunningRestrictedRuntimeEndpointReceiverV1,
+    endpoint_config: RestrictedRuntimeEndpointConfigV1,
     expected_carrier: RestrictedRuntimeApplyCarrierBindingV1,
     protocol: RestrictedRuntimeEndpointProtocolV1,
 }
@@ -4311,19 +4386,36 @@ impl RunningRestrictedRuntimeInboundV1 {
     }
 }
 
+fn validate_restricted_runtime_apply_endpoint_pair(
+    endpoint_config: &RestrictedRuntimeEndpointConfigV1,
+    expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    provisioning: &RuntimeProvisioningV1,
+) -> Result<(), RuntimeBootstrapEndpointError> {
+    if !endpoint_config.matches_restricted_carrier(expected_carrier) {
+        return Err(RuntimeBootstrapEndpointError::InvalidProvisioning);
+    }
+    validate_restricted_runtime_apply_carrier_pins(provisioning, expected_carrier)
+        .map(|_| ())
+        .map_err(|_| RuntimeBootstrapEndpointError::InvalidProvisioning)
+}
+
 fn validate_restricted_runtime_apply_endpoint_dependencies(
     dependencies: &RuntimeRestrictedApplyEndpointDependenciesV1,
     provisioning: &RuntimeProvisioningV1,
 ) -> Result<(), RuntimeBootstrapEndpointError> {
-    if !dependencies
-        .endpoint_config
-        .matches_restricted_carrier(&dependencies.expected_carrier)
-    {
-        return Err(RuntimeBootstrapEndpointError::InvalidProvisioning);
-    }
-    validate_restricted_runtime_apply_carrier_pins(provisioning, &dependencies.expected_carrier)
-        .map(|_| ())
-        .map_err(|_| RuntimeBootstrapEndpointError::InvalidProvisioning)
+    validate_restricted_runtime_apply_endpoint_pair(
+        &dependencies.endpoint_config,
+        &dependencies.expected_carrier,
+        provisioning,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_restricted_apply_carrier_pin_for_test<'dependencies>(
+    dependencies: &'dependencies RuntimeRestrictedApplyEndpointDependenciesV1,
+    provisioning: &RuntimeProvisioningV1,
+) -> Result<RuntimeRestrictedApplyCarrierPinV1<'dependencies>, RuntimeBootstrapEndpointError> {
+    RuntimeRestrictedApplyCarrierPinV1::try_from_fixture(dependencies, provisioning)
 }
 
 impl RunningRestrictedRuntimeApplyEndpointV1 {
@@ -4337,6 +4429,7 @@ impl RunningRestrictedRuntimeApplyEndpointV1 {
             expected_carrier,
             protocol,
         } = dependencies;
+        let retained_endpoint_config = endpoint_config.clone();
         let (endpoint, receiver) = match endpoint_config {
             RestrictedRuntimeEndpointConfigV1::LegacyApply(config) => {
                 let (endpoint, receiver) = RestrictedRuntimeApplyEndpointV1::start(config)
@@ -4360,15 +4453,24 @@ impl RunningRestrictedRuntimeApplyEndpointV1 {
         Ok(Self {
             endpoint,
             receiver,
+            endpoint_config: retained_endpoint_config,
             expected_carrier,
             protocol,
         })
+    }
+
+    fn terminal_carrier_pin(
+        &self,
+        provisioning: &RuntimeProvisioningV1,
+    ) -> Result<RuntimeRestrictedApplyCarrierPinV1<'_>, RuntimeBootstrapEndpointError> {
+        RuntimeRestrictedApplyCarrierPinV1::try_from_live_endpoint(self, provisioning)
     }
 
     async fn shutdown(self) -> Result<(), RuntimeBootstrapEndpointError> {
         let Self {
             endpoint,
             receiver,
+            endpoint_config: _,
             expected_carrier: _,
             protocol: _,
         } = self;
@@ -4601,11 +4703,18 @@ where
                             RestrictedRuntimeApplyErrorV1::EndpointWorkerFailed,
                         ));
                     };
+                    let carrier_pin = match restricted.terminal_carrier_pin(&control.provisioning) {
+                        Ok(carrier_pin) => carrier_pin,
+                        Err(error) => break Err(error),
+                    };
+                    let Some(expected_carrier) = carrier_pin.exact_carrier() else {
+                        break Err(RuntimeBootstrapEndpointError::InvalidProvisioning);
+                    };
                     let response = match restricted.protocol {
                         RestrictedRuntimeEndpointProtocolV1::LegacyApply => control
                             .handle_restricted_distributed_agent_stack_apply_v1(
                                 inbound.canonical_request(),
-                                &restricted.expected_carrier,
+                                expected_carrier,
                             )
                             .await
                             .map_err(|error| match error {
@@ -4621,7 +4730,7 @@ where
                             control
                                 .handle_restricted_runtime_control_frame_v1(
                                     inbound.canonical_request(),
-                                    &restricted.expected_carrier,
+                                    expected_carrier,
                                 )
                                 .await
                                 .map_err(|error| match error {
@@ -6865,7 +6974,7 @@ mod tests {
         let source = include_str!("runtime_control_endpoint.rs");
         let dependency_validation = section(
             source,
-            "fn validate_restricted_runtime_apply_endpoint_dependencies",
+            "fn validate_restricted_runtime_apply_endpoint_pair",
             "impl RunningRestrictedRuntimeApplyEndpointV1",
         );
         assert!(
