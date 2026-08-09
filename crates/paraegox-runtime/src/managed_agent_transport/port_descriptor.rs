@@ -66,6 +66,22 @@ pub(crate) enum AgentConversationPortLiveOwnerExportErrorV1 {
     Descriptor(AgentConversationPortDescriptorError),
 }
 
+impl fmt::Display for AgentConversationPortLiveOwnerExportErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BindingNotActive => {
+                formatter.write_str("Agent conversation binding is not active")
+            }
+            Self::InvalidPhysicalBindingCensus => {
+                formatter.write_str("Agent conversation binding census is invalid")
+            }
+            Self::Descriptor(error) => {
+                write!(formatter, "Agent conversation PXAP validation failed: {error}")
+            }
+        }
+    }
+}
+
 impl AgentConversationPortDescriptorV1 {
     /// Validates lane identity, schemas, bounds, and the unique lane order.
     pub fn try_new(
