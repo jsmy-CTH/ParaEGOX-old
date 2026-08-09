@@ -3687,8 +3687,7 @@ const _: () = {
     fn typecheck_remote_agent_access_genesis_boundary_v2() {
         let _initialize_remote_agent_access_genesis_v2 =
             ManagedFabricControlService::initialize_remote_agent_access_genesis_v2;
-        let _retained_s0_census_digest_v2 =
-            RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;
+        let _retained_s0_census_digest_v2 = RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;
         let _exact_pxap_v2 = RemoteAgentLiveLowerFactsV2::exact_pxap;
         let _intended_client_v2 = RemoteAgentLiveLowerFactsV2::intended_client;
     }
@@ -9400,8 +9399,7 @@ mod tests {
         }
         assert!(compile_boundary.contains("const _: () = {"));
         assert!(
-            compile_boundary
-                .contains("let _ = typecheck_remote_agent_access_genesis_boundary_v2;")
+            compile_boundary.contains("let _ = typecheck_remote_agent_access_genesis_boundary_v2;")
         );
         assert!(!compile_boundary.contains(".await"));
         assert!(!compile_boundary.contains("RuntimeRestrictedApplyCarrierPinV1::"));
