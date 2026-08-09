@@ -9235,22 +9235,52 @@ mod tests {
                 .unwrap_or_else(|error| panic!("retained census domain rejected: {error}"));
         expected_census
             .field_bytes(live.target.as_bytes())
-            .and_then(|_| expected_census.field_bytes(&live.store_instance_id))
-            .and_then(|_| expected_census.field_digest(&live.owner_target_fingerprint))
-            .and_then(|_| expected_census.field_digest(&live.transition_projection_digest))
-            .and_then(|_| expected_census.field_u64(live.runtime_host_epoch))
-            .and_then(|_| expected_census.field_digest(&live.carrier_binding_digest))
-            .and_then(|_| expected_census.field_bytes(live.intended_client.as_bytes()))
-            .and_then(|_| expected_census.field_digest(&live.fabric_execution_digest))
-            .and_then(|_| expected_census.field_digest(&live.retained_s0_cas.cas_digest()))
-            .and_then(|_| expected_census.field_digest(&live.lower_capability_projection_digest))
-            .and_then(|_| expected_census.field_digest(&live.pxap_descriptor_digest))
-            .and_then(|_| expected_census.field_digest(&live.request_binding_descriptor_digest))
-            .and_then(|_| expected_census.field_digest(&live.event_binding_descriptor_digest))
-            .and_then(|_| expected_census.field_u64(live.submit_binding_epoch))
-            .and_then(|_| expected_census.field_u64(live.control_binding_epoch))
-            .and_then(|_| expected_census.field_u16(live.physical_binding_census))
-            .unwrap_or_else(|error| panic!("retained census field rejected: {error}"));
+            .unwrap_or_else(|error| panic!("retained census target rejected: {error}"));
+        expected_census
+            .field_bytes(&live.store_instance_id)
+            .unwrap_or_else(|error| panic!("retained census store id rejected: {error}"));
+        expected_census
+            .field_digest(&live.owner_target_fingerprint)
+            .unwrap_or_else(|error| panic!("retained census owner fingerprint rejected: {error}"));
+        expected_census
+            .field_digest(&live.transition_projection_digest)
+            .unwrap_or_else(|error| panic!("retained census transition rejected: {error}"));
+        expected_census
+            .field_u64(live.runtime_host_epoch)
+            .unwrap_or_else(|error| panic!("retained census host epoch rejected: {error}"));
+        expected_census
+            .field_digest(&live.carrier_binding_digest)
+            .unwrap_or_else(|error| panic!("retained census carrier rejected: {error}"));
+        expected_census
+            .field_bytes(live.intended_client.as_bytes())
+            .unwrap_or_else(|error| panic!("retained census client rejected: {error}"));
+        expected_census
+            .field_digest(&live.fabric_execution_digest)
+            .unwrap_or_else(|error| panic!("retained census Fabric rejected: {error}"));
+        expected_census
+            .field_digest(&live.retained_s0_cas.cas_digest())
+            .unwrap_or_else(|error| panic!("retained census S0 CAS rejected: {error}"));
+        expected_census
+            .field_digest(&live.lower_capability_projection_digest)
+            .unwrap_or_else(|error| panic!("retained census lower rejected: {error}"));
+        expected_census
+            .field_digest(&live.pxap_descriptor_digest)
+            .unwrap_or_else(|error| panic!("retained census PXAP rejected: {error}"));
+        expected_census
+            .field_digest(&live.request_binding_descriptor_digest)
+            .unwrap_or_else(|error| panic!("retained census request PXBD rejected: {error}"));
+        expected_census
+            .field_digest(&live.event_binding_descriptor_digest)
+            .unwrap_or_else(|error| panic!("retained census event PXBD rejected: {error}"));
+        expected_census
+            .field_u64(live.submit_binding_epoch)
+            .unwrap_or_else(|error| panic!("retained census submit epoch rejected: {error}"));
+        expected_census
+            .field_u64(live.control_binding_epoch)
+            .unwrap_or_else(|error| panic!("retained census control epoch rejected: {error}"));
+        expected_census
+            .field_u16(live.physical_binding_census)
+            .unwrap_or_else(|error| panic!("retained census cardinality rejected: {error}"));
         assert_eq!(live.retained_s0_census_digest(), expected_census.finish());
         assert!(
             live.lower_capability_projection_digest()
