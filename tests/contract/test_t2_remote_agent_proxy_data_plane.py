@@ -1683,6 +1683,25 @@ def test_terminal_temporal_authority_is_exact_and_outcome_sensitive() -> None:
         assert _terminal_selection_time_is_valid(cleanup_outcome, 100, 200, 250)
 
 
+def test_terminal_selection_exactly_at_admission_is_accepted() -> None:
+    value = _vectors()["active_ready"]
+    admitted_at_nanos = value["terminal"]["values"]["evidence"]["admitted_at_nanos"]
+    at_admission = _resign_pxau(
+        _replace(
+            value["terminal"]["wire"],
+            PXAU_OFFSETS["selection_observed_at_nanos"],
+            _u64(admitted_at_nanos),
+        )
+    )
+    transcript = PXAU_SIGNING_MAGIC + _u16(PXAU_SIGNING_VERSION) + at_admission[6:681]
+    Ed25519PublicKey.from_public_bytes(value["terminal"]["public_key"]).verify(
+        at_admission[683:],
+        transcript,
+    )
+    parsed = _parse_pxau(at_admission, value["pxar"], value["terminal"]["public_key"])
+    assert parsed["values"]["evidence"]["selection_observed_at_nanos"] == admitted_at_nanos
+
+
 def test_local_only_drain_bitmaps_and_counters_fail_closed() -> None:
     value = _vectors()["local_only_ready"]
     wire = value["terminal"]["wire"]

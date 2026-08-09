@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = REPO_ROOT / "tests/fixtures/wire/t2_remote_agent_access_v2.json"
 INNER_FIXTURE_PATH = REPO_ROOT / "tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json"
+INNER_ORACLE_PATH = REPO_ROOT / "tests/contract/test_t2_remote_agent_proxy_data_plane.py"
 V1_FIXTURE_PATH = REPO_ROOT / "tests/fixtures/wire/t2_remote_agent_access_v1.json"
 OUTER_SOURCE_PATH = REPO_ROOT / "crates/paraegox-runtime-contracts/src/remote_agent_access.rs"
 PLAN_SOURCE_PATH = (
@@ -29,8 +30,9 @@ PLAN_SOURCE_PATH = (
 R236_REF = "build/mac-source-snapshot-20260809-r236-t2-b2-outer-successor-high-fixes-fmt"
 R236_COMMIT = "786d96cded7ca7efbe248fe464a69c26fc6dcbb7"
 OUTER_SOURCE_SHA256 = "ee42b276ad30d9fa2c9240af49315db8fd6499a4c45a8a2c9107cdab44a58be7"
-PLAN_SOURCE_SHA256 = "8597f75ec6bb6b41a97fb3ebd2d8cdefcde431ceb0d32d6b125ed17f0a1a64e7"
-INNER_FIXTURE_SHA256 = "983e4449636dd559e9ca0508b756f186ecc34a47ff8a2c5f6c38f3941a31499a"
+PLAN_SOURCE_SHA256 = "2649e0457c47e63a2132df2b8db9de52818b71645c54b656747c978fb2d882e7"
+INNER_ORACLE_SHA256 = "4d81b195fc7b3546891eb37b173c2e323143c7cf3b110dc7e7cb959dbf2c58d3"
+INNER_FIXTURE_SHA256 = "c76b61aa3f47fa694fc075d77979a9bdeb9bda95674e073e8410c352df74b0c3"
 
 DIGEST_MAGIC = b"ParaEGOX\0canonical-digest"
 DIGEST_VERSION = 1
@@ -89,6 +91,14 @@ INNER_PXAU_SIGNING_MAGIC = b"ParaEGOX\0remote-agent-proxy-data-plane-terminal-si
 INNER_PXAU_VERSION = 2
 INNER_PXAU_FIXED_BYTES = 683
 MAX_INNER_PXAU_BYTES = 2_048
+INNER_PROFILE_OPERATION_TIMEOUT_NANOS = 20_000_000_000
+INNER_ENVELOPE_ORIGINAL_BUDGET_NANOS = 30_000_000_000
+INNER_ENVELOPE_REMAINING_BUDGET_NANOS = 25_000_000_000
+INNER_OUTCOME_ACTIVE_READY = 1
+INNER_OUTCOME_LOCAL_ONLY_READY = 2
+INNER_OUTCOME_NO_EFFECT_REJECTED = 3
+INNER_OUTCOME_UNCERTAIN = 4
+INNER_OUTCOME_QUARANTINED = 5
 ENVELOPE_MAGIC = b"ParaEGOX\0runtime-apply-envelope"
 ENVELOPE_VERSION = 2
 ENVELOPE_FIELD_COUNT = 38
@@ -369,6 +379,17 @@ def _parse_envelope(wire: bytes) -> dict[int, bytes]:
     cursor.finish()
     if any(fields[tag] == bytes(len(fields[tag])) for tag in (2, 24, 32, 33, 34)):
         raise ContractReject("envelope identity")
+    if (
+        fields[26] != _u16(1)
+        or len(fields[27]) != 16
+        or len(fields[28]) != 16
+        or fields[28] == bytes(16)
+        or any(len(fields[tag]) != 8 for tag in (29, 30, 31))
+        or int.from_bytes(fields[29], "big") == 0
+        or int.from_bytes(fields[30], "big") == 0
+        or int.from_bytes(fields[31], "big") > int.from_bytes(fields[30], "big")
+    ):
+        raise ContractReject("envelope temporal authority")
     if fields[35] != _u16(1) or fields[36] != _u16(1):
         raise ContractReject("envelope algorithm")
     if not 0 < len(fields[37]) <= MAX_NONCE_BYTES or len(fields[38]) != SIGNATURE_BYTES:
@@ -410,6 +431,9 @@ def _parse_inner_pxar(wire: bytes) -> dict[str, Any]:
         raise ContractReject("PXTE10 magic/version")
     if struct.unpack_from(">H", pxte, 308)[0] != PXAD_VERSION or pxte[311] != 1:
         raise ContractReject("PXTE10 profile")
+    mode = pxte[310]
+    if mode not in {1, 2}:
+        raise ContractReject("PXTE10 mode")
     predecessor_length, profile_length = struct.unpack_from(">II", pxte, 312)
     retained_offset = PXTE_PREFIX_BYTES + predecessor_length
     expected_s1_offset = retained_offset + RETAINED_S0_BYTES
@@ -421,6 +445,10 @@ def _parse_inner_pxar(wire: bytes) -> dict[str, Any]:
     profile = _parse_profile(pxte[profile_offset:])
     if fields[2] != profile["target"]:
         raise ContractReject("PXAR11 target")
+    original_budget_nanos = int.from_bytes(fields[30], "big")
+    remaining_budget_nanos = int.from_bytes(fields[31], "big")
+    if remaining_budget_nanos < profile["operation_timeout_nanos"]:
+        raise ContractReject("PXAR11 remaining budget shorter than operation timeout")
     transcript = _inner_envelope_transcript(fields)
     try:
         Ed25519PublicKey.from_public_bytes(_public(CONTROLLER_SEED)).verify(fields[38], transcript)
@@ -441,6 +469,11 @@ def _parse_inner_pxar(wire: bytes) -> dict[str, Any]:
         "algorithm": int.from_bytes(fields[35], "big"),
         "algorithm_version": int.from_bytes(fields[36], "big"),
         "nonce": fields[37],
+        "mode": mode,
+        "clock_domain": fields[28],
+        "clock_generation": int.from_bytes(fields[29], "big"),
+        "original_budget_nanos": original_budget_nanos,
+        "remaining_budget_nanos": remaining_budget_nanos,
         "retained_s0": retained,
         "expected_s1": expected_s1,
         "profile": profile,
@@ -460,7 +493,14 @@ def _parse_inner_pxau(wire: bytes, request: dict[str, Any]) -> dict[str, Any]:
         "store": wire[22:54],
         "operation_id": wire[70:86],
         "request_digest": wire[118:150],
+        "request_mode": wire[230],
+        "outcome": wire[231],
         "completion_runtime_host_epoch": struct.unpack_from(">Q", wire, 563)[0],
+        "selection_clock_domain": wire[587:603],
+        "selection_clock_generation": struct.unpack_from(">Q", wire, 603)[0],
+        "admitted_at_nanos": struct.unpack_from(">Q", wire, 611)[0],
+        "absolute_deadline_nanos": struct.unpack_from(">Q", wire, 619)[0],
+        "selection_observed_at_nanos": struct.unpack_from(">Q", wire, 627)[0],
         "runtime_principal": wire[645:661],
         "runtime_key": wire[661:677],
         "algorithm": struct.unpack_from(">H", wire, 677)[0],
@@ -471,7 +511,26 @@ def _parse_inner_pxau(wire: bytes, request: dict[str, Any]) -> dict[str, Any]:
         or values["store"] != request["store"]
         or values["operation_id"] != request["operation_id"]
         or values["request_digest"] != request["digest"]
+        or values["request_mode"] != request["mode"]
         or values["completion_runtime_host_epoch"] == 0
+        or values["selection_clock_domain"] != request["clock_domain"]
+        or values["selection_clock_generation"] != request["clock_generation"]
+        or values["admitted_at_nanos"] == 0
+        or values["absolute_deadline_nanos"]
+        != values["admitted_at_nanos"] + request["profile"]["operation_timeout_nanos"]
+        or values["selection_observed_at_nanos"] < values["admitted_at_nanos"]
+        or values["outcome"]
+        not in {
+            INNER_OUTCOME_ACTIVE_READY,
+            INNER_OUTCOME_LOCAL_ONLY_READY,
+            INNER_OUTCOME_NO_EFFECT_REJECTED,
+            INNER_OUTCOME_UNCERTAIN,
+            INNER_OUTCOME_QUARANTINED,
+        }
+        or (
+            values["outcome"] == INNER_OUTCOME_ACTIVE_READY
+            and values["selection_observed_at_nanos"] >= values["absolute_deadline_nanos"]
+        )
         or values["runtime_principal"] == bytes(16)
         or values["runtime_key"] == bytes(16)
         or (values["algorithm"], values["algorithm_version"]) != (1, 1)
@@ -1035,6 +1094,29 @@ def _resign_pxrr(wire: bytes) -> bytes:
     return wire[:-SIGNATURE_BYTES] + _private(RUNTIME_SEED).sign(transcript)
 
 
+def _resign_inner_pxau(wire: bytes) -> bytes:
+    if len(wire) != INNER_PXAU_FIXED_BYTES + SIGNATURE_BYTES:
+        raise AssertionError("inner PXAU2 Ed25519 width")
+    transcript = INNER_PXAU_SIGNING_MAGIC + _u16(2) + wire[6:681]
+    return wire[:683] + _private(RUNTIME_SEED).sign(transcript)
+
+
+def _rebuild_inner_pxar_envelope(wire: bytes, changes: dict[int, bytes]) -> bytes:
+    envelope_length = struct.unpack_from(">I", wire, 6)[0]
+    envelope_end = PXAR_HEADER_BYTES + envelope_length
+    fields = _parse_envelope(wire[PXAR_HEADER_BYTES:envelope_end])
+    fields.update(changes)
+    fields[38] = _private(CONTROLLER_SEED).sign(_inner_envelope_transcript(fields))
+    envelope = ENVELOPE_MAGIC + _u16(ENVELOPE_VERSION) + _u16(ENVELOPE_FIELD_COUNT)
+    envelope += b"".join(
+        _u16(tag) + _u32(len(fields[tag])) + fields[tag]
+        for tag in range(1, ENVELOPE_FIELD_COUNT + 1)
+    )
+    if len(envelope) != envelope_length:
+        raise AssertionError("temporal rebuild must preserve envelope width")
+    return wire[:PXAR_HEADER_BYTES] + envelope + wire[envelope_end:]
+
+
 @lru_cache(maxsize=1)
 def _vectors() -> dict[str, Any]:
     inner = _inner_fixture()
@@ -1130,6 +1212,7 @@ def _generated_fixture() -> dict[str, Any]:
             "commit": R236_COMMIT,
             "remote_agent_access.rs_sha256": OUTER_SOURCE_SHA256,
             "remote_agent_data_plane_plan.rs_sha256": PLAN_SOURCE_SHA256,
+            "inner_python_oracle_sha256": INNER_ORACLE_SHA256,
             "corrected_inner_fixture_sha256": INNER_FIXTURE_SHA256,
         },
         "semantic_constants": {
@@ -1145,6 +1228,9 @@ def _generated_fixture() -> dict[str, Any]:
             "max_canonical_pxau_v2_bytes": MAX_CANONICAL_PXAU_BYTES,
             "retained_s0_cas_bytes": RETAINED_S0_BYTES,
             "active_s1_cas_bytes": ACTIVE_S1_BYTES,
+            "inner_profile_operation_timeout_nanos": INNER_PROFILE_OPERATION_TIMEOUT_NANOS,
+            "inner_envelope_original_budget_nanos": INNER_ENVELOPE_ORIGINAL_BUDGET_NANOS,
+            "inner_envelope_remaining_budget_nanos": INNER_ENVELOPE_REMAINING_BUDGET_NANOS,
             "request_offsets": REQUEST_OFFSETS,
             "response_offsets": RESPONSE_OFFSETS,
         },
@@ -1183,6 +1269,9 @@ def _generated_fixture() -> dict[str, Any]:
                 inner_request["transcript"]
             ).hexdigest(),
             "controller_signature_hex": inner_request["signature"].hex(),
+            "original_budget_nanos": inner_request["original_budget_nanos"],
+            "remaining_budget_nanos": inner_request["remaining_budget_nanos"],
+            "operation_timeout_nanos": inner_request["profile"]["operation_timeout_nanos"],
             "pxau_v2_wire_length": len(vectors["inner_pxau"]),
             "pxau_v2_digest_hex": inner_terminal["digest"].hex(),
             "runtime_transcript_hex": inner_terminal["transcript"].hex(),
@@ -1191,6 +1280,10 @@ def _generated_fixture() -> dict[str, Any]:
                 inner_terminal["transcript"]
             ).hexdigest(),
             "runtime_signature_hex": inner_terminal["signature"].hex(),
+            "selection_clock_generation": inner_terminal["selection_clock_generation"],
+            "admitted_at_nanos": inner_terminal["admitted_at_nanos"],
+            "absolute_deadline_nanos": inner_terminal["absolute_deadline_nanos"],
+            "selection_observed_at_nanos": inner_terminal["selection_observed_at_nanos"],
         },
         "apply": {
             "pxra_v2": _wire_entry(vectors["apply_request"]),
@@ -1208,9 +1301,10 @@ def _generated_fixture() -> dict[str, Any]:
     }
 
 
-def test_r236_source_freeze_widths_offsets_and_maxima() -> None:
+def test_r236_outer_and_r244_inner_freeze_widths_offsets_and_maxima() -> None:
     assert hashlib.sha256(OUTER_SOURCE_PATH.read_bytes()).hexdigest() == OUTER_SOURCE_SHA256
     assert hashlib.sha256(PLAN_SOURCE_PATH.read_bytes()).hexdigest() == PLAN_SOURCE_SHA256
+    assert hashlib.sha256(INNER_ORACLE_PATH.read_bytes()).hexdigest() == INNER_ORACLE_SHA256
     assert hashlib.sha256(INNER_FIXTURE_PATH.read_bytes()).hexdigest() == INNER_FIXTURE_SHA256
     assert PXRA_FIXED_BYTES == 544
     assert MAX_PXRA_BYTES == 544 + 64 + 483 + 6_700 + 64
@@ -1218,6 +1312,9 @@ def test_r236_source_freeze_widths_offsets_and_maxima() -> None:
     assert MAX_PXRR_BYTES == 5_792
     assert MAX_DESCRIPTOR_BYTES == 2_048
     assert MAX_CANONICAL_PXAU_BYTES == 1_195
+    assert INNER_ENVELOPE_ORIGINAL_BUDGET_NANOS == 30_000_000_000
+    assert INNER_ENVELOPE_REMAINING_BUDGET_NANOS == 25_000_000_000
+    assert INNER_PROFILE_OPERATION_TIMEOUT_NANOS == 20_000_000_000
     assert REQUEST_OFFSETS["nonce"] == 542
     assert RESPONSE_OFFSETS["signature_length"] == 644
     assert RESPONSE_OFFSETS["values"] == PXRR_FIXED_BYTES
@@ -1225,6 +1322,66 @@ def test_r236_source_freeze_widths_offsets_and_maxima() -> None:
 
 def test_independent_outer_v2_oracle_matches_checked_in_golden() -> None:
     assert _read_json(FIXTURE_PATH) == _generated_fixture()
+
+
+def test_outer_consumer_enforces_r244_inner_temporal_authority() -> None:
+    vectors = _vectors()
+    active_request = vectors["parsed_inner"]
+    active_terminal = _parse_inner_pxau(vectors["inner_pxau"], active_request)
+    assert active_request["original_budget_nanos"] == INNER_ENVELOPE_ORIGINAL_BUDGET_NANOS
+    assert active_request["remaining_budget_nanos"] == INNER_ENVELOPE_REMAINING_BUDGET_NANOS
+    assert (
+        active_request["profile"]["operation_timeout_nanos"]
+        == INNER_PROFILE_OPERATION_TIMEOUT_NANOS
+    )
+    assert active_terminal["selection_clock_generation"] == active_request["clock_generation"]
+    assert (
+        active_terminal["admitted_at_nanos"]
+        <= active_terminal["selection_observed_at_nanos"]
+        < active_terminal["absolute_deadline_nanos"]
+    )
+
+    inner = _inner_fixture()
+    local_request = _parse_inner_pxar(
+        bytes.fromhex(inner["local_only_ready"]["pxar_v11"]["wire_hex"])
+    )
+    local_terminal = _parse_inner_pxau(
+        bytes.fromhex(inner["local_only_ready"]["pxau_v2"]["wire_hex"]),
+        local_request,
+    )
+    assert local_terminal["outcome"] == INNER_OUTCOME_LOCAL_ONLY_READY
+    assert local_terminal["selection_clock_generation"] == local_request["clock_generation"]
+    assert (
+        local_terminal["selection_observed_at_nanos"]
+        > local_terminal["absolute_deadline_nanos"]
+        > local_terminal["admitted_at_nanos"]
+    )
+
+    short_budget = _rebuild_inner_pxar_envelope(
+        vectors["inner_pxar"],
+        {31: _u64(INNER_PROFILE_OPERATION_TIMEOUT_NANOS - 1)},
+    )
+    with pytest.raises(ContractReject):
+        _parse_inner_pxar(short_budget)
+
+    temporal_mutations = (
+        (
+            627,
+            _u64(active_terminal["absolute_deadline_nanos"]),
+        ),
+        (
+            627,
+            _u64(active_terminal["admitted_at_nanos"] - 1),
+        ),
+        (
+            603,
+            _u64(active_request["clock_generation"] + 1),
+        ),
+    )
+    for offset, replacement in temporal_mutations:
+        tampered = _resign_inner_pxau(_replace(vectors["inner_pxau"], offset, replacement))
+        with pytest.raises(ContractReject):
+            _parse_inner_pxau(tampered, active_request)
 
 
 def test_apply_round_trip_exercises_four_signature_callbacks() -> None:

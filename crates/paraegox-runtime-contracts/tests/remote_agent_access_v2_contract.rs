@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 
 use paraegox_kernel::digest::Digest32;
+use paraegox_kernel::time::BoundedDuration;
 
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
@@ -16,7 +17,8 @@ use paraegox_runtime_contracts::remote_agent_access::{
 use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
     REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES, REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES,
     RemoteAgentActiveS1CasV2, RemoteAgentDataPlaneApplyRequestDraftV2,
-    RemoteAgentDataPlaneApplyRequestV2, RemoteAgentDataPlaneTerminalReceiptV2,
+    RemoteAgentDataPlaneApplyRequestV2, RemoteAgentDataPlaneTerminalOutcomeV2,
+    RemoteAgentDataPlaneTerminalReceiptV2,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyRequestAuthClaim};
 
@@ -27,6 +29,10 @@ const ACCESS_V1_GOLDEN: &str =
 const ACCESS_V2_GOLDEN: &str =
     include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v2.json");
 const OUTER_SOURCE: &str = include_str!("../src/remote_agent_access.rs");
+const EXPECTED_OUTER_PYTHON_ORACLE_SHA256: &str =
+    "508041d265036c6fc52d42ee5e68c4d78a27c826540ebd8f5ac250b3824ef2f7";
+const EXPECTED_OUTER_JSON_GOLDEN_SHA256: &str =
+    "749e708ed598328aaed76dc8b553331ba03b16d4358451c80ac57d121e932284";
 const OUTER_CONTROLLER_NONCE: &[u8; 32] = &[0xe1; 32];
 const DESCRIBE_CONTROLLER_NONCE: &[u8; 32] = &[0xe3; 32];
 const OUTER_CONTROLLER_SIGNATURE: &[u8; 64] = &[0xe2; 64];
@@ -103,6 +109,20 @@ fn active_inner_terminal() -> RemoteAgentDataPlaneTerminalReceiptV2 {
     let pxau = fixture_section_after(active, "\"pxau_v2\"");
     RemoteAgentDataPlaneTerminalReceiptV2::decode(&fixture_hex_after(pxau, "\"wire_hex\""))
         .expect("shared-golden PXAU v2")
+}
+
+fn local_inner_request() -> RemoteAgentDataPlaneApplyRequestV2 {
+    let local_only = fixture_section_after(PROXY_DATA_PLANE_V2_GOLDEN, "\"local_only_ready\"");
+    let pxar = fixture_section_after(local_only, "\"pxar_v11\"");
+    RemoteAgentDataPlaneApplyRequestV2::decode(&fixture_hex_after(pxar, "\"wire_hex\""))
+        .expect("shared-golden local-only PXAR v11")
+}
+
+fn local_inner_terminal() -> RemoteAgentDataPlaneTerminalReceiptV2 {
+    let local_only = fixture_section_after(PROXY_DATA_PLANE_V2_GOLDEN, "\"local_only_ready\"");
+    let pxau = fixture_section_after(local_only, "\"pxau_v2\"");
+    RemoteAgentDataPlaneTerminalReceiptV2::decode(&fixture_hex_after(pxau, "\"wire_hex\""))
+        .expect("shared-golden local-only PXAU v2")
 }
 
 fn current_active_s1_cas() -> RemoteAgentActiveS1CasV2 {
@@ -656,6 +676,264 @@ fn all_four_signatures_are_independent_and_wrong_or_zero_bytes_fail_closed() {
 }
 
 #[test]
+fn outer_apply_enforces_inner_temporal_budget_clock_and_outcome_boundaries() {
+    const ORIGINAL_BUDGET_NANOS: u64 = 30_000_000_000;
+    const FORWARDED_BUDGET_NANOS: u64 = 25_000_000_000;
+    const OPERATION_TIMEOUT_NANOS: u64 = 20_000_000_000;
+    const EXACT_BUDGET_SIGNATURE: &[u8; 64] = &[0x31; 64];
+    const SELECTION_GENERATION_OFFSET: usize = 603;
+    const ADMITTED_AT_OFFSET: usize = 611;
+    const ABSOLUTE_DEADLINE_OFFSET: usize = 619;
+    const SELECTION_OBSERVED_AT_OFFSET: usize = 627;
+
+    let active = active_inner_request();
+    let active_terminal = active_inner_terminal();
+    let active_temporal = active.temporal();
+    let active_evidence = active_terminal.facts().evidence().fields();
+    let operation_timeout = active.target_execution().profile().operation_timeout_nanos();
+
+    assert_eq!(active_temporal.original_budget().value(), ORIGINAL_BUDGET_NANOS);
+    assert_eq!(
+        active_temporal.remaining_budget().value(),
+        FORWARDED_BUDGET_NANOS
+    );
+    assert_eq!(operation_timeout, OPERATION_TIMEOUT_NANOS);
+    assert_eq!(
+        active_evidence.selection_clock_domain,
+        active_temporal.target_clock_domain()
+    );
+    assert_eq!(
+        active_evidence.selection_clock_generation,
+        active_temporal.target_clock_generation()
+    );
+    assert_eq!(
+        active_evidence.absolute_deadline_nanos,
+        active_evidence.admitted_at_nanos + operation_timeout
+    );
+    assert_eq!(
+        active_terminal.facts().state().outcome(),
+        RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady
+    );
+    assert!(
+        active_evidence.admitted_at_nanos <= active_evidence.selection_observed_at_nanos
+            && active_evidence.selection_observed_at_nanos
+                < active_evidence.absolute_deadline_nanos
+    );
+
+    let exact_temporal = active_temporal
+        .try_reduce_remaining(BoundedDuration::from_nanos(operation_timeout))
+        .expect("remaining budget may reduce to the exact operation timeout");
+    let exact_inner = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+        active.target_execution().clone(),
+        active.provenance(),
+        active.control_commitment().control().clone(),
+        exact_temporal,
+        active.expected_runtime_store_instance_id(),
+        active.authentication().claim().clone(),
+    )
+    .expect("exact operation-timeout budget remains admissible")
+    .finalize(EXACT_BUDGET_SIGNATURE)
+    .expect("exact-budget PXAR v11");
+    assert_eq!(
+        exact_inner.temporal().remaining_budget().value(),
+        operation_timeout
+    );
+    assert_eq!(
+        RemoteAgentDataPlaneApplyRequestV2::decode(exact_inner.canonical_wire()).unwrap(),
+        exact_inner
+    );
+    let carrier = carrier_for(&exact_inner, &active_terminal);
+    let exact_outer = apply_access_request(&exact_inner, &active_terminal, carrier.clone());
+    let exact_inner_transcript = exact_inner.signing_transcript().unwrap();
+    let exact_outer_transcript = exact_outer.signing_transcript().unwrap();
+    exact_outer
+        .verify_controller_apply_request(
+            &carrier,
+            |principal, key, algorithm, version, transcript, signature| {
+                let claim = exact_inner.authentication().claim();
+                principal == claim.principal()
+                    && key == claim.key()
+                    && algorithm == claim.algorithm()
+                    && version == claim.algorithm_version()
+                    && transcript == exact_inner_transcript.as_bytes()
+                    && signature == EXACT_BUDGET_SIGNATURE
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                principal == carrier.controller_principal()
+                    && key == carrier.controller_request_key()
+                    && fingerprint == carrier.controller_request_key_fingerprint()
+                    && transcript == exact_outer_transcript.as_bytes()
+                    && signature == OUTER_CONTROLLER_SIGNATURE
+            },
+        )
+        .expect("outer Apply accepts an authenticated exact-timeout inner budget");
+
+    let short_temporal = active_temporal
+        .try_reduce_remaining(BoundedDuration::from_nanos(operation_timeout - 1))
+        .expect("standalone temporal reduction remains well-shaped");
+    assert!(
+        RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+            active.target_execution().clone(),
+            active.provenance(),
+            active.control_commitment().control().clone(),
+            short_temporal,
+            active.expected_runtime_store_instance_id(),
+            active.authentication().claim().clone(),
+        )
+        .is_err(),
+        "PXAR v11 producer accepted less remaining budget than the operation timeout",
+    );
+
+    let remaining_budget_bytes = FORWARDED_BUDGET_NANOS.to_be_bytes();
+    let remaining_budget_offsets = active
+        .canonical_wire()
+        .windows(remaining_budget_bytes.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| {
+            (bytes == remaining_budget_bytes.as_slice()).then_some(offset)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(remaining_budget_offsets.len(), 1);
+    let mut short_wire = active.canonical_wire().to_vec();
+    let remaining_budget_offset = remaining_budget_offsets[0];
+    short_wire[remaining_budget_offset..remaining_budget_offset + 8]
+        .copy_from_slice(&(operation_timeout - 1).to_be_bytes());
+    assert!(
+        RemoteAgentDataPlaneApplyRequestV2::decode(&short_wire).is_err(),
+        "PXAR v11 decoder accepted less remaining budget than the operation timeout",
+    );
+
+    let mut later_generation_wire = active_terminal.canonical_wire().to_vec();
+    later_generation_wire[SELECTION_GENERATION_OFFSET..ADMITTED_AT_OFFSET].copy_from_slice(
+        &(active_evidence.selection_clock_generation.value() + 1).to_be_bytes(),
+    );
+    let later_generation = RemoteAgentDataPlaneTerminalReceiptV2::decode(&later_generation_wire)
+        .expect("later-generation terminal remains structurally canonical");
+    assert!(later_generation.validate_against_request(&active).is_err());
+    assert!(
+        later_generation
+            .verify_runtime_terminal(
+                &active,
+                later_generation.authentication(),
+                |_, _, _, _, _, _| true,
+            )
+            .is_err(),
+        "outer Runtime authentication admitted a different clock generation",
+    );
+
+    let mut before_admission_wire = active_terminal.canonical_wire().to_vec();
+    before_admission_wire[SELECTION_OBSERVED_AT_OFFSET..SELECTION_OBSERVED_AT_OFFSET + 8]
+        .copy_from_slice(&(active_evidence.admitted_at_nanos - 1).to_be_bytes());
+    assert!(RemoteAgentDataPlaneTerminalReceiptV2::decode(&before_admission_wire).is_err());
+
+    let mut active_at_deadline_wire = active_terminal.canonical_wire().to_vec();
+    active_at_deadline_wire[SELECTION_OBSERVED_AT_OFFSET..SELECTION_OBSERVED_AT_OFFSET + 8]
+        .copy_from_slice(&active_evidence.absolute_deadline_nanos.to_be_bytes());
+    assert!(
+        RemoteAgentDataPlaneTerminalReceiptV2::decode(&active_at_deadline_wire).is_err(),
+        "ActiveReady admitted selection at the exact deadline",
+    );
+    assert_eq!(
+        read_u64(&active_terminal.canonical_wire()[ADMITTED_AT_OFFSET..ABSOLUTE_DEADLINE_OFFSET]),
+        active_evidence.admitted_at_nanos
+    );
+    assert_eq!(
+        read_u64(
+            &active_terminal.canonical_wire()
+                [ABSOLUTE_DEADLINE_OFFSET..SELECTION_OBSERVED_AT_OFFSET]
+        ),
+        active_evidence.absolute_deadline_nanos
+    );
+
+    let local = local_inner_request();
+    let local_terminal = local_inner_terminal();
+    let local_evidence = local_terminal.facts().evidence().fields();
+    assert_eq!(
+        local_terminal.facts().state().outcome(),
+        RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady
+    );
+    assert_eq!(
+        local_evidence.selection_clock_domain,
+        local.temporal().target_clock_domain()
+    );
+    assert_eq!(
+        local_evidence.selection_clock_generation,
+        local.temporal().target_clock_generation()
+    );
+    assert_eq!(
+        local_evidence.absolute_deadline_nanos,
+        local_evidence.admitted_at_nanos
+            + local.target_execution().profile().operation_timeout_nanos()
+    );
+    assert_eq!(
+        local_evidence.selection_observed_at_nanos,
+        local_evidence.admitted_at_nanos + 21_000_000_000
+    );
+    assert!(local_evidence.selection_observed_at_nanos > local_evidence.absolute_deadline_nanos);
+    local_terminal
+        .validate_against_request(&local)
+        .expect("LocalOnlyReady cleanup may complete after its admission deadline");
+
+    let local_carrier = carrier_for(&local, &local_terminal);
+    let local_outer_request =
+        apply_access_request(&local, &local_terminal, local_carrier.clone());
+    let local_inner_controller_transcript = local.signing_transcript().unwrap();
+    let local_outer_controller_transcript = local_outer_request.signing_transcript().unwrap();
+    local_outer_request
+        .verify_controller_apply_request(
+            &local_carrier,
+            |principal, key, algorithm, version, transcript, signature| {
+                let claim = local.authentication().claim();
+                principal == claim.principal()
+                    && key == claim.key()
+                    && algorithm == claim.algorithm()
+                    && version == claim.algorithm_version()
+                    && transcript == local_inner_controller_transcript.as_bytes()
+                    && signature == local.authentication().signature()
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                principal == local_carrier.controller_principal()
+                    && key == local_carrier.controller_request_key()
+                    && fingerprint == local_carrier.controller_request_key_fingerprint()
+                    && transcript == local_outer_controller_transcript.as_bytes()
+                    && signature == OUTER_CONTROLLER_SIGNATURE
+            },
+        )
+        .expect("outer Apply authenticates post-deadline LocalOnlyReady request authority");
+    let local_outer_response = apply_access_response(
+        &local_outer_request,
+        &local,
+        &local_terminal,
+        &local_carrier,
+    );
+    let local_inner_runtime_transcript = local_terminal.signing_transcript().unwrap();
+    let local_outer_runtime_transcript = local_outer_response.signing_transcript().unwrap();
+    local_outer_response
+        .verify_runtime_apply_response(
+            &local_outer_request,
+            &local_carrier,
+            local_terminal.authentication(),
+            |principal, key, algorithm, version, transcript, signature| {
+                let claim = local_terminal.authentication();
+                principal == claim.runtime_principal()
+                    && key == claim.key()
+                    && algorithm == claim.algorithm()
+                    && version == claim.algorithm_version()
+                    && transcript == local_inner_runtime_transcript.as_bytes()
+                    && signature == local_terminal.authentication_signature()
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                principal == local_carrier.runtime_principal()
+                    && key == local_carrier.runtime_response_key()
+                    && fingerprint == local_carrier.runtime_response_key_fingerprint()
+                    && transcript == local_outer_runtime_transcript.as_bytes()
+                    && signature == OUTER_RUNTIME_SIGNATURE
+            },
+        )
+        .expect("outer Apply consumes authenticated post-deadline LocalOnlyReady cleanup");
+}
+
+#[test]
 fn pxra2_strict_wire_rejects_length_reserved_identity_cas_auth_and_payload_tamper() {
     let inner = active_inner_request();
     let terminal = active_inner_terminal();
@@ -886,6 +1164,17 @@ fn describe_response_signing_has_no_public_historical_pair_producer() {
 
 #[test]
 fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires() {
+    for source_sha256 in [
+        EXPECTED_OUTER_PYTHON_ORACLE_SHA256,
+        EXPECTED_OUTER_JSON_GOLDEN_SHA256,
+    ] {
+        assert_eq!(source_sha256.len(), 64);
+        assert!(
+            source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
     assert!(ACCESS_V2_GOLDEN.contains("\"format\": \"paraegox-t2-remote-agent-access-v2\""));
     assert!(ACCESS_V2_GOLDEN.contains(
         "\"source\": \"independent Python struct/hashlib/cryptography outer-v2 oracle\""
@@ -894,10 +1183,13 @@ fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires(
         "\"remote_agent_access.rs_sha256\": \"ee42b276ad30d9fa2c9240af49315db8fd6499a4c45a8a2c9107cdab44a58be7\""
     ));
     assert!(ACCESS_V2_GOLDEN.contains(
-        "\"remote_agent_data_plane_plan.rs_sha256\": \"8597f75ec6bb6b41a97fb3ebd2d8cdefcde431ceb0d32d6b125ed17f0a1a64e7\""
+        "\"remote_agent_data_plane_plan.rs_sha256\": \"2649e0457c47e63a2132df2b8db9de52818b71645c54b656747c978fb2d882e7\""
     ));
     assert!(ACCESS_V2_GOLDEN.contains(
-        "\"corrected_inner_fixture_sha256\": \"983e4449636dd559e9ca0508b756f186ecc34a47ff8a2c5f6c38f3941a31499a\""
+        "\"corrected_inner_fixture_sha256\": \"c76b61aa3f47fa694fc075d77979a9bdeb9bda95674e073e8410c352df74b0c3\""
+    ));
+    assert!(ACCESS_V2_GOLDEN.contains(
+        "\"inner_python_oracle_sha256\": \"4d81b195fc7b3546891eb37b173c2e323143c7cf3b110dc7e7cb959dbf2c58d3\""
     ));
 
     let carrier_scope = fixture_section_after(ACCESS_V2_GOLDEN, "\"carrier\"");

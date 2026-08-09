@@ -1154,6 +1154,31 @@ fn pxau2_deadline_is_single_admission_derived_and_s0_identity_cannot_drift() {
     selected_before_admission.selection_observed_at_nanos = valid.admitted_at_nanos - 1;
     assert!(terminal_draft(&request, active_ready_state(), selected_before_admission).is_err());
 
+    let mut selected_at_admission = valid;
+    selected_at_admission.selection_observed_at_nanos = valid.admitted_at_nanos;
+    let selected_at_admission_receipt = terminal_draft(
+        &request,
+        active_ready_state(),
+        selected_at_admission,
+    )
+    .expect("PXAU v2 draft selected exactly at admission")
+    .finalize(&[0xe1; 64])
+    .expect("PXAU v2 selected exactly at admission");
+    let selected_at_admission_decoded = RemoteAgentDataPlaneTerminalReceiptV2::decode(
+        selected_at_admission_receipt.canonical_wire(),
+    )
+    .expect("round-tripped PXAU v2 selected exactly at admission");
+    assert_eq!(selected_at_admission_decoded, selected_at_admission_receipt);
+    assert_eq!(
+        selected_at_admission_decoded
+            .validate_against_request(&request)
+            .expect("request-correlated PXAU v2 selected exactly at admission")
+            .evidence()
+            .fields()
+            .selection_observed_at_nanos,
+        valid.admitted_at_nanos
+    );
+
     let mut selected_before_deadline = valid;
     selected_before_deadline.selection_observed_at_nanos = valid.absolute_deadline_nanos - 1;
     assert!(terminal_draft(&request, active_ready_state(), selected_before_deadline).is_ok());
