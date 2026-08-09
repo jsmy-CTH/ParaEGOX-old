@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use paraegox_kernel::digest::Digest32;
 
@@ -9,19 +9,25 @@ use paraegox_runtime_contracts::remote_agent_access::{
     MAX_REMOTE_AGENT_ACCESS_REQUEST_V2_BYTES, MAX_REMOTE_AGENT_ACCESS_RESPONSE_V2_BYTES,
     REMOTE_AGENT_ACCESS_REQUEST_MAGIC, REMOTE_AGENT_ACCESS_RESPONSE_MAGIC,
     REMOTE_AGENT_ACCESS_V2_VERSION, RemoteAgentAccessKindV2, RemoteAgentAccessRequestDraftV2,
-    RemoteAgentAccessRequestFieldsV2, RemoteAgentAccessRequestIdV2, RemoteAgentAccessRequestV2,
-    RemoteAgentAccessResponseAuthClaimV2, RemoteAgentAccessResponseDraftV2,
-    RemoteAgentAccessResponseV2,
+    RemoteAgentAccessRequestFieldsV2, RemoteAgentAccessRequestIdV2, RemoteAgentAccessRequestV1,
+    RemoteAgentAccessRequestV2, RemoteAgentAccessResponseAuthClaimV2,
+    RemoteAgentAccessResponseDraftV2, RemoteAgentAccessResponseV1, RemoteAgentAccessResponseV2,
 };
 use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
     REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES, REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES,
-    RemoteAgentActiveS1CasV2, RemoteAgentDataPlaneApplyRequestV2,
+    RemoteAgentActiveS1CasV2, RemoteAgentDataPlaneApplyRequestDraftV2,
+    RemoteAgentDataPlaneApplyRequestV2,
     RemoteAgentDataPlaneTerminalReceiptV2,
 };
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyRequestAuthClaim};
 
 const PROXY_DATA_PLANE_V2_GOLDEN: &str =
     include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
+const ACCESS_V1_GOLDEN: &str =
+    include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v1.json");
+const ACCESS_V2_GOLDEN: &str =
+    include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v2.json");
+const OUTER_SOURCE: &str = include_str!("../src/remote_agent_access.rs");
 const OUTER_CONTROLLER_NONCE: &[u8; 32] = &[0xe1; 32];
 const DESCRIBE_CONTROLLER_NONCE: &[u8; 32] = &[0xe3; 32];
 const OUTER_CONTROLLER_SIGNATURE: &[u8; 64] = &[0xe2; 64];
@@ -58,6 +64,27 @@ fn fixture_hex_after(fixture: &str, key: &str) -> Vec<u8> {
         .chunks_exact(2)
         .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect()
+}
+
+fn fixture_digest_after(fixture: &str, key: &str) -> Digest32 {
+    Digest32::from_bytes(
+        fixture_hex_after(fixture, key)
+            .try_into()
+            .expect("32-byte fixture digest"),
+    )
+}
+
+fn fixture_u64_after(fixture: &str, key: &str) -> u64 {
+    let key_start = fixture
+        .find(key)
+        .map(|offset| offset + key.len())
+        .expect("fixture key");
+    let value = fixture[key_start..]
+        .trim_start_matches(|character: char| character == ':' || character.is_whitespace());
+    let end = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    value[..end].parse().expect("fixture integer")
 }
 
 fn fixture_section_after<'a>(fixture: &'a str, section: &str) -> &'a str {
@@ -144,13 +171,55 @@ fn apply_access_request(
     terminal: &RemoteAgentDataPlaneTerminalReceiptV2,
     carrier: RestrictedRuntimeApplyCarrierBindingV1,
 ) -> RemoteAgentAccessRequestV2 {
+    apply_access_request_with_outer_signature(
+        inner,
+        terminal,
+        carrier,
+        OUTER_CONTROLLER_SIGNATURE,
+    )
+}
+
+fn apply_access_request_with_outer_signature(
+    inner: &RemoteAgentDataPlaneApplyRequestV2,
+    terminal: &RemoteAgentDataPlaneTerminalReceiptV2,
+    carrier: RestrictedRuntimeApplyCarrierBindingV1,
+    signature: &[u8],
+) -> RemoteAgentAccessRequestV2 {
     RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
         access_fields(inner, terminal, carrier, OUTER_CONTROLLER_NONCE),
         inner.clone(),
     )
     .expect("PXRA v2 Apply draft")
-    .finalize(OUTER_CONTROLLER_SIGNATURE)
+    .finalize(signature)
     .expect("PXRA v2 Apply")
+}
+
+fn reissue_inner_request(
+    request: &RemoteAgentDataPlaneApplyRequestV2,
+    signature: &[u8],
+) -> RemoteAgentDataPlaneApplyRequestV2 {
+    RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+        request.target_execution().clone(),
+        request.provenance(),
+        request.control_commitment().control().clone(),
+        request.temporal(),
+        request.expected_runtime_store_instance_id(),
+        request.authentication().claim().clone(),
+    )
+    .expect("reissued PXAR v11 draft")
+    .finalize(signature)
+    .expect("reissued PXAR v11")
+}
+
+fn reissue_inner_terminal(
+    terminal: &RemoteAgentDataPlaneTerminalReceiptV2,
+    signature: &[u8; 64],
+) -> RemoteAgentDataPlaneTerminalReceiptV2 {
+    assert_eq!(terminal.authentication_signature().len(), signature.len());
+    let mut wire = terminal.canonical_wire().to_vec();
+    let signature_start = wire.len() - signature.len();
+    wire[signature_start..].copy_from_slice(signature);
+    RemoteAgentDataPlaneTerminalReceiptV2::decode(&wire).expect("reissued PXAU v2")
 }
 
 fn response_auth(
@@ -171,6 +240,22 @@ fn apply_access_response(
     terminal: &RemoteAgentDataPlaneTerminalReceiptV2,
     carrier: &RestrictedRuntimeApplyCarrierBindingV1,
 ) -> RemoteAgentAccessResponseV2 {
+    apply_access_response_with_outer_signature(
+        request,
+        inner,
+        terminal,
+        carrier,
+        OUTER_RUNTIME_SIGNATURE,
+    )
+}
+
+fn apply_access_response_with_outer_signature(
+    request: &RemoteAgentAccessRequestV2,
+    inner: &RemoteAgentDataPlaneApplyRequestV2,
+    terminal: &RemoteAgentDataPlaneTerminalReceiptV2,
+    carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    signature: &[u8],
+) -> RemoteAgentAccessResponseV2 {
     let authenticated_request = request
         .verify_controller_apply_request(carrier, |_, _, _, _, _, _| true, |_, _, _, _, _| true)
         .expect("structurally authenticated PXRA v2");
@@ -183,7 +268,7 @@ fn apply_access_response(
         response_auth(carrier),
     )
     .expect("PXRR v2 Apply draft")
-    .finalize(OUTER_RUNTIME_SIGNATURE)
+    .finalize(signature)
     .expect("PXRR v2 Apply")
 }
 
@@ -457,4 +542,591 @@ fn pxrr2_apply_freezes_fixed_header_offsets_and_runtime_verification_order() {
             "outer-runtime",
         ],
     );
+}
+
+#[test]
+fn all_four_signatures_are_independent_and_wrong_or_zero_bytes_fail_closed() {
+    let inner = active_inner_request();
+    let terminal = active_inner_terminal();
+    let carrier = carrier_for(&inner, &terminal);
+    let expected_inner_controller_signature = inner.authentication().signature().to_vec();
+    let expected_inner_runtime_signature = terminal.authentication_signature().to_vec();
+
+    for bad_signature in [[0; 64], [0x7f; 64]] {
+        let bad_inner = reissue_inner_request(&inner, &bad_signature);
+        let request = apply_access_request(&bad_inner, &terminal, carrier.clone());
+        let inner_calls = Cell::new(0);
+        let outer_calls = Cell::new(0);
+        assert!(
+            request
+                .verify_controller_apply_request(
+                    &carrier,
+                    |_, _, _, _, _, signature| {
+                        inner_calls.set(inner_calls.get() + 1);
+                        signature == expected_inner_controller_signature.as_slice()
+                    },
+                    |_, _, _, _, _| {
+                        outer_calls.set(outer_calls.get() + 1);
+                        true
+                    },
+                )
+                .is_err(),
+            "wrong inner Controller signature must fail",
+        );
+        assert_eq!(inner_calls.get(), 1);
+        assert_eq!(outer_calls.get(), 0);
+
+        let request = apply_access_request_with_outer_signature(
+            &inner,
+            &terminal,
+            carrier.clone(),
+            &bad_signature,
+        );
+        let inner_calls = Cell::new(0);
+        let outer_calls = Cell::new(0);
+        assert!(
+            request
+                .verify_controller_apply_request(
+                    &carrier,
+                    |_, _, _, _, _, signature| {
+                        inner_calls.set(inner_calls.get() + 1);
+                        signature == expected_inner_controller_signature.as_slice()
+                    },
+                    |_, _, _, _, signature| {
+                        outer_calls.set(outer_calls.get() + 1);
+                        signature == OUTER_CONTROLLER_SIGNATURE
+                    },
+                )
+                .is_err(),
+            "wrong outer Controller signature must fail",
+        );
+        assert_eq!(inner_calls.get(), 1);
+        assert_eq!(outer_calls.get(), 1);
+
+        let request = apply_access_request(&inner, &terminal, carrier.clone());
+        let bad_terminal = reissue_inner_terminal(&terminal, &bad_signature);
+        let response = apply_access_response(
+            &request,
+            &inner,
+            &bad_terminal,
+            &carrier,
+        );
+        let inner_calls = Cell::new(0);
+        let outer_calls = Cell::new(0);
+        assert!(
+            response
+                .verify_runtime_apply_response(
+                    &request,
+                    &carrier,
+                    terminal.authentication(),
+                    |_, _, _, _, _, signature| {
+                        inner_calls.set(inner_calls.get() + 1);
+                        signature == expected_inner_runtime_signature.as_slice()
+                    },
+                    |_, _, _, _, _| {
+                        outer_calls.set(outer_calls.get() + 1);
+                        true
+                    },
+                )
+                .is_err(),
+            "wrong inner Runtime signature must fail",
+        );
+        assert_eq!(inner_calls.get(), 1);
+        assert_eq!(outer_calls.get(), 0);
+
+        let response = apply_access_response_with_outer_signature(
+            &request,
+            &inner,
+            &terminal,
+            &carrier,
+            &bad_signature,
+        );
+        let inner_calls = Cell::new(0);
+        let outer_calls = Cell::new(0);
+        assert!(
+            response
+                .verify_runtime_apply_response(
+                    &request,
+                    &carrier,
+                    terminal.authentication(),
+                    |_, _, _, _, _, signature| {
+                        inner_calls.set(inner_calls.get() + 1);
+                        signature == expected_inner_runtime_signature.as_slice()
+                    },
+                    |_, _, _, _, signature| {
+                        outer_calls.set(outer_calls.get() + 1);
+                        signature == OUTER_RUNTIME_SIGNATURE
+                    },
+                )
+                .is_err(),
+            "wrong outer Runtime signature must fail",
+        );
+        assert_eq!(inner_calls.get(), 1);
+        assert_eq!(outer_calls.get(), 1);
+    }
+}
+
+#[test]
+fn pxra2_strict_wire_rejects_length_reserved_identity_cas_auth_and_payload_tamper() {
+    let inner = active_inner_request();
+    let terminal = active_inner_terminal();
+    let carrier = carrier_for(&inner, &terminal);
+    let request = apply_access_request(&inner, &terminal, carrier.clone());
+    let wire = request.canonical_wire();
+    let carrier_start = 576;
+    let payload_start = carrier_start + carrier.canonical_wire().len();
+
+    for (name, offset) in [
+        ("magic", 0),
+        ("version", 5),
+        ("reserved", 8),
+        ("carrier length", 11),
+        ("payload length", 15),
+        ("request id", 16),
+        ("PXCB digest", 32),
+        ("target", 64),
+        ("store", 80),
+        ("retained-S0 CAS", 120),
+        ("active-S1 CAS", 320),
+        ("payload digest", 472),
+        ("Controller principal", 504),
+        ("Controller key", 520),
+        ("algorithm", 537),
+        ("algorithm version", 539),
+        ("signature length", 575),
+        ("PXCB bytes", carrier_start),
+        ("PXAR11 payload", payload_start),
+    ] {
+        let mut tampered = wire.to_vec();
+        tampered[offset] ^= 1;
+        assert!(
+            RemoteAgentAccessRequestV2::decode(&tampered).is_err(),
+            "PXRA v2 accepted tampered {name} at offset {offset}",
+        );
+    }
+
+    assert!(RemoteAgentAccessRequestV2::decode(&wire[..wire.len() - 1]).is_err());
+    let mut trailing = wire.to_vec();
+    trailing.push(0);
+    assert!(RemoteAgentAccessRequestV2::decode(&trailing).is_err());
+    let oversized = vec![0; MAX_REMOTE_AGENT_ACCESS_REQUEST_V2_BYTES + 1];
+    assert!(RemoteAgentAccessRequestV2::decode(&oversized).is_err());
+
+    let expected_transcript = request.signing_transcript().unwrap().as_bytes().to_vec();
+    for (name, offset) in [
+        ("RuntimeHost epoch", 119),
+        ("Controller nonce", 542),
+        ("outer signature", wire.len() - 1),
+    ] {
+        let mut tampered = wire.to_vec();
+        tampered[offset] ^= 1;
+        let decoded = RemoteAgentAccessRequestV2::decode(&tampered)
+            .unwrap_or_else(|error| panic!("structural {name} tamper: {error}"));
+        assert!(
+            decoded
+                .verify_controller_apply_request(
+                    &carrier,
+                    |_, _, _, _, _, _| true,
+                    |_, _, _, transcript, signature| {
+                        transcript == expected_transcript.as_slice()
+                            && signature == OUTER_CONTROLLER_SIGNATURE
+                    },
+                )
+                .is_err(),
+            "PXRA v2 authenticated tampered {name}",
+        );
+    }
+
+    let short_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+        access_fields(
+            &inner,
+            &terminal,
+            carrier.clone(),
+            OUTER_CONTROLLER_NONCE,
+        ),
+        inner.clone(),
+    )
+    .unwrap();
+    assert!(short_draft.clone().finalize(&[0; 63]).is_err());
+    assert!(short_draft.finalize(&[0; 65]).is_err());
+}
+
+#[test]
+fn pxrr2_strict_wire_rejects_length_reserved_auth_payload_and_correlation_tamper() {
+    let inner = active_inner_request();
+    let terminal = active_inner_terminal();
+    let carrier = carrier_for(&inner, &terminal);
+    let request = apply_access_request(&inner, &terminal, carrier.clone());
+    let response = apply_access_response(&request, &inner, &terminal, &carrier);
+    let wire = response.canonical_wire();
+    let carrier_start = 646 + OUTER_CONTROLLER_NONCE.len();
+    let payload_start = carrier_start + carrier.canonical_wire().len();
+
+    for (name, offset) in [
+        ("magic", 0),
+        ("version", 5),
+        ("reserved", 8),
+        ("carrier length", 11),
+        ("payload length", 15),
+        ("profile length", 17),
+        ("descriptor length", 21),
+        ("nonce length", 23),
+        ("PXCB digest", 72),
+        ("target", 104),
+        ("store", 120),
+        ("RuntimeHost epoch", 159),
+        ("payload digest", 512),
+        ("Apply descriptor digest", 544),
+        ("Runtime principal", 576),
+        ("Runtime key", 592),
+        ("algorithm", 609),
+        ("algorithm version", 611),
+        ("auth PXCB digest", 612),
+        ("signature length", 645),
+        ("PXCB bytes", carrier_start),
+        ("PXAU2 payload", payload_start),
+    ] {
+        let mut tampered = wire.to_vec();
+        tampered[offset] ^= 1;
+        assert!(
+            RemoteAgentAccessResponseV2::decode(&tampered).is_err(),
+            "PXRR v2 accepted tampered {name} at offset {offset}",
+        );
+    }
+
+    assert!(RemoteAgentAccessResponseV2::decode(&wire[..wire.len() - 1]).is_err());
+    let mut trailing = wire.to_vec();
+    trailing.push(0);
+    assert!(RemoteAgentAccessResponseV2::decode(&trailing).is_err());
+    let oversized = vec![0; MAX_REMOTE_AGENT_ACCESS_RESPONSE_V2_BYTES + 1];
+    assert!(RemoteAgentAccessResponseV2::decode(&oversized).is_err());
+
+    for (name, offset) in [
+        ("request id", 24),
+        ("request digest", 40),
+        ("retained-S0 CAS", 160),
+        ("active-S1 CAS", 375),
+        ("request nonce", 646),
+    ] {
+        let mut tampered = wire.to_vec();
+        tampered[offset] ^= 1;
+        let decoded = RemoteAgentAccessResponseV2::decode(&tampered)
+            .unwrap_or_else(|error| panic!("structural {name} tamper: {error}"));
+        assert!(
+            decoded.validate_against_request(&request).is_err(),
+            "PXRR v2 correlated tampered {name}",
+        );
+    }
+
+    let mut signature_tamper = wire.to_vec();
+    *signature_tamper.last_mut().unwrap() ^= 1;
+    let signature_tamper = RemoteAgentAccessResponseV2::decode(&signature_tamper)
+        .expect("opaque outer signature tamper remains structurally decodable");
+    assert!(
+        signature_tamper
+            .verify_runtime_apply_response(
+                &request,
+                &carrier,
+                terminal.authentication(),
+                |_, _, _, _, _, signature| signature == terminal.authentication_signature(),
+                |_, _, _, _, signature| signature == OUTER_RUNTIME_SIGNATURE,
+            )
+            .is_err()
+    );
+
+    let authenticated_request = request
+        .verify_controller_apply_request(&carrier, |_, _, _, _, _, _| true, |_, _, _, _, _| true)
+        .unwrap();
+    let authenticated_terminal = terminal
+        .verify_runtime_terminal(&inner, terminal.authentication(), |_, _, _, _, _, _| true)
+        .unwrap();
+    let short_draft = RemoteAgentAccessResponseDraftV2::try_apply_remote_access(
+        authenticated_request,
+        authenticated_terminal,
+        response_auth(&carrier),
+    )
+    .unwrap();
+    assert!(short_draft.clone().finalize(&[0; 63]).is_err());
+    assert!(short_draft.finalize(&[0; 65]).is_err());
+}
+
+#[test]
+fn pxra2_pxrr2_cross_reject_v1_inner_and_other_control_protocols() {
+    let inner = active_inner_request();
+    let terminal = active_inner_terminal();
+    let carrier = carrier_for(&inner, &terminal);
+    let request = apply_access_request(&inner, &terminal, carrier.clone());
+    let response = apply_access_response(&request, &inner, &terminal, &carrier);
+
+    let access_v1 = fixture_section_after(ACCESS_V1_GOLDEN, "\"access\"");
+    let v1_request_wire = fixture_hex_after(access_v1, "\"pxra_apply_hex\"");
+    let v1_response_wire = fixture_hex_after(access_v1, "\"pxrr_apply_hex\"");
+    assert!(RemoteAgentAccessRequestV1::decode(&v1_request_wire).is_ok());
+    assert!(RemoteAgentAccessResponseV1::decode(&v1_response_wire).is_ok());
+    assert!(RemoteAgentAccessRequestV2::decode(&v1_request_wire).is_err());
+    assert!(RemoteAgentAccessResponseV2::decode(&v1_response_wire).is_err());
+    assert!(RemoteAgentAccessRequestV1::decode(request.canonical_wire()).is_err());
+    assert!(RemoteAgentAccessResponseV1::decode(response.canonical_wire()).is_err());
+
+    assert!(RemoteAgentAccessRequestV2::decode(inner.canonical_wire()).is_err());
+    assert!(RemoteAgentAccessResponseV2::decode(terminal.canonical_wire()).is_err());
+    for magic in [b"PXAG", b"PXAH", b"PXCC", b"PXDR"] {
+        let mut cross_request = request.canonical_wire().to_vec();
+        cross_request[..4].copy_from_slice(magic);
+        assert!(RemoteAgentAccessRequestV2::decode(&cross_request).is_err());
+
+        let mut cross_response = response.canonical_wire().to_vec();
+        cross_response[..4].copy_from_slice(magic);
+        assert!(RemoteAgentAccessResponseV2::decode(&cross_response).is_err());
+    }
+}
+
+#[test]
+fn describe_response_signing_has_no_public_historical_pair_producer() {
+    let response_impl = OUTER_SOURCE
+        .split_once("impl RemoteAgentAccessResponseDraftV2")
+        .expect("PXRR v2 draft implementation")
+        .1
+        .split_once("/// Strict independently Runtime-signed PXRR v2 response.")
+        .expect("PXRR v2 response boundary")
+        .0;
+    assert!(response_impl.contains("pub fn try_apply_remote_access"));
+    assert!(response_impl.contains("fn try_new"));
+    assert!(!response_impl.contains("pub fn try_new"));
+    assert!(!response_impl.contains("pub fn try_describe_remote_access"));
+    assert!(response_impl.contains("current-final, non-Clone authority marker"));
+
+    assert!(OUTER_SOURCE.contains("enum RemoteAgentAccessResponsePayloadV2"));
+    assert!(!OUTER_SOURCE.contains("pub enum RemoteAgentAccessResponsePayloadV2"));
+}
+
+#[test]
+fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires() {
+    assert!(ACCESS_V2_GOLDEN.contains("\"format\": \"paraegox-t2-remote-agent-access-v2\""));
+    assert!(ACCESS_V2_GOLDEN.contains(
+        "\"source\": \"independent Python struct/hashlib/cryptography outer-v2 oracle\""
+    ));
+    assert!(ACCESS_V2_GOLDEN.contains(
+        "\"remote_agent_access.rs_sha256\": \"ee42b276ad30d9fa2c9240af49315db8fd6499a4c45a8a2c9107cdab44a58be7\""
+    ));
+    assert!(ACCESS_V2_GOLDEN.contains(
+        "\"remote_agent_data_plane_plan.rs_sha256\": \"8597f75ec6bb6b41a97fb3ebd2d8cdefcde431ceb0d32d6b125ed17f0a1a64e7\""
+    ));
+    assert!(ACCESS_V2_GOLDEN.contains(
+        "\"corrected_inner_fixture_sha256\": \"983e4449636dd559e9ca0508b756f186ecc34a47ff8a2c5f6c38f3941a31499a\""
+    ));
+
+    let carrier_scope = fixture_section_after(ACCESS_V2_GOLDEN, "\"carrier\"");
+    let carrier_wire = fixture_hex_after(carrier_scope, "\"wire_hex\"");
+    let carrier = RestrictedRuntimeApplyCarrierBindingV1::decode(&carrier_wire)
+        .expect("independent-golden PXCB");
+    assert_eq!(carrier.canonical_wire(), carrier_wire);
+    assert_eq!(
+        carrier.binding_digest(),
+        fixture_digest_after(carrier_scope, "\"digest_hex\"")
+    );
+    assert_eq!(
+        carrier_wire.len() as u64,
+        fixture_u64_after(carrier_scope, "\"wire_length\"")
+    );
+
+    let inner_inputs = fixture_section_after(ACCESS_V2_GOLDEN, "\"inner_signature_inputs\"");
+    let expected_inner_controller_transcript =
+        fixture_hex_after(inner_inputs, "\"controller_transcript_hex\"");
+    let expected_inner_controller_signature =
+        fixture_hex_after(inner_inputs, "\"controller_signature_hex\"");
+    let expected_inner_runtime_transcript =
+        fixture_hex_after(inner_inputs, "\"runtime_transcript_hex\"");
+    let expected_inner_runtime_signature =
+        fixture_hex_after(inner_inputs, "\"runtime_signature_hex\"");
+
+    let apply_scope = fixture_section_after(ACCESS_V2_GOLDEN, "\"apply\"");
+    let apply_request_scope = fixture_section_after(apply_scope, "\"pxra_v2\"");
+    let apply_request_wire = fixture_hex_after(apply_request_scope, "\"wire_hex\"");
+    let apply_request_transcript =
+        fixture_hex_after(apply_request_scope, "\"signing_transcript_hex\"");
+    let apply_request_signature = fixture_hex_after(apply_request_scope, "\"signature_hex\"");
+    let apply_request = RemoteAgentAccessRequestV2::decode(&apply_request_wire)
+        .expect("independent-golden PXRA v2 Apply");
+    assert_eq!(apply_request.canonical_wire(), apply_request_wire);
+    assert_eq!(
+        apply_request_wire.len() as u64,
+        fixture_u64_after(apply_request_scope, "\"wire_length\"")
+    );
+    assert_eq!(
+        apply_request.request_digest(),
+        fixture_digest_after(apply_request_scope, "\"digest_hex\"")
+    );
+    assert_eq!(
+        apply_request.payload_wire_digest(),
+        fixture_digest_after(apply_request_scope, "\"payload_digest_hex\"")
+    );
+    assert_eq!(
+        apply_request.signing_transcript().unwrap().as_bytes(),
+        apply_request_transcript
+    );
+    assert_eq!(
+        apply_request.authentication().signature(),
+        apply_request_signature
+    );
+    let embedded_inner = apply_request.apply_request().expect("embedded PXAR v11");
+    assert_eq!(embedded_inner, &active_inner_request());
+    apply_request
+        .verify_controller_apply_request(
+            &carrier,
+            |principal, key, algorithm, version, transcript, signature| {
+                let claim = embedded_inner.authentication().claim();
+                principal == claim.principal()
+                    && key == claim.key()
+                    && algorithm == claim.algorithm()
+                    && version == claim.algorithm_version()
+                    && transcript == expected_inner_controller_transcript.as_slice()
+                    && signature == expected_inner_controller_signature.as_slice()
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                principal == carrier.controller_principal()
+                    && key == carrier.controller_request_key()
+                    && fingerprint == carrier.controller_request_key_fingerprint()
+                    && transcript == apply_request_transcript.as_slice()
+                    && signature == apply_request_signature.as_slice()
+            },
+        )
+        .expect("independent-golden Controller signatures");
+
+    let apply_response_scope = fixture_section_after(apply_scope, "\"pxrr_v2\"");
+    let apply_response_wire = fixture_hex_after(apply_response_scope, "\"wire_hex\"");
+    let apply_response_transcript =
+        fixture_hex_after(apply_response_scope, "\"signing_transcript_hex\"");
+    let apply_response_signature = fixture_hex_after(apply_response_scope, "\"signature_hex\"");
+    let apply_response = RemoteAgentAccessResponseV2::decode(&apply_response_wire)
+        .expect("independent-golden PXRR v2 Apply");
+    assert_eq!(apply_response.canonical_wire(), apply_response_wire);
+    assert_eq!(
+        apply_response_wire.len() as u64,
+        fixture_u64_after(apply_response_scope, "\"wire_length\"")
+    );
+    assert_eq!(
+        apply_response.response_digest(),
+        fixture_digest_after(apply_response_scope, "\"digest_hex\"")
+    );
+    assert_eq!(
+        apply_response.payload_wire_digest(),
+        fixture_digest_after(apply_response_scope, "\"payload_digest_hex\"")
+    );
+    assert_eq!(
+        apply_response.signing_transcript().unwrap().as_bytes(),
+        apply_response_transcript
+    );
+    assert_eq!(
+        apply_response.authentication_signature(),
+        apply_response_signature
+    );
+    let embedded_terminal = apply_response.apply_receipt().expect("embedded PXAU v2");
+    assert_eq!(embedded_terminal, &active_inner_terminal());
+    apply_response
+        .verify_runtime_apply_response(
+            &apply_request,
+            &carrier,
+            embedded_terminal.authentication(),
+            |principal, key, algorithm, version, transcript, signature| {
+                let claim = embedded_terminal.authentication();
+                principal == claim.runtime_principal()
+                    && key == claim.key()
+                    && algorithm == claim.algorithm()
+                    && version == claim.algorithm_version()
+                    && transcript == expected_inner_runtime_transcript.as_slice()
+                    && signature == expected_inner_runtime_signature.as_slice()
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                principal == carrier.runtime_principal()
+                    && key == carrier.runtime_response_key()
+                    && fingerprint == carrier.runtime_response_key_fingerprint()
+                    && transcript == apply_response_transcript.as_slice()
+                    && signature == apply_response_signature.as_slice()
+            },
+        )
+        .expect("independent-golden Runtime signatures");
+
+    let describe_scope = fixture_section_after(ACCESS_V2_GOLDEN, "\"describe\"");
+    let describe_request_scope = fixture_section_after(describe_scope, "\"pxra_v2\"");
+    let describe_request_wire = fixture_hex_after(describe_request_scope, "\"wire_hex\"");
+    let describe_request_transcript =
+        fixture_hex_after(describe_request_scope, "\"signing_transcript_hex\"");
+    let describe_request_signature =
+        fixture_hex_after(describe_request_scope, "\"signature_hex\"");
+    let describe_request = RemoteAgentAccessRequestV2::decode(&describe_request_wire)
+        .expect("independent-golden PXRA v2 Describe");
+    assert_eq!(describe_request.canonical_wire(), describe_request_wire);
+    assert_eq!(
+        describe_request.request_digest(),
+        fixture_digest_after(describe_request_scope, "\"digest_hex\"")
+    );
+    assert_eq!(
+        describe_request.payload_wire_digest(),
+        fixture_digest_after(describe_request_scope, "\"payload_digest_hex\"")
+    );
+    assert_eq!(
+        describe_request.signing_transcript().unwrap().as_bytes(),
+        describe_request_transcript
+    );
+    assert_eq!(
+        describe_request.authentication().signature(),
+        describe_request_signature
+    );
+    describe_request
+        .verify_controller_describe_request(
+            &carrier,
+            |principal, key, fingerprint, transcript, signature| {
+                principal == carrier.controller_principal()
+                    && key == carrier.controller_request_key()
+                    && fingerprint == carrier.controller_request_key_fingerprint()
+                    && transcript == describe_request_transcript.as_slice()
+                    && signature == describe_request_signature.as_slice()
+            },
+        )
+        .expect("independent-golden Describe Controller signature");
+
+    let historical_scope =
+        fixture_section_after(describe_scope, "\"pxrr_v2_strict_consumer\"");
+    assert!(historical_scope.contains("\"classification\": \"synthetic/historical-negative\""));
+    assert!(historical_scope.contains("\"currentness_evidence\": false"));
+    assert!(historical_scope.contains("\"producer_evidence\": false"));
+    let historical_wire = fixture_hex_after(historical_scope, "\"wire_hex\"");
+    let historical_transcript =
+        fixture_hex_after(historical_scope, "\"signing_transcript_hex\"");
+    let historical_signature = fixture_hex_after(historical_scope, "\"signature_hex\"");
+    let historical = RemoteAgentAccessResponseV2::decode(&historical_wire)
+        .expect("synthetic historical PXRR v2 Describe consumer fixture");
+    assert_eq!(historical.canonical_wire(), historical_wire);
+    assert_eq!(
+        historical.response_digest(),
+        fixture_digest_after(historical_scope, "\"digest_hex\"")
+    );
+    assert_eq!(
+        historical.payload_wire_digest(),
+        fixture_digest_after(historical_scope, "\"payload_digest_hex\"")
+    );
+    assert_eq!(
+        historical.signing_transcript().unwrap().as_bytes(),
+        historical_transcript
+    );
+    assert_eq!(
+        historical.authentication_signature(),
+        historical_signature
+    );
+    assert!(historical.profile().is_some());
+    assert!(historical.descriptor().is_some());
+    historical
+        .verify_runtime_describe_response(
+            &describe_request,
+            &carrier,
+            |principal, key, fingerprint, transcript, signature| {
+                principal == carrier.runtime_principal()
+                    && key == carrier.runtime_response_key()
+                    && fingerprint == carrier.runtime_response_key_fingerprint()
+                    && transcript == historical_transcript.as_slice()
+                    && signature == historical_signature.as_slice()
+            },
+        )
+        .expect("strict consumer validation is not producer/currentness evidence");
 }
