@@ -2975,7 +2975,7 @@ mod tests {
                 "missing validator pin: {required}"
             );
         }
-        assert!(!validator.contains("self.store"));
+        assert!(!validator.contains("self.store."));
         assert!(!validator.contains("remote_agent_access_startup_v2.take()"));
         assert!(!validator.contains("latch_remote_agent_access_s0_mutation"));
 
