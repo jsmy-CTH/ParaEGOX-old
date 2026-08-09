@@ -5799,8 +5799,7 @@ mod tests {
                 |_, _, _, _, _| true,
             )
             .unwrap_or_else(|error| panic!("permissive public marker rejected: {error}"));
-        let (admission, _) =
-            python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
         let reading = ClockReading::new(
             ClockDomainRef::from_bytes([0x0a; 16]),
             ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero"),
