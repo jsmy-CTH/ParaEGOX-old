@@ -132,11 +132,8 @@ fn temporal_with_remaining(
 }
 
 fn overwrite_pxar_envelope_u64_tlv(frame: &mut [u8], tag: u16, value: u64) {
-    let envelope_length = u32::from_be_bytes(
-        frame[6..10]
-            .try_into()
-            .expect("PXAR v11 envelope length"),
-    ) as usize;
+    let envelope_length =
+        u32::from_be_bytes(frame[6..10].try_into().expect("PXAR v11 envelope length")) as usize;
     let envelope = &mut frame[18..18 + envelope_length];
     let mut header = [0_u8; 6];
     header[..2].copy_from_slice(&tag.to_be_bytes());
@@ -895,10 +892,8 @@ fn pxar11_public_pipeline_enforces_profile_operation_timeout_budget() {
         )
     };
 
-    let short_temporal = temporal_with_remaining(
-        predecessor.temporal(),
-        OPERATION_TIMEOUT_NANOS - 1,
-    );
+    let short_temporal =
+        temporal_with_remaining(predecessor.temporal(), OPERATION_TIMEOUT_NANOS - 1);
     assert!(matches!(
         draft_with_temporal(short_temporal),
         Err(RemoteAgentDataPlanePlanError::InvalidShape)
@@ -1356,11 +1351,8 @@ fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures
         "",
         "\"profile_operation_timeout_nanos\"",
     );
-    let golden_original_budget = fixture_u64_after(
-        semantic_constants,
-        "",
-        "\"envelope_original_budget_nanos\"",
-    );
+    let golden_original_budget =
+        fixture_u64_after(semantic_constants, "", "\"envelope_original_budget_nanos\"");
     let golden_remaining_budget = fixture_u64_after(
         semantic_constants,
         "",
@@ -1573,8 +1565,7 @@ fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures
             Some(golden_profile_timeout)
         );
         assert!(
-            temporal_evidence.selection_observed_at_nanos
-                >= temporal_evidence.admitted_at_nanos
+            temporal_evidence.selection_observed_at_nanos >= temporal_evidence.admitted_at_nanos
         );
         match expected_outcome {
             RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady => assert!(
