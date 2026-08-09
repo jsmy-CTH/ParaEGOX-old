@@ -3040,7 +3040,10 @@ mod tests {
             ".signing_transcript()",
             ".verify_strict(transcript.as_bytes(), &signature)",
         ] {
-            assert!(lookup.contains(required), "missing retained-terminal check: {required}");
+            assert!(
+                lookup.contains(required),
+                "missing retained-terminal check: {required}"
+            );
         }
 
         let apply = source
@@ -3048,13 +3051,21 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("    /// Reconciles a successor snapshot"))
             .map(|(apply, _)| apply)
             .expect("missing managed Fabric apply boundary");
-        let replay = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let replay = apply
+            .find("self.lookup_terminal(")
+            .expect("missing exact replay lookup");
         let gate = apply
             .find("self.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
             .expect("missing S0 freeze gate");
-        let phase = apply.find("self.snapshot.phase").expect("missing phase gate");
-        let deadline = apply.find("self.observe_deadline(").expect("missing deadline observation");
-        let admission = apply.find("self.admit_transition(").expect("missing transition admission");
+        let phase = apply
+            .find("self.snapshot.phase")
+            .expect("missing phase gate");
+        let deadline = apply
+            .find("self.observe_deadline(")
+            .expect("missing deadline observation");
+        let admission = apply
+            .find("self.admit_transition(")
+            .expect("missing transition admission");
         assert!(replay < gate && gate < phase && phase < deadline && deadline < admission);
 
         let descriptor_commit = source
@@ -3842,7 +3853,9 @@ mod tests {
         assert_eq!(core.snapshot.sequence(), frozen_sequence);
         assert!(TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_err());
 
-        core.shutdown().await.expect("ordered shutdown must ignore S0 freeze");
+        core.shutdown()
+            .await
+            .expect("ordered shutdown must ignore S0 freeze");
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
             .expect("ordered shutdown must release the Fabric endpoint");
         drop(listener);
@@ -3874,7 +3887,9 @@ mod tests {
             core.authenticated_terminal_replay(&request, response_channel),
             Err(ManagedFabricRuntimeError::TerminalCorrelation)
         ));
-        core.shutdown().await.expect("bad retained bytes must not block shutdown");
+        core.shutdown()
+            .await
+            .expect("bad retained bytes must not block shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

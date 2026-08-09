@@ -13060,48 +13060,45 @@ mod tests {
     #[test]
     fn protected_apply_authentication_and_replay_precede_every_fresh_s0_guard() {
         let source = include_str!("runtime_control_endpoint.rs");
-        let assert_order =
-            |name: &str,
-             handler: &str,
-             authentication: &str,
-             fresh_admission: &str,
-             first_owner_mutation: &str| {
-                let authentication = handler
-                    .find(authentication)
-                    .unwrap_or_else(|| {
-                        panic!("{name} protected request authentication disappeared")
-                    });
-                let replay = handler
-                    .find("authenticated_terminal_replay")
-                    .unwrap_or_else(|| panic!("{name} authenticated terminal replay disappeared"));
-                let fresh_guard = handler
-                    .find("require_remote_agent_access_s0_mutation_unfrozen_v2")
-                    .unwrap_or_else(|| panic!("{name} endpoint S0 freeze guard disappeared"));
-                let fresh_clock = handler
-                    .find(".clock_reading()")
-                    .unwrap_or_else(|| panic!("{name} fresh admission clock disappeared"));
-                let fresh_admission = handler
-                    .find(fresh_admission)
-                    .unwrap_or_else(|| panic!("{name} fresh request admission disappeared"));
-                let first_owner_mutation = handler
-                    .find(first_owner_mutation)
-                    .unwrap_or_else(|| panic!("{name} mutation owner handoff disappeared"));
-                assert!(
-                    authentication < replay
-                        && replay < fresh_guard
-                        && fresh_guard < fresh_clock
-                        && fresh_clock < fresh_admission
-                        && fresh_admission < first_owner_mutation,
-                    "{name} must authenticate, replay, freeze-gate, freshly admit, then hand off",
-                );
-                assert_eq!(
-                    handler
-                        .match_indices("require_remote_agent_access_s0_mutation_unfrozen_v2")
-                        .count(),
-                    1,
-                    "{name} must have one endpoint fresh-path guard",
-                );
-            };
+        let assert_order = |name: &str,
+                            handler: &str,
+                            authentication: &str,
+                            fresh_admission: &str,
+                            first_owner_mutation: &str| {
+            let authentication = handler
+                .find(authentication)
+                .unwrap_or_else(|| panic!("{name} protected request authentication disappeared"));
+            let replay = handler
+                .find("authenticated_terminal_replay")
+                .unwrap_or_else(|| panic!("{name} authenticated terminal replay disappeared"));
+            let fresh_guard = handler
+                .find("require_remote_agent_access_s0_mutation_unfrozen_v2")
+                .unwrap_or_else(|| panic!("{name} endpoint S0 freeze guard disappeared"));
+            let fresh_clock = handler
+                .find(".clock_reading()")
+                .unwrap_or_else(|| panic!("{name} fresh admission clock disappeared"));
+            let fresh_admission = handler
+                .find(fresh_admission)
+                .unwrap_or_else(|| panic!("{name} fresh request admission disappeared"));
+            let first_owner_mutation = handler
+                .find(first_owner_mutation)
+                .unwrap_or_else(|| panic!("{name} mutation owner handoff disappeared"));
+            assert!(
+                authentication < replay
+                    && replay < fresh_guard
+                    && fresh_guard < fresh_clock
+                    && fresh_clock < fresh_admission
+                    && fresh_admission < first_owner_mutation,
+                "{name} must authenticate, replay, freeze-gate, freshly admit, then hand off",
+            );
+            assert_eq!(
+                handler
+                    .match_indices("require_remote_agent_access_s0_mutation_unfrozen_v2")
+                    .count(),
+                1,
+                "{name} must have one endpoint fresh-path guard",
+            );
+        };
 
         let fabric = section(
             source,
@@ -13598,10 +13595,7 @@ mod tests {
             .publish_distributed(exact_handle, &pxds1)
             .unwrap_or_else(|error| panic!("existing-alias fixture publish failed: {error}"));
         existing_alias
-            .register_restricted_distributed_alias(
-                pxds1.canonical_wire(),
-                pxds2.canonical_wire(),
-            )
+            .register_restricted_distributed_alias(pxds1.canonical_wire(), pxds2.canonical_wire())
             .unwrap_or_else(|error| panic!("existing-alias fixture register failed: {error}"));
         control
             .core
@@ -13625,10 +13619,7 @@ mod tests {
 
         control.handle_broker = existing_alias.clone();
         control
-            .ensure_restricted_distributed_alias_v1(
-                pxds1.canonical_wire(),
-                pxds2.canonical_wire(),
-            )
+            .ensure_restricted_distributed_alias_v1(pxds1.canonical_wire(), pxds2.canonical_wire())
             .unwrap_or_else(|error| panic!("existing-alias frozen replay failed: {error}"));
         assert!(
             existing_alias

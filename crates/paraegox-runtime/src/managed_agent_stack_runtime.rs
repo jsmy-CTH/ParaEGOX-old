@@ -2547,13 +2547,21 @@ mod provider_resolver_tests {
             .and_then(|(_, tail)| tail.split_once("    async fn apply_empty("))
             .map(|(apply, _)| apply)
             .expect("missing Agent-stack apply boundary");
-        let replay = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let replay = apply
+            .find("self.lookup_terminal(")
+            .expect("missing exact replay lookup");
         let gate = apply
             .find("fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
             .expect("missing Agent-stack S0 freeze gate");
-        let phase = apply.find("self.snapshot.phase").expect("missing phase check");
-        let deadline = apply.find("observe_deadline(").expect("missing deadline check");
-        let admission = apply.find("self.admit_transition(").expect("missing admission");
+        let phase = apply
+            .find("self.snapshot.phase")
+            .expect("missing phase check");
+        let deadline = apply
+            .find("observe_deadline(")
+            .expect("missing deadline check");
+        let admission = apply
+            .find("self.admit_transition(")
+            .expect("missing admission");
         assert!(replay < gate && gate < phase && phase < deadline && deadline < admission);
 
         let lookup = source
@@ -2571,7 +2579,10 @@ mod provider_resolver_tests {
             ".signing_transcript()",
             ".verify_strict(transcript.as_bytes(), &signature)",
         ] {
-            assert!(lookup.contains(required), "missing Agent terminal check: {required}");
+            assert!(
+                lookup.contains(required),
+                "missing Agent terminal check: {required}"
+            );
         }
         let authenticated_replay = source
             .split_once("    pub(crate) fn authenticated_terminal_replay(")
@@ -2607,7 +2618,9 @@ mod provider_resolver_tests {
             .find(|record| record.operation_id == operation_id)
             .expect("committed Agent terminal disappeared");
         let mut tampered = record.receipt.canonical_wire().to_vec();
-        *tampered.last_mut().expect("Agent terminal signature disappeared") ^= 1;
+        *tampered
+            .last_mut()
+            .expect("Agent terminal signature disappeared") ^= 1;
         record.receipt = ManagedAgentStackTerminalReceiptV1::decode(&tampered)
             .expect("opaque bad Agent signature must remain canonical");
         assert!(matches!(

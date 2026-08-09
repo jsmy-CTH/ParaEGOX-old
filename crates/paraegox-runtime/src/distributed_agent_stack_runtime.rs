@@ -4419,7 +4419,10 @@ mod tests {
             ".signing_transcript()",
             ".verify_strict(transcript.as_bytes(), &signature)",
         ] {
-            assert!(lookup.contains(required), "missing distributed terminal check: {required}");
+            assert!(
+                lookup.contains(required),
+                "missing distributed terminal check: {required}"
+            );
         }
 
         let cutover = source
@@ -4441,7 +4444,9 @@ mod tests {
         let gate = cutover
             .find("owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
             .expect("missing cutover freeze gate");
-        let deadline = cutover.find("observe_deadline(").expect("missing deadline observation");
+        let deadline = cutover
+            .find("observe_deadline(")
+            .expect("missing deadline observation");
         let predecessor = cutover
             .find("predecessor.distributed_cutover_observation()?")
             .expect("missing predecessor observation");
@@ -4466,7 +4471,9 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("    #[cfg(test)]"))
             .map(|(replay, _)| replay)
             .expect("missing distributed authenticated replay boundary");
-        let lookup = replay.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let lookup = replay
+            .find("self.lookup_terminal(")
+            .expect("missing exact replay lookup");
         let pending = replay
             .find("if self.handle_publication_pending")
             .expect("missing pending-publication branch");
@@ -4486,12 +4493,18 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("    async fn apply_empty("))
             .map(|(apply, _)| apply)
             .expect("missing distributed apply boundary");
-        let lookup = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let lookup = apply
+            .find("self.lookup_terminal(")
+            .expect("missing exact replay lookup");
         let gate = apply
             .find("owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
             .expect("missing apply freeze gate");
-        let deadline = apply.find("observe_deadline(").expect("missing deadline check");
-        let admission = apply.find("self.admit_transition(").expect("missing admission");
+        let deadline = apply
+            .find("observe_deadline(")
+            .expect("missing deadline check");
+        let admission = apply
+            .find("self.admit_transition(")
+            .expect("missing admission");
         assert!(lookup < gate && gate < deadline && deadline < admission);
 
         let shutdown = source

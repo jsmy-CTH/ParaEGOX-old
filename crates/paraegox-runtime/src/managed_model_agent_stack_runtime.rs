@@ -2159,7 +2159,10 @@ mod tests {
             ".signing_transcript()",
             ".verify_strict(transcript.as_bytes(), &signature)",
         ] {
-            assert!(lookup.contains(required), "missing Model terminal check: {required}");
+            assert!(
+                lookup.contains(required),
+                "missing Model terminal check: {required}"
+            );
         }
 
         let cutover = source
@@ -2176,7 +2179,9 @@ mod tests {
         let predecessor = cutover
             .find("fabric.stack_cutover_observation().await?")
             .expect("missing predecessor observation");
-        let deadline = cutover.find("observe_deadline(").expect("missing deadline observation");
+        let deadline = cutover
+            .find("observe_deadline(")
+            .expect("missing deadline observation");
         let initialize = cutover
             .find("initialize_managed_model_agent_stack")
             .expect("missing PXMA initialization");
@@ -2194,13 +2199,21 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("    async fn apply_empty("))
             .map(|(apply, _)| apply)
             .expect("missing Model+Agent apply boundary");
-        let replay = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let replay = apply
+            .find("self.lookup_terminal(")
+            .expect("missing exact replay lookup");
         let gate = apply
             .find("fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
             .expect("missing apply freeze gate");
-        let phase = apply.find("self.snapshot.phase").expect("missing phase gate");
-        let deadline = apply.find("observe_deadline(").expect("missing deadline gate");
-        let admission = apply.find("self.admit_transition(").expect("missing admission");
+        let phase = apply
+            .find("self.snapshot.phase")
+            .expect("missing phase gate");
+        let deadline = apply
+            .find("observe_deadline(")
+            .expect("missing deadline gate");
+        let admission = apply
+            .find("self.admit_transition(")
+            .expect("missing admission");
         assert!(replay < gate && gate < phase && phase < deadline && deadline < admission);
 
         let shutdown = source
