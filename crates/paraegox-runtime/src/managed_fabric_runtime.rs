@@ -909,8 +909,9 @@ impl ManagedFabricRuntimeCore {
         candidate: &RemoteAgentAccessSnapshotV2,
         canonical_wire: &[u8],
     ) -> Result<RemoteAgentActiveS1CasV2, ManagedFabricStoreError> {
-        let current_transition_projection_digest = transition_projection_digest(&self.projection)
-            .map_err(|_| ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch)?;
+        let current_transition_projection_digest =
+            transition_projection_digest(&self.projection)
+                .map_err(|_| ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch)?;
         let current_static_identity = RemoteAgentAccessStaticIdentityPinsV2 {
             target: self.projection.target(),
             store_instance_id: self.store_instance_id(),
@@ -2969,7 +2970,10 @@ mod tests {
             "current_snapshot.owner_slot_revision() != 1",
             "RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)",
         ] {
-            assert!(validator.contains(required), "missing validator pin: {required}");
+            assert!(
+                validator.contains(required),
+                "missing validator pin: {required}"
+            );
         }
         assert!(!validator.contains("self.store"));
         assert!(!validator.contains("remote_agent_access_startup_v2.take()"));
@@ -3279,8 +3283,7 @@ mod tests {
         wire[TRANSITION_PROJECTION_DIGEST_OFFSET
             ..TRANSITION_PROJECTION_DIGEST_OFFSET + DIGEST_BYTES]
             .copy_from_slice(transition_projection_digest.as_bytes());
-        wire[PREVIOUS_SNAPSHOT_DIGEST_OFFSET
-            ..PREVIOUS_SNAPSHOT_DIGEST_OFFSET + DIGEST_BYTES]
+        wire[PREVIOUS_SNAPSHOT_DIGEST_OFFSET..PREVIOUS_SNAPSHOT_DIGEST_OFFSET + DIGEST_BYTES]
             .fill(0);
 
         let digest_offset = wire
@@ -3351,10 +3354,8 @@ mod tests {
         let final_path = directory.path().join("remote-agent-access.snapshot-v2");
         assert!(!final_path.exists());
 
-        let valid = remote_agent_access_initial_snapshot_v2(
-            &core.projection,
-            fixture_runtime_host_epoch,
-        );
+        let valid =
+            remote_agent_access_initial_snapshot_v2(&core.projection, fixture_runtime_host_epoch);
         let committed = core
             .initialize_remote_agent_access_and_latch_v2(valid)
             .expect("retained Absent lease must permit exact legal initialization");
