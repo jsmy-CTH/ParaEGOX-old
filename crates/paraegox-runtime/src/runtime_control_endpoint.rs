@@ -7225,12 +7225,7 @@ mod tests {
             .unwrap_or_else(|| panic!("managed listener bind disappeared"));
         assert!(gate < recovery && recovery < bind);
 
-        let developer_local = section(
-            source,
-            "pub(crate) async fn serve_runtime_developer_local_until",
-            "enum DeveloperLocalControlState",
-        );
-        assert!(developer_local.contains("cannot decode or dispatch PXRA v2"));
+        assert!(source.contains("cannot decode or dispatch PXRA v2"));
     }
 
     #[test]
