@@ -51,6 +51,7 @@ use crate::managed_service_assembly::{
     ManagedServiceFuture, ManagedServiceImplementation, ManagedServiceReadiness,
     ManagedServiceStartupOutcome,
 };
+use crate::remote_agent_access_state::RemoteAgentAccessStaticIdentityPinsV2;
 use crate::remote_agent_descriptor_evidence::{
     RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
 };
@@ -766,19 +767,15 @@ impl ManagedFabricRuntimeCore {
         self.snapshot.owner_target_fingerprint()
     }
 
-    /// Retains the one pre-effect PXRS v2 startup classification produced by
-    /// this core's already-open store. Older-epoch finals are rejected by the
-    /// caller before core construction and therefore can never enter this
-    /// owner.
+    /// Retains the one pre-effect PXRS v2 absent lease produced by this core's
+    /// already-open store. Any existing final is rejected by the caller before
+    /// core construction and therefore can never enter this owner.
     pub(crate) fn install_remote_agent_access_startup_v2(
         &mut self,
         startup: RemoteAgentAccessStartupSlotV2,
     ) -> Result<(), ManagedFabricRuntimeError> {
         if self.remote_agent_access_startup_v2.is_some()
-            || matches!(
-                &startup,
-                RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)
-            )
+            || !matches!(&startup, RemoteAgentAccessStartupSlotV2::Absent(_))
         {
             return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired);
         }
@@ -786,18 +783,58 @@ impl ManagedFabricRuntimeCore {
         Ok(())
     }
 
+    /// After the first PXAR-v7 marker has been durably published and exactly
+    /// read back, classifies and installs PXRS v2 exactly once. Only a proven
+    /// absent final grants the caller permission to resolve a provider or
+    /// start an Agent. Existing finals remain frozen structural authority.
+    pub(crate) fn adjudicate_remote_agent_access_after_first_stack_marker_v2(
+        &mut self,
+    ) -> Result<(), ManagedFabricRuntimeError> {
+        if self.remote_agent_access_startup_v2.is_some()
+            || self.store.managed_agent_stack_projection_digest().is_none()
+            || !self.store.remote_agent_access_startup_required_v2()
+        {
+            return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired);
+        }
+        let static_identity = RemoteAgentAccessStaticIdentityPinsV2 {
+            target: self.projection.target(),
+            store_instance_id: self.store_instance_id(),
+            owner_target_fingerprint: self.owner_target_fingerprint(),
+            transition_projection_digest: transition_projection_digest(&self.projection)?,
+        };
+        let startup = self
+            .store
+            .adjudicate_remote_agent_access_startup_v2(
+                static_identity,
+                self.runtime_host_epoch,
+            )?;
+        match startup {
+            startup @ RemoteAgentAccessStartupSlotV2::Absent(_) => {
+                self.remote_agent_access_startup_v2 = Some(startup);
+                Ok(())
+            }
+            startup @ RemoteAgentAccessStartupSlotV2::SameEpoch(_) => {
+                self.remote_agent_access_startup_v2 = Some(startup);
+                Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+            }
+            startup @ RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
+                self.remote_agent_access_startup_v2 = Some(startup);
+                Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired)
+            }
+        }
+    }
+
     /// Enforces that any retained Agent-stack authority or existing PXRS v2
     /// final was classified before successor recovery. This gate grants no S1
-    /// or transition authority; Absent and SameEpoch remain opaque leases.
+    /// or transition authority; only an exact absent lease permits recovery.
     pub(crate) fn require_remote_agent_access_startup_v2(
         &self,
     ) -> Result<(), ManagedFabricRuntimeError> {
         let required = self.store.remote_agent_access_startup_required_v2();
         match (&self.remote_agent_access_startup_v2, required) {
-            (Some(RemoteAgentAccessStartupSlotV2::Absent(_)), true)
-            | (Some(RemoteAgentAccessStartupSlotV2::SameEpoch(_)), true)
-            | (None, false) => Ok(()),
-            (Some(RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)), _)
+            (Some(RemoteAgentAccessStartupSlotV2::Absent(_)), true) | (None, false) => Ok(()),
+            (Some(RemoteAgentAccessStartupSlotV2::SameEpoch(_)), _)
+            | (Some(RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)), _)
             | (Some(_), false)
             | (None, true) => Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired),
         }
@@ -2347,6 +2384,7 @@ pub(crate) enum ManagedFabricRuntimeError {
     ExpectedActiveMismatch,
     ReplayConflict,
     ReplayCapacityReached,
+    RemoteAgentAccessSameEpochFrozen,
     RemoteAgentAccessReconcileRequired,
     GenerationExhausted,
     InvalidDurableState,
@@ -2425,6 +2463,9 @@ impl fmt::Display for ManagedFabricRuntimeError {
             Self::ReplayConflict => formatter.write_str("managed Fabric replay conflict"),
             Self::ReplayCapacityReached => {
                 formatter.write_str("managed Fabric replay capacity reached")
+            }
+            Self::RemoteAgentAccessSameEpochFrozen => {
+                formatter.write_str("remote Agent access is frozen by same-epoch authority")
             }
             Self::RemoteAgentAccessReconcileRequired => {
                 formatter.write_str("remote Agent access startup requires reconciliation")
@@ -2557,6 +2598,35 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s7_managed_fabric_successor_v1.json");
     const STORE_BYTE: u8 = 0x44;
     const TARGET_FINGERPRINT_BYTE: u8 = 0x55;
+
+    #[test]
+    fn post_marker_pxrs2_compile_boundary_allows_only_absent() {
+        let source = include_str!("managed_fabric_runtime.rs");
+        let start = source
+            .find("    pub(crate) fn adjudicate_remote_agent_access_after_first_stack_marker_v2(")
+            .expect("missing post-marker PXRS v2 gate");
+        let tail = &source[start..];
+        let end = tail
+            .find("    /// Enforces that any retained Agent-stack authority")
+            .expect("missing post-marker PXRS v2 gate boundary");
+        let gate = &tail[..end];
+
+        assert!(gate.contains("startup @ RemoteAgentAccessStartupSlotV2::Absent(_)"));
+        assert!(gate.contains("startup @ RemoteAgentAccessStartupSlotV2::SameEpoch(_)"));
+        assert!(gate.contains(
+            "startup @ RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)"
+        ));
+        assert_eq!(gate.match_indices("Ok(())").count(), 1);
+        assert_eq!(
+            gate.match_indices("self.remote_agent_access_startup_v2 = Some(startup)")
+                .count(),
+            3
+        );
+        assert!(gate.contains("RemoteAgentAccessSameEpochFrozen"));
+        assert!(gate.contains("RemoteAgentAccessReconcileRequired"));
+        assert!(!gate.contains("start_agent"));
+        assert!(!gate.contains("prepare_agent_provider"));
+    }
 
     struct DeterministicFixtureResolver;
 

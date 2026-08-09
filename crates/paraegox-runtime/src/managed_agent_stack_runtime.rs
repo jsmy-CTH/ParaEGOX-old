@@ -549,8 +549,6 @@ impl ManagedAgentStackRuntimeCore {
             .agent()
             .ok_or(ManagedAgentStackRuntimeError::RequestRejected)?
             .provider();
-        let prepared_provider =
-            prepare_agent_provider(provider, config.provider_resolver.as_ref())?;
         observe_deadline(config.clock, verified)?;
         let predecessor = fabric.stack_cutover_observation().await?;
         validate_cutover_cas_and_fabric(&request, &predecessor)?;
@@ -572,7 +570,13 @@ impl ManagedAgentStackRuntimeCore {
             transition,
             &config.projection,
         )?;
+        // The store returns only after exact marker readback. Any non-Absent
+        // PXRS v2 result then exits through `?`, retaining that marker while
+        // keeping provider resolution and every Agent binding at zero.
         fabric.initialize_managed_agent_stack(projection_digest, snapshot.canonical_wire())?;
+        fabric.adjudicate_remote_agent_access_after_first_stack_marker_v2()?;
+        let prepared_provider =
+            prepare_agent_provider(provider, config.provider_resolver.as_ref())?;
         let mut core = Self {
             snapshot,
             projection: config.projection,
@@ -1747,6 +1751,13 @@ pub(crate) enum ManagedAgentStackRuntimeError {
 }
 
 impl ManagedAgentStackRuntimeError {
+    pub(crate) const fn is_request_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Fabric(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+        )
+    }
+
     pub(crate) const fn is_request_rejection(&self) -> bool {
         matches!(
             self,
@@ -1901,5 +1912,53 @@ mod provider_resolver_tests {
                 ManagedAgentStackRuntimeError::ProviderResolverUnavailable
             ));
         }
+    }
+
+    #[test]
+    fn first_cutover_compile_boundary_static_gate_precedes_effects() {
+        // This compile-boundary guard fixes source order around the synchronous
+        // `?` gate. A later CurrentFinal tranche still needs an adversarial
+        // Runtime/store test for the SameEpoch branch and physical bind census.
+        let source = include_str!("managed_agent_stack_runtime.rs");
+        let start = source
+            .find("    pub(crate) async fn cutover(")
+            .expect("missing first-cutover entrypoint");
+        let tail = &source[start..];
+        let end = tail
+            .find("    pub(crate) async fn recover(")
+            .expect("missing first-cutover boundary");
+        let cutover = &tail[..end];
+        let marker = cutover
+            .find("fabric.initialize_managed_agent_stack(")
+            .expect("missing exact marker publication");
+        let adjudication = cutover
+            .find("fabric.adjudicate_remote_agent_access_after_first_stack_marker_v2()?")
+            .expect("missing post-marker PXRS v2 adjudication");
+        let resolver = cutover
+            .find("prepare_agent_provider(provider, config.provider_resolver.as_ref())?")
+            .expect("missing provider resolution");
+        let start_agent = cutover
+            .find(".start_agent(")
+            .expect("missing Agent start");
+
+        assert!(marker < adjudication && adjudication < resolver && resolver < start_agent);
+        assert_eq!(
+            cutover[..adjudication]
+                .match_indices("prepare_agent_provider(")
+                .count(),
+            0
+        );
+        assert_eq!(
+            cutover[..adjudication]
+                .match_indices(".start_agent(")
+                .count(),
+            0
+        );
+        assert_eq!(
+            cutover[..adjudication]
+                .match_indices("publish_handle(")
+                .count(),
+            0
+        );
     }
 }

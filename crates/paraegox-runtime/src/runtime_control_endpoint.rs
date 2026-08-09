@@ -1614,12 +1614,13 @@ impl StartedManagedFabricService {
                 runtime_host_epoch,
             )?;
             match startup {
-                RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
+                startup @ RemoteAgentAccessStartupSlotV2::Absent(_) => Some(startup),
+                RemoteAgentAccessStartupSlotV2::SameEpoch(_)
+                | RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
                     return Err(
                         ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired.into(),
                     );
                 }
-                startup => Some(startup),
             }
         } else {
             None
@@ -3101,7 +3102,9 @@ fn map_managed_fabric_error(error: ManagedFabricRuntimeError) -> RuntimeControlR
 fn map_managed_agent_stack_error(
     error: ManagedAgentStackRuntimeError,
 ) -> RuntimeControlRequestError {
-    if error.is_request_rejection() {
+    if error.is_request_unavailable() {
+        RuntimeControlRequestError::Unavailable
+    } else if error.is_request_rejection() {
         RuntimeControlRequestError::Rejected
     } else {
         RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedAgentStack(
@@ -7190,16 +7193,36 @@ mod tests {
         let adjudication = startup
             .find(".adjudicate_remote_agent_access_startup_v2(")
             .unwrap_or_else(|| panic!("PXRS v2 startup adjudication disappeared"));
-        let reconcile = startup
+        let absent = startup
+            .find("startup @ RemoteAgentAccessStartupSlotV2::Absent(_)")
+            .unwrap_or_else(|| panic!("PXRS v2 absent-only continuation disappeared"));
+        let same_epoch = startup
+            .find("RemoteAgentAccessStartupSlotV2::SameEpoch(_)")
+            .unwrap_or_else(|| panic!("same-epoch PXRS v2 fail-stop disappeared"));
+        let restart = startup
             .find("RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)")
             .unwrap_or_else(|| panic!("old-epoch PXRS v2 fail-stop disappeared"));
         let core = startup
             .find("ManagedFabricRuntimeCore::from_preopened_store(")
             .unwrap_or_else(|| panic!("managed Fabric core construction disappeared"));
+        let model_stack = startup
+            .find("ManagedModelAgentStackRuntimeCore::open(")
+            .unwrap_or_else(|| panic!("managed Model+Agent child open disappeared"));
         let stack = startup
             .find("ManagedAgentStackRuntimeCore::open(")
             .unwrap_or_else(|| panic!("managed Agent-stack construction disappeared"));
-        assert!(adjudication < reconcile && reconcile < core && core < stack);
+        let distributed = startup
+            .find("DistributedAgentStackRuntimeCore::open(")
+            .unwrap_or_else(|| panic!("distributed Agent child open disappeared"));
+        assert!(
+            adjudication < absent
+                && absent < same_epoch
+                && same_epoch < restart
+                && restart < core
+                && core < model_stack
+                && core < stack
+                && core < distributed
+        );
 
         let existing_channel = section(
             source,
@@ -12629,6 +12652,16 @@ mod tests {
         };
         assert_restricted_unavailable_continues(developer);
         assert_restricted_unavailable_continues(managed);
+    }
+
+    #[test]
+    fn same_process_pxrs2_freeze_maps_to_nonfatal_unavailable() {
+        assert!(matches!(
+            map_managed_agent_stack_error(ManagedAgentStackRuntimeError::Fabric(
+                ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen,
+            )),
+            RuntimeControlRequestError::Unavailable
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
