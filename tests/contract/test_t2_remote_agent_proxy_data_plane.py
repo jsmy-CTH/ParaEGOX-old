@@ -55,6 +55,8 @@ PXAU_SIGNING_VERSION = 2
 PXAU_FIXED_BYTES = 683
 PXAU_SIGNATURE_BYTES = 64
 PXAU_CANONICAL_BYTES = 747
+MAX_PXAU_SIGNATURE_BYTES = 512
+MAX_CANONICAL_PXAU_BYTES = PXAU_FIXED_BYTES + MAX_PXAU_SIGNATURE_BYTES
 MAX_PXAU_CARRIER_BYTES = 2_048
 
 RETAINED_S0_CAS_BYTES = 200
@@ -284,8 +286,8 @@ def _topology_compatibility_digest() -> bytes:
         _u16(PXAU_SIGNING_VERSION),
         _u32(PXAU_FIXED_BYTES),
         _u16(MAX_PXAU_CARRIER_BYTES),
-        _u16(PXAU_CANONICAL_BYTES),
-        _u16(PXAU_SIGNATURE_BYTES),
+        _u16(MAX_CANONICAL_PXAU_BYTES),
+        _u16(MAX_PXAU_SIGNATURE_BYTES),
         PXTA_ZERO,
         _u16(RETAINED_S0_CAS_BYTES),
         _u16(ACTIVE_S1_CAS_BYTES),
@@ -1127,7 +1129,7 @@ def _parse_pxau(wire: bytes, request_wire: bytes, runtime_public: bytes) -> dict
     body = cursor.take(PXAU_FIXED_BYTES - 8)
     values = _parse_terminal_body(body)
     signature_length = cursor.u16()
-    if not 0 < signature_length <= PXAU_SIGNATURE_BYTES:
+    if not 0 < signature_length <= MAX_PXAU_SIGNATURE_BYTES:
         raise ContractReject("PXAU v2 signature length")
     signature = cursor.take(signature_length)
     cursor.finish()
@@ -1331,6 +1333,8 @@ def _generated_fixture() -> dict[str, Any]:
             "pxau_v2_fixed_bytes": PXAU_FIXED_BYTES,
             "pxau_v2_signature_bytes": PXAU_SIGNATURE_BYTES,
             "pxau_v2_canonical_bytes": PXAU_CANONICAL_BYTES,
+            "max_pxau_v2_signature_bytes": MAX_PXAU_SIGNATURE_BYTES,
+            "max_canonical_pxau_v2_bytes": MAX_CANONICAL_PXAU_BYTES,
             "max_pxau_v2_carrier_bytes": MAX_PXAU_CARRIER_BYTES,
             "terminal_transcript_bytes": len(
                 PXAU_SIGNING_MAGIC + _u16(PXAU_SIGNING_VERSION) + bytes(675)
@@ -1419,9 +1423,12 @@ def test_semantic_constants_and_r225_source_freeze() -> None:
     assert MAX_PXAR_BYTES == 18 + 4_096 + 10 + 2_576
     assert PXAU_FIXED_BYTES == PXAU_OFFSETS["signature"]
     assert PXAU_CANONICAL_BYTES == PXAU_FIXED_BYTES + PXAU_SIGNATURE_BYTES
+    assert MAX_PXAU_SIGNATURE_BYTES == 512
+    assert MAX_CANONICAL_PXAU_BYTES == PXAU_FIXED_BYTES + MAX_PXAU_SIGNATURE_BYTES
+    assert MAX_CANONICAL_PXAU_BYTES < MAX_PXAU_CARRIER_BYTES
     assert len(PXAU_SIGNING_MAGIC + _u16(2) + bytes(675)) == 732
     assert _topology_compatibility_digest().hex() == (
-        "c21c4a3a83f8ce89ccbde6e732e8ed888259485ce0bd38db2e390c5c0e022803"
+        "20e2d991048fd0c0fcb38551bcc40cbe351376ad2b6113ee4ddc456f77f70e18"
     )
 
 
