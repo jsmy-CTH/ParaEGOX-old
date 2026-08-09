@@ -8727,6 +8727,12 @@ mod tests {
 
         #[test]
         fn pxrs2_current_final_rejects_s1_root_drift_and_invalid_live_facts() {
+            let exact = current_final_v2(initial_snapshot_v2(), |_| {})
+                .unwrap_or_else(|error| panic!("exact CurrentFinal rejected: {error}"));
+            assert_eq!(
+                exact.current_retained_s0_cas_for_test(),
+                retained_s0_cas_v2()
+            );
             let request = active_request_v2();
             assert!(matches!(
                 authorize_on_snapshot_v2(
