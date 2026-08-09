@@ -1311,9 +1311,10 @@ impl<Candidate> fmt::Debug for RemoteAgentAccessCommitErrorV2<Candidate> {
                 .debug_tuple("ProvenNotCommitted")
                 .field(cause)
                 .finish_non_exhaustive(),
-            Self::OutcomeUncertain(cause) => {
-                formatter.debug_tuple("OutcomeUncertain").field(cause).finish()
-            }
+            Self::OutcomeUncertain(cause) => formatter
+                .debug_tuple("OutcomeUncertain")
+                .field(cause)
+                .finish(),
         }
     }
 }
@@ -6981,32 +6982,24 @@ fn publish_temp_name_to(
                 // point. This fallback exists only so explicit test fixtures
                 // can exercise the rest of the transaction on development
                 // hosts while PC1/PC2 remain unadmitted.
-                renameat(
-                    &directory.file,
-                    temp_name,
-                    &directory.file,
-                    active_name,
+                renameat(&directory.file, temp_name, &directory.file, active_name).map_err(
+                    |error| {
+                        RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+                            RuntimeFileStage::Rename,
+                            error,
+                        ))
+                    },
                 )
-                .map_err(|error| {
-                    RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
-                        RuntimeFileStage::Rename,
-                        error,
-                    ))
-                })
             }
         }
-        RuntimePublishMode::ReplaceExisting(_) => renameat(
-            &directory.file,
-            temp_name,
-            &directory.file,
-            active_name,
-        )
-        .map_err(|error| {
-            RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
-                RuntimeFileStage::Rename,
-                error,
-            ))
-        }),
+        RuntimePublishMode::ReplaceExisting(_) => {
+            renameat(&directory.file, temp_name, &directory.file, active_name).map_err(|error| {
+                RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
+                    RuntimeFileStage::Rename,
+                    error,
+                ))
+            })
+        }
     }
 }
 
@@ -7059,35 +7052,23 @@ fn install_competing_remote_agent_access_final_for_test(
         PRIVATE_FILE_MODE,
     )
     .map_err(|error| {
-        ManagedFabricStoreError::Io(nix_failure(
-            RuntimeFileStage::RequireMissingActive,
-            error,
-        ))
+        ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::RequireMissingActive, error))
     })?;
     let mut final_file = File::from(owned);
     fchmod(&final_file, PRIVATE_FILE_MODE).map_err(|error| {
         ManagedFabricStoreError::Io(nix_failure(RuntimeFileStage::InspectTemp, error))
     })?;
     let metadata = final_file.metadata().map_err(|error| {
-        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
-            RuntimeFileStage::InspectTemp,
-            &error,
-        ))
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::InspectTemp, &error))
     })?;
     validate_regular_file(&metadata, directory.owner_uid, directory.owner_gid)
         .map_err(ManagedFabricStoreError::Open)?;
     let identity = FileIdentity::from_metadata(&metadata);
     final_file.write_all(encoded).map_err(|error| {
-        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
-            RuntimeFileStage::WriteTemp,
-            &error,
-        ))
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::WriteTemp, &error))
     })?;
     final_file.sync_all().map_err(|error| {
-        ManagedFabricStoreError::Io(RuntimeIoFailure::new(
-            RuntimeFileStage::SyncTemp,
-            &error,
-        ))
+        ManagedFabricStoreError::Io(RuntimeIoFailure::new(RuntimeFileStage::SyncTemp, &error))
     })?;
     validate_named_file_identity(
         directory,
@@ -7971,7 +7952,7 @@ pub(crate) mod tests {
     };
 
     use super::{
-        ACTIVE_FILE_NAME, LOCK_FILE_NAME, LinuxMountEvidenceError,
+        ACTIVE_FILE_NAME, FileIdentity, LOCK_FILE_NAME, LinuxMountEvidenceError,
         MANAGED_FABRIC_CUTOVER_FILE_NAME, MAX_LINUX_FDINFO_BYTES, MAX_LINUX_FDINFO_LINE_BYTES,
         MAX_LINUX_FDINFO_RECORDS, MAX_LINUX_MOUNTINFO_BYTES, MAX_LINUX_MOUNTINFO_LINE_BYTES,
         MAX_LINUX_MOUNTINFO_RECORDS, MAX_MIGRATION_EVIDENCE_DIRECTORY_ENTRIES,
@@ -8689,18 +8670,18 @@ pub(crate) mod tests {
                 )
                 .expect("missing PXRS2 final must adjudicate as absent"),
         );
-        let candidate = remote_agent_access_initial_snapshot_v2(
+        let candidate =
+            remote_agent_access_initial_snapshot_v2(identity, REMOTE_AGENT_ACCESS_FIXTURE_EPOCH);
+        let competing = remote_agent_access_initial_snapshot_v2(
             identity,
-            REMOTE_AGENT_ACCESS_FIXTURE_EPOCH,
+            REMOTE_AGENT_ACCESS_FIXTURE_EPOCH - 1,
         );
-        let competing =
-            remote_agent_access_initial_snapshot_v2(identity, REMOTE_AGENT_ACCESS_FIXTURE_EPOCH - 1);
         let competing_wire = competing.canonical_wire().to_vec();
         let failure = match store.initialize_remote_agent_access_v2_with_competing_final(
-                absent,
-                candidate,
-                &competing_wire,
-            ) {
+            absent,
+            candidate,
+            &competing_wire,
+        ) {
             Err(failure) => failure,
             Ok(_) => panic!("atomic no-replace must reject a last-moment PXRS2 final"),
         };
@@ -8876,10 +8857,7 @@ pub(crate) mod tests {
             remote_agent_access_prepared_store_fixture_v2();
         let absent = remote_agent_access_absent_lease_v2(
             store
-                .adjudicate_remote_agent_access_startup_v2(
-                    static_identity,
-                    runtime_host_epoch,
-                )
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
                 .expect("prepared PXRS2 store must start absent"),
         );
         let current = store
@@ -8905,10 +8883,7 @@ pub(crate) mod tests {
         .expect("replaced PXRS2 store must reopen");
         let recovered = remote_agent_access_same_epoch_lease_v2(
             reopened
-                .adjudicate_remote_agent_access_startup_v2(
-                    static_identity,
-                    runtime_host_epoch,
-                )
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
                 .expect("replaced PXRS2 final must recover at the same epoch"),
         );
         assert_eq!(recovered.canonical_wire(), expected_wire);
@@ -8921,10 +8896,7 @@ pub(crate) mod tests {
             remote_agent_access_prepared_store_fixture_v2();
         let absent = remote_agent_access_absent_lease_v2(
             store
-                .adjudicate_remote_agent_access_startup_v2(
-                    static_identity,
-                    runtime_host_epoch,
-                )
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
                 .expect("prepared PXRS2 store must start absent"),
         );
         let current = store
@@ -8937,10 +8909,10 @@ pub(crate) mod tests {
         );
         let expected_wire = pending.canonical_wire().to_vec();
         let failure = match store.replace_remote_agent_access_v2_at_failpoint(
-                current,
-                pending,
-                RemoteAgentAccessCommitFailpointV2::BeforeRename,
-            ) {
+            current,
+            pending,
+            RemoteAgentAccessCommitFailpointV2::BeforeRename,
+        ) {
             Err(failure) => failure,
             Ok(_) => panic!("prepublish replacement failpoint must not commit"),
         };
@@ -8973,10 +8945,7 @@ pub(crate) mod tests {
         .expect("proven replacement failure must reopen");
         let current = remote_agent_access_same_epoch_lease_v2(
             reopened
-                .adjudicate_remote_agent_access_startup_v2(
-                    static_identity,
-                    runtime_host_epoch,
-                )
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
                 .expect("reopen must recover the preserved predecessor"),
         );
         let committed = reopened
@@ -8992,10 +8961,7 @@ pub(crate) mod tests {
             remote_agent_access_prepared_store_fixture_v2();
         let absent = remote_agent_access_absent_lease_v2(
             store
-                .adjudicate_remote_agent_access_startup_v2(
-                    static_identity,
-                    runtime_host_epoch,
-                )
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
                 .expect("prepared PXRS2 store must start absent"),
         );
         let current = store
@@ -9003,10 +8969,10 @@ pub(crate) mod tests {
             .expect("prepared PXRS2 initial commit must pass");
         let expected_wire = pending.canonical_wire().to_vec();
         let failure = match store.replace_remote_agent_access_v2_at_failpoint(
-                current,
-                pending,
-                RemoteAgentAccessCommitFailpointV2::AfterRenameBeforeDirectorySync,
-            ) {
+            current,
+            pending,
+            RemoteAgentAccessCommitFailpointV2::AfterRenameBeforeDirectorySync,
+        ) {
             Err(failure) => failure,
             Ok(_) => panic!("postpublish replacement failpoint must be uncertain"),
         };
@@ -9026,10 +8992,7 @@ pub(crate) mod tests {
         .expect("uncertain replacement must resolve by final reopen");
         let recovered = remote_agent_access_same_epoch_lease_v2(
             reopened
-                .adjudicate_remote_agent_access_startup_v2(
-                    static_identity,
-                    runtime_host_epoch,
-                )
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
                 .expect("uncertain replacement must recover the published final"),
         );
         assert_eq!(recovered.canonical_wire(), expected_wire);
@@ -9042,10 +9005,7 @@ pub(crate) mod tests {
             remote_agent_access_prepared_store_fixture_v2();
         let absent = remote_agent_access_absent_lease_v2(
             store
-                .adjudicate_remote_agent_access_startup_v2(
-                    static_identity,
-                    runtime_host_epoch,
-                )
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
                 .expect("prepared PXRS2 store must start absent"),
         );
         let current = store

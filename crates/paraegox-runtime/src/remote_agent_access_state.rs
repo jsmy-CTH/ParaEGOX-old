@@ -7763,8 +7763,7 @@ mod tests {
             let mut facts = snapshot
                 .progress
                 .unwrap_or_else(|| panic!("Local Prepared PXRS2 must retain progress"));
-            facts.lifecycle_effect =
-                RemoteAgentDataPlaneTerminalLifecycleEffectV2::MayHaveStarted;
+            facts.lifecycle_effect = RemoteAgentDataPlaneTerminalLifecycleEffectV2::MayHaveStarted;
             facts.public_phase = RemoteAgentDataPlaneTerminalPhaseV2::IngressFenceIntent;
             facts.selection_observed_at_nanos = fact_ticks;
             let admission = snapshot
@@ -8850,7 +8849,10 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("unknown-currentness Uncertain rejected: {error}"));
             let uncertain = readback_pending_v2(uncertain);
-            assert_eq!(uncertain.phase(), RemoteAgentAccessDurablePhaseV2::Uncertain);
+            assert_eq!(
+                uncertain.phase(),
+                RemoteAgentAccessDurablePhaseV2::Uncertain
+            );
             assert_eq!(
                 uncertain
                     .progress
@@ -8922,24 +8924,26 @@ mod tests {
                         .as_ref()
                         .unwrap_or_else(|| panic!("success predecessor must retain PXRA v2")),
                 );
-                assert!(try_terminal_receipt_v2(
-                    &snapshot,
-                    outcome,
-                    claim,
-                    &TERMINAL_SIGNATURE_V2,
-                    |evidence| {
-                        evidence.retained_s0_current_cas_digest = zero_digest();
-                        evidence.retained_s0_census_after_digest = zero_digest();
-                        evidence.physical_binding_census = 0;
-                        evidence.remote_observation =
-                            RemoteAgentDataPlaneRemoteObservationV2::Unknown;
-                        evidence.retained_s0_census_complete = false;
-                        evidence.retained_s0_ready = false;
-                        evidence.s1_tls_ready = false;
-                        evidence.s1_acl_ready = false;
-                    },
-                )
-                .is_err());
+                assert!(
+                    try_terminal_receipt_v2(
+                        &snapshot,
+                        outcome,
+                        claim,
+                        &TERMINAL_SIGNATURE_V2,
+                        |evidence| {
+                            evidence.retained_s0_current_cas_digest = zero_digest();
+                            evidence.retained_s0_census_after_digest = zero_digest();
+                            evidence.physical_binding_census = 0;
+                            evidence.remote_observation =
+                                RemoteAgentDataPlaneRemoteObservationV2::Unknown;
+                            evidence.retained_s0_census_complete = false;
+                            evidence.retained_s0_ready = false;
+                            evidence.s1_tls_ready = false;
+                            evidence.s1_acl_ready = false;
+                        },
+                    )
+                    .is_err()
+                );
             }
         }
 
@@ -8970,11 +8974,8 @@ mod tests {
                 .admission
                 .unwrap_or_else(|| panic!("Local Prepared PXRS2 must retain admission"))
                 .absolute_deadline_nanos;
-            let after_deadline = local_fence_observation_v2(
-                prepared.snapshot(),
-                deadline + 1,
-                deadline + 1,
-            );
+            let after_deadline =
+                local_fence_observation_v2(prepared.snapshot(), deadline + 1, deadline + 1);
             assert!(matches!(
                 prepared.try_observed_successor(after_deadline),
                 Err(RemoteAgentAccessStateErrorV2::DeadlineExpired)
