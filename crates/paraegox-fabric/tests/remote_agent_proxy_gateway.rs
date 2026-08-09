@@ -464,9 +464,7 @@ async fn install_gated_binding(
     PortBinding,
     Arc<AtomicUsize>,
     JoinHandle<()>,
-    oneshot::Receiver<()>,
-    watch::Sender<bool>,
-    oneshot::Receiver<bool>,
+    mpsc::Receiver<GatedEffectObservation>,
 ) {
     let installed = finish_before(
         deadline_after(OPERATION_BUDGET),
@@ -478,38 +476,29 @@ async fn install_gated_binding(
     let (binding, mut requests) = installed.into_parts();
     let callbacks = Arc::new(AtomicUsize::new(0));
     let handler_callbacks = Arc::clone(&callbacks);
-    let (entered_sender, entered_receiver) = oneshot::channel();
-    let (release_sender, mut release_receiver) = watch::channel(false);
-    let (completed_sender, completed_receiver) = oneshot::channel();
+    let (effect_sender, effect_receiver) = mpsc::channel(3);
     let handler = tokio::spawn(async move {
-        let mut entered_sender = Some(entered_sender);
-        let mut completed_sender = Some(completed_sender);
         while let Some(request) = requests.recv().await {
             handler_callbacks.fetch_add(1, Ordering::SeqCst);
             let body = request.body().to_vec();
             if body == IN_FLIGHT_STOP_BODY {
-                entered_sender
-                    .take()
-                    .expect("only one gated request is admitted")
-                    .send(())
-                    .expect("in-flight observer remains live");
+                let (release_sender, release_receiver) = oneshot::channel();
+                let (completed_sender, completed_receiver) = oneshot::channel();
+                effect_sender
+                    .try_send(GatedEffectObservation {
+                        release: release_sender,
+                        completed: completed_receiver,
+                    })
+                    .expect("bounded gated-effect observer has capacity");
                 finish_before(
                     deadline_after(OPERATION_BUDGET),
-                    async {
-                        while !*release_receiver.borrow() {
-                            release_receiver
-                                .changed()
-                                .await
-                                .expect("in-flight release owner remains live");
-                        }
-                    },
+                    release_receiver,
                     "release admitted downstream request",
                 )
-                .await;
+                .await
+                .expect("gated-effect release owner remains live");
                 let responder_was_closed = request.respond(HandlerResponse::Ok(body)).is_err();
                 completed_sender
-                    .take()
-                    .expect("only one gated request completes")
                     .send(responder_was_closed)
                     .expect("in-flight completion observer remains live");
             } else {
@@ -519,14 +508,13 @@ async fn install_gated_binding(
             }
         }
     });
-    (
-        binding,
-        callbacks,
-        handler,
-        entered_receiver,
-        release_sender,
-        completed_receiver,
-    )
+    (binding, callbacks, handler, effect_receiver)
+}
+
+#[derive(Debug)]
+struct GatedEffectObservation {
+    release: oneshot::Sender<()>,
+    completed: oneshot::Receiver<bool>,
 }
 
 fn spawn_echo_handler(
@@ -1211,14 +1199,8 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     )
     .await
     .expect("open S0 FabricService");
-    let (
-        submit,
-        submit_callbacks,
-        submit_handler,
-        in_flight_entered,
-        in_flight_release,
-        in_flight_completed,
-    ) = install_gated_binding(&mut s0, 0x31, SUBMIT_ROUTE).await;
+    let (submit, submit_callbacks, submit_handler, mut gated_effects) =
+        install_gated_binding(&mut s0, 0x31, SUBMIT_ROUTE).await;
     let (control, control_callbacks, control_handler) =
         install_counting_binding(&mut s0, 0x32, CONTROL_ROUTE).await;
     let s0 = Arc::new(s0);
@@ -1397,16 +1379,37 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
         )
         .await
     });
-    finish_before(
+    let in_flight_effect = finish_before(
         deadline_after(OPERATION_BUDGET),
-        in_flight_entered,
+        gated_effects.recv(),
         "observe request inside S0 handler",
     )
     .await
-    .expect("gated S0 handler must observe the request");
+    .expect("gated S0 handler must report the request");
     proxy.wait_for_admitted(0, 2).await;
     assert_eq!(proxy.observed(), [2, 1]);
     assert_eq!(proxy.admitted(), [2, 1]);
+    assert_eq!(proxy.forwarded(), [2, 1]);
+    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
+    assert_eq!(control_callbacks.load(Ordering::SeqCst), 1);
+
+    let queued_session = stop_client.clone();
+    let queued_body = b"queued-before-proxy-stop";
+    let queued_frame = request_frame(&submit, 0x5a, queued_body);
+    let queued_query = tokio::spawn(async move {
+        raw_query_once(
+            &queued_session,
+            SUBMIT_ROUTE,
+            queued_frame,
+            true,
+            deadline_after(QUERY_BUDGET),
+            deadline_after(OPERATION_BUDGET),
+        )
+        .await
+    });
+    proxy.wait_for_admitted(0, 3).await;
+    assert_eq!(proxy.observed(), [3, 1]);
+    assert_eq!(proxy.admitted(), [3, 1]);
     assert_eq!(proxy.forwarded(), [2, 1]);
     assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
     assert_eq!(control_callbacks.load(Ordering::SeqCst), 1);
@@ -1428,18 +1431,22 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     .await
     .expect("raw proxy link observer must undeclare");
 
+    let stop_observed = Arc::clone(&proxy.observed[0]);
+    let stop_admitted = Arc::clone(&proxy.admitted[0]);
+    let stop_forwarded = Arc::clone(&proxy.forwarded[0]);
     let proxy_shutdown = tokio::spawn(proxy.shutdown(deadline_after(OPERATION_BUDGET)));
     tokio::task::yield_now().await;
     assert!(
         !proxy_shutdown.is_finished(),
-        "graceful proxy shutdown must wait for the admitted S0 effect"
+        "graceful proxy shutdown must wait for the in-handler and queued S0 effects"
     );
-    in_flight_release
-        .send(true)
+    in_flight_effect
+        .release
+        .send(())
         .expect("release the admitted S0 effect during proxy drain");
     let responder_was_closed = finish_before(
         deadline_after(OPERATION_BUDGET),
-        in_flight_completed,
+        in_flight_effect.completed,
         "complete admitted S0 effect during proxy drain",
     )
     .await
@@ -1459,8 +1466,25 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
         RawQueryOutcome::Response(response) => response,
         outcome => panic!("in-handler drain caller used unexpected terminal: {outcome:?}"),
     };
+    assert_eq!(in_flight_response.binding_id(), submit.binding_id());
+    assert_eq!(in_flight_response.binding_epoch(), submit.binding_epoch());
     assert_eq!(in_flight_response.status(), ResponseStatus::Ok);
     assert_eq!(in_flight_response.body(), IN_FLIGHT_STOP_BODY);
+    let queued_outcome = finish_before(
+        deadline_after(OPERATION_BUDGET),
+        queued_query,
+        "join queued-before-stop caller",
+    )
+    .await
+    .expect("queued-before-stop caller task must join");
+    let queued_response = match queued_outcome {
+        RawQueryOutcome::Response(response) => response,
+        outcome => panic!("queued drain caller used unexpected terminal: {outcome:?}"),
+    };
+    assert_eq!(queued_response.binding_id(), submit.binding_id());
+    assert_eq!(queued_response.binding_epoch(), submit.binding_epoch());
+    assert_eq!(queued_response.status(), ResponseStatus::Ok);
+    assert_eq!(queued_response.body(), queued_body);
     finish_before(
         deadline_after(OPERATION_BUDGET),
         proxy_shutdown,
@@ -1468,7 +1492,14 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     )
     .await
     .expect("graceful proxy shutdown task must join");
-    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
+    assert_eq!(stop_observed.load(Ordering::SeqCst), 3);
+    assert_eq!(stop_admitted.load(Ordering::SeqCst), 3);
+    assert_eq!(stop_forwarded.load(Ordering::SeqCst), 3);
+    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 3);
+    assert!(matches!(
+        gated_effects.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
     finish_before(
         deadline_after(OPERATION_BUDGET),
         stop_client.close(),
@@ -1478,7 +1509,10 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     .expect("in-handler stop S2 must close");
     assert_port_released(s1_socket);
     expect_local_echo(&s0, &control, 0x61, b"local-after-proxy-stop").await;
-    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
+    assert_eq!(stop_observed.load(Ordering::SeqCst), 3);
+    assert_eq!(stop_admitted.load(Ordering::SeqCst), 3);
+    assert_eq!(stop_forwarded.load(Ordering::SeqCst), 3);
+    assert_eq!(submit_callbacks.load(Ordering::SeqCst), 3);
     assert_eq!(control_callbacks.load(Ordering::SeqCst), 2);
 
     let s0 = Arc::try_unwrap(s0).unwrap_or_else(|_| panic!("proxy must release S0 FabricService"));
