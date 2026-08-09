@@ -19,7 +19,7 @@ use paraegox_fabric::{
     FabricServiceConfig, SessionEndpoint,
 };
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
-use paraegox_kernel::identity::RuntimeHostId;
+use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{ClockGeneration, ClockReading, MonotonicDeadline};
 use paraegox_runtime_contracts::apply::ExpectedActive;
 use paraegox_runtime_contracts::managed_fabric_plan::{
@@ -35,7 +35,9 @@ use paraegox_runtime_contracts::managed_service::{
     ManagedServiceGeneration, ManagedServiceLifecycleStage,
 };
 use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
-use paraegox_runtime_contracts::remote_agent_data_plane_plan::RemoteAgentActiveS1CasV2;
+use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+    RemoteAgentActiveS1CasV2, RemoteAgentRetainedS0CasV2,
+};
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 use tokio::sync::RwLock;
 use tokio::time::{Instant, timeout_at};
@@ -54,15 +56,17 @@ use crate::managed_service_assembly::{
 };
 use crate::remote_agent_access_state::{
     RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessGenesisCandidateV2,
-    RemoteAgentAccessSnapshotV2, RemoteAgentAccessStateErrorV2,
-    RemoteAgentAccessStaticIdentityPinsV2,
+    RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
+    RemoteAgentAccessStateErrorV2, RemoteAgentAccessStaticIdentityPinsV2,
+    RemoteAgentCurrentFinalAccessSnapshotV2,
 };
 use crate::remote_agent_descriptor_evidence::{
     RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
 };
 use crate::runtime_clock::RuntimeClock;
 use crate::runtime_control_endpoint::{
-    RemoteAgentLiveLowerFactsV2, RemoteAgentLiveLowerProjectionV2,
+    RemoteAgentLiveLowerCurrentFinalGenesisPartsV2, RemoteAgentLiveLowerFactsV2,
+    RemoteAgentLiveLowerProjectionV2,
 };
 #[cfg(test)]
 use crate::runtime_store::RemoteAgentAccessInitializeCommitErrorV2;
@@ -696,6 +700,154 @@ impl<'running> RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running> {
     }
 }
 
+/// Named, move-only proof that the exact genesis readback and every current
+/// live fact survived the managed owner's final borrowed store reopen. The
+/// state owner consumes only this seal; it has no raw or tuple CurrentFinal
+/// constructor.
+pub(crate) struct RemoteAgentAccessRevalidatedCurrentFinalGenesisV2 {
+    snapshot: RemoteAgentAccessSnapshotV2,
+    current_identity: RemoteAgentAccessSnapshotIdentityPinsV2,
+    current_runtime_host_epoch: u64,
+    current_retained_s0_cas: RemoteAgentRetainedS0CasV2,
+    current_retained_s0_census_digest: Digest32,
+    current_submit_binding_epoch: u64,
+    current_control_binding_epoch: u64,
+    current_carrier_binding_digest: Digest32,
+    current_intended_client: PrincipalRef,
+    current_s1_cas: RemoteAgentActiveS1CasV2,
+}
+
+pub(crate) struct RemoteAgentAccessRevalidatedCurrentFinalGenesisPartsV2 {
+    pub(crate) snapshot: RemoteAgentAccessSnapshotV2,
+    pub(crate) current_identity: RemoteAgentAccessSnapshotIdentityPinsV2,
+    pub(crate) current_runtime_host_epoch: u64,
+    pub(crate) current_retained_s0_cas: RemoteAgentRetainedS0CasV2,
+    pub(crate) current_retained_s0_census_digest: Digest32,
+    pub(crate) current_submit_binding_epoch: u64,
+    pub(crate) current_control_binding_epoch: u64,
+    pub(crate) current_carrier_binding_digest: Digest32,
+    pub(crate) current_intended_client: PrincipalRef,
+    pub(crate) current_s1_cas: RemoteAgentActiveS1CasV2,
+}
+
+impl RemoteAgentAccessRevalidatedCurrentFinalGenesisV2 {
+    #[must_use]
+    pub(crate) fn into_parts(self) -> RemoteAgentAccessRevalidatedCurrentFinalGenesisPartsV2 {
+        let Self {
+            snapshot,
+            current_identity,
+            current_runtime_host_epoch,
+            current_retained_s0_cas,
+            current_retained_s0_census_digest,
+            current_submit_binding_epoch,
+            current_control_binding_epoch,
+            current_carrier_binding_digest,
+            current_intended_client,
+            current_s1_cas,
+        } = self;
+        RemoteAgentAccessRevalidatedCurrentFinalGenesisPartsV2 {
+            snapshot,
+            current_identity,
+            current_runtime_host_epoch,
+            current_retained_s0_cas,
+            current_retained_s0_census_digest,
+            current_submit_binding_epoch,
+            current_control_binding_epoch,
+            current_carrier_binding_digest,
+            current_intended_client,
+            current_s1_cas,
+        }
+    }
+}
+
+/// Sole successful genesis CurrentFinal authority. The same-epoch lease stays
+/// private and unique for the later exact replace owner, while the exact PXAP
+/// bytes are retained now so S1 can never re-select a descriptor from mutable
+/// PXDE evidence after this boundary.
+pub(crate) struct RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+    same_epoch: RemoteAgentAccessSameEpochLeaseV2,
+    current_final: RemoteAgentCurrentFinalAccessSnapshotV2,
+    exact_pxap: Box<[u8]>,
+}
+
+impl fmt::Debug for RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _retained_authority = (
+            &self.same_epoch,
+            &self.current_final,
+            &self.exact_pxap,
+        );
+        formatter
+            .debug_struct("RemoteAgentAccessCurrentFinalLeaseBundleV2")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn same_epoch_snapshot_for_test(&self) -> &RemoteAgentAccessSnapshotV2 {
+        self.same_epoch.snapshot()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_final_for_test(
+        &self,
+    ) -> &RemoteAgentCurrentFinalAccessSnapshotV2 {
+        &self.current_final
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn exact_pxap_for_test(&self) -> &[u8] {
+        &self.exact_pxap
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RemoteAgentAccessCurrentFinalGenesisBindFailureV2 {
+    InvalidCurrentFacts,
+    State(RemoteAgentAccessStateErrorV2),
+    Store(ManagedFabricStoreError),
+}
+
+/// Failure owns the complete post-readback bundle, including the sole lease
+/// and still-live Pin. A store-currentness failure has already stopped the
+/// store and therefore grants no same-process retry authority.
+pub(crate) struct RemoteAgentAccessCurrentFinalGenesisBindErrorV2<'running> {
+    cause: RemoteAgentAccessCurrentFinalGenesisBindFailureV2,
+    whole: Box<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running>>,
+}
+
+impl fmt::Debug for RemoteAgentAccessCurrentFinalGenesisBindErrorV2<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _retained_whole_authority = self.whole.as_ref();
+        formatter
+            .debug_struct("RemoteAgentAccessCurrentFinalGenesisBindErrorV2")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteAgentAccessCurrentFinalGenesisBindErrorV2<'_> {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn cause_for_test(
+        &self,
+    ) -> &RemoteAgentAccessCurrentFinalGenesisBindFailureV2 {
+        &self.cause
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn whole_for_test(
+        &self,
+    ) -> &RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'_> {
+        self.whole.as_ref()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TerminalSelection {
     outcome: ManagedFabricApplyTerminalOutcomeV1,
@@ -1189,6 +1341,182 @@ impl ManagedFabricRuntimeCore {
             .store
             .initialize_remote_agent_access_v2_at_failpoint(absent, candidate, failpoint);
         self.finish_remote_agent_access_initialization_v2(result)
+    }
+
+    /// Binds the exact sequence-one PXRS readback to one genesis CurrentFinal
+    /// marker. Every comparison before the borrowed store reopen is pure. The
+    /// reopen is the sole fallible boundary after live observation; success
+    /// then consumes the whole authority without another selector or I/O.
+    pub(crate) fn bind_remote_agent_access_current_final_genesis_v2<'running>(
+        &mut self,
+        whole: RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running>,
+    ) -> Result<
+        RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        RemoteAgentAccessCurrentFinalGenesisBindErrorV2<'running>,
+    > {
+        // PURE BORROWED VALIDATION. No lease, Pin, candidate, or bundle is
+        // consumed before every current fact has been compared.
+        let precommit = whole.precommit_live_lower.exact_facts();
+        let post_readback = &whole.post_readback_live_lower;
+        let current_transition_projection_digest =
+            match transition_projection_digest(&self.projection) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                        cause:
+                            RemoteAgentAccessCurrentFinalGenesisBindFailureV2::InvalidCurrentFacts,
+                        whole: Box::new(whole),
+                    });
+                }
+            };
+        if precommit != post_readback
+            || !self.remote_agent_access_s0_mutation_frozen_v2()
+            || precommit.target() != self.projection.target()
+            || precommit.store_instance_id() != self.store_instance_id()
+            || precommit.owner_target_fingerprint() != self.owner_target_fingerprint()
+            || precommit.transition_projection_digest() != current_transition_projection_digest
+            || precommit.runtime_host_epoch() != self.runtime_host_epoch
+            || whole.readback.target() != precommit.target()
+            || whole.readback.store_instance_id() != precommit.store_instance_id()
+            || whole.readback.runtime_host_epoch() != precommit.runtime_host_epoch()
+            || precommit.submit_binding_epoch() == 0
+            || precommit.control_binding_epoch() == 0
+            || precommit.exact_pxap().is_empty()
+            || precommit
+                .intended_client()
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || precommit
+                .retained_s0_census_digest()
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+        {
+            return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                cause: RemoteAgentAccessCurrentFinalGenesisBindFailureV2::InvalidCurrentFacts,
+                whole: Box::new(whole),
+            });
+        }
+        let current_carrier_binding_digest =
+            match whole.precommit_live_lower.exact_carrier_binding_digest() {
+                Some(digest) if digest.as_bytes().iter().any(|byte| *byte != 0) => digest,
+                _ => {
+                    return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                        cause:
+                            RemoteAgentAccessCurrentFinalGenesisBindFailureV2::InvalidCurrentFacts,
+                        whole: Box::new(whole),
+                    });
+                }
+            };
+        let candidate = match RemoteAgentAccessGenesisCandidateV2::try_from_live_lower_v2(
+            &whole.precommit_live_lower,
+        ) {
+            Ok(candidate) => candidate,
+            Err(cause) => {
+                return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                    cause: RemoteAgentAccessCurrentFinalGenesisBindFailureV2::State(cause),
+                    whole: Box::new(whole),
+                });
+            }
+        };
+        let current_s1_cas = match RemoteAgentActiveS1CasV2::try_expect_absent(0, 1) {
+            Ok(cas) => cas,
+            Err(_) => {
+                return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                    cause: RemoteAgentAccessCurrentFinalGenesisBindFailureV2::InvalidCurrentFacts,
+                    whole: Box::new(whole),
+                });
+            }
+        };
+        let exact_readback_s1 = match self
+            .verify_remote_agent_access_initialized_absent_candidate_v2(
+                whole.readback.committed_snapshot(),
+                whole.readback.committed_canonical_wire(),
+            ) {
+            Ok(cas) => cas,
+            Err(_) => {
+                return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                    cause: RemoteAgentAccessCurrentFinalGenesisBindFailureV2::InvalidCurrentFacts,
+                    whole: Box::new(whole),
+                });
+            }
+        };
+        if candidate.snapshot() != whole.readback.committed_snapshot()
+            || candidate.snapshot().canonical_wire() != whole.readback.committed_canonical_wire()
+            || whole.readback.initial_absent_s1_cas() != current_s1_cas
+            || exact_readback_s1 != current_s1_cas
+        {
+            return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                cause: RemoteAgentAccessCurrentFinalGenesisBindFailureV2::InvalidCurrentFacts,
+                whole: Box::new(whole),
+            });
+        }
+
+        let current_identity = RemoteAgentAccessSnapshotIdentityPinsV2 {
+            target: precommit.target(),
+            store_instance_id: precommit.store_instance_id(),
+            owner_target_fingerprint: precommit.owner_target_fingerprint(),
+            transition_projection_digest: precommit.transition_projection_digest(),
+            lower_capability_projection_digest: precommit.lower_capability_projection_digest(),
+        };
+        let current_runtime_host_epoch = precommit.runtime_host_epoch();
+        let current_retained_s0_cas = precommit.retained_s0_cas();
+        let current_retained_s0_census_digest = precommit.retained_s0_census_digest();
+        let current_submit_binding_epoch = precommit.submit_binding_epoch();
+        let current_control_binding_epoch = precommit.control_binding_epoch();
+        let current_intended_client = precommit.intended_client();
+
+        // SOLE FALLIBLE POST-OBSERVATION BOUNDARY: one borrowed named-final
+        // reopen. Any failure has already stopped the store.
+        if let Err(cause) = self
+            .store
+            .revalidate_remote_agent_access_same_epoch_v2(&whole.readback.same_epoch)
+        {
+            return Err(RemoteAgentAccessCurrentFinalGenesisBindErrorV2 {
+                cause: RemoteAgentAccessCurrentFinalGenesisBindFailureV2::Store(cause),
+                whole: Box::new(whole),
+            });
+        }
+
+        // INFALLIBLE CONSUMPTION: destructure the whole value, mint the named
+        // seal, construct CurrentFinal, then and only then release the Pin.
+        let RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2 {
+            readback,
+            precommit_live_lower,
+            post_readback_live_lower: _,
+        } = whole;
+        let RemoteAgentAccessInitializedAbsentReadbackV2 {
+            same_epoch,
+            target: _,
+            store_instance_id: _,
+            runtime_host_epoch: _,
+            initial_absent_s1_cas: _,
+        } = readback;
+        let RemoteAgentLiveLowerCurrentFinalGenesisPartsV2 {
+            carrier_pin,
+            exact_pxap,
+        } = precommit_live_lower.into_current_final_genesis_parts_v2();
+        let seal = RemoteAgentAccessRevalidatedCurrentFinalGenesisV2 {
+            snapshot: candidate.into_snapshot(),
+            current_identity,
+            current_runtime_host_epoch,
+            current_retained_s0_cas,
+            current_retained_s0_census_digest,
+            current_submit_binding_epoch,
+            current_control_binding_epoch,
+            current_carrier_binding_digest,
+            current_intended_client,
+            current_s1_cas,
+        };
+        let current_final =
+            RemoteAgentCurrentFinalAccessSnapshotV2::from_revalidated_genesis_v2(seal);
+        drop(carrier_pin);
+        Ok(RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+            same_epoch,
+            current_final,
+            exact_pxap,
+        })
     }
 
     /// After the first PXAR-v7 marker has been durably published and exactly
@@ -3073,7 +3401,7 @@ mod tests {
             .expect("missing post-readback genesis bundle");
         let tail = &source[start..];
         let end = tail
-            .find("\n#[derive(Clone, Copy)]\nstruct TerminalSelection")
+            .find("\n/// Named, move-only proof that the exact genesis readback")
             .expect("missing post-readback genesis bundle boundary");
         let bundle = &tail[..end];
 
@@ -3122,6 +3450,103 @@ mod tests {
             .expect("exact success must retain the one-shot named-final readback");
         assert!(latch < core_redecode && core_redecode < bundle_mint);
         assert!(!finish.contains("return Ok(same_epoch)"));
+    }
+
+    #[test]
+    fn current_final_genesis_binder_reopens_once_then_consumes_infallibly() {
+        let source = include_str!("managed_fabric_runtime.rs");
+        let start = source
+            .find("    pub(crate) fn bind_remote_agent_access_current_final_genesis_v2<")
+            .expect("missing genesis CurrentFinal binder");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n    /// After the first PXAR-v7 marker")
+            .expect("missing genesis CurrentFinal binder boundary");
+        let binder = &tail[..end];
+
+        let pure = binder
+            .find("// PURE BORROWED VALIDATION")
+            .expect("missing pure validation boundary");
+        let remint = binder
+            .find("RemoteAgentAccessGenesisCandidateV2::try_from_live_lower_v2(")
+            .expect("missing same-LiveLower candidate remint");
+        let revalidate = binder
+            .find(".revalidate_remote_agent_access_same_epoch_v2(")
+            .expect("missing borrowed named-final reopen");
+        let destructure = binder
+            .find("let RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2 {")
+            .expect("missing whole-bundle destructure");
+        let seal = binder
+            .find("let seal = RemoteAgentAccessRevalidatedCurrentFinalGenesisV2 {")
+            .expect("missing named genesis seal");
+        let current_final = binder
+            .find("RemoteAgentCurrentFinalAccessSnapshotV2::from_revalidated_genesis_v2(seal)")
+            .expect("missing sealed CurrentFinal constructor");
+        let drop_pin = binder
+            .find("drop(carrier_pin);")
+            .expect("missing explicit post-CurrentFinal Pin release");
+        let success = binder
+            .find("Ok(RemoteAgentAccessCurrentFinalLeaseBundleV2 {")
+            .expect("missing sole-lease success bundle");
+        assert!(
+            pure < remint
+                && remint < revalidate
+                && revalidate < destructure
+                && destructure < seal
+                && seal < current_final
+                && current_final < drop_pin
+                && drop_pin < success
+        );
+        assert_eq!(
+            binder
+                .match_indices(".revalidate_remote_agent_access_same_epoch_v2(")
+                .count(),
+            1,
+        );
+        assert!(!binder[revalidate..].contains('?'));
+        for exact in [
+            "precommit != post_readback",
+            "remote_agent_access_s0_mutation_frozen_v2()",
+            "candidate.snapshot() != whole.readback.committed_snapshot()",
+            "candidate.snapshot().canonical_wire() != whole.readback.committed_canonical_wire()",
+            "whole.readback.initial_absent_s1_cas() != current_s1_cas",
+            "exact_carrier_binding_digest()",
+            "retained_s0_census_digest()",
+            "submit_binding_epoch()",
+            "control_binding_epoch()",
+            "intended_client()",
+        ] {
+            assert!(binder.contains(exact), "binder lost pure pin: {exact}");
+        }
+
+        let wrapper_start = source
+            .find("pub(crate) struct RemoteAgentAccessCurrentFinalLeaseBundleV2 {")
+            .expect("missing CurrentFinal lease bundle");
+        let wrapper_tail = &source[wrapper_start..];
+        let wrapper_end = wrapper_tail
+            .find("\n#[derive(Debug)]\npub(crate) enum RemoteAgentAccessCurrentFinalGenesisBindFailureV2")
+            .expect("missing CurrentFinal lease bundle boundary");
+        let wrapper = &wrapper_tail[..wrapper_end];
+        assert!(wrapper.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
+        assert!(wrapper.contains("current_final: RemoteAgentCurrentFinalAccessSnapshotV2"));
+        assert!(wrapper.contains("exact_pxap: Box<[u8]>"));
+        assert!(!wrapper.contains("#[derive(Clone"));
+        assert!(!wrapper.contains("impl Clone"));
+        assert!(!wrapper.contains("impl Copy"));
+        assert!(!wrapper.contains("pub(crate) fn into_"));
+        assert!(!wrapper.contains("pub(crate) fn same_epoch"));
+
+        let error_start = source
+            .find("pub(crate) struct RemoteAgentAccessCurrentFinalGenesisBindErrorV2<")
+            .expect("missing owned CurrentFinal bind error");
+        let error_tail = &source[error_start..];
+        let error_end = error_tail
+            .find("\nimpl fmt::Debug for RemoteAgentAccessCurrentFinalGenesisBindErrorV2")
+            .expect("missing owned CurrentFinal bind error boundary");
+        let error = &error_tail[..error_end];
+        assert!(error.contains(
+            "whole: Box<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running>>"
+        ));
     }
 
     #[test]

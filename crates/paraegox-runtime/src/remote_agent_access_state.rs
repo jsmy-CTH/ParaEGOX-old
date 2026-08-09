@@ -20,7 +20,7 @@ use core::fmt;
 
 use paraegox_kernel::{
     digest::Digest32,
-    identity::RuntimeHostId,
+    identity::{PrincipalRef, RuntimeHostId},
     time::{ClockDomainRef, ClockGeneration, ClockReading},
 };
 use paraegox_runtime_contracts::{
@@ -52,6 +52,7 @@ use crate::{
         VerifiedRemoteAgentAccessApplyIngressV2, VerifiedRemoteAgentDataPlaneApplyIngressV1,
         VerifiedRemoteAgentDataPlaneTerminalIngressV2,
     },
+    managed_fabric_runtime::RemoteAgentAccessRevalidatedCurrentFinalGenesisV2,
     managed_agent_stack_state::{
         MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES, ManagedAgentStackDurablePhase,
         ManagedAgentStackSnapshot, ManagedAgentStackStateError,
@@ -1896,9 +1897,9 @@ pub(crate) struct RemoteAgentAccessSnapshotV2 {
     snapshot_digest: Digest32,
 }
 
-/// D2 will construct this non-cloneable marker only after exact named-final
-/// readback and live S0/current-epoch verification. D1 deliberately exposes no
-/// production constructor, so raw decode cannot acquire transition authority.
+/// Non-cloneable CurrentFinal authority. Production genesis construction can
+/// consume only D2's exact named-final, same-epoch revalidation seal; raw decode
+/// and loose currentness facts cannot acquire this transition authority.
 pub(crate) struct RemoteAgentCurrentFinalAccessSnapshotV2 {
     snapshot: RemoteAgentAccessSnapshotV2,
     current_identity: RemoteAgentAccessSnapshotIdentityPinsV2,
@@ -1907,6 +1908,9 @@ pub(crate) struct RemoteAgentCurrentFinalAccessSnapshotV2 {
     current_retained_s0_census_digest: Digest32,
     current_submit_binding_epoch: u64,
     current_control_binding_epoch: u64,
+    current_carrier_binding_digest: Digest32,
+    current_intended_client: PrincipalRef,
+    current_s1_cas: RemoteAgentActiveS1CasV2,
 }
 
 /// Fresh-only authenticated request marker retained inside one authorized
@@ -2510,9 +2514,106 @@ impl RemoteAgentAccessSnapshotV2 {
             _ => Err(RemoteAgentAccessStateErrorV2::OperationInProgress),
         }
     }
+
+    /// Resolves the durable S1 root which an exact-current store marker must
+    /// carry. Root publication changes only with a successful terminal value;
+    /// a nonterminal value therefore retains its admitted `expected_s1_cas`.
+    /// This is a durable-state invariant, not a substitute for live S1
+    /// observation. Uncertain and quarantine states remain unrecoverable here.
+    fn resolved_current_s1_for_current_final_marker_v2(
+        &self,
+    ) -> Result<RemoteAgentActiveS1CasV2, RemoteAgentAccessStateErrorV2> {
+        match self.resolved_current_s1_cas() {
+            Err(RemoteAgentAccessStateErrorV2::OperationInProgress) => Ok(self.expected_s1_cas),
+            result => result,
+        }
+    }
 }
 
 impl RemoteAgentCurrentFinalAccessSnapshotV2 {
+    /// Consumes the sole store-owned, same-epoch genesis seal. No raw snapshot
+    /// or loose currentness fact can construct production CurrentFinal authority.
+    #[must_use]
+    pub(crate) fn from_revalidated_genesis_v2(
+        seal: RemoteAgentAccessRevalidatedCurrentFinalGenesisV2,
+    ) -> Self {
+        let parts = seal.into_parts();
+        Self {
+            snapshot: parts.snapshot,
+            current_identity: parts.current_identity,
+            current_runtime_host_epoch: parts.current_runtime_host_epoch,
+            current_retained_s0_cas: parts.current_retained_s0_cas,
+            current_retained_s0_census_digest: parts.current_retained_s0_census_digest,
+            current_submit_binding_epoch: parts.current_submit_binding_epoch,
+            current_control_binding_epoch: parts.current_control_binding_epoch,
+            current_carrier_binding_digest: parts.current_carrier_binding_digest,
+            current_intended_client: parts.current_intended_client,
+            current_s1_cas: parts.current_s1_cas,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn snapshot_for_test(&self) -> &RemoteAgentAccessSnapshotV2 {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_identity_for_test(
+        &self,
+    ) -> RemoteAgentAccessSnapshotIdentityPinsV2 {
+        self.current_identity
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_runtime_host_epoch_for_test(&self) -> u64 {
+        self.current_runtime_host_epoch
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_retained_s0_cas_for_test(&self) -> RemoteAgentRetainedS0CasV2 {
+        self.current_retained_s0_cas
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_retained_s0_census_digest_for_test(&self) -> Digest32 {
+        self.current_retained_s0_census_digest
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_submit_binding_epoch_for_test(&self) -> u64 {
+        self.current_submit_binding_epoch
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_control_binding_epoch_for_test(&self) -> u64 {
+        self.current_control_binding_epoch
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_carrier_binding_digest_for_test(&self) -> Digest32 {
+        self.current_carrier_binding_digest
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_intended_client_for_test(&self) -> PrincipalRef {
+        self.current_intended_client
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn current_s1_cas_for_test(&self) -> RemoteAgentActiveS1CasV2 {
+        self.current_s1_cas
+    }
+
     /// Test-only stand-in for the exact D2 store/readback marker. Keeping this
     /// constructor out of production is the D1 proof that raw decode is inert.
     #[cfg(test)]
@@ -2524,6 +2625,9 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
         current_retained_s0_census_digest: Digest32,
         current_submit_binding_epoch: u64,
         current_control_binding_epoch: u64,
+        current_carrier_binding_digest: Digest32,
+        current_intended_client: PrincipalRef,
+        current_s1_cas: RemoteAgentActiveS1CasV2,
     ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
         if current_runtime_host_epoch == 0
             || current_identity
@@ -2539,6 +2643,11 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
             || digest_is_zero(current_identity.transition_projection_digest)
             || digest_is_zero(current_identity.lower_capability_projection_digest)
             || digest_is_zero(current_retained_s0_census_digest)
+            || digest_is_zero(current_carrier_binding_digest)
+            || current_intended_client
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
             || current_submit_binding_epoch == 0
             || current_control_binding_epoch == 0
         {
@@ -2552,6 +2661,9 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
             current_retained_s0_census_digest,
             current_submit_binding_epoch,
             current_control_binding_epoch,
+            current_carrier_binding_digest,
+            current_intended_client,
+            current_s1_cas,
         })
     }
 
@@ -2561,6 +2673,16 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
             || self.snapshot.retained_s0_cas != self.current_retained_s0_cas
             || self.snapshot.submit_binding_epoch != self.current_submit_binding_epoch
             || self.snapshot.control_binding_epoch != self.current_control_binding_epoch
+            || digest_is_zero(self.current_carrier_binding_digest)
+            || self
+                .current_intended_client
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || self
+                .snapshot
+                .resolved_current_s1_for_current_final_marker_v2()?
+                != self.current_s1_cas
         {
             return Err(RemoteAgentAccessStateErrorV2::InvalidCurrentFinalMarker);
         }
@@ -2576,21 +2698,32 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
         durable_replay_checked: RemoteAgentDurableReplayCheckedV2,
     ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
         self.validate_marker()?;
+        let live_carrier_binding_digest = verified_ingress
+            .carrier_binding_digest()
+            .ok_or(RemoteAgentAccessStateErrorV2::InvalidFreshRequest)?;
+        if live_carrier_binding_digest != self.current_carrier_binding_digest {
+            return Err(RemoteAgentAccessStateErrorV2::CasMismatch);
+        }
         let current = self.snapshot;
         let fresh = bind_fresh_request_v2(&verified_ingress, self.current_runtime_host_epoch)?;
         let request = fresh.request;
+        let inner = inner_request_v2(request)?;
+        let resolved_current_s1_cas = current.resolved_current_s1_cas()?;
         if request.kind() != RemoteAgentAccessKindV2::ApplyRemoteAccess
             || request.target() != current.identity.target
             || request.expected_runtime_store_instance_id() != current.identity.store_instance_id
             || request.expected_runtime_host_epoch() != self.current_runtime_host_epoch
             || request.retained_s0_cas() != self.current_retained_s0_cas
-            || request.expected_s1_cas() != current.resolved_current_s1_cas()?
+            || inner.target_execution().profile().mac_agent_client_principal()
+                != self.current_intended_client
+            || request.expected_s1_cas() != self.current_s1_cas
+            || inner.target_execution().expected_s1_cas() != self.current_s1_cas
+            || resolved_current_s1_cas != self.current_s1_cas
         {
             return Err(RemoteAgentAccessStateErrorV2::CasMismatch);
         }
         durable_replay_checked.validate(&current, &fresh)?;
         validate_fresh_replay_fence_v2(&current, &fresh)?;
-        let inner = inner_request_v2(request)?;
         let mode = inner.target_execution().mode();
         let current_head = current.resolved_active_head_for_replacement()?;
         match (mode, current_head.as_ref()) {
@@ -7398,6 +7531,9 @@ mod tests {
             retained_s0_census_digest: Digest32,
             submit_binding_epoch: u64,
             control_binding_epoch: u64,
+            carrier_binding_digest: Digest32,
+            intended_client: PrincipalRef,
+            current_s1_cas: RemoteAgentActiveS1CasV2,
         }
 
         fn current_final_v2(
@@ -7405,6 +7541,8 @@ mod tests {
             mutate: impl FnOnce(&mut CurrentFinalFactsV2),
         ) -> Result<RemoteAgentCurrentFinalAccessSnapshotV2, RemoteAgentAccessStateErrorV2>
         {
+            let live_request = active_request_v2();
+            let current_s1_cas = snapshot.resolved_current_s1_for_current_final_marker_v2()?;
             let mut facts = CurrentFinalFactsV2 {
                 identity: snapshot.identity,
                 runtime_host_epoch: snapshot.writer_runtime_host_epoch,
@@ -7412,6 +7550,12 @@ mod tests {
                 retained_s0_census_digest: Digest32::from_bytes([0xd4; 32]),
                 submit_binding_epoch: snapshot.submit_binding_epoch,
                 control_binding_epoch: snapshot.control_binding_epoch,
+                carrier_binding_digest: live_request.carrier().binding_digest(),
+                intended_client: inner_request_v2(&live_request)?
+                    .target_execution()
+                    .profile()
+                    .mac_agent_client_principal(),
+                current_s1_cas,
             };
             mutate(&mut facts);
             RemoteAgentCurrentFinalAccessSnapshotV2::from_exact_readback_for_test(
@@ -7422,6 +7566,9 @@ mod tests {
                 facts.retained_s0_census_digest,
                 facts.submit_binding_epoch,
                 facts.control_binding_epoch,
+                facts.carrier_binding_digest,
+                facts.intended_client,
+                facts.current_s1_cas,
             )
         }
 
@@ -8549,6 +8696,115 @@ mod tests {
         }
 
         #[test]
+        fn pxrs2_fresh_authorization_binds_fixed_live_carrier_and_intended_client() {
+            let request = active_request_v2();
+            assert!(matches!(
+                authorize_on_snapshot_v2(
+                    initial_snapshot_v2(),
+                    &request,
+                    clock_for_request_v2(&request, 7),
+                    |facts| {
+                        facts.carrier_binding_digest = Digest32::from_bytes([0xb1; 32]);
+                    },
+                ),
+                Err(RemoteAgentAccessStateErrorV2::CasMismatch)
+            ));
+            assert!(matches!(
+                authorize_on_snapshot_v2(
+                    initial_snapshot_v2(),
+                    &request,
+                    clock_for_request_v2(&request, 7),
+                    |facts| {
+                        facts.intended_client = PrincipalRef::from_bytes([0xb2; 16]);
+                    },
+                ),
+                Err(RemoteAgentAccessStateErrorV2::CasMismatch)
+            ));
+        }
+
+        #[test]
+        fn pxrs2_current_final_rejects_s1_root_drift_and_invalid_live_facts() {
+            let request = active_request_v2();
+            assert!(matches!(
+                authorize_on_snapshot_v2(
+                    initial_snapshot_v2(),
+                    &request,
+                    clock_for_request_v2(&request, 7),
+                    |facts| {
+                        facts.current_s1_cas = RemoteAgentActiveS1CasV2::try_expect_absent(0, 2)
+                            .unwrap_or_else(|error| {
+                                panic!("alternate current S1 CAS rejected: {error}")
+                            });
+                    },
+                ),
+                Err(RemoteAgentAccessStateErrorV2::InvalidCurrentFinalMarker)
+            ));
+            assert!(matches!(
+                current_final_v2(initial_snapshot_v2(), |facts| {
+                    facts.carrier_binding_digest = Digest32::from_bytes([0; 32]);
+                }),
+                Err(RemoteAgentAccessStateErrorV2::InvalidCurrentFinalMarker)
+            ));
+            assert!(matches!(
+                current_final_v2(initial_snapshot_v2(), |facts| {
+                    facts.intended_client = PrincipalRef::from_bytes([0; 16]);
+                }),
+                Err(RemoteAgentAccessStateErrorV2::InvalidCurrentFinalMarker)
+            ));
+        }
+
+        #[test]
+        fn pxrs2_current_final_production_authority_has_one_sealed_constructor() {
+            let source = include_str!("remote_agent_access_state.rs");
+            let marker_name = "pub(crate) struct RemoteAgentCurrentFinalAccessSnapshotV2";
+            let marker_offset = source
+                .find(marker_name)
+                .unwrap_or_else(|| panic!("CurrentFinal marker declaration missing"));
+            let marker_declaration = source[..marker_offset]
+                .rsplit_once("\n\n")
+                .map_or(&source[..marker_offset], |(_, declaration)| declaration);
+            assert!(!marker_declaration.contains("#[derive(Clone"));
+            assert!(!marker_declaration.contains("#[derive(Copy"));
+
+            let constructor_name = "pub(crate) fn from_revalidated_genesis_v2(";
+            assert_eq!(source.matches(constructor_name).count(), 1);
+            let constructor_tail = source
+                .split_once(constructor_name)
+                .map(|(_, tail)| tail)
+                .unwrap_or_else(|| panic!("sealed CurrentFinal constructor missing"));
+            let (signature, constructor_tail) = constructor_tail
+                .split_once(") -> Self {")
+                .unwrap_or_else(|| panic!("sealed CurrentFinal signature missing"));
+            assert!(signature.contains("RemoteAgentAccessRevalidatedCurrentFinalGenesisV2"));
+            assert!(!signature.contains("RemoteAgentAccessSnapshotV2"));
+            assert!(!signature.contains("Digest32"));
+            assert!(!signature.contains("PrincipalRef"));
+            assert!(!signature.contains("RemoteAgentActiveS1CasV2"));
+            let constructor = constructor_tail
+                .split_once("/// Test-only stand-in")
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("sealed CurrentFinal body missing"));
+            assert!(constructor.contains("let parts = seal.into_parts();"));
+            for field in [
+                "snapshot",
+                "current_identity",
+                "current_runtime_host_epoch",
+                "current_retained_s0_cas",
+                "current_retained_s0_census_digest",
+                "current_submit_binding_epoch",
+                "current_control_binding_epoch",
+                "current_carrier_binding_digest",
+                "current_intended_client",
+                "current_s1_cas",
+            ] {
+                assert!(constructor.contains(&format!("parts.{field}")));
+            }
+            assert!(source.contains(
+                "#[cfg(test)]\n    fn from_exact_readback_for_test("
+            ));
+        }
+
+        #[test]
         fn pxrs2_public_outer_marker_and_raw_clock_cannot_bypass_private_apply_admission() {
             let source = include_str!("remote_agent_access_state.rs");
             let signature_start = source
@@ -8614,9 +8870,25 @@ mod tests {
                         .map(|(implementation, _)| implementation)
                 })
                 .unwrap_or_else(|| panic!("fresh transition implementation missing"));
+            let normalized_fresh_transition = fresh_transition
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             let build = fresh_transition
                 .find("let snapshot = RemoteAgentAccessSnapshotV2::try_build")
                 .unwrap_or_else(|| panic!("fresh Pending build missing"));
+            for exact_check in [
+                "live_carrier_binding_digest != self.current_carrier_binding_digest",
+                "inner.target_execution().profile().mac_agent_client_principal() != self.current_intended_client",
+                "request.expected_s1_cas() != self.current_s1_cas",
+                "inner.target_execution().expected_s1_cas() != self.current_s1_cas",
+                "resolved_current_s1_cas != self.current_s1_cas",
+            ] {
+                assert!(
+                    normalized_fresh_transition.contains(exact_check),
+                    "fresh CurrentFinal check missing: {exact_check}",
+                );
+            }
             let release = fresh_transition
                 .find("drop(verified_ingress);")
                 .unwrap_or_else(|| panic!("fresh live carrier Pin release missing"));

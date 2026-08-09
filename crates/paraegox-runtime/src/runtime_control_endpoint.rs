@@ -140,7 +140,8 @@ use crate::{
     managed_agent_transport::AgentConversationPortDescriptorV1,
     managed_fabric_runtime::{
         ManagedFabricApplyOutcome, ManagedFabricOwnerConfig, ManagedFabricRuntimeCore,
-        ManagedFabricRuntimeError, RemoteAgentAccessGenesisInitializeErrorV2,
+        ManagedFabricRuntimeError, RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        RemoteAgentAccessGenesisInitializeErrorV2,
         RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2, transition_projection_digest,
     },
     managed_fabric_state::{ManagedFabricSnapshot, ManagedFabricStateError},
@@ -546,9 +547,42 @@ impl<'running> RemoteAgentLiveLowerProjectionV2<'running> {
         &self.facts
     }
 
+    /// Revalidates the live endpoint Pin on every call and returns its exact
+    /// carrier digest only when it still equals the protected live facts.
+    /// Neither a recovered PXRS value nor a caller-supplied raw carrier can
+    /// satisfy this check.
+    #[must_use]
+    pub(crate) fn exact_carrier_binding_digest(&self) -> Option<Digest32> {
+        let current = self.carrier_pin.exact_carrier()?.binding_digest();
+        (current == self.facts.carrier_binding_digest).then_some(current)
+    }
+
     fn carrier_pin(&self) -> &RuntimeRestrictedApplyCarrierPinV1<'running> {
         &self.carrier_pin
     }
+
+    /// Consumes the live-lower marker only after the managed owner has
+    /// completed its final borrowed store revalidation. The result retains
+    /// exactly the still-live Pin and canonical PXAP bytes needed by the
+    /// genesis-only CurrentFinal boundary; all other observation facts are
+    /// deliberately discarded rather than exposed as a second authority.
+    pub(crate) fn into_current_final_genesis_parts_v2(
+        self,
+    ) -> RemoteAgentLiveLowerCurrentFinalGenesisPartsV2<'running> {
+        let Self { carrier_pin, facts } = self;
+        let RemoteAgentLiveLowerFactsV2 { exact_pxap, .. } = facts;
+        RemoteAgentLiveLowerCurrentFinalGenesisPartsV2 {
+            carrier_pin,
+            exact_pxap,
+        }
+    }
+}
+
+/// Narrow consumed form used only by the genesis CurrentFinal binder. This is
+/// move-only and retains no raw carrier getter or reusable live observation.
+pub(crate) struct RemoteAgentLiveLowerCurrentFinalGenesisPartsV2<'running> {
+    pub(crate) carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    pub(crate) exact_pxap: Box<[u8]>,
 }
 
 impl RemoteAgentCurrentOwnerObservationV2 {
@@ -2279,9 +2313,9 @@ impl ManagedFabricControlService {
     }
 
     /// Initializes PXRS genesis between two complete live-lower observations.
-    /// The returned authority remains move-only and retains both the exact
-    /// SameEpoch lease and this same endpoint Pin for the future binder.
-    pub(crate) async fn initialize_remote_agent_access_genesis_v2<'running>(
+    /// Any post-commit observation failure is fail-stop Unavailable: PXRS stays
+    /// committed, the core stays frozen, and no retry authority is claimed.
+    async fn initialize_remote_agent_access_genesis_v2<'running>(
         &mut self,
         carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
     ) -> Result<
@@ -2303,6 +2337,24 @@ impl ManagedFabricControlService {
             .map_err(|_| RuntimeControlRequestError::Unavailable)?;
         initialized
             .try_verify_post_readback_v2(post_readback)
+            .map_err(|_| RuntimeControlRequestError::Unavailable)
+    }
+
+    /// Sole composition root for sequence-one PXRS genesis and CurrentFinal.
+    /// The intermediate post-readback bundle never escapes this production
+    /// path: it is handed immediately to the managed owner for the one final
+    /// borrowed store reopen and consuming bind.
+    pub(crate) async fn initialize_and_bind_remote_agent_access_current_final_genesis_v2<
+        'running,
+    >(
+        &mut self,
+        carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    ) -> Result<RemoteAgentAccessCurrentFinalLeaseBundleV2, RuntimeControlRequestError> {
+        let whole = self
+            .initialize_remote_agent_access_genesis_v2(carrier_pin)
+            .await?;
+        self.core
+            .bind_remote_agent_access_current_final_genesis_v2(whole)
             .map_err(|_| RuntimeControlRequestError::Unavailable)
     }
 
@@ -3679,20 +3731,19 @@ fn authenticate_managed_serving_request(
         .map_err(|_| RuntimeControlRequestError::Rejected)
 }
 
-// Compile-only boundary for the latent move-only genesis chain and the exact
-// facts consumed by its future binder. Referencing function items keeps the
-// complete production types checked without minting a carrier Pin or
-// dispatching initialization.
+// Compile-only boundary for the complete move-only genesis-to-CurrentFinal
+// composition. Referencing the final function item keeps the production path
+// checked without minting a carrier Pin or dispatching initialization.
 const _: () = {
-    fn typecheck_remote_agent_access_genesis_boundary_v2() {
-        let _initialize_remote_agent_access_genesis_v2 =
-            ManagedFabricControlService::initialize_remote_agent_access_genesis_v2;
+    fn typecheck_remote_agent_access_current_final_genesis_boundary_v2() {
+        let _initialize_and_bind_remote_agent_access_current_final_genesis_v2 =
+            ManagedFabricControlService::initialize_and_bind_remote_agent_access_current_final_genesis_v2;
         let _retained_s0_census_digest_v2 = RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;
         let _exact_pxap_v2 = RemoteAgentLiveLowerFactsV2::exact_pxap;
         let _intended_client_v2 = RemoteAgentLiveLowerFactsV2::intended_client;
     }
 
-    let _ = typecheck_remote_agent_access_genesis_boundary_v2;
+    let _ = typecheck_remote_agent_access_current_final_genesis_boundary_v2;
 };
 
 fn managed_terminal_response_wire(
@@ -9337,6 +9388,129 @@ mod tests {
         .unwrap_or_else(|error| panic!("sealed genesis cleanup failed: {error}"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_final_genesis_binder_retains_exact_pxap_fixed_facts_and_sole_lease() {
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut control, dependencies, intended_client) =
+            managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
+        let expected_carrier_binding_digest = dependencies.expected_carrier.binding_digest();
+        let pin =
+            runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
+                .unwrap_or_else(|error| panic!("CurrentFinal genesis Pin rejected: {error}"));
+        let bundle = control
+            .initialize_and_bind_remote_agent_access_current_final_genesis_v2(pin)
+            .await
+            .unwrap_or_else(|error| panic!("CurrentFinal genesis bind failed: {error:?}"));
+
+        assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
+        let current = bundle.current_final_for_test();
+        assert_eq!(
+            current.snapshot_for_test(),
+            bundle.same_epoch_snapshot_for_test(),
+        );
+        assert_eq!(
+            current.snapshot_for_test().phase(),
+            RemoteAgentAccessDurablePhaseV2::InitializedAbsent,
+        );
+        assert_eq!(current.snapshot_for_test().sequence(), 1);
+        assert_eq!(current.snapshot_for_test().previous_snapshot_digest(), None);
+        assert_eq!(current.snapshot_for_test().access_generation_high_water(), 0);
+        assert_eq!(current.snapshot_for_test().owner_slot_revision(), 1);
+        assert_eq!(current.current_identity_for_test().target, TARGET);
+        assert_eq!(
+            current.current_identity_for_test().store_instance_id,
+            STORE_INSTANCE_ID,
+        );
+        assert_eq!(
+            current.current_runtime_host_epoch_for_test(),
+            control.core.runtime_host_epoch(),
+        );
+        assert_eq!(
+            current.current_carrier_binding_digest_for_test(),
+            expected_carrier_binding_digest,
+        );
+        assert_eq!(current.current_intended_client_for_test(), intended_client);
+        assert_eq!(
+            current.current_s1_cas_for_test(),
+            RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                .unwrap_or_else(|error| panic!("fixed CurrentFinal S1 CAS rejected: {error}")),
+        );
+        assert!(
+            current
+                .current_retained_s0_census_digest_for_test()
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        assert_ne!(current.current_submit_binding_epoch_for_test(), 0);
+        assert_ne!(current.current_control_binding_epoch_for_test(), 0);
+        assert!(bundle.exact_pxap_for_test().starts_with(b"PXAP\0\x01"));
+        drop(bundle);
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("CurrentFinal genesis cleanup failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_final_binder_same_bytes_new_inode_is_fail_stop_without_current_final() {
+        let socket_directory = TestSocketDirectory::create();
+        let (state_directory, mut control, dependencies, _intended_client) =
+            managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
+        let pin =
+            runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
+                .unwrap_or_else(|error| panic!("inode-swap genesis Pin rejected: {error}"));
+        let whole = control
+            .initialize_remote_agent_access_genesis_v2(pin)
+            .await
+            .unwrap_or_else(|error| panic!("inode-swap genesis failed: {error:?}"));
+        let final_path = state_directory
+            .path()
+            .join("remote-agent-access.snapshot-v2");
+        let replacement_path = state_directory
+            .path()
+            .join("remote-agent-access.snapshot-v2.current-final-swap");
+        let exact_bytes = fs::read(&final_path)
+            .unwrap_or_else(|error| panic!("PXRS2 inode-swap read failed: {error}"));
+        let original_inode = fs::metadata(&final_path)
+            .unwrap_or_else(|error| panic!("PXRS2 original metadata failed: {error}"))
+            .ino();
+        fs::write(&replacement_path, &exact_bytes)
+            .unwrap_or_else(|error| panic!("PXRS2 inode-swap write failed: {error}"));
+        fs::rename(&replacement_path, &final_path)
+            .unwrap_or_else(|error| panic!("PXRS2 inode-swap rename failed: {error}"));
+        let replacement_inode = fs::metadata(&final_path)
+            .unwrap_or_else(|error| panic!("PXRS2 replacement metadata failed: {error}"))
+            .ino();
+        assert_ne!(original_inode, replacement_inode);
+
+        let error = match control
+            .core
+            .bind_remote_agent_access_current_final_genesis_v2(whole)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("same bytes under a new inode minted CurrentFinal"),
+        };
+        assert!(matches!(
+            error.cause_for_test(),
+            crate::managed_fabric_runtime::RemoteAgentAccessCurrentFinalGenesisBindFailureV2::Store(
+                _,
+            )
+        ));
+        assert_eq!(
+            error.whole_for_test().committed_canonical_wire(),
+            exact_bytes.as_slice(),
+        );
+        assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
+        drop(error);
+        drop(control);
+    }
+
     #[test]
     fn live_lower_source_has_no_raw_selector_and_orders_both_full_observations() {
         let source = include_str!("runtime_control_endpoint.rs");
@@ -9392,8 +9566,8 @@ mod tests {
 
         let orchestrator = section(
             source,
-            "    pub(crate) async fn initialize_remote_agent_access_genesis_v2<'running>(",
-            "    async fn handle_request(",
+            "    async fn initialize_remote_agent_access_genesis_v2<'running>(",
+            "    /// Sole composition root for sequence-one PXRS genesis and CurrentFinal.",
         );
         let pre = orchestrator
             .find("observe_remote_agent_live_lower_projection_v2(carrier_pin)")
@@ -9413,17 +9587,34 @@ mod tests {
                 .match_indices("RuntimeControlRequestError::Unavailable")
                 .count(),
             2,
-            "post-commit drift/failure must be retryable-reconcile, never no-effect rejection",
+            "post-commit drift/failure must be fail-stop Unavailable, never no-effect rejection",
         );
         assert!(!orchestrator.contains("RuntimeControlRequestError::Rejected"));
 
+        let final_orchestrator = section(
+            source,
+            "    pub(crate) async fn initialize_and_bind_remote_agent_access_current_final_genesis_v2<",
+            "    async fn handle_request(",
+        );
+        let post_bundle = final_orchestrator
+            .find(".initialize_remote_agent_access_genesis_v2(carrier_pin)")
+            .unwrap_or_else(|| panic!("post-readback genesis composition disappeared"));
+        let current_final = final_orchestrator
+            .find(".bind_remote_agent_access_current_final_genesis_v2(whole)")
+            .unwrap_or_else(|| panic!("CurrentFinal binder composition disappeared"));
+        assert!(post_bundle < current_final);
+        assert!(final_orchestrator.contains("RemoteAgentAccessCurrentFinalLeaseBundleV2"));
+        assert!(!final_orchestrator.contains(
+            "Result<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2"
+        ));
+
         let compile_boundary = section(
             source,
-            "// Compile-only boundary for the latent move-only genesis chain",
+            "// Compile-only boundary for the complete move-only genesis-to-CurrentFinal",
             "fn managed_terminal_response_wire(",
         );
         for function_item in [
-            "ManagedFabricControlService::initialize_remote_agent_access_genesis_v2;",
+            "ManagedFabricControlService::initialize_and_bind_remote_agent_access_current_final_genesis_v2;",
             "RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;",
             "RemoteAgentLiveLowerFactsV2::exact_pxap;",
             "RemoteAgentLiveLowerFactsV2::intended_client;",
@@ -9434,9 +9625,9 @@ mod tests {
             );
         }
         assert!(compile_boundary.contains("const _: () = {"));
-        assert!(
-            compile_boundary.contains("let _ = typecheck_remote_agent_access_genesis_boundary_v2;")
-        );
+        assert!(compile_boundary.contains(
+            "let _ = typecheck_remote_agent_access_current_final_genesis_boundary_v2;"
+        ));
         assert!(!compile_boundary.contains(".await"));
         assert!(!compile_boundary.contains("RuntimeRestrictedApplyCarrierPinV1::"));
     }
