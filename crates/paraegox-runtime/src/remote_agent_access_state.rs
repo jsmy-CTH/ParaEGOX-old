@@ -1641,9 +1641,7 @@ mod tests {
     use paraegox_kernel::{
         digest::Digest32,
         identity::{PrincipalRef, RuntimeHostId},
-        time::{
-            BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicInstant,
-        },
+        time::{BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicInstant},
     };
     use paraegox_runtime_contracts::{
         apply::{
@@ -1651,8 +1649,7 @@ mod tests {
             TenureProofAlgorithm,
         },
         distributed_agent_stack_plan::{
-            RestrictedRuntimeApplyCarrierBindingFieldsV1,
-            RestrictedRuntimeApplyCarrierBindingV1,
+            RestrictedRuntimeApplyCarrierBindingFieldsV1, RestrictedRuntimeApplyCarrierBindingV1,
         },
         managed_agent_stack_plan::{
             ManagedAgentStackApplyRequestV1, ManagedAgentStackTerminalReceiptV1,
@@ -2373,7 +2370,7 @@ mod tests {
         } else {
             authorized.try_effect_successor(phase, generations)
         }
-            .unwrap_or_else(|error| panic!("valid {phase:?} successor rejected: {error}"));
+        .unwrap_or_else(|error| panic!("valid {phase:?} successor rejected: {error}"));
         assert_eq!(successor.snapshot().sequence(), sequence + 1);
         assert_eq!(
             successor.snapshot().previous_snapshot_digest(),
