@@ -1268,50 +1268,50 @@ fn valid_phase_successor(
         (mode, current, next),
         (_, PreparedNoEffects, NoEffectTerminal)
             | (
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-            PreparedNoEffects,
-            AgentStopIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-            AgentStopIntent,
-            FabricStopIntent | Uncertain | QuarantineIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-            FabricStopIntent,
-            FabricStartIntent | Uncertain | QuarantineIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-            FabricStartIntent,
-            AgentStartIntent | Uncertain | QuarantineIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-            AgentStartIntent,
-            ReadyObservation | Uncertain | QuarantineIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-            ReadyObservation,
-            ActiveReady | Uncertain | QuarantineIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-            PreparedNoEffects,
-            RemoteAccessStopIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-            RemoteAccessStopIntent,
-            ReadyObservation | Uncertain | QuarantineIntent,
-        )
-        | (
-            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-            ReadyObservation,
-            LocalOnlyReady | Uncertain | QuarantineIntent,
-        )
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                PreparedNoEffects,
+                AgentStopIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                AgentStopIntent,
+                FabricStopIntent | Uncertain | QuarantineIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                FabricStopIntent,
+                FabricStartIntent | Uncertain | QuarantineIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                FabricStartIntent,
+                AgentStartIntent | Uncertain | QuarantineIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                AgentStartIntent,
+                ReadyObservation | Uncertain | QuarantineIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
+                ReadyObservation,
+                ActiveReady | Uncertain | QuarantineIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+                PreparedNoEffects,
+                RemoteAccessStopIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+                RemoteAccessStopIntent,
+                ReadyObservation | Uncertain | QuarantineIntent,
+            )
+            | (
+                RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
+                ReadyObservation,
+                LocalOnlyReady | Uncertain | QuarantineIntent,
+            )
             | (_, QuarantineIntent, Quarantined)
     )
 }
