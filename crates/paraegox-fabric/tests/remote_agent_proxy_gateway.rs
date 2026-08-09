@@ -23,7 +23,7 @@ use paraegox_fabric::{
 use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
 use paraegox_runtime_contracts::assignment::{BindingId, SchemaRef};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, watch},
     task::JoinHandle,
     time::Instant,
 };
@@ -886,7 +886,7 @@ fn spawn_link_event_listener(
     deadline: Instant,
 ) -> impl Future<
     Output = (
-        zenoh::session::LinkEventsListener<zenoh::handlers::Callback<LinkEvent>>,
+        zenoh::session::LinkEventsListener<()>,
         mpsc::Receiver<LinkEvent>,
     ),
 > + '_ {
@@ -1105,13 +1105,4 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
         .expect("S0 binding handler must join");
     }
     assert_port_released(s0_socket);
-
-    let (entered_sender, entered_receiver) = oneshot::channel();
-    let (release_sender, release_receiver) = watch::channel(false);
-    drop((
-        entered_sender,
-        entered_receiver,
-        release_sender,
-        release_receiver,
-    ));
 }
