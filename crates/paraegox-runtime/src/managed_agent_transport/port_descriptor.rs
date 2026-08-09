@@ -76,7 +76,10 @@ impl fmt::Display for AgentConversationPortLiveOwnerExportErrorV1 {
                 formatter.write_str("Agent conversation binding census is invalid")
             }
             Self::Descriptor(error) => {
-                write!(formatter, "Agent conversation PXAP validation failed: {error}")
+                write!(
+                    formatter,
+                    "Agent conversation PXAP validation failed: {error}"
+                )
             }
         }
     }
