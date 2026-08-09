@@ -144,6 +144,9 @@ const MAX_LINUX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeFilesystemPolicy {
+    /// Owner-private production policy. The non-root Runtime service account
+    /// and privileged host administration are trusted not to mutate this
+    /// directory outside the exclusive `runtime.lock` writer protocol.
     ProductionReference,
     /// Explicit non-production policy for the single-process DeveloperLocal
     /// launcher.  This changes only the production filesystem-capability
@@ -209,6 +212,90 @@ impl fmt::Debug for RuntimeDirectory {
 struct OpenedRegularFile {
     file: File,
     identity: FileIdentity,
+}
+
+/// Owns one successfully acquired Runtime writer lock until it is either
+/// transferred into a long-lived store owner or an error unwinds the open.
+/// Explicit unlock is required because a fork-like descriptor clone shares
+/// the open-file description and can otherwise outlive `File::drop`.
+struct AcquiredRuntimeLock {
+    file: Option<File>,
+}
+
+impl AcquiredRuntimeLock {
+    fn new(file: File) -> Self {
+        #[cfg(test)]
+        capture_acquired_runtime_lock_clone_for_test(&file);
+        Self { file: Some(file) }
+    }
+
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("acquired Runtime lock must remain armed")
+    }
+
+    fn into_owner_file(mut self) -> File {
+        self.file
+            .take()
+            .expect("acquired Runtime lock must transfer exactly once")
+    }
+}
+
+impl Drop for AcquiredRuntimeLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.as_ref() {
+            let _ = file.unlock();
+        }
+    }
+}
+
+#[cfg(test)]
+enum AcquiredRuntimeLockCloneProbe {
+    Idle,
+    Armed,
+    Captured(File),
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ACQUIRED_RUNTIME_LOCK_CLONE_PROBE: std::cell::RefCell<AcquiredRuntimeLockCloneProbe> =
+        const { std::cell::RefCell::new(AcquiredRuntimeLockCloneProbe::Idle) };
+}
+
+#[cfg(test)]
+fn arm_acquired_runtime_lock_clone_probe() {
+    ACQUIRED_RUNTIME_LOCK_CLONE_PROBE.with(|probe| {
+        let previous = probe.replace(AcquiredRuntimeLockCloneProbe::Armed);
+        assert!(
+            matches!(previous, AcquiredRuntimeLockCloneProbe::Idle),
+            "acquired Runtime lock clone probe must be idle before arming"
+        );
+    });
+}
+
+#[cfg(test)]
+fn capture_acquired_runtime_lock_clone_for_test(file: &File) {
+    ACQUIRED_RUNTIME_LOCK_CLONE_PROBE.with(|probe| {
+        let mut probe = probe.borrow_mut();
+        if matches!(*probe, AcquiredRuntimeLockCloneProbe::Armed) {
+            let clone = file
+                .try_clone()
+                .unwrap_or_else(|error| panic!("acquired Runtime lock clone failed: {error}"));
+            *probe = AcquiredRuntimeLockCloneProbe::Captured(clone);
+        }
+    });
+}
+
+#[cfg(test)]
+fn take_acquired_runtime_lock_clone_probe() -> File {
+    ACQUIRED_RUNTIME_LOCK_CLONE_PROBE.with(|probe| {
+        let captured = probe.replace(AcquiredRuntimeLockCloneProbe::Idle);
+        let AcquiredRuntimeLockCloneProbe::Captured(file) = captured else {
+            panic!("acquired Runtime lock clone probe did not capture a descriptor");
+        };
+        file
+    })
 }
 
 struct ActiveSnapshot {
@@ -659,6 +746,9 @@ enum RuntimeStoreState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimePublishMode {
     RequireMissing,
+    /// Rechecked under the caller's held exclusive `runtime.lock`. This is an
+    /// owner-protocol continuity check, not a filesystem CAS against a same-uid
+    /// or privileged process that bypasses the advisory lock.
     ReplaceExisting(FileIdentity),
 }
 
@@ -1702,6 +1792,7 @@ impl RuntimeStore {
                 &error,
             )),
         })?;
+        let lock_file = AcquiredRuntimeLock::new(lock_file);
         validate_named_file_identity(
             &directory,
             LOCK_FILE_NAME,
@@ -1723,7 +1814,7 @@ impl RuntimeStore {
 
         Ok(Self {
             directory,
-            lock_file,
+            lock_file: lock_file.into_owner_file(),
             lock_identity,
             active,
             state: RuntimeStoreState::Operational,
@@ -2165,6 +2256,7 @@ impl ManagedFabricStore {
                 &error,
             )),
         })?;
+        let lock_file = AcquiredRuntimeLock::new(lock_file);
         validate_named_file_identity(
             &directory,
             LOCK_FILE_NAME,
@@ -2282,7 +2374,7 @@ impl ManagedFabricStore {
         let active = read_optional_managed_fabric_snapshot(&directory)?;
         Ok(Self {
             directory,
-            lock_file,
+            lock_file: lock_file.into_owner_file(),
             lock_identity,
             marker,
             legacy_snapshot: legacy.snapshot,
@@ -2562,7 +2654,10 @@ impl ManagedFabricStore {
     }
 
     /// Replaces one exact same-epoch final with the single Pending successor
-    /// whose sequence and previous digest extend that exact final.
+    /// whose sequence and previous digest extend that exact final. "Exact" is
+    /// scoped to Runtime writers honoring this owner's held exclusive
+    /// `runtime.lock`; the inode recheck is not a filesystem CAS against a
+    /// same-uid or privileged writer that bypasses that owner protocol.
     pub(crate) fn replace_remote_agent_access_v2(
         &mut self,
         current: RemoteAgentAccessSameEpochLeaseV2,
@@ -4422,6 +4517,7 @@ fn acquire_runtime_migration_guard(
             RuntimeIoFailure::new(RuntimeFileStage::AcquireLock, &error),
         )),
     })?;
+    let lock_file = AcquiredRuntimeLock::new(lock_file);
     validate_named_file_identity(
         &directory,
         LOCK_FILE_NAME,
@@ -4431,7 +4527,7 @@ fn acquire_runtime_migration_guard(
     .map_err(RuntimeStoreMigrationError::Store)?;
     Ok(RuntimeMigrationGuard {
         directory,
-        lock_file,
+        lock_file: lock_file.into_owner_file(),
         lock_identity,
     })
 }
@@ -5479,23 +5575,25 @@ fn create_and_lock_runtime_initializer_lock(
             runtime_marker_consumed_io(RuntimeFileStage::AcquireLock, &error)
         }
     })?;
-    fchmod(&lock_file, PRIVATE_FILE_MODE)
+    let lock_file = AcquiredRuntimeLock::new(lock_file);
+    fchmod(lock_file.file(), PRIVATE_FILE_MODE)
         .map_err(|error| runtime_marker_consumed_nix(RuntimeFileStage::CreateLock, error))?;
     let lock_metadata = lock_file
+        .file()
         .metadata()
         .map_err(|error| runtime_marker_consumed_io(RuntimeFileStage::CreateLock, &error))?;
     validate_regular_file(&lock_metadata, directory.owner_uid, directory.owner_gid)
         .map_err(RuntimeInitializerLockFailure::MarkerConsumed)?;
     let lock_identity = FileIdentity::from_metadata(&lock_metadata);
-    lock_file.sync_all().map_err(|error| {
+    lock_file.file().sync_all().map_err(|error| {
         runtime_marker_consumed_io(RuntimeFileStage::SyncInitializerMarker, &error)
     })?;
     directory.file.sync_all().map_err(|error| {
         runtime_marker_consumed_io(RuntimeFileStage::SyncInitializerMarkerDirectory, &error)
     })?;
-    validate_runtime_initializer_lock_is_only_entry(directory, &lock_file)
+    validate_runtime_initializer_lock_is_only_entry(directory, lock_file.file())
         .map_err(RuntimeInitializerLockFailure::MarkerConsumed)?;
-    Ok((lock_file, lock_identity))
+    Ok((lock_file.into_owner_file(), lock_identity))
 }
 
 fn runtime_marker_consumed_io(
@@ -6992,7 +7090,20 @@ fn publish_temp_name_to(
                 )
             }
         }
-        RuntimePublishMode::ReplaceExisting(_) => {
+        RuntimePublishMode::ReplaceExisting(expected_active_identity) => {
+            // This is the closest diagnostic predecessor revalidation before
+            // the replacing rename. Exclusive `runtime.lock` ownership keeps
+            // participating writers out; renameat itself is not an atomic
+            // identity CAS against a writer that bypasses that protocol.
+            validate_named_file_identity(
+                directory,
+                active_name,
+                expected_active_identity,
+                RuntimeFileStage::ValidateActiveIdentity,
+            )
+            .map_err(|error| {
+                rejected_open_error(RuntimeFileStage::ValidateActiveIdentity, error)
+            })?;
             renameat(&directory.file, temp_name, &directory.file, active_name).map_err(|error| {
                 RuntimePublishFailure::RejectedBeforePublish(RuntimePublishFault::nix(
                     RuntimeFileStage::Rename,
@@ -8852,7 +8963,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn remote_agent_access_v2_replacement_commits_and_reopens_exact_successor() {
+    fn remote_agent_access_v2_replacement_commits_exact_successor_under_held_lock() {
         let (directory, mut store, initial, pending, static_identity, runtime_host_epoch) =
             remote_agent_access_prepared_store_fixture_v2();
         let absent = remote_agent_access_absent_lease_v2(
@@ -11871,6 +11982,80 @@ pub(crate) mod tests {
 
         drop(replacement);
         drop(inherited_lock_reference);
+    }
+
+    #[test]
+    fn post_acquire_open_error_unlocks_while_a_fork_like_descriptor_reference_survives() {
+        let snapshot = sequence_one_snapshot(0x13, 0x24);
+        let directory = fixture_with_snapshot(&snapshot);
+        super::arm_acquired_runtime_lock_clone_probe();
+
+        assert_eq!(
+            RuntimeStore::open_with_policy(
+                directory.path(),
+                [0x14; 32],
+                *snapshot.owner_target_fingerprint(),
+                RuntimeFilesystemPolicy::ExplicitFixture,
+            )
+            .err(),
+            Some(RuntimeStoreOpenError::StoreInstanceMismatch)
+        );
+        let inherited_lock_reference = super::take_acquired_runtime_lock_clone_probe();
+        let replacement = open_fixture(directory.path(), &snapshot).unwrap_or_else(|error| {
+            panic!("post-acquire open error left restart blocked by cloned descriptor: {error}")
+        });
+
+        drop(replacement);
+        drop(inherited_lock_reference);
+    }
+
+    #[test]
+    fn replace_publish_revalidates_predecessor_at_rename_boundary_under_held_lock() {
+        let snapshot = sequence_one_snapshot(0x15, 0x26);
+        let directory = fixture_with_snapshot(&snapshot);
+        let store = open_fixture(directory.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("Runtime store open failed: {error}"));
+        let expected_active_identity = store.active.identity;
+        let candidate_name = temp_name([0x37; TEMP_TOKEN_BYTES]);
+        let candidate_path = directory.path().join(&candidate_name);
+        install_private_file(&candidate_path, b"candidate");
+        let competitor_path = directory.path().join("competing-active-before-replace");
+        install_private_file(&competitor_path, b"competitor");
+        fs::rename(&competitor_path, directory.path().join(ACTIVE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("competing active install failed: {error}"));
+        let competitor_identity = FileIdentity::from_metadata(
+            &fs::metadata(directory.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("competing active metadata failed: {error}")),
+        );
+
+        assert!(matches!(
+            super::publish_temp_name_to(
+                &store.directory,
+                candidate_name.as_str(),
+                ACTIVE_FILE_NAME,
+                super::RuntimePublishMode::ReplaceExisting(expected_active_identity),
+            ),
+            Err(RuntimePublishFailure::RejectedBeforePublish(fault))
+                if fault.stage == RuntimeFileStage::ValidateActiveIdentity
+        ));
+        assert_eq!(
+            FileIdentity::from_metadata(
+                &fs::metadata(directory.path().join(ACTIVE_FILE_NAME)).unwrap_or_else(
+                    |error| panic!("preserved competitor metadata failed: {error}")
+                )
+            ),
+            competitor_identity
+        );
+        assert_eq!(
+            fs::read(directory.path().join(ACTIVE_FILE_NAME))
+                .unwrap_or_else(|error| panic!("preserved competitor read failed: {error}")),
+            b"competitor"
+        );
+        assert_eq!(
+            fs::read(candidate_path)
+                .unwrap_or_else(|error| panic!("preserved candidate read failed: {error}")),
+            b"candidate"
+        );
     }
 
     #[test]
