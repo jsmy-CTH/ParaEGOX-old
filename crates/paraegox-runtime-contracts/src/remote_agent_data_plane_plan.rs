@@ -4374,7 +4374,8 @@ fn validate_terminal_facts_shape_v2(
             !exact_s1_ready_shape && !exact_s1_absent_shape
         }
     };
-    let drain_proof_consistent = fields.drain_outcome != RemoteAgentDataPlaneDrainOutcomeV2::Drained
+    let drain_proof_consistent = fields.drain_outcome
+        != RemoteAgentDataPlaneDrainOutcomeV2::Drained
         || (fields.ingress_fenced_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
             && fields.worker_joined_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
             && fields.submit_admitted_count == fields.submit_terminalized_count
@@ -4422,8 +4423,7 @@ fn validate_terminal_facts_shape_v2(
         }
         NoEffectRejected => {
             no_admitted_work
-                && (!fields.retained_s0_ready
-                    || (current_s0_cas_known && exact_retained_census))
+                && (!fields.retained_s0_ready || (current_s0_cas_known && exact_retained_census))
                 && fields.ingress_fenced_bitmap == 0
                 && fields.worker_joined_bitmap == 0
                 && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::NotStarted
@@ -4551,10 +4551,7 @@ fn validate_terminal_facts_against_execution_v2(
                                     | RemoteAgentDataPlaneRemoteObservationV2::Unknown
                             )
                     }
-                    (
-                        RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate,
-                        Some(active),
-                    ) => {
+                    (RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate, Some(active)) => {
                         state.access_generation() == Some(active.active_access_generation)
                             && state.proxy_session_epoch()
                                 == Some(active.active_proxy_session_epoch)
@@ -4580,16 +4577,12 @@ fn validate_terminal_facts_against_execution_v2(
                             }
                             Some(generation) => {
                                 next_high_water == Some(generation.value())
-                                    && next_high_water
-                                        == Some(fields.access_generation_high_water)
+                                    && next_high_water == Some(fields.access_generation_high_water)
                                     && state.proxy_session_epoch().is_some()
                             }
                         }
                     }
-                    (
-                        RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate,
-                        Some(active),
-                    ) => {
+                    (RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate, Some(active)) => {
                         fields.access_generation_high_water == prior_high_water
                             && match state.access_generation() {
                                 None => state.proxy_session_epoch().is_none(),
