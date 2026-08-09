@@ -70,6 +70,32 @@ enum ReadyPublicationTestInterlock {
     RetireOwnerAfterFinishedProbe,
 }
 
+/// Deterministic test-only pause after the real Fabric observation and before
+/// the Agent owner performs its post-observation liveness checks.
+#[cfg(test)]
+pub(crate) struct LiveConversationPortExportTestInterlockV1 {
+    observation_completed: Arc<tokio::sync::Barrier>,
+    broker_mutation_completed: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl LiveConversationPortExportTestInterlockV1 {
+    pub(crate) fn new(
+        observation_completed: Arc<tokio::sync::Barrier>,
+        broker_mutation_completed: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        Self {
+            observation_completed,
+            broker_mutation_completed,
+        }
+    }
+
+    async fn pause_after_observation(&self) {
+        self.observation_completed.wait().await;
+        self.broker_mutation_completed.wait().await;
+    }
+}
+
 /// Fully resolved, already-admitted Runtime inputs for one Agent service.
 ///
 /// No constructor derives values or supplies defaults. A production caller
@@ -513,6 +539,50 @@ impl ManagedAgentAssembly {
         broker_handle: &RuntimeAgentConversationHandle,
         expected_fabric_generation: ManagedServiceGeneration,
     ) -> Result<AgentConversationPortLiveOwnerExportV1, ManagedAgentAssemblyError> {
+        #[cfg(test)]
+        {
+            return self
+                .export_live_conversation_port_descriptor_inner_v1(
+                    owner_handle,
+                    broker_handle,
+                    expected_fabric_generation,
+                    None,
+                )
+                .await;
+        }
+        #[cfg(not(test))]
+        self.export_live_conversation_port_descriptor_inner_v1(
+            owner_handle,
+            broker_handle,
+            expected_fabric_generation,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn export_live_conversation_port_descriptor_with_interlock_v1(
+        &self,
+        owner_handle: &RuntimeAgentConversationHandle,
+        broker_handle: &RuntimeAgentConversationHandle,
+        expected_fabric_generation: ManagedServiceGeneration,
+        interlock: &LiveConversationPortExportTestInterlockV1,
+    ) -> Result<AgentConversationPortLiveOwnerExportV1, ManagedAgentAssemblyError> {
+        self.export_live_conversation_port_descriptor_inner_v1(
+            owner_handle,
+            broker_handle,
+            expected_fabric_generation,
+            Some(interlock),
+        )
+        .await
+    }
+
+    async fn export_live_conversation_port_descriptor_inner_v1(
+        &self,
+        owner_handle: &RuntimeAgentConversationHandle,
+        broker_handle: &RuntimeAgentConversationHandle,
+        expected_fabric_generation: ManagedServiceGeneration,
+        #[cfg(test)] interlock: Option<&LiveConversationPortExportTestInterlockV1>,
+    ) -> Result<AgentConversationPortLiveOwnerExportV1, ManagedAgentAssemblyError> {
         let port = self
             .port
             .as_ref()
@@ -531,6 +601,10 @@ impl ManagedAgentAssembly {
                 port.export_live_owner_facts_v1(live)
             })
             .await??;
+        #[cfg(test)]
+        if let Some(interlock) = interlock {
+            interlock.pause_after_observation().await;
+        }
         if self.owner_state.load(Ordering::Acquire) != OWNER_READY
             || !self.owns_live_handle(owner_handle, port, expected_fabric_generation)
             || !self.owns_live_handle(broker_handle, port, expected_fabric_generation)

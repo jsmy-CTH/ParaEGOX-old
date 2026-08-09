@@ -43,6 +43,8 @@ use crate::managed_agent_runtime::{
     ManagedAgentAssembly, ManagedAgentAssemblyConfig, ManagedAgentAssemblyError,
     RuntimeAgentConversationHandle,
 };
+#[cfg(test)]
+use crate::managed_agent_runtime::LiveConversationPortExportTestInterlockV1;
 use crate::managed_agent_stack_state::{
     ManagedAgentStackDurableActive, ManagedAgentStackDurablePending, ManagedAgentStackDurablePhase,
     ManagedAgentStackPendingKind, ManagedAgentStackReplayRecord,
@@ -92,8 +94,30 @@ pub(crate) struct RuntimeAgentHandleBroker {
 
 struct PublishedRuntimeAgentHandle {
     handle: RuntimeAgentConversationHandle,
+    publication_identity: Arc<RuntimeAgentHandlePublicationIdentity>,
     committed_receipt_wire: Box<[u8]>,
     restricted_distributed_alias_wire: Option<Box<[u8]>>,
+}
+
+struct RuntimeAgentHandlePublicationIdentity;
+
+/// Owned proof of one exact broker publication. It deliberately is not
+/// Clone: a raw cloned conversation handle cannot preserve publication
+/// authority across an asynchronous owner observation.
+struct RuntimeAgentHandlePublicationClaim {
+    handle: RuntimeAgentConversationHandle,
+    publication_identity: Arc<RuntimeAgentHandlePublicationIdentity>,
+}
+
+impl PublishedRuntimeAgentHandle {
+    fn new(handle: RuntimeAgentConversationHandle, committed_receipt_wire: &[u8]) -> Self {
+        Self {
+            handle,
+            publication_identity: Arc::new(RuntimeAgentHandlePublicationIdentity),
+            committed_receipt_wire: committed_receipt_wire.into(),
+            restricted_distributed_alias_wire: None,
+        }
+    }
 }
 
 impl RuntimeAgentHandleBroker {
@@ -120,6 +144,46 @@ impl RuntimeAgentHandleBroker {
         Ok(guard.as_ref().and_then(|published| {
             (published.committed_receipt_wire.as_ref() == committed_receipt_wire)
                 .then(|| published.handle.clone())
+        }))
+    }
+
+    fn try_claim_publication(
+        &self,
+        committed_receipt_wire: &[u8],
+    ) -> Result<Option<RuntimeAgentHandlePublicationClaim>, ManagedAgentStackRuntimeError> {
+        let receipt = ManagedAgentStackTerminalReceiptV1::decode(committed_receipt_wire)
+            .map_err(|_| ManagedAgentStackRuntimeError::RequestRejected)?;
+        if receipt.facts().state().outcome() != ManagedAgentStackTerminalOutcomeV1::ActiveReady {
+            return Err(ManagedAgentStackRuntimeError::RequestRejected);
+        }
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)?;
+        Ok(guard.as_ref().and_then(|published| {
+            (published.committed_receipt_wire.as_ref() == committed_receipt_wire).then(|| {
+                RuntimeAgentHandlePublicationClaim {
+                    handle: published.handle.clone(),
+                    publication_identity: Arc::clone(&published.publication_identity),
+                }
+            })
+        }))
+    }
+
+    fn retains_publication_claim(
+        &self,
+        claim: &RuntimeAgentHandlePublicationClaim,
+        committed_receipt_wire: &[u8],
+    ) -> Result<bool, ManagedAgentStackRuntimeError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)?;
+        Ok(guard.as_ref().is_some_and(|published| {
+            Arc::ptr_eq(
+                &published.publication_identity,
+                &claim.publication_identity,
+            ) && published.committed_receipt_wire.as_ref() == committed_receipt_wire
         }))
     }
 
@@ -196,11 +260,10 @@ impl RuntimeAgentHandleBroker {
             .inner
             .write()
             .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? =
-            Some(PublishedRuntimeAgentHandle {
+            Some(PublishedRuntimeAgentHandle::new(
                 handle,
-                committed_receipt_wire: receipt.canonical_wire().into(),
-                restricted_distributed_alias_wire: None,
-            });
+                receipt.canonical_wire(),
+            ));
         Ok(())
     }
 
@@ -216,11 +279,10 @@ impl RuntimeAgentHandleBroker {
             .inner
             .write()
             .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? =
-            Some(PublishedRuntimeAgentHandle {
+            Some(PublishedRuntimeAgentHandle::new(
                 handle,
-                committed_receipt_wire: receipt.canonical_wire().into(),
-                restricted_distributed_alias_wire: None,
-            });
+                receipt.canonical_wire(),
+            ));
         Ok(())
     }
 
@@ -277,11 +339,10 @@ impl RuntimeAgentHandleBroker {
             .inner
             .write()
             .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? =
-            Some(PublishedRuntimeAgentHandle {
+            Some(PublishedRuntimeAgentHandle::new(
                 handle,
-                committed_receipt_wire: receipt.canonical_wire().into(),
-                restricted_distributed_alias_wire: None,
-            });
+                receipt.canonical_wire(),
+            ));
         Ok(())
     }
 
@@ -339,6 +400,29 @@ pub(crate) struct RuntimeAgentConversationPortExportV1 {
     pub(crate) submit_binding_epoch: u64,
     pub(crate) control_binding_epoch: u64,
     pub(crate) physical_binding_census: u16,
+}
+
+/// Exact current Agent root selected by the owner itself. This value is owned
+/// and intentionally non-Clone; it contains no conversation handle, route, or
+/// Fabric session capability.
+pub(crate) struct RuntimeAgentCurrentConversationPortExportV2 {
+    active_request: ManagedAgentStackApplyRequestV1,
+    active_terminal_receipt: ManagedAgentStackTerminalReceiptV1,
+    live_port: RuntimeAgentConversationPortExportV1,
+}
+
+impl RuntimeAgentCurrentConversationPortExportV2 {
+    pub(crate) fn active_request(&self) -> &ManagedAgentStackApplyRequestV1 {
+        &self.active_request
+    }
+
+    pub(crate) fn active_terminal_receipt(&self) -> &ManagedAgentStackTerminalReceiptV1 {
+        &self.active_terminal_receipt
+    }
+
+    pub(crate) const fn live_port(&self) -> &RuntimeAgentConversationPortExportV1 {
+        &self.live_port
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -456,6 +540,46 @@ impl ManagedAgentStackRuntimeCore {
         expected_active_pxst_digest: Digest32,
     ) -> Result<RuntimeAgentConversationPortExportV1, RuntimeAgentConversationPortExportErrorV1>
     {
+        let current = self
+            .export_current_conversation_port_inner_v2(
+                Some(expected_active_pxst_digest),
+                #[cfg(test)]
+                None,
+            )
+            .await?;
+        Ok(current.live_port)
+    }
+
+    /// Exports the exact current ActiveReady PXAR-v7 request, PXST root, and
+    /// live PXAP facts without accepting a caller-selected PXST or PXRS value.
+    pub(crate) async fn export_current_conversation_port_v2(
+        &self,
+    ) -> Result<RuntimeAgentCurrentConversationPortExportV2, RuntimeAgentConversationPortExportErrorV1>
+    {
+        self.export_current_conversation_port_inner_v2(
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn export_current_conversation_port_with_interlock_v2(
+        &self,
+        interlock: &LiveConversationPortExportTestInterlockV1,
+    ) -> Result<RuntimeAgentCurrentConversationPortExportV2, RuntimeAgentConversationPortExportErrorV1>
+    {
+        self.export_current_conversation_port_inner_v2(None, Some(interlock))
+            .await
+    }
+
+    async fn export_current_conversation_port_inner_v2(
+        &self,
+        expected_active_pxst_digest: Option<Digest32>,
+        #[cfg(test)] interlock: Option<&LiveConversationPortExportTestInterlockV1>,
+    ) -> Result<RuntimeAgentCurrentConversationPortExportV2, RuntimeAgentConversationPortExportErrorV1>
+    {
         if !self.recovery_completed
             || self.snapshot.phase != ManagedAgentStackDurablePhase::ActiveReady
         {
@@ -480,14 +604,16 @@ impl ManagedAgentStackRuntimeCore {
         if receipt.facts().state().outcome() != ManagedAgentStackTerminalOutcomeV1::ActiveReady {
             return Err(RuntimeAgentConversationPortExportErrorV1::InternalInvariant);
         }
-        if receipt.receipt_digest() != expected_active_pxst_digest {
+        if expected_active_pxst_digest
+            .is_some_and(|expected| receipt.receipt_digest() != expected)
+        {
             return Err(RuntimeAgentConversationPortExportErrorV1::ExpectedActiveReceiptMismatch);
         }
-        let broker_handle = self
+        let broker_claim = self
             .handle_broker
-            .try_claim(receipt.canonical_wire())
+            .try_claim_publication(receipt.canonical_wire())
             .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?
-            .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+            .ok_or(RuntimeAgentConversationPortExportErrorV1::OwnerUnavailable)?;
         let owner_handle = self
             .handle
             .as_ref()
@@ -496,14 +622,45 @@ impl ManagedAgentStackRuntimeCore {
             .assembly
             .as_ref()
             .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        #[cfg(test)]
+        let live_port = match interlock {
+            Some(interlock) => {
+                assembly
+                    .export_live_conversation_port_descriptor_with_interlock_v1(
+                        owner_handle,
+                        &broker_claim.handle,
+                        active.fabric_generation,
+                        interlock,
+                    )
+                    .await
+            }
+            None => {
+                assembly
+                    .export_live_conversation_port_descriptor_v1(
+                        owner_handle,
+                        &broker_claim.handle,
+                        active.fabric_generation,
+                    )
+                    .await
+            }
+        }
+        .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        #[cfg(not(test))]
         let live_port = assembly
             .export_live_conversation_port_descriptor_v1(
                 owner_handle,
-                &broker_handle,
+                &broker_claim.handle,
                 active.fabric_generation,
             )
             .await
             .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        if !self
+            .handle_broker
+            .retains_publication_claim(&broker_claim, receipt.canonical_wire())
+            .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?
+        {
+            return Err(RuntimeAgentConversationPortExportErrorV1::OwnerUnavailable);
+        }
         if live_port.physical_binding_census != 2 {
             return Err(RuntimeAgentConversationPortExportErrorV1::InternalInvariant);
         }
@@ -512,19 +669,23 @@ impl ManagedAgentStackRuntimeCore {
             .target_execution()
             .fabric()
             .execution_digest();
-        Ok(RuntimeAgentConversationPortExportV1 {
-            active_pxst_digest: receipt.receipt_digest(),
-            descriptor_wire: live_port.descriptor_wire,
-            fabric_generation: active.fabric_generation,
-            agent_generation: active.agent_generation,
-            fabric_execution_digest,
-            fabric_session_epoch: live_port.fabric_session_epoch,
-            descriptor_digest: live_port.descriptor_digest,
-            request_binding_descriptor_digest: live_port.request_binding_descriptor_digest,
-            event_binding_descriptor_digest: live_port.event_binding_descriptor_digest,
-            submit_binding_epoch: live_port.submit_binding_epoch,
-            control_binding_epoch: live_port.control_binding_epoch,
-            physical_binding_census: live_port.physical_binding_census,
+        Ok(RuntimeAgentCurrentConversationPortExportV2 {
+            active_request: active.request.clone(),
+            active_terminal_receipt: receipt.clone(),
+            live_port: RuntimeAgentConversationPortExportV1 {
+                active_pxst_digest: receipt.receipt_digest(),
+                descriptor_wire: live_port.descriptor_wire,
+                fabric_generation: active.fabric_generation,
+                agent_generation: active.agent_generation,
+                fabric_execution_digest,
+                fabric_session_epoch: live_port.fabric_session_epoch,
+                descriptor_digest: live_port.descriptor_digest,
+                request_binding_descriptor_digest: live_port.request_binding_descriptor_digest,
+                event_binding_descriptor_digest: live_port.event_binding_descriptor_digest,
+                submit_binding_epoch: live_port.submit_binding_epoch,
+                control_binding_epoch: live_port.control_binding_epoch,
+                physical_binding_census: live_port.physical_binding_census,
+            },
         })
     }
 
@@ -1824,14 +1985,52 @@ impl From<RuntimeClockError> for ManagedAgentStackRuntimeError {
 mod provider_resolver_tests {
     use super::*;
 
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
     use paraegox_agent_contracts::AgentConversationRequestV1;
     use paraegox_agent_service::{
         AgentConversationModelCancellation, AgentConversationModelFuture,
         AgentConversationModelOutcomeV1, AgentConversationModelProvider,
     };
-    use paraegox_runtime_contracts::managed_agent_stack_plan::{
-        ManagedAgentProviderRefV1, ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1,
+    use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
+    use paraegox_kernel::time::BoundedDuration;
+    use paraegox_runtime_contracts::apply::{
+        PlanWriterRef, RuntimeApplyControl, TenureAuthorityRef, TenureKeyRef,
+        TenureProofAlgorithm,
     };
+    use paraegox_runtime_contracts::assignment::BindingId;
+    use paraegox_runtime_contracts::managed_agent_stack_plan::{
+        ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderRefV1,
+        ManagedAgentProviderSelectionV1, ManagedAgentSecretRefV1, ManagedAgentSemanticLimitsV1,
+        ManagedAgentServicePlanV1, ManagedAgentStackApplyRequestDraftV1,
+        ManagedAgentStackTargetExecutionV1,
+    };
+    use paraegox_runtime_contracts::managed_fabric_plan::{
+        ManagedFabricApplyRequestDraftV1, ManagedFabricApplyRequestV1,
+        ManagedFabricApplyTerminalOutcomeV1, ManagedFabricListenEndpointV1,
+        ManagedFabricTargetExecutionV1,
+    };
+    use paraegox_runtime_contracts::managed_service::{
+        ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
+    };
+    use paraegox_runtime_contracts::provenance::SourceScopeRef;
+    use paraegox_runtime_contracts::temporal::ApplyTemporalConstraint;
+    use tokio::sync::Barrier;
+
+    use crate::admission::{
+        AdmissionStateLimits, ApplyAdmissionPolicy, TrustedApplyIdentity, TrustedApplyKey,
+        TrustedTenureIdentity, TrustedTenureKey,
+    };
+    use crate::managed_fabric_runtime::{
+        ManagedFabricApplyOutcome, ManagedFabricOwnerConfig, transition_projection_digest,
+    };
+    use crate::runtime_store::tests::{TestDirectory, managed_fabric_store_fixture};
+
+    const FABRIC_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/wire/s7_managed_fabric_successor_v1.json");
+    const STORE_BYTE: u8 = 0x44;
+    const TARGET_FINGERPRINT_BYTE: u8 = 0x55;
+    const REQUEST_SIGNING_SEED: [u8; 32] = [0x22; 32];
 
     struct ReturnedSelectionResolver(ManagedAgentProviderSelectionV1);
 
@@ -1873,6 +2072,385 @@ mod provider_resolver_tests {
             Digest32::from_bytes([byte.wrapping_add(1); 32]),
         )
         .expect("test deterministic selection")
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        fn nibble(byte: u8) -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => panic!("fixture contains non-hex byte"),
+            }
+        }
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
+    fn fabric_basis_request() -> ManagedFabricApplyRequestV1 {
+        let section = "\"one_managed_fabric_service\"";
+        let section_start = FABRIC_FIXTURE
+            .find(section)
+            .unwrap_or_else(|| panic!("missing managed Fabric fixture section"));
+        let field = "\"outer_v6_hex\": \"";
+        let field_start = FABRIC_FIXTURE[section_start..]
+            .find(field)
+            .map(|offset| section_start + offset + field.len())
+            .unwrap_or_else(|| panic!("missing managed Fabric request fixture"));
+        let field_end = FABRIC_FIXTURE[field_start..]
+            .find('"')
+            .map(|offset| field_start + offset)
+            .unwrap_or_else(|| panic!("unterminated managed Fabric request fixture"));
+        ManagedFabricApplyRequestV1::decode(&decode_hex(
+            &FABRIC_FIXTURE[field_start..field_end],
+        ))
+        .unwrap_or_else(|error| panic!("managed Fabric request fixture must decode: {error}"))
+    }
+
+    fn available_port() -> u16 {
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .unwrap_or_else(|error| panic!("ephemeral loopback bind failed: {error}"))
+            .local_addr()
+            .unwrap_or_else(|error| panic!("ephemeral loopback address failed: {error}"))
+            .port()
+    }
+
+    fn long_temporal(
+        basis: &ManagedFabricApplyRequestV1,
+    ) -> ApplyTemporalConstraint {
+        let budget = BoundedDuration::from_nanos(60_000_000_000);
+        ApplyTemporalConstraint::try_new(
+            basis.temporal().constraint_id(),
+            basis.temporal().target_clock_domain(),
+            basis.temporal().target_clock_generation(),
+            budget,
+            budget,
+        )
+        .unwrap_or_else(|error| panic!("long test temporal constraint rejected: {error}"))
+    }
+
+    fn signed_fabric_request(
+        basis: &ManagedFabricApplyRequestV1,
+        execution: ManagedFabricTargetExecutionV1,
+    ) -> ManagedFabricApplyRequestV1 {
+        let control = RuntimeApplyControl::new(
+            basis
+                .control_commitment()
+                .control()
+                .writer_context()
+                .clone(),
+            ExpectedActive::None,
+            basis.operation_id(),
+        );
+        let draft = ManagedFabricApplyRequestDraftV1::try_new(
+            execution,
+            basis.provenance(),
+            control,
+            long_temporal(basis),
+            [STORE_BYTE; 32],
+            basis.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("managed Fabric request draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&REQUEST_SIGNING_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("Fabric transcript rejected: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("managed Fabric request rejected: {error}"))
+    }
+
+    fn agent_stack_execution(
+        fabric_execution: ManagedFabricTargetExecutionV1,
+    ) -> ManagedAgentStackTargetExecutionV1 {
+        let lifecycle_budget = BoundedDuration::from_nanos(5_000_000_000);
+        let lifecycle_budgets = ManagedServiceLifecycleBudgetsV1::try_new(
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+        )
+        .unwrap_or_else(|error| panic!("Agent lifecycle budgets rejected: {error}"));
+        let service =
+            ManagedServiceSpecV1::new(ManagedServiceId::from_bytes([0xa1; 16]), lifecycle_budgets);
+        let semantic_limits = ManagedAgentSemanticLimitsV1::try_new(8, 16, 16, 32)
+            .unwrap_or_else(|error| panic!("Agent semantic limits rejected: {error}"));
+        let ingress_limits = ManagedAgentIngressLimitsV1::try_new(
+            8,
+            512 * 1024,
+            64 * 1024,
+            64 * 1024,
+            2_000_000_000,
+        )
+        .unwrap_or_else(|error| panic!("Agent ingress limits rejected: {error}"));
+        let port = ManagedAgentPortPlanV1::try_new(
+            BindingId::from_bytes([0xa2; 16]),
+            BindingId::from_bytes([0xa3; 16]),
+            "paraegox/runtime/current-agent-export/submit",
+            "paraegox/runtime/current-agent-export/control",
+            ingress_limits,
+        )
+        .unwrap_or_else(|error| panic!("Agent port plan rejected: {error}"));
+        let provider = deterministic(0xa4);
+        let agent = ManagedAgentServicePlanV1::try_new(service, semantic_limits, port, provider)
+            .unwrap_or_else(|error| panic!("Agent service plan rejected: {error}"));
+        let projection = ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(
+            fabric_execution.projection().clone(),
+        )
+        .unwrap_or_else(|error| panic!("Agent stack projection rejected: {error}"));
+        ManagedAgentStackTargetExecutionV1::try_fabric_and_agent(
+            projection,
+            fabric_execution,
+            agent,
+        )
+        .unwrap_or_else(|error| panic!("Agent stack execution rejected: {error}"))
+    }
+
+    fn signed_stack_request(
+        basis: &ManagedFabricApplyRequestV1,
+        execution: ManagedAgentStackTargetExecutionV1,
+        active_fabric_digest: paraegox_runtime_contracts::provenance::TargetSliceDigest,
+    ) -> ManagedAgentStackApplyRequestV1 {
+        let control = RuntimeApplyControl::new(
+            basis
+                .control_commitment()
+                .control()
+                .writer_context()
+                .clone(),
+            ExpectedActive::Exact(active_fabric_digest),
+            basis.operation_id(),
+        );
+        let draft = ManagedAgentStackApplyRequestDraftV1::try_new(
+            execution,
+            basis.provenance(),
+            control,
+            long_temporal(basis),
+            [STORE_BYTE; 32],
+            basis.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("Agent stack request draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&REQUEST_SIGNING_SEED)
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("Agent transcript rejected: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("Agent stack request rejected: {error}"))
+    }
+
+    fn admission_policy() -> ApplyAdmissionPolicy {
+        let tenure_algorithm = TenureProofAlgorithm::try_new(ED25519_ALGORITHM)
+            .unwrap_or_else(|error| panic!("tenure algorithm rejected: {error}"));
+        let apply_algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+            .unwrap_or_else(|error| panic!("apply algorithm rejected: {error}"));
+        let tenure = TrustedTenureKey::try_new(
+            TrustedTenureIdentity::new(
+                SourceScopeRef::from_bytes([0x01; 16]),
+                PrincipalRef::from_bytes([0x06; 16]),
+                1_001,
+                1_002,
+                TenureAuthorityRef::from_bytes([0x07; 16]),
+            ),
+            TenureKeyRef::from_bytes([0x08; 16]),
+            tenure_algorithm,
+            ED25519_ALGORITHM_VERSION,
+            SigningKey::from_bytes(&[0x11; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("tenure trust rejected: {error}"));
+        let apply = TrustedApplyKey::try_new(
+            TrustedApplyIdentity::new(
+                SourceScopeRef::from_bytes([0x01; 16]),
+                RuntimeHostId::from_bytes([0x05; 16]),
+                PrincipalRef::from_bytes([0x09; 16]),
+                PlanWriterRef::from_bytes([0x09; 16]),
+            ),
+            ApplyAuthKeyRef::from_bytes([0x0c; 16]),
+            apply_algorithm,
+            ED25519_ALGORITHM_VERSION,
+            SigningKey::from_bytes(&REQUEST_SIGNING_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("apply trust rejected: {error}"));
+        ApplyAdmissionPolicy::try_new(
+            BoundedDuration::from_nanos(60_000_000_000),
+            AdmissionStateLimits::try_new(4, 4, 4)
+                .unwrap_or_else(|error| panic!("admission limits rejected: {error}")),
+            [tenure],
+            [apply],
+        )
+        .unwrap_or_else(|error| panic!("admission policy rejected: {error}"))
+    }
+
+    fn response_channel(
+        target: RuntimeHostId,
+    ) -> ReferenceChannelBindingV1 {
+        ReferenceChannelBindingV1::try_new(
+            target,
+            PrincipalRef::from_bytes([0xe1; 16]),
+            Digest32::from_bytes([0xe3; 32]),
+            Digest32::from_bytes([0xe4; 32]),
+        )
+        .unwrap_or_else(|error| panic!("response channel rejected: {error}"))
+    }
+
+    struct LiveCurrentAgentFixture {
+        _directory: TestDirectory,
+        fabric: ManagedFabricRuntimeCore,
+        stack: ManagedAgentStackRuntimeCore,
+        broker: RuntimeAgentHandleBroker,
+        request: ManagedAgentStackApplyRequestV1,
+        receipt: ManagedAgentStackTerminalReceiptV1,
+    }
+
+    impl LiveCurrentAgentFixture {
+        async fn shutdown(mut self) {
+            self.stack
+                .shutdown(&mut self.fabric)
+                .await
+                .unwrap_or_else(|error| panic!("Agent stack shutdown failed: {error}"));
+            self.fabric
+                .shutdown()
+                .await
+                .unwrap_or_else(|error| panic!("managed Fabric shutdown failed: {error}"));
+        }
+    }
+
+    async fn live_current_agent_fixture() -> LiveCurrentAgentFixture {
+        let basis = fabric_basis_request();
+        let endpoint = ManagedFabricListenEndpointV1::try_new(&format!(
+            "tcp/127.0.0.1:{}",
+            available_port()
+        ))
+        .unwrap_or_else(|error| panic!("ephemeral Fabric endpoint rejected: {error}"));
+        let fabric_execution = ManagedFabricTargetExecutionV1::try_one_managed_fabric_service(
+            basis.target_execution().projection().clone(),
+            basis
+                .target_execution()
+                .service()
+                .unwrap_or_else(|| panic!("fixture Fabric service disappeared")),
+            endpoint,
+        )
+        .unwrap_or_else(|error| panic!("managed Fabric execution rejected: {error}"));
+        let fabric_request = signed_fabric_request(&basis, fabric_execution.clone());
+        let stack_request = signed_stack_request(
+            &basis,
+            agent_stack_execution(fabric_execution),
+            fabric_request.target_slice_digest(),
+        );
+        let projection = basis.target_execution().projection().clone();
+        let projection_digest = transition_projection_digest(&projection)
+            .unwrap_or_else(|error| panic!("Fabric projection digest failed: {error}"));
+        let (directory, store) = managed_fabric_store_fixture(
+            STORE_BYTE,
+            TARGET_FINGERPRINT_BYTE,
+            projection_digest,
+        );
+        let clock = RuntimeClock::new(
+            fabric_request.temporal().target_clock_domain(),
+            fabric_request.temporal().target_clock_generation(),
+            1,
+        );
+        let mut fabric = ManagedFabricRuntimeCore::from_preopened_store(
+            store,
+            ManagedFabricOwnerConfig {
+                state_directory: directory.path().to_path_buf(),
+                store_instance_id: [STORE_BYTE; 32],
+                owner_target_fingerprint: Digest32::from_bytes([TARGET_FINGERPRINT_BYTE; 32]),
+                projection,
+                runtime_host_epoch: 1,
+                clock,
+                response_key_ref: ApplyAuthKeyRef::from_bytes([0xe2; 16]),
+                response_signer: SigningKey::from_bytes(&[0x71; 32]),
+            },
+        )
+        .unwrap_or_else(|error| panic!("managed Fabric core open failed: {error}"));
+        fabric
+            .recover()
+            .await
+            .unwrap_or_else(|error| panic!("managed Fabric recovery failed: {error}"));
+        let policy = admission_policy();
+        let fabric_ingress = policy
+            .verify_managed_fabric_apply_request(
+                &fabric_request,
+                fabric
+                    .clock_reading()
+                    .unwrap_or_else(|error| panic!("Fabric clock read failed: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("managed Fabric admission failed: {error}"));
+        let channel = response_channel(fabric_request.target());
+        let ManagedFabricApplyOutcome::Committed(fabric_receipt) = fabric
+            .apply(fabric_request, fabric_ingress, channel)
+            .await
+            .unwrap_or_else(|error| panic!("managed Fabric apply failed: {error}"))
+        else {
+            panic!("first managed Fabric apply must commit")
+        };
+        assert_eq!(
+            fabric_receipt.facts().outcome(),
+            ManagedFabricApplyTerminalOutcomeV1::ActiveReady
+        );
+
+        let stack_ingress = policy
+            .verify_managed_agent_stack_apply_request(
+                &stack_request,
+                fabric
+                    .clock_reading()
+                    .unwrap_or_else(|error| panic!("Agent stack clock read failed: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("Agent stack admission failed: {error}"));
+        let selection = stack_request
+            .target_execution()
+            .agent()
+            .unwrap_or_else(|| panic!("active Agent plan disappeared"))
+            .provider();
+        let broker = RuntimeAgentHandleBroker::default();
+        let (stack, outcome) = ManagedAgentStackRuntimeCore::cutover(
+            &mut fabric,
+            ManagedAgentStackOwnerConfig {
+                state_directory: directory.path().to_path_buf(),
+                projection: stack_request.target_execution().projection().clone(),
+                runtime_host_epoch: 1,
+                clock,
+                response_key_ref: ApplyAuthKeyRef::from_bytes([0xe2; 16]),
+                response_signer: SigningKey::from_bytes(&[0x71; 32]),
+                handle_broker: broker.clone(),
+                provider_resolver: Arc::new(ReturnedSelectionResolver(selection)),
+            },
+            stack_request.clone(),
+            stack_ingress,
+            channel,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("Agent stack cutover failed: {error}"));
+        let ManagedAgentStackApplyOutcome::Committed(receipt) = outcome else {
+            panic!("first Agent stack cutover must commit")
+        };
+        assert_eq!(
+            receipt.facts().state().outcome(),
+            ManagedAgentStackTerminalOutcomeV1::ActiveReady
+        );
+        LiveCurrentAgentFixture {
+            _directory: directory,
+            fabric,
+            stack,
+            broker,
+            request: stack_request,
+            receipt,
+        }
     }
 
     #[test]
@@ -1958,5 +2536,81 @@ mod provider_resolver_tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broker_revoke_during_live_observation_invalidates_preclaim() {
+        let fixture = live_current_agent_fixture().await;
+        let observation_completed = Arc::new(Barrier::new(2));
+        let broker_mutation_completed = Arc::new(Barrier::new(2));
+        let interlock = LiveConversationPortExportTestInterlockV1::new(
+            Arc::clone(&observation_completed),
+            Arc::clone(&broker_mutation_completed),
+        );
+        let export = fixture
+            .stack
+            .export_current_conversation_port_with_interlock_v2(&interlock);
+        let revoke = async {
+            observation_completed.wait().await;
+            fixture
+                .broker
+                .revoke()
+                .unwrap_or_else(|error| panic!("broker revoke failed: {error}"));
+            broker_mutation_completed.wait().await;
+        };
+        let (result, ()) = tokio::join!(export, revoke);
+        assert!(matches!(
+            result,
+            Err(RuntimeAgentConversationPortExportErrorV1::OwnerUnavailable)
+        ));
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_selector_current_export_is_exact_and_rejects_same_facts_republication() {
+        let fixture = live_current_agent_fixture().await;
+        let current = fixture
+            .stack
+            .export_current_conversation_port_v2()
+            .await
+            .unwrap_or_else(|error| panic!("current Agent export failed: {error:?}"));
+        assert_eq!(current.active_request(), &fixture.request);
+        assert_eq!(current.active_terminal_receipt(), &fixture.receipt);
+        assert_eq!(
+            current.live_port().active_pxst_digest,
+            fixture.receipt.receipt_digest()
+        );
+        assert_eq!(current.live_port().physical_binding_census, 2);
+        assert!(current.live_port().descriptor_wire.starts_with(b"PXAP\0\x01"));
+
+        let observation_completed = Arc::new(Barrier::new(2));
+        let broker_mutation_completed = Arc::new(Barrier::new(2));
+        let interlock = LiveConversationPortExportTestInterlockV1::new(
+            Arc::clone(&observation_completed),
+            Arc::clone(&broker_mutation_completed),
+        );
+        let handle = fixture
+            .stack
+            .handle
+            .as_ref()
+            .unwrap_or_else(|| panic!("current Agent handle disappeared"))
+            .clone();
+        let export = fixture
+            .stack
+            .export_current_conversation_port_with_interlock_v2(&interlock);
+        let replace = async {
+            observation_completed.wait().await;
+            fixture
+                .broker
+                .publish(handle, &fixture.receipt)
+                .unwrap_or_else(|error| panic!("same-facts broker replacement failed: {error}"));
+            broker_mutation_completed.wait().await;
+        };
+        let (result, ()) = tokio::join!(export, replace);
+        assert!(matches!(
+            result,
+            Err(RuntimeAgentConversationPortExportErrorV1::OwnerUnavailable)
+        ));
+        fixture.shutdown().await;
     }
 }
