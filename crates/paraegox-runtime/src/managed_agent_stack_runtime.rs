@@ -1937,9 +1937,7 @@ mod provider_resolver_tests {
         let resolver = cutover
             .find("prepare_agent_provider(provider, config.provider_resolver.as_ref())?")
             .expect("missing provider resolution");
-        let start_agent = cutover
-            .find(".start_agent(")
-            .expect("missing Agent start");
+        let start_agent = cutover.find(".start_agent(").expect("missing Agent start");
 
         assert!(marker < adjudication && adjudication < resolver && resolver < start_agent);
         assert_eq!(

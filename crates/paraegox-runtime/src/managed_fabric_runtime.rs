@@ -804,10 +804,7 @@ impl ManagedFabricRuntimeCore {
         };
         let startup = self
             .store
-            .adjudicate_remote_agent_access_startup_v2(
-                static_identity,
-                self.runtime_host_epoch,
-            )?;
+            .adjudicate_remote_agent_access_startup_v2(static_identity, self.runtime_host_epoch)?;
         match startup {
             startup @ RemoteAgentAccessStartupSlotV2::Absent(_) => {
                 self.remote_agent_access_startup_v2 = Some(startup);
@@ -2613,9 +2610,9 @@ mod tests {
 
         assert!(gate.contains("startup @ RemoteAgentAccessStartupSlotV2::Absent(_)"));
         assert!(gate.contains("startup @ RemoteAgentAccessStartupSlotV2::SameEpoch(_)"));
-        assert!(gate.contains(
-            "startup @ RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)"
-        ));
+        assert!(
+            gate.contains("startup @ RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)")
+        );
         assert_eq!(gate.match_indices("Ok(())").count(), 1);
         assert_eq!(
             gate.match_indices("self.remote_agent_access_startup_v2 = Some(startup)")
