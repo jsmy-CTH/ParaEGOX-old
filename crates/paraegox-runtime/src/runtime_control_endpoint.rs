@@ -149,12 +149,12 @@ use crate::{
     managed_model_runtime::{
         RuntimeModelBackendResolverV1, UnavailableRuntimeModelBackendResolver,
     },
+    remote_agent_access_state::RemoteAgentAccessStaticIdentityPinsV2,
     remote_agent_descriptor_evidence::{
         RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
         RemoteAgentDescriptorLiveFactsV1, RemoteAgentVerifiedDescriptorEvidenceV1,
         verify_remote_agent_descriptor_evidence_v1,
     },
-    remote_agent_access_state::RemoteAgentAccessStaticIdentityPinsV2,
     runtime_agent_provider::{
         RuntimeAgentProviderResolverV1, UnavailableRuntimeAgentProviderResolver,
     },
@@ -179,8 +179,8 @@ use crate::{
         RuntimeProvisioningError, RuntimeProvisioningV1, validate_canonical_absolute_path,
     },
     runtime_store::{
-        ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessStartupSlotV2,
-        RuntimeStore, RuntimeStoreError, RuntimeStoreOpenError,
+        ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessStartupSlotV2, RuntimeStore,
+        RuntimeStoreError, RuntimeStoreOpenError,
     },
 };
 
@@ -1603,9 +1603,7 @@ impl StartedManagedFabricService {
             generation,
             1,
         );
-        let remote_agent_access_startup_v2 = if store
-            .remote_agent_access_startup_required_v2()
-        {
+        let remote_agent_access_startup_v2 = if store.remote_agent_access_startup_required_v2() {
             let startup = store.adjudicate_remote_agent_access_startup_v2(
                 RemoteAgentAccessStaticIdentityPinsV2 {
                     target: projection.target(),
@@ -1617,7 +1615,9 @@ impl StartedManagedFabricService {
             )?;
             match startup {
                 RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
-                    return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired.into());
+                    return Err(
+                        ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired.into(),
+                    );
                 }
                 startup => Some(startup),
             }

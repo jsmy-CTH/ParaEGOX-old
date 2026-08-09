@@ -751,10 +751,7 @@ impl ManagedFabricRuntimeCore {
             (Some(RemoteAgentAccessStartupSlotV2::Absent(_)), true)
             | (Some(RemoteAgentAccessStartupSlotV2::SameEpoch(_)), true)
             | (None, false) => Ok(()),
-            (
-                Some(RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)),
-                _,
-            )
+            (Some(RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)), _)
             | (Some(_), false)
             | (None, true) => Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired),
         }
