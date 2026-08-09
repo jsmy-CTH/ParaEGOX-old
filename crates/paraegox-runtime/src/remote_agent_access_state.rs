@@ -2420,9 +2420,11 @@ mod tests {
             ),
             RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady => {
                 let (fabric, agent) = local_generations.unwrap_or_else(|| {
-                    let active = snapshot.predecessor.active.as_ref().unwrap_or_else(|| {
-                        panic!("LocalOnly predecessor must remain active")
-                    });
+                    let active = snapshot
+                        .predecessor
+                        .active
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("LocalOnly predecessor must remain active"));
                     (active.fabric_generation, active.agent_generation)
                 });
                 (
