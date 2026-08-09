@@ -14,6 +14,8 @@ use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{
     BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicDeadline, TimeError,
 };
+#[cfg(unix)]
+use paraegox_runtime_contracts::apply::ApplyOperationId;
 use paraegox_runtime_contracts::apply::{
     ApplyContractError, PlanWriterRef, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
     TenureProofError,
@@ -47,6 +49,10 @@ use paraegox_runtime_contracts::remote_agent_access::{
 use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
     RemoteAgentDataPlaneApplyRequestV1, RemoteAgentDataPlaneApplyRequestV2,
 };
+#[cfg(unix)]
+use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+    RemoteAgentDataPlaneTerminalReceiptV2, RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2,
+};
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
 use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
 use paraegox_runtime_contracts::wire::{
@@ -58,6 +64,11 @@ use crate::apply_state::{AdmittedApply, VerifiedWriterTenure};
 use crate::request::{
     RuntimeExecutionRequestAdmissionTransition, RuntimeRequestAdmissionError,
     RuntimeRequestAdmissionTransition, RuntimeThreadExecutionRequestAdmissionTransition,
+};
+#[cfg(unix)]
+use crate::{
+    runtime_control_endpoint::validate_restricted_runtime_apply_carrier_pins,
+    runtime_provisioning::RuntimeProvisioningV1,
 };
 
 /// Registry value for pure Ed25519 request and tenure signatures.
@@ -1768,6 +1779,228 @@ impl VerifiedRemoteAgentDataPlaneApplyIngressV1 {
     }
 }
 
+/// Runtime-owned PXAU-v2 verification policy reconstructed only from the
+/// protected provisioning capability and its independently pinned PXCB.
+///
+/// There is deliberately no constructor from principal/key/fingerprint/public
+/// key primitives.  Callers cannot turn receipt-selected or PXRS-selected
+/// bytes into trust: the sole production constructor reuses the restricted
+/// endpoint's exact provisioning-to-carrier predicate before retaining the
+/// protected Runtime verification key.
+#[cfg(unix)]
+pub(crate) struct RemoteAgentDataPlaneTerminalRuntimeTrustV2 {
+    target: RuntimeHostId,
+    runtime_principal: PrincipalRef,
+    runtime_response_key: ApplyAuthKeyRef,
+    runtime_response_key_fingerprint: Digest32,
+    carrier_binding_digest: Digest32,
+    verifying_key: VerifyingKey,
+}
+
+#[cfg(unix)]
+impl RemoteAgentDataPlaneTerminalRuntimeTrustV2 {
+    pub(crate) fn try_from_provisioning(
+        provisioning: &RuntimeProvisioningV1,
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> Result<Self, RemoteAgentDataPlaneTerminalAdmissionErrorV2> {
+        validate_restricted_runtime_apply_carrier_pins(provisioning, expected_carrier)
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&provisioning.runtime_response_public_key())
+                .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        if verifying_key.is_weak() {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins);
+        }
+        let runtime_response_key_fingerprint =
+            ed25519_control_key_fingerprint(verifying_key.as_bytes())
+                .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        if runtime_response_key_fingerprint != expected_carrier.runtime_response_key_fingerprint() {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins);
+        }
+        Ok(Self {
+            target: provisioning.target(),
+            runtime_principal: provisioning.runtime_principal(),
+            runtime_response_key: provisioning.runtime_response_key_ref(),
+            runtime_response_key_fingerprint,
+            carrier_binding_digest: expected_carrier.binding_digest(),
+            verifying_key,
+        })
+    }
+
+    /// Independently authenticates one public structural PXAU-v2 marker.
+    ///
+    /// The public marker's caller-supplied callback result is never an
+    /// authority input here.  This method repeats exact request correlation,
+    /// signer selection, signature-width parsing and strict Ed25519
+    /// verification with the protected provisioning key.
+    pub(crate) fn verify_terminal_ingress<'terminal>(
+        &self,
+        structural_terminal: RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'terminal>,
+        authorized_request: &RemoteAgentAccessRequestV2,
+    ) -> Result<
+        VerifiedRemoteAgentDataPlaneTerminalIngressV2<'terminal>,
+        RemoteAgentDataPlaneTerminalAdmissionErrorV2,
+    > {
+        if authorized_request.kind() != RemoteAgentAccessKindV2::ApplyRemoteAccess
+            || authorized_request.target() != self.target
+            || authorized_request.carrier().binding_digest() != self.carrier_binding_digest
+            || authorized_request.carrier().runtime_principal() != self.runtime_principal
+            || authorized_request.carrier().runtime_response_key() != self.runtime_response_key
+            || authorized_request
+                .carrier()
+                .runtime_response_key_fingerprint()
+                != self.runtime_response_key_fingerprint
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        }
+        let Some(request) = authorized_request.apply_request() else {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        };
+        if authorized_request.request_id().as_bytes() != request.operation_id().as_bytes()
+            || authorized_request.target() != request.target()
+            || authorized_request.expected_runtime_store_instance_id()
+                != request.expected_runtime_store_instance_id()
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        }
+
+        let receipt = structural_terminal.receipt();
+        let facts = receipt
+            .validate_against_request(request)
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation)?;
+        let evidence = facts.evidence().fields();
+        if facts.target() != authorized_request.target()
+            || facts.runtime_store_instance_id()
+                != authorized_request.expected_runtime_store_instance_id()
+            || facts.operation_id().as_bytes() != authorized_request.request_id().as_bytes()
+            || facts.request_digest() != request.request_digest()
+            || facts.envelope_request_digest() != request.envelope_request_digest()
+            || evidence.completion_runtime_host_epoch
+                != authorized_request.expected_runtime_host_epoch()
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        }
+
+        let claim = receipt.authentication();
+        if claim.runtime_principal() != self.runtime_principal
+            || claim.key() != self.runtime_response_key
+            || claim.algorithm().value() != ED25519_ALGORITHM
+            || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::SignerSelection);
+        }
+        let signature_bytes =
+            <&[u8; ED25519_SIGNATURE_BYTES]>::try_from(receipt.authentication_signature())
+                .map_err(|_| {
+                    RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignatureLength
+                })?;
+        let transcript = receipt
+            .signing_transcript()
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidTranscript)?;
+        self.verifying_key
+            .verify_strict(
+                transcript.as_bytes(),
+                &Signature::from_bytes(signature_bytes),
+            )
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignature)?;
+
+        Ok(VerifiedRemoteAgentDataPlaneTerminalIngressV2 {
+            receipt,
+            outer_request_digest: authorized_request.request_digest(),
+            carrier_binding_digest: self.carrier_binding_digest,
+            target: facts.target(),
+            runtime_store_instance_id: facts.runtime_store_instance_id(),
+            runtime_host_epoch: evidence.completion_runtime_host_epoch,
+            operation_id: facts.operation_id(),
+            inner_request_digest: facts.request_digest(),
+            inner_envelope_request_digest: facts.envelope_request_digest(),
+            terminal_receipt_digest: receipt.receipt_digest(),
+        })
+    }
+}
+
+/// Complete Runtime-private authority for one exact PXAU-v2 terminal edge.
+///
+/// This marker is intentionally non-`Clone`/non-`Copy`; only protected Runtime
+/// provisioning verification can construct it.
+#[cfg(unix)]
+pub(crate) struct VerifiedRemoteAgentDataPlaneTerminalIngressV2<'terminal> {
+    receipt: &'terminal RemoteAgentDataPlaneTerminalReceiptV2,
+    outer_request_digest: Digest32,
+    carrier_binding_digest: Digest32,
+    target: RuntimeHostId,
+    runtime_store_instance_id: [u8; 32],
+    runtime_host_epoch: u64,
+    operation_id: ApplyOperationId,
+    inner_request_digest: Digest32,
+    inner_envelope_request_digest: Digest32,
+    terminal_receipt_digest: Digest32,
+}
+
+#[cfg(unix)]
+impl<'terminal> VerifiedRemoteAgentDataPlaneTerminalIngressV2<'terminal> {
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> &'terminal RemoteAgentDataPlaneTerminalReceiptV2 {
+        self.receipt
+    }
+
+    #[must_use]
+    pub(crate) const fn outer_request_digest(&self) -> Digest32 {
+        self.outer_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn carrier_binding_digest(&self) -> Digest32 {
+        self.carrier_binding_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_store_instance_id(&self) -> [u8; 32] {
+        self.runtime_store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_host_epoch(&self) -> u64 {
+        self.runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn operation_id(&self) -> ApplyOperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub(crate) const fn inner_request_digest(&self) -> Digest32 {
+        self.inner_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn inner_envelope_request_digest(&self) -> Digest32 {
+        self.inner_envelope_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn terminal_receipt_digest(&self) -> Digest32 {
+        self.terminal_receipt_digest
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteAgentDataPlaneTerminalAdmissionErrorV2 {
+    ProvisioningPins,
+    CanonicalCorrelation,
+    SignerSelection,
+    InvalidSignatureLength,
+    InvalidTranscript,
+    InvalidSignature,
+}
+
 /// Complete Runtime-private PXRA-v2 Apply ingress evidence.
 ///
 /// This marker intentionally does not implement `Clone` or `Copy`. Its exact
@@ -2814,6 +3047,12 @@ mod tests {
         RemoteAgentDataPlaneApplyRequestDraftV1, RemoteAgentDataPlaneApplyRequestDraftV2,
         RemoteAgentDataPlaneApplyRequestV1,
     };
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+        RemoteAgentDataPlaneApplyRequestV2, RemoteAgentDataPlaneTerminalAuthClaimV2,
+        RemoteAgentDataPlaneTerminalReceiptDraftV2, RemoteAgentDataPlaneTerminalReceiptV2,
+        RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2,
+    };
     use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
     use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
     use paraegox_runtime_contracts::wire::{
@@ -2822,6 +3061,8 @@ mod tests {
         WireErrorCode,
     };
     use sha2::{Digest as _, Sha256};
+    #[cfg(unix)]
+    use zeroize::Zeroizing;
 
     use crate::apply_state::{
         ApplyControlState, ApplyRejection, FenceDisposition, OperationPhase, PrepareDisposition,
@@ -2843,6 +3084,10 @@ mod tests {
     };
     use crate::port_binding::PortBinding;
     use crate::runtime_clock::RuntimeClock;
+    #[cfg(unix)]
+    use crate::runtime_provisioning::{
+        RuntimeDeveloperLocalProvisioningInputV1, RuntimeProvisioningV1,
+    };
     use crate::task_registry::CancellationSource;
     use crate::thread_component_runtime::{
         PreparedThreadComponentRuntime, SynchronousThreadCard, ThreadCardFailure,
@@ -2857,6 +3102,11 @@ mod tests {
         ED25519_ALGORITHM_VERSION, ManagedFabricApplyAdmissionError,
         RuntimeProcessExecutionRequestAdmissionError, TrustedApplyIdentity, TrustedApplyKey,
         TrustedTenureIdentity, TrustedTenureKey,
+    };
+    #[cfg(unix)]
+    use super::{
+        RemoteAgentDataPlaneTerminalAdmissionErrorV2, RemoteAgentDataPlaneTerminalRuntimeTrustV2,
+        ed25519_control_key_fingerprint,
     };
 
     const SCOPE: u8 = 1;
@@ -2888,9 +3138,14 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/t2_remote_agent_data_plane_v1.json");
     const REMOTE_AGENT_ACCESS_V2_GOLDEN: &str =
         include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v2.json");
+    #[cfg(unix)]
+    const REMOTE_AGENT_PROXY_DATA_PLANE_V2_GOLDEN: &str =
+        include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
+    #[cfg(unix)]
+    const RUNTIME_TERMINAL_SIGNING_SEED_V2: [u8; 32] = [0xa6; 32];
 
     struct AdmittedFixtureCard;
 
@@ -3493,6 +3748,18 @@ mod tests {
         template: &RestrictedRuntimeApplyCarrierBindingV1,
         controller_request_key_fingerprint: Digest32,
     ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        remote_agent_access_carrier_with_fingerprints(
+            template,
+            controller_request_key_fingerprint,
+            template.runtime_response_key_fingerprint(),
+        )
+    }
+
+    fn remote_agent_access_carrier_with_fingerprints(
+        template: &RestrictedRuntimeApplyCarrierBindingV1,
+        controller_request_key_fingerprint: Digest32,
+        runtime_response_key_fingerprint: Digest32,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
         RestrictedRuntimeApplyCarrierBindingV1::try_new(
             RestrictedRuntimeApplyCarrierBindingFieldsV1 {
                 target: template.target(),
@@ -3504,7 +3771,7 @@ mod tests {
                 controller_request_key: template.controller_request_key(),
                 controller_request_key_fingerprint,
                 runtime_response_key: template.runtime_response_key(),
-                runtime_response_key_fingerprint: template.runtime_response_key_fingerprint(),
+                runtime_response_key_fingerprint,
                 control_transport_profile_ref: template.control_transport_profile_ref(),
                 control_transport_profile_digest: template.control_transport_profile_digest(),
             },
@@ -3612,6 +3879,245 @@ mod tests {
             .finalize(&outer_signature)
             .unwrap_or_else(|error| panic!("PXRA v2 must finalize: {error}"));
         (request, carrier)
+    }
+
+    #[cfg(unix)]
+    fn finalize_remote_agent_access_outer_v2(
+        template: &RemoteAgentAccessRequestV2,
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        inner: RemoteAgentDataPlaneApplyRequestV2,
+        expected_runtime_host_epoch: u64,
+    ) -> RemoteAgentAccessRequestV2 {
+        let draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+            RemoteAgentAccessRequestFieldsV2 {
+                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
+                    *inner.operation_id().as_bytes(),
+                )
+                .unwrap_or_else(|error| panic!("terminal PXRA v2 request id rejected: {error}")),
+                carrier,
+                target: inner.target(),
+                expected_runtime_store_instance_id: inner.expected_runtime_store_instance_id(),
+                expected_runtime_host_epoch,
+                auth_claim: template.authentication().claim().clone(),
+            },
+            inner,
+        )
+        .unwrap_or_else(|error| panic!("terminal PXRA v2 draft rejected: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("terminal PXRA v2 transcript rejected: {error}"));
+        let signature = SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("terminal PXRA v2 finalization rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn signed_remote_agent_access_request_for_terminal_v2() -> (
+        RemoteAgentAccessRequestV2,
+        RestrictedRuntimeApplyCarrierBindingV1,
+    ) {
+        let (base, _) = signed_remote_agent_access_request_v2(
+            PYTHON_FIXTURE_TENURE_SEED,
+            PYTHON_FIXTURE_REQUEST_SEED,
+            None,
+        );
+        let runtime_fingerprint = ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&RUNTIME_TERMINAL_SIGNING_SEED_V2)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("terminal Runtime fingerprint rejected: {error}"));
+        let carrier = remote_agent_access_carrier_with_fingerprints(
+            base.carrier(),
+            base.carrier().controller_request_key_fingerprint(),
+            runtime_fingerprint,
+        );
+        let request = finalize_remote_agent_access_outer_v2(
+            &base,
+            carrier.clone(),
+            base.apply_request()
+                .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11"))
+                .clone(),
+            base.expected_runtime_host_epoch(),
+        );
+        (request, carrier)
+    }
+
+    #[cfg(unix)]
+    fn alternate_terminal_authorized_request_v2(
+        base: &RemoteAgentAccessRequestV2,
+    ) -> RemoteAgentAccessRequestV2 {
+        let inner = base
+            .apply_request()
+            .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11"));
+        let control = inner.control_commitment().control();
+        let alternate_control = RuntimeApplyControl::new(
+            control.writer_context().clone(),
+            control.expected_active(),
+            ApplyOperationId::from_bytes([0xf8; 16]),
+        );
+        let claim = inner.authentication().claim();
+        let alternate_claim = ApplyRequestAuthClaim::try_new(
+            claim.principal(),
+            claim.key(),
+            claim.algorithm(),
+            claim.algorithm_version(),
+            &[0xf9; 16],
+        )
+        .unwrap_or_else(|error| panic!("alternate PXAR v11 auth claim rejected: {error}"));
+        let draft = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+            inner.target_execution().clone(),
+            inner.provenance(),
+            alternate_control,
+            inner.temporal(),
+            inner.expected_runtime_store_instance_id(),
+            alternate_claim,
+        )
+        .unwrap_or_else(|error| panic!("alternate PXAR v11 draft rejected: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("alternate PXAR v11 transcript rejected: {error}"));
+        let signature = SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        let alternate_inner = draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("alternate PXAR v11 finalization rejected: {error}"));
+        finalize_remote_agent_access_outer_v2(
+            base,
+            base.carrier().clone(),
+            alternate_inner,
+            base.expected_runtime_host_epoch(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn terminal_runtime_provisioning_v2(
+        request: &RemoteAgentAccessRequestV2,
+    ) -> RuntimeProvisioningV1 {
+        let inner = request
+            .apply_request()
+            .unwrap_or_else(|| panic!("terminal provisioning requires PXAR v11"));
+        let writer = inner.control_commitment().control().writer_context();
+        let proof_authority = writer.proof().authority();
+        RuntimeProvisioningV1::try_new_developer_local(RuntimeDeveloperLocalProvisioningInputV1 {
+            socket_path: std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|error| {
+                    panic!("terminal temp directory canonicalization failed: {error}")
+                })
+                .join("paraegox-runtime-terminal-admission-test.sock"),
+            target: request.target(),
+            source_scope: inner.provenance().source_scope(),
+            writer: writer.writer(),
+            runtime_principal: request.carrier().runtime_principal(),
+            controller_principal: request.carrier().controller_principal(),
+            controller_request_key_ref: request.carrier().controller_request_key(),
+            controller_request_verification_key: SigningKey::from_bytes(
+                &PYTHON_FIXTURE_REQUEST_SEED,
+            )
+            .verifying_key()
+            .to_bytes(),
+            runtime_response_key_ref: request.carrier().runtime_response_key(),
+            runtime_response_signing_seed: Zeroizing::new(RUNTIME_TERMINAL_SIGNING_SEED_V2),
+            authority_principal: PrincipalRef::from_bytes([0x06; 16]),
+            tenure_authority_ref: proof_authority.authority(),
+            tenure_key_ref: proof_authority.key(),
+            tenure_verification_key: SigningKey::from_bytes(&PYTHON_FIXTURE_TENURE_SEED)
+                .verifying_key()
+                .to_bytes(),
+        })
+        .unwrap_or_else(|error| panic!("terminal Runtime provisioning rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_auth_claim_v2(
+        request: &RemoteAgentAccessRequestV2,
+    ) -> RemoteAgentDataPlaneTerminalAuthClaimV2 {
+        RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+            request.carrier().runtime_principal(),
+            request.carrier().runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("terminal Ed25519 algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("terminal Runtime auth claim rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_receipt_v2(
+        request: &RemoteAgentAccessRequestV2,
+        auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
+        signing_seed: Option<[u8; 32]>,
+        signature_override: Option<&[u8]>,
+    ) -> RemoteAgentDataPlaneTerminalReceiptV2 {
+        let active = REMOTE_AGENT_PROXY_DATA_PLANE_V2_GOLDEN
+            .split_once("\"active_ready\"")
+            .map(|(_, tail)| tail)
+            .unwrap_or_else(|| panic!("active terminal fixture section missing"));
+        let terminal = active
+            .split_once("\"pxau_v2\"")
+            .map(|(_, tail)| tail)
+            .unwrap_or_else(|| panic!("PXAU v2 fixture section missing"));
+        let golden = RemoteAgentDataPlaneTerminalReceiptV2::decode(&fixture_document_hex_bytes(
+            terminal, "wire_hex",
+        ))
+        .unwrap_or_else(|error| panic!("PXAU v2 fixture rejected: {error}"));
+        let inner = request
+            .apply_request()
+            .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11"));
+        let draft = RemoteAgentDataPlaneTerminalReceiptDraftV2::try_new(
+            inner,
+            golden.facts().state(),
+            golden.facts().evidence(),
+            auth_claim,
+        )
+        .unwrap_or_else(|error| panic!("PXAU v2 terminal draft rejected: {error}"));
+        let signature = signature_override.map_or_else(
+            || {
+                let transcript = draft.signing_transcript().unwrap_or_else(|error| {
+                    panic!("PXAU v2 terminal transcript rejected: {error}")
+                });
+                SigningKey::from_bytes(&signing_seed.unwrap_or(RUNTIME_TERMINAL_SIGNING_SEED_V2))
+                    .sign(transcript.as_bytes())
+                    .to_bytes()
+                    .to_vec()
+            },
+            |signature| signature.to_vec(),
+        );
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("PXAU v2 terminal finalization rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn permissive_terminal_marker_v2<'terminal>(
+        receipt: &'terminal RemoteAgentDataPlaneTerminalReceiptV2,
+        request: &RemoteAgentAccessRequestV2,
+    ) -> RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'terminal> {
+        receipt
+            .verify_runtime_terminal(
+                request
+                    .apply_request()
+                    .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11")),
+                receipt.authentication(),
+                |_, _, _, _, _, _| true,
+            )
+            .unwrap_or_else(|error| panic!("permissive public PXAU v2 marker rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn expect_terminal_admission_error<T>(
+        result: Result<T, RemoteAgentDataPlaneTerminalAdmissionErrorV2>,
+        message: &str,
+    ) -> RemoteAgentDataPlaneTerminalAdmissionErrorV2 {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
     }
 
     fn ed25519_signature_verifies(
@@ -5994,5 +6500,254 @@ mod tests {
                 ManagedFabricApplyAdmissionError::DeadlineOverflow,
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_terminal_v2_protected_signature_mints_exact_private_marker() {
+        let (request, carrier) = signed_remote_agent_access_request_for_terminal_v2();
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let trust = RemoteAgentDataPlaneTerminalRuntimeTrustV2::try_from_provisioning(
+            &provisioning,
+            &carrier,
+        )
+        .expect("provisioning-pinned terminal Runtime trust must build");
+        let receipt = terminal_receipt_v2(&request, terminal_auth_claim_v2(&request), None, None);
+        let marker = trust
+            .verify_terminal_ingress(permissive_terminal_marker_v2(&receipt, &request), &request)
+            .expect("the protected exact Runtime signature must admit");
+        let inner = request
+            .apply_request()
+            .expect("terminal PXRA v2 must carry PXAR v11");
+
+        assert_eq!(marker.receipt(), &receipt);
+        assert_eq!(marker.outer_request_digest(), request.request_digest());
+        assert_eq!(marker.carrier_binding_digest(), carrier.binding_digest());
+        assert_eq!(marker.target(), request.target());
+        assert_eq!(
+            marker.runtime_store_instance_id(),
+            request.expected_runtime_store_instance_id(),
+        );
+        assert_eq!(
+            marker.runtime_host_epoch(),
+            request.expected_runtime_host_epoch(),
+        );
+        assert_eq!(marker.operation_id(), inner.operation_id());
+        assert_eq!(marker.inner_request_digest(), inner.request_digest());
+        assert_eq!(
+            marker.inner_envelope_request_digest(),
+            inner.envelope_request_digest(),
+        );
+        assert_eq!(marker.terminal_receipt_digest(), receipt.receipt_digest());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_terminal_v2_permissive_public_marker_cannot_bypass_protected_signature() {
+        let (request, carrier) = signed_remote_agent_access_request_for_terminal_v2();
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let trust = RemoteAgentDataPlaneTerminalRuntimeTrustV2::try_from_provisioning(
+            &provisioning,
+            &carrier,
+        )
+        .expect("provisioning-pinned terminal Runtime trust must build");
+        let claim = terminal_auth_claim_v2(&request);
+
+        let junk = terminal_receipt_v2(&request, claim, None, Some(&[0xee; 64]));
+        assert_eq!(
+            expect_terminal_admission_error(
+                trust.verify_terminal_ingress(
+                    permissive_terminal_marker_v2(&junk, &request),
+                    &request,
+                ),
+                "junk terminal signature must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignature,
+            "a permissive public callback cannot authenticate junk bytes",
+        );
+
+        let other_runtime = terminal_receipt_v2(&request, claim, Some(WRONG_SEED), None);
+        assert_eq!(
+            expect_terminal_admission_error(
+                trust.verify_terminal_ingress(
+                    permissive_terminal_marker_v2(&other_runtime, &request),
+                    &request,
+                ),
+                "other Runtime terminal signature must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignature,
+            "a valid signature by another Runtime key cannot substitute",
+        );
+
+        let wrong_width = terminal_receipt_v2(&request, claim, None, Some(&[0xef; 63]));
+        assert_eq!(
+            expect_terminal_admission_error(
+                trust.verify_terminal_ingress(
+                    permissive_terminal_marker_v2(&wrong_width, &request),
+                    &request,
+                ),
+                "wrong-width terminal signature must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignatureLength,
+            "PXAU v2 Runtime signatures are exactly 64 bytes",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_terminal_v2_rejects_signer_profile_carrier_epoch_and_request_correlation() {
+        let (request, carrier) = signed_remote_agent_access_request_for_terminal_v2();
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let trust = RemoteAgentDataPlaneTerminalRuntimeTrustV2::try_from_provisioning(
+            &provisioning,
+            &carrier,
+        )
+        .expect("provisioning-pinned terminal Runtime trust must build");
+        let algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+            .expect("terminal Ed25519 algorithm must build");
+        let wrong_claims = [
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                PrincipalRef::from_bytes([0xe1; 16]),
+                carrier.runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+            )
+            .expect("wrong-principal terminal claim must remain structural"),
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                carrier.runtime_principal(),
+                ApplyAuthKeyRef::from_bytes([0xe2; 16]),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+            )
+            .expect("wrong-key terminal claim must remain structural"),
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                carrier.runtime_principal(),
+                carrier.runtime_response_key(),
+                ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM + 1)
+                    .expect("alternate terminal algorithm must build"),
+                ED25519_ALGORITHM_VERSION,
+            )
+            .expect("wrong-algorithm terminal claim must remain structural"),
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                carrier.runtime_principal(),
+                carrier.runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION + 1,
+            )
+            .expect("wrong-version terminal claim must remain structural"),
+        ];
+        for claim in wrong_claims {
+            let receipt = terminal_receipt_v2(&request, claim, None, None);
+            assert_eq!(
+                expect_terminal_admission_error(
+                    trust.verify_terminal_ingress(
+                        permissive_terminal_marker_v2(&receipt, &request),
+                        &request,
+                    ),
+                    "wrong terminal signer tuple must be rejected",
+                ),
+                RemoteAgentDataPlaneTerminalAdmissionErrorV2::SignerSelection,
+            );
+        }
+
+        let alternate_carrier = RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: carrier.target(),
+                runtime_principal: carrier.runtime_principal(),
+                controller_principal: carrier.controller_principal(),
+                endpoint_ref: carrier.endpoint_ref(),
+                endpoint_generation: carrier
+                    .endpoint_generation()
+                    .checked_add(1)
+                    .expect("carrier endpoint generation must have a successor"),
+                route: carrier.route(),
+                controller_request_key: carrier.controller_request_key(),
+                controller_request_key_fingerprint: carrier.controller_request_key_fingerprint(),
+                runtime_response_key: carrier.runtime_response_key(),
+                runtime_response_key_fingerprint: carrier.runtime_response_key_fingerprint(),
+                control_transport_profile_ref: carrier.control_transport_profile_ref(),
+                control_transport_profile_digest: carrier.control_transport_profile_digest(),
+            },
+        )
+        .expect("alternate structural carrier must build");
+        let carrier_mismatch = finalize_remote_agent_access_outer_v2(
+            &request,
+            alternate_carrier,
+            request
+                .apply_request()
+                .expect("terminal PXRA v2 must carry PXAR v11")
+                .clone(),
+            request.expected_runtime_host_epoch(),
+        );
+        let receipt = terminal_receipt_v2(&request, terminal_auth_claim_v2(&request), None, None);
+        assert_eq!(
+            expect_terminal_admission_error(
+                trust.verify_terminal_ingress(
+                    permissive_terminal_marker_v2(&receipt, &carrier_mismatch),
+                    &carrier_mismatch,
+                ),
+                "alternate carrier must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation,
+        );
+
+        let epoch_mismatch = finalize_remote_agent_access_outer_v2(
+            &request,
+            carrier.clone(),
+            request
+                .apply_request()
+                .expect("terminal PXRA v2 must carry PXAR v11")
+                .clone(),
+            request
+                .expected_runtime_host_epoch()
+                .checked_add(1)
+                .expect("RuntimeHost epoch must have a successor"),
+        );
+        assert_eq!(
+            expect_terminal_admission_error(
+                trust.verify_terminal_ingress(
+                    permissive_terminal_marker_v2(&receipt, &epoch_mismatch),
+                    &epoch_mismatch,
+                ),
+                "alternate RuntimeHost epoch must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation,
+        );
+
+        let alternate_request = alternate_terminal_authorized_request_v2(&request);
+        assert_ne!(
+            alternate_request.request_id(),
+            request.request_id(),
+            "the request-correlation negative must alter the exact operation",
+        );
+        assert_eq!(
+            expect_terminal_admission_error(
+                trust.verify_terminal_ingress(
+                    permissive_terminal_marker_v2(&receipt, &request),
+                    &alternate_request,
+                ),
+                "alternate authorized operation must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation,
+        );
+
+        let unpinned_carrier = remote_agent_access_carrier_with_fingerprints(
+            &carrier,
+            carrier.controller_request_key_fingerprint(),
+            Digest32::from_bytes([0xe4; 32]),
+        );
+        let mismatched_carrier_trust =
+            RemoteAgentDataPlaneTerminalRuntimeTrustV2::try_from_provisioning(
+                &provisioning,
+                &unpinned_carrier,
+            );
+        assert_eq!(
+            expect_terminal_admission_error(
+                mismatched_carrier_trust,
+                "mismatched carrier trust must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins,
+            "trust construction itself must reject a carrier not pinned by provisioning",
+        );
     }
 }

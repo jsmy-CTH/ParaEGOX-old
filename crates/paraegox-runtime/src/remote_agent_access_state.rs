@@ -43,7 +43,6 @@ use paraegox_runtime_contracts::{
         RemoteAgentDataPlaneTerminalPhaseV2, RemoteAgentDataPlaneTerminalReceiptV1,
         RemoteAgentDataPlaneTerminalReceiptV2, RemoteAgentRetainedS0CasV2,
         RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1,
-        RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2,
     },
 };
 use sha2::{Digest as ShaDigest, Sha256};
@@ -51,6 +50,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 use crate::{
     admission::{
         VerifiedRemoteAgentAccessApplyIngressV2, VerifiedRemoteAgentDataPlaneApplyIngressV1,
+        VerifiedRemoteAgentDataPlaneTerminalIngressV2,
     },
     managed_agent_stack_state::{
         MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES, ManagedAgentStackDurablePhase,
@@ -2771,18 +2771,33 @@ impl RemoteAgentAuthorizedTransitionV2 {
     /// phase. A raw or merely decoded receipt cannot enter this seam.
     pub(crate) fn try_terminal_successor(
         self,
-        authenticated_terminal: RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'_>,
+        verified_terminal: VerifiedRemoteAgentDataPlaneTerminalIngressV2<'_>,
     ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
         let current = &self.snapshot;
-        let terminal = authenticated_terminal.receipt().clone();
+        let terminal = verified_terminal.receipt().clone();
         let outer = current
             .operation_request
             .as_ref()
             .ok_or(RemoteAgentAccessStateErrorV2::InvalidOperationRequest)?;
-        if !terminal_auth_matches_outer_carrier_v2(&terminal, outer) {
+        let request = inner_request_v2(outer)?;
+        if verified_terminal.outer_request_digest() != outer.request_digest()
+            || verified_terminal.carrier_binding_digest() != outer.carrier().binding_digest()
+            || verified_terminal.target() != current.identity.target
+            || verified_terminal.target() != outer.target()
+            || verified_terminal.runtime_store_instance_id() != current.identity.store_instance_id
+            || verified_terminal.runtime_store_instance_id()
+                != outer.expected_runtime_store_instance_id()
+            || verified_terminal.runtime_host_epoch() != current.writer_runtime_host_epoch
+            || verified_terminal.runtime_host_epoch() != outer.expected_runtime_host_epoch()
+            || verified_terminal.operation_id().as_bytes() != outer.request_id().as_bytes()
+            || verified_terminal.operation_id() != request.operation_id()
+            || verified_terminal.inner_request_digest() != request.request_digest()
+            || verified_terminal.inner_envelope_request_digest()
+                != request.envelope_request_digest()
+            || verified_terminal.terminal_receipt_digest() != terminal.receipt_digest()
+        {
             return Err(RemoteAgentAccessStateErrorV2::InvalidTerminalAuthentication);
         }
-        let request = inner_request_v2(outer)?;
         let facts = terminal
             .validate_against_request(request)
             .map_err(RemoteAgentAccessStateErrorV2::Contract)?;
@@ -4410,12 +4425,14 @@ mod tests {
         },
         wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim},
     };
+    use zeroize::Zeroizing;
 
     use crate::{
         admission::{
             AdmissionStateLimits, ApplyAdmissionPolicy, ED25519_ALGORITHM,
-            ED25519_ALGORITHM_VERSION, ManagedFabricApplyAdmissionError, TrustedApplyIdentity,
-            TrustedApplyKey, TrustedTenureIdentity, TrustedTenureKey,
+            ED25519_ALGORITHM_VERSION, ManagedFabricApplyAdmissionError,
+            RemoteAgentDataPlaneTerminalRuntimeTrustV2, TrustedApplyIdentity, TrustedApplyKey,
+            TrustedTenureIdentity, TrustedTenureKey,
         },
         managed_agent_stack_state::{
             ManagedAgentStackDurableActive, ManagedAgentStackSnapshot,
@@ -4429,6 +4446,7 @@ mod tests {
             RemoteAgentDescriptorEvidenceV1, RemoteAgentDescriptorLiveFactsV1,
             verify_remote_agent_descriptor_evidence_v1,
         },
+        runtime_provisioning::{RuntimeDeveloperLocalProvisioningInputV1, RuntimeProvisioningV1},
     };
 
     use super::*;
@@ -6676,7 +6694,7 @@ mod tests {
             include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
         const ACCESS_V2_FIXTURE: &str =
             include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v2.json");
-        const TERMINAL_SIGNATURE_V2: [u8; 64] = [0xa6; 64];
+        const TERMINAL_SIGNING_SEED_V2: [u8; 32] = [0xa6; 32];
         const ACTIVE_PROXY_SESSION_EPOCH_V2: [u8; 16] = [0xa7; 16];
         const OBSERVED_RESOURCE_CENSUS_V2: Digest32 = Digest32::from_bytes([0xa8; 32]);
         const OBSERVED_RAW_OUTCOME_V2: Digest32 = Digest32::from_bytes([0xa9; 32]);
@@ -6729,6 +6747,7 @@ mod tests {
             template: &RestrictedRuntimeApplyCarrierBindingV1,
         ) -> RestrictedRuntimeApplyCarrierBindingV1 {
             let controller_key = SigningKey::from_bytes(&INNER_SIGNING_SEED).verifying_key();
+            let runtime_key = SigningKey::from_bytes(&TERMINAL_SIGNING_SEED_V2).verifying_key();
             RestrictedRuntimeApplyCarrierBindingV1::try_new(
                 RestrictedRuntimeApplyCarrierBindingFieldsV1 {
                     target: template.target(),
@@ -6745,7 +6764,12 @@ mod tests {
                         panic!("Controller request key fingerprint rejected: {error}")
                     }),
                     runtime_response_key: template.runtime_response_key(),
-                    runtime_response_key_fingerprint: template.runtime_response_key_fingerprint(),
+                    runtime_response_key_fingerprint: ed25519_control_key_fingerprint(
+                        runtime_key.as_bytes(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("Runtime response key fingerprint rejected: {error}")
+                    }),
                     control_transport_profile_ref: template.control_transport_profile_ref(),
                     control_transport_profile_digest: template.control_transport_profile_digest(),
                 },
@@ -7473,11 +7497,48 @@ mod tests {
             .unwrap_or_else(|error| panic!("terminal auth claim rejected: {error}"))
         }
 
+        fn terminal_provisioning_v2(outer: &RemoteAgentAccessRequestV2) -> RuntimeProvisioningV1 {
+            let inner = outer
+                .apply_request()
+                .unwrap_or_else(|| panic!("terminal provisioning requires PXAR v11"));
+            let writer = inner.control_commitment().control().writer_context();
+            let proof_authority = writer.proof().authority();
+            RuntimeProvisioningV1::try_new_developer_local(
+                RuntimeDeveloperLocalProvisioningInputV1 {
+                    socket_path: std::env::temp_dir()
+                        .canonicalize()
+                        .unwrap_or_else(|error| {
+                            panic!("terminal temp directory canonicalization failed: {error}")
+                        })
+                        .join("paraegox-runtime-pxau-v2-test.sock"),
+                    target: outer.target(),
+                    source_scope: inner.provenance().source_scope(),
+                    writer: writer.writer(),
+                    runtime_principal: outer.carrier().runtime_principal(),
+                    controller_principal: outer.carrier().controller_principal(),
+                    controller_request_key_ref: outer.carrier().controller_request_key(),
+                    controller_request_verification_key: SigningKey::from_bytes(
+                        &INNER_SIGNING_SEED,
+                    )
+                    .verifying_key()
+                    .to_bytes(),
+                    runtime_response_key_ref: outer.carrier().runtime_response_key(),
+                    runtime_response_signing_seed: Zeroizing::new(TERMINAL_SIGNING_SEED_V2),
+                    authority_principal: PrincipalRef::from_bytes([0x06; 16]),
+                    tenure_authority_ref: proof_authority.authority(),
+                    tenure_key_ref: proof_authority.key(),
+                    tenure_verification_key: SigningKey::from_bytes(&TENURE_SIGNING_SEED)
+                        .verifying_key()
+                        .to_bytes(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("terminal Runtime provisioning rejected: {error}"))
+        }
+
         fn try_terminal_receipt_v2(
             snapshot: &RemoteAgentAccessSnapshotV2,
             outcome: RemoteAgentDataPlaneTerminalOutcomeV2,
             auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
-            signature: &[u8],
             mutate: impl FnOnce(&mut RemoteAgentDataPlaneTerminalEvidenceFieldsV2),
         ) -> Result<RemoteAgentDataPlaneTerminalReceiptV2, RemoteAgentDataPlanePlanError> {
             let outer = snapshot
@@ -7627,20 +7688,23 @@ mod tests {
             };
             mutate(&mut evidence);
             let evidence = RemoteAgentDataPlaneTerminalEvidenceV2::try_new(evidence)?;
-            RemoteAgentDataPlaneTerminalReceiptDraftV2::try_new(
+            let draft = RemoteAgentDataPlaneTerminalReceiptDraftV2::try_new(
                 request, state, evidence, auth_claim,
-            )?
-            .finalize(signature)
+            )?;
+            let transcript = draft.signing_transcript()?;
+            let signature = SigningKey::from_bytes(&TERMINAL_SIGNING_SEED_V2)
+                .sign(transcript.as_bytes())
+                .to_bytes();
+            draft.finalize(&signature)
         }
 
         fn terminal_receipt_v2(
             snapshot: &RemoteAgentAccessSnapshotV2,
             outcome: RemoteAgentDataPlaneTerminalOutcomeV2,
             auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
-            signature: &[u8],
             mutate: impl FnOnce(&mut RemoteAgentDataPlaneTerminalEvidenceFieldsV2),
         ) -> RemoteAgentDataPlaneTerminalReceiptV2 {
-            try_terminal_receipt_v2(snapshot, outcome, auth_claim, signature, mutate)
+            try_terminal_receipt_v2(snapshot, outcome, auth_claim, mutate)
                 .unwrap_or_else(|error| panic!("PXAU v2 receipt rejected: {error}"))
         }
 
@@ -7648,16 +7712,9 @@ mod tests {
             authorized: RemoteAgentAuthorizedTransitionV2,
             outcome: RemoteAgentDataPlaneTerminalOutcomeV2,
             auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
-            signature: &[u8],
             mutate: impl FnOnce(&mut RemoteAgentDataPlaneTerminalEvidenceFieldsV2),
         ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
-            let receipt = terminal_receipt_v2(
-                authorized.snapshot(),
-                outcome,
-                auth_claim,
-                signature,
-                mutate,
-            );
+            let receipt = terminal_receipt_v2(authorized.snapshot(), outcome, auth_claim, mutate);
             let outer = authorized
                 .snapshot()
                 .operation_request
@@ -7668,7 +7725,16 @@ mod tests {
             let authenticated = receipt
                 .verify_runtime_terminal(request, receipt.authentication(), |_, _, _, _, _, _| true)
                 .unwrap_or_else(|error| panic!("PXAU v2 authentication rejected: {error}"));
-            authorized.try_terminal_successor(authenticated)
+            let provisioning = terminal_provisioning_v2(outer);
+            let trust = RemoteAgentDataPlaneTerminalRuntimeTrustV2::try_from_provisioning(
+                &provisioning,
+                outer.carrier(),
+            )
+            .map_err(|_| RemoteAgentAccessStateErrorV2::InvalidTerminalAuthentication)?;
+            let verified = trust
+                .verify_terminal_ingress(authenticated, outer)
+                .map_err(|_| RemoteAgentAccessStateErrorV2::InvalidTerminalAuthentication)?;
+            authorized.try_terminal_successor(verified)
         }
 
         fn active_ready_snapshot_v2() -> RemoteAgentAccessSnapshotV2 {
@@ -7683,7 +7749,6 @@ mod tests {
                 authorized,
                 RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady,
                 auth_claim,
-                &TERMINAL_SIGNATURE_V2,
                 |_| {},
             )
             .unwrap_or_else(|error| panic!("ActiveReady PXRS2 rejected: {error}"));
@@ -7832,7 +7897,6 @@ mod tests {
                 authorized,
                 RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady,
                 auth_claim,
-                &TERMINAL_SIGNATURE_V2,
                 |_| {},
             )
             .unwrap_or_else(|error| panic!("LocalOnlyReady PXRS2 rejected: {error}"));
@@ -7859,7 +7923,6 @@ mod tests {
                 authorized,
                 RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected,
                 auth_claim,
-                &TERMINAL_SIGNATURE_V2,
                 |_| {},
             )
             .unwrap_or_else(|error| panic!("Active NoEffect PXRS2 rejected: {error}"));
@@ -7897,7 +7960,6 @@ mod tests {
                 authorized,
                 RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected,
                 auth_claim,
-                &TERMINAL_SIGNATURE_V2,
                 |_| {},
             )
             .unwrap_or_else(|error| panic!("Local NoEffect PXRS2 rejected: {error}"));
@@ -8674,7 +8736,7 @@ mod tests {
         }
 
         #[test]
-        fn pxrs2_terminal_requires_exact_outer_runtime_signer_tuple_and_signature_width() {
+        fn pxrs2_terminal_requires_private_admission_marker_and_exact_runtime_signer_tuple() {
             let ready = active_ready_observed_v2().snapshot().clone();
             let outer = ready
                 .operation_request
@@ -8682,6 +8744,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("ReadyObserved PXRS2 must retain PXRA v2"));
             let carrier = outer.carrier();
             let wrong_claims = [
+                RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                    PrincipalRef::from_bytes([0xef; 16]),
+                    carrier.runtime_response_key(),
+                    ApplyAuthAlgorithm::try_new(SNAPSHOT_V2_ED25519_ALGORITHM)
+                        .unwrap_or_else(|error| panic!("terminal algorithm rejected: {error}")),
+                    SNAPSHOT_V2_ED25519_ALGORITHM_VERSION,
+                )
+                .unwrap_or_else(|error| panic!("wrong-principal terminal claim rejected: {error}")),
                 RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
                     carrier.runtime_principal(),
                     ApplyAuthKeyRef::from_bytes([0xee; 16]),
@@ -8716,33 +8786,76 @@ mod tests {
                         authorized,
                         RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady,
                         claim,
-                        &TERMINAL_SIGNATURE_V2,
                         |_| {},
                     ),
                     Err(RemoteAgentAccessStateErrorV2::InvalidTerminalAuthentication)
                 ));
             }
+        }
 
-            let authorized = current_final_v2(ready, |_| {})
-                .and_then(RemoteAgentCurrentFinalAccessSnapshotV2::try_authorize_existing)
-                .unwrap_or_else(|error| panic!("ReadyObserved remint rejected: {error}"));
-            let auth_claim = terminal_auth_for_outer_v2(
-                authorized
-                    .snapshot()
-                    .operation_request
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("ReadyObserved PXRS2 must retain PXRA v2")),
+        #[test]
+        fn pxrs2_terminal_authority_api_has_no_public_marker_or_raw_trust_constructor() {
+            let state_source = include_str!("remote_agent_access_state.rs");
+            let terminal_api = state_source
+                .split_once("impl RemoteAgentAuthorizedTransitionV2 {")
+                .and_then(|(_, implementation)| {
+                    implementation.split_once("pub(crate) fn try_terminal_successor(")
+                })
+                .map(|(_, tail)| {
+                    tail.split_once(") -> Result<")
+                        .map_or(tail, |(signature, _)| signature)
+                })
+                .unwrap_or_else(|| panic!("terminal successor API missing"));
+            assert!(
+                terminal_api.contains("VerifiedRemoteAgentDataPlaneTerminalIngressV2<'_>"),
+                "state must consume only the private protected-key marker",
             );
-            assert!(matches!(
-                try_terminal_pending_v2(
-                    authorized,
-                    RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady,
-                    auth_claim,
-                    &[0xab; 63],
-                    |_| {},
-                ),
-                Err(RemoteAgentAccessStateErrorV2::InvalidTerminalAuthentication)
+            assert!(
+                !terminal_api.contains("RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2"),
+                "the public callback-authenticated marker must not type-check at the state seam",
+            );
+
+            let admission_source = include_str!("admission.rs");
+            let trust_impl = admission_source
+                .split_once("impl RemoteAgentDataPlaneTerminalRuntimeTrustV2 {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("/// Complete Runtime-private authority")
+                        .map(|(implementation, _)| implementation)
+                })
+                .unwrap_or_else(|| panic!("terminal Runtime trust implementation missing"));
+            assert!(trust_impl.contains("try_from_provisioning("));
+            assert!(trust_impl.contains("provisioning: &RuntimeProvisioningV1"));
+            assert!(trust_impl.contains(
+                "validate_restricted_runtime_apply_carrier_pins(provisioning, expected_carrier)"
             ));
+            assert_eq!(
+                trust_impl.matches("pub(crate) fn ").count(),
+                2,
+                "trust exposes only provisioning construction and protected verification",
+            );
+            assert!(!trust_impl.contains("pub(crate) fn new("));
+            assert!(!trust_impl.contains("pub(crate) fn try_new("));
+            assert!(!trust_impl.contains("pub(crate) const fn"));
+            assert!(
+                !admission_source
+                    .contains("impl From<RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2")
+            );
+            assert!(
+                !admission_source
+                    .contains("impl TryFrom<RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2")
+            );
+
+            let marker_declaration = admission_source
+                .split_once("pub(crate) struct VerifiedRemoteAgentDataPlaneTerminalIngressV2")
+                .map(|(prefix, _)| prefix)
+                .and_then(|prefix| {
+                    prefix
+                        .rsplit_once("\n\n")
+                        .map(|(_, declaration)| declaration)
+                })
+                .unwrap_or_else(|| panic!("private terminal marker declaration missing"));
+            assert!(!marker_declaration.contains("#[derive(Clone"));
+            assert!(!marker_declaration.contains("#[derive(Copy"));
         }
 
         #[test]
@@ -8851,7 +8964,6 @@ mod tests {
                 fresh_authorized,
                 RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected,
                 fresh_claim,
-                &TERMINAL_SIGNATURE_V2,
                 |_| {},
             )
             .unwrap_or_else(|error| panic!("fresh Active NoEffect rejected: {error}"));
@@ -8945,7 +9057,6 @@ mod tests {
                     authorize_existing_snapshot_v2(local),
                     RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady,
                     local_claim,
-                    &TERMINAL_SIGNATURE_V2,
                     |evidence| {
                         evidence.submit_admitted_count = 0;
                         evidence.submit_terminalized_count = 0;
@@ -8968,7 +9079,6 @@ mod tests {
                     authorize_existing_snapshot_v2(ready.clone()),
                     RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain,
                     claim,
-                    &TERMINAL_SIGNATURE_V2,
                     |evidence| {
                         evidence.queryable_declared_bitmap = 0b01;
                         evidence.remote_observation =
@@ -8982,7 +9092,6 @@ mod tests {
                     authorize_existing_snapshot_v2(ready.clone()),
                     RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain,
                     claim,
-                    &TERMINAL_SIGNATURE_V2,
                     |evidence| evidence.selection_observed_at_nanos = 103,
                 ),
                 Err(RemoteAgentAccessStateErrorV2::InvalidProgressSuccessor)
@@ -8992,7 +9101,6 @@ mod tests {
                     authorize_existing_snapshot_v2(ready),
                     RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain,
                     claim,
-                    &TERMINAL_SIGNATURE_V2,
                     |evidence| {
                         evidence.resource_census_digest = Digest32::from_bytes([0xcc; 32])
                     },
@@ -9020,7 +9128,6 @@ mod tests {
                 prepared,
                 RemoteAgentDataPlaneTerminalOutcomeV2::NoEffectRejected,
                 claim,
-                &TERMINAL_SIGNATURE_V2,
                 |evidence| {
                     evidence.retained_s0_current_cas_digest = zero_digest();
                     evidence.retained_s0_census_after_digest = zero_digest();
@@ -9064,7 +9171,6 @@ mod tests {
                 started,
                 RemoteAgentDataPlaneTerminalOutcomeV2::Uncertain,
                 claim,
-                &TERMINAL_SIGNATURE_V2,
                 |evidence| {
                     evidence.retained_s0_current_cas_digest = zero_digest();
                     evidence.retained_s0_census_after_digest = zero_digest();
@@ -9119,7 +9225,6 @@ mod tests {
                 quarantine,
                 RemoteAgentDataPlaneTerminalOutcomeV2::Quarantined,
                 claim,
-                &TERMINAL_SIGNATURE_V2,
                 |evidence| {
                     evidence.retained_s0_current_cas_digest = zero_digest();
                     evidence.retained_s0_census_after_digest = zero_digest();
@@ -9154,23 +9259,17 @@ mod tests {
                         .unwrap_or_else(|| panic!("success predecessor must retain PXRA v2")),
                 );
                 assert!(
-                    try_terminal_receipt_v2(
-                        &snapshot,
-                        outcome,
-                        claim,
-                        &TERMINAL_SIGNATURE_V2,
-                        |evidence| {
-                            evidence.retained_s0_current_cas_digest = zero_digest();
-                            evidence.retained_s0_census_after_digest = zero_digest();
-                            evidence.physical_binding_census = 0;
-                            evidence.remote_observation =
-                                RemoteAgentDataPlaneRemoteObservationV2::Unknown;
-                            evidence.retained_s0_census_complete = false;
-                            evidence.retained_s0_ready = false;
-                            evidence.s1_tls_ready = false;
-                            evidence.s1_acl_ready = false;
-                        },
-                    )
+                    try_terminal_receipt_v2(&snapshot, outcome, claim, |evidence| {
+                        evidence.retained_s0_current_cas_digest = zero_digest();
+                        evidence.retained_s0_census_after_digest = zero_digest();
+                        evidence.physical_binding_census = 0;
+                        evidence.remote_observation =
+                            RemoteAgentDataPlaneRemoteObservationV2::Unknown;
+                        evidence.retained_s0_census_complete = false;
+                        evidence.retained_s0_ready = false;
+                        evidence.s1_tls_ready = false;
+                        evidence.s1_acl_ready = false;
+                    },)
                     .is_err()
                 );
             }
