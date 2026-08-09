@@ -1016,15 +1016,19 @@ impl ManagedAgentStackRuntimeCore {
         response_channel: ReferenceChannelBindingV1,
     ) -> Result<Option<ManagedAgentStackApplyOutcome>, ManagedAgentStackRuntimeError> {
         self.validate_request(request, response_channel)?;
-        let Some(receipt) = self.lookup_terminal(request, response_channel)? else {
+        let Some(record) = self.terminal_record(request)? else {
             return Ok(None);
         };
+        let receipt = record.receipt.clone();
         let completion_runtime_host_epoch = receipt
             .facts()
             .evidence()
             .fields()
             .completion_runtime_host_epoch;
         if completion_runtime_host_epoch == self.runtime_host_epoch {
+            let receipt = self
+                .lookup_terminal(request, response_channel)?
+                .ok_or(ManagedAgentStackRuntimeError::InvalidDurableState)?;
             return Ok(Some(ManagedAgentStackApplyOutcome::Replayed(receipt)));
         }
         let verified = RuntimeVerifiedHistoricalManagedAgentStackReceiptV1::try_verify(
@@ -1035,6 +1039,7 @@ impl ManagedAgentStackRuntimeCore {
                 if key != self.response_key_ref
                     || algorithm.value() != ED25519_ALGORITHM
                     || version != ED25519_ALGORITHM_VERSION
+                    || signature.len() != 64
                 {
                     return false;
                 }
@@ -2589,8 +2594,29 @@ mod provider_resolver_tests {
             .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn apply("))
             .map(|(replay, _)| replay)
             .expect("missing authenticated replay boundary");
+        let retained = authenticated_replay
+            .find("self.terminal_record(request)?")
+            .expect("missing retained terminal selection");
+        let epoch = authenticated_replay
+            .find("completion_runtime_host_epoch")
+            .expect("missing completion-epoch classification");
+        let current = authenticated_replay
+            .find("if completion_runtime_host_epoch == self.runtime_host_epoch")
+            .expect("missing current-epoch branch");
+        let current_lookup = authenticated_replay
+            .find("self.lookup_terminal(request, response_channel)?")
+            .expect("current replay bypasses strict terminal lookup");
+        let historical = authenticated_replay
+            .find("RuntimeVerifiedHistoricalManagedAgentStackReceiptV1::try_verify(")
+            .expect("missing historical receipt verification");
+        assert!(
+            retained < epoch
+                && epoch < current
+                && current < current_lookup
+                && current_lookup < historical
+        );
         assert!(authenticated_replay.contains("self.lookup_terminal(request, response_channel)?"));
-        assert!(!authenticated_replay.contains("self.terminal_record(request)?"));
+        assert!(authenticated_replay.contains("|| signature.len() != 64"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
