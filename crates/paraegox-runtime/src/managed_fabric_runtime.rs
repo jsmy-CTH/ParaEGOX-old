@@ -624,9 +624,9 @@ impl<'running> RemoteAgentAccessInitializedGenesisBundleV2<'running> {
     pub(crate) fn try_verify_post_readback_v2(
         self,
         post_readback_live_lower: RemoteAgentLiveLowerFactsV2,
-    ) -> Result<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running>, Self> {
+    ) -> Result<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running>, Box<Self>> {
         if self.precommit_live_lower.exact_facts() != &post_readback_live_lower {
-            return Err(self);
+            return Err(Box::new(self));
         }
         Ok(RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2 {
             readback: self.readback,
@@ -3088,6 +3088,20 @@ mod tests {
         assert!(bundle.contains("precommit_live_lower: RemoteAgentLiveLowerProjectionV2"));
         assert!(bundle.contains("post_readback_live_lower: RemoteAgentLiveLowerFactsV2"));
         assert!(!include_str!("lib.rs").contains("remote_agent_s1_owner"));
+
+        let verify_start = source
+            .find("    pub(crate) fn try_verify_post_readback_v2(")
+            .expect("missing post-readback exact verifier");
+        let verify_tail = &source[verify_start..];
+        let verify_end = verify_tail
+            .find("\n}\n\n/// Move-only post-readback genesis authority")
+            .expect("missing post-readback exact verifier boundary");
+        let verify = &verify_tail[..verify_end];
+        assert!(verify.contains("Box<Self>"));
+        assert!(verify.contains("return Err(Box::new(self));"));
+        assert!(verify.contains("readback: self.readback"));
+        assert!(verify.contains("precommit_live_lower: self.precommit_live_lower"));
+        assert!(!verify.contains("Err(self)"));
 
         let finish_start = source
             .find("    fn finish_remote_agent_access_initialization_v2<Candidate>(")
