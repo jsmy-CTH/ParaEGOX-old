@@ -1624,6 +1624,7 @@ fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures
 #[test]
 fn pxar11_keeps_the_predecessor_controller_authentication_transcript_structural() {
     let predecessor = managed_agent_request();
+    let temporal = temporal_with_remaining(predecessor.temporal(), OPERATION_TIMEOUT_NANOS);
     let claim = ApplyRequestAuthClaim::try_new(
         predecessor.authentication().claim().principal(),
         predecessor.authentication().claim().key(),
@@ -1639,7 +1640,7 @@ fn pxar11_keeps_the_predecessor_controller_authentication_transcript_structural(
         ),
         predecessor.provenance(),
         predecessor.control_commitment().control().clone(),
-        predecessor.temporal(),
+        temporal,
         predecessor.expected_runtime_store_instance_id(),
         claim,
     )
