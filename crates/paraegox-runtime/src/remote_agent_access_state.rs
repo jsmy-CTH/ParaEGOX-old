@@ -267,38 +267,37 @@ impl RemoteAgentAuthorizedAccessSnapshotV1 {
             .ok_or(RemoteAgentAccessStateError::InvalidPredecessor)?;
         let (sequence, previous_snapshot_digest, access_generation_high_water) =
             match previous.as_ref() {
-            Some(previous) => {
-                let prior_inner = inner_request(&previous.request)?;
-                if !matches!(
-                    previous.phase,
-                    RemoteAgentAccessDurablePhaseV1::NoEffectTerminal
-                        | RemoteAgentAccessDurablePhaseV1::ActiveReady
-                        | RemoteAgentAccessDurablePhaseV1::LocalOnlyReady
-                )
-                    || previous.store_instance_id != identity.store_instance_id
-                    || previous.owner_target_fingerprint != identity.owner_target_fingerprint
-                    || previous.transition_projection_digest
-                        != identity.transition_projection_digest
-                    || previous.fabric_owner_target_fingerprint
-                        != identity.fabric_owner_target_fingerprint
-                    || previous.fabric_transition_projection_digest
-                        != identity.fabric_transition_projection_digest
-                    || previous.target != outer.target()
-                    || prior_inner.operation_id() == inner.operation_id()
-                {
-                    return Err(RemoteAgentAccessStateError::InvalidOperationReplacement);
+                Some(previous) => {
+                    let prior_inner = inner_request(&previous.request)?;
+                    if !matches!(
+                        previous.phase,
+                        RemoteAgentAccessDurablePhaseV1::NoEffectTerminal
+                            | RemoteAgentAccessDurablePhaseV1::ActiveReady
+                            | RemoteAgentAccessDurablePhaseV1::LocalOnlyReady
+                    ) || previous.store_instance_id != identity.store_instance_id
+                        || previous.owner_target_fingerprint != identity.owner_target_fingerprint
+                        || previous.transition_projection_digest
+                            != identity.transition_projection_digest
+                        || previous.fabric_owner_target_fingerprint
+                            != identity.fabric_owner_target_fingerprint
+                        || previous.fabric_transition_projection_digest
+                            != identity.fabric_transition_projection_digest
+                        || previous.target != outer.target()
+                        || prior_inner.operation_id() == inner.operation_id()
+                    {
+                        return Err(RemoteAgentAccessStateError::InvalidOperationReplacement);
+                    }
+                    (
+                        previous
+                            .sequence
+                            .checked_add(1)
+                            .ok_or(RemoteAgentAccessStateError::SequenceExhausted)?,
+                        Some(previous.snapshot_digest),
+                        previous.generations.access_generation_high_water,
+                    )
                 }
-                (
-                    previous
-                        .sequence
-                        .checked_add(1)
-                        .ok_or(RemoteAgentAccessStateError::SequenceExhausted)?,
-                    Some(previous.snapshot_digest),
-                    previous.generations.access_generation_high_water,
-                )
-            }
-            None => (1, None, 0),
-        };
+                None => (1, None, 0),
+            };
         let observed_fabric_high_water = strict_predecessor
             .fabric_generation_high_water
             .max(strict_fabric.generation_high_water());
@@ -311,15 +310,15 @@ impl RemoteAgentAuthorizedAccessSnapshotV1 {
                         .fabric_generation_high_water
                         .max(observed_fabric_high_water)
                 });
-        let inherited_agent_high_water = previous.as_ref().map_or(
-            strict_predecessor.agent_generation_high_water,
-            |prior| {
-                prior
-                    .generations
-                    .agent_generation_high_water
-                    .max(strict_predecessor.agent_generation_high_water)
-            },
-        );
+        let inherited_agent_high_water =
+            previous
+                .as_ref()
+                .map_or(strict_predecessor.agent_generation_high_water, |prior| {
+                    prior
+                        .generations
+                        .agent_generation_high_water
+                        .max(strict_predecessor.agent_generation_high_water)
+                });
         if active.fabric_generation.value() > inherited_fabric_high_water
             || active.agent_generation.value() > inherited_agent_high_water
         {
@@ -382,7 +381,11 @@ impl RemoteAgentAuthorizedAccessSnapshotV1 {
         {
             return Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor);
         }
-        validate_clock_window(inner_request(&snapshot.request)?, snapshot.admission, fresh_clock)?;
+        validate_clock_window(
+            inner_request(&snapshot.request)?,
+            snapshot.admission,
+            fresh_clock,
+        )?;
         validate_generation_successor(snapshot, phase, generations)?;
         self.try_successor(phase, generations, None)
     }
@@ -414,9 +417,7 @@ impl RemoteAgentAuthorizedAccessSnapshotV1 {
         authenticated_terminal: RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1<'_>,
     ) -> Result<Self, RemoteAgentAccessStateError> {
         let snapshot = &self.snapshot;
-        if !phase.is_terminal()
-            || !valid_phase_successor(snapshot.phase, phase, snapshot.mode)
-        {
+        if !phase.is_terminal() || !valid_phase_successor(snapshot.phase, phase, snapshot.mode) {
             return Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor);
         }
         validate_generation_successor(snapshot, phase, generations)?;
@@ -671,18 +672,20 @@ impl RemoteAgentAccessSnapshotV1 {
         let inner = inner_request(&self.request)?;
         if authenticated_inner.request_digest() != self.admission.request_digest
             || authenticated_inner.request_digest() != inner.request_digest()
-            || authenticated_inner.proof_envelope_digest()
-                != self.admission.proof_envelope_digest
-            || authenticated_inner.tenure_nonce_identity()
-                != self.admission.tenure_nonce_identity
-            || authenticated_inner.request_nonce_identity()
-                != self.admission.request_nonce_identity
+            || authenticated_inner.proof_envelope_digest() != self.admission.proof_envelope_digest
+            || authenticated_inner.tenure_nonce_identity() != self.admission.tenure_nonce_identity
+            || authenticated_inner.request_nonce_identity() != self.admission.request_nonce_identity
             || authenticated_inner.temporal_lineage_identity()
                 != self.admission.temporal_lineage_identity
         {
             return Err(RemoteAgentAccessStateError::AuthenticationMismatch);
         }
-        match (self.mode, self.phase, self.descriptor_evidence.as_ref(), verified_descriptor) {
+        match (
+            self.mode,
+            self.phase,
+            self.descriptor_evidence.as_ref(),
+            verified_descriptor,
+        ) {
             (
                 RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
                 RemoteAgentAccessDurablePhaseV1::PreparedNoEffects,
@@ -691,26 +694,16 @@ impl RemoteAgentAccessSnapshotV1 {
             ) if retained.canonical_wire() == verified.evidence().canonical_wire() => {
                 validate_descriptor_authority_scope(&self.request, inner, retained)?;
             }
-            (
-                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-                phase,
-                Some(_),
-                None,
-            ) if phase != RemoteAgentAccessDurablePhaseV1::PreparedNoEffects => {}
-            (
-                RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-                _,
-                None,
-                None,
-            ) => {}
+            (RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive, phase, Some(_), None)
+                if phase != RemoteAgentAccessDurablePhaseV1::PreparedNoEffects => {}
+            (RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate, _, None, None) => {}
             _ => return Err(RemoteAgentAccessStateError::InvalidDescriptorShape),
         }
         match (self.terminal.as_ref(), authenticated_terminal) {
             (None, None) if !self.phase.is_terminal() => {}
             (Some(retained), Some(authenticated))
                 if self.phase.is_terminal()
-                    && retained.canonical_wire()
-                        == authenticated.receipt().canonical_wire() =>
+                    && retained.canonical_wire() == authenticated.receipt().canonical_wire() =>
             {
                 retained
                     .validate_against_request(inner)
