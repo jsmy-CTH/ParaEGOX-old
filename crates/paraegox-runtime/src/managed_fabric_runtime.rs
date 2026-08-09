@@ -55,7 +55,9 @@ use crate::remote_agent_descriptor_evidence::{
     RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
 };
 use crate::runtime_clock::RuntimeClock;
-use crate::runtime_store::{ManagedFabricStore, ManagedFabricStoreError, RuntimeStore};
+use crate::runtime_store::{
+    ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessStartupSlotV2, RuntimeStore,
+};
 use crate::task_registry::CancellationSource;
 
 /// Exact Fabric implementation owned by one managed-service assembly.
@@ -458,6 +460,7 @@ pub(crate) struct ManagedFabricRuntimeCore {
     assembly: Option<ManagedServiceAssembly>,
     fabric_control: Option<ManagedFabricControlHandle>,
     remote_agent_descriptor_evidence: Option<RemoteAgentDescriptorEvidenceV1>,
+    remote_agent_access_startup_v2: Option<RemoteAgentAccessStartupSlotV2>,
     #[cfg(test)]
     fail_next_remote_agent_descriptor_post_commit_reverify: bool,
     cleanup_exact_zero: bool,
@@ -586,6 +589,7 @@ impl ManagedFabricRuntimeCore {
             assembly: None,
             fabric_control: None,
             remote_agent_descriptor_evidence,
+            remote_agent_access_startup_v2: None,
             #[cfg(test)]
             fail_next_remote_agent_descriptor_post_commit_reverify: false,
             cleanup_exact_zero,
@@ -647,6 +651,7 @@ impl ManagedFabricRuntimeCore {
             assembly: None,
             fabric_control: None,
             remote_agent_descriptor_evidence,
+            remote_agent_access_startup_v2: None,
             #[cfg(test)]
             fail_next_remote_agent_descriptor_post_commit_reverify: false,
             cleanup_exact_zero,
@@ -713,6 +718,46 @@ impl ManagedFabricRuntimeCore {
     #[must_use]
     pub(crate) fn owner_target_fingerprint(&self) -> Digest32 {
         self.snapshot.owner_target_fingerprint()
+    }
+
+    /// Retains the one pre-effect PXRS v2 startup classification produced by
+    /// this core's already-open store. Older-epoch finals are rejected by the
+    /// caller before core construction and therefore can never enter this
+    /// owner.
+    pub(crate) fn install_remote_agent_access_startup_v2(
+        &mut self,
+        startup: RemoteAgentAccessStartupSlotV2,
+    ) -> Result<(), ManagedFabricRuntimeError> {
+        if self.remote_agent_access_startup_v2.is_some()
+            || matches!(
+                &startup,
+                RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)
+            )
+        {
+            return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired);
+        }
+        self.remote_agent_access_startup_v2 = Some(startup);
+        Ok(())
+    }
+
+    /// Enforces that any retained Agent-stack authority or existing PXRS v2
+    /// final was classified before successor recovery. This gate grants no S1
+    /// or transition authority; Absent and SameEpoch remain opaque leases.
+    pub(crate) fn require_remote_agent_access_startup_v2(
+        &self,
+    ) -> Result<(), ManagedFabricRuntimeError> {
+        let required = self.store.remote_agent_access_startup_required_v2();
+        match (&self.remote_agent_access_startup_v2, required) {
+            (Some(RemoteAgentAccessStartupSlotV2::Absent(_)), true)
+            | (Some(RemoteAgentAccessStartupSlotV2::SameEpoch(_)), true)
+            | (None, false) => Ok(()),
+            (
+                Some(RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)),
+                _,
+            )
+            | (Some(_), false)
+            | (None, true) => Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired),
+        }
     }
 
     /// Returns the strictly decoded latest PXDE slot. It is historical bytes,
@@ -2221,6 +2266,7 @@ pub(crate) enum ManagedFabricRuntimeError {
     ExpectedActiveMismatch,
     ReplayConflict,
     ReplayCapacityReached,
+    RemoteAgentAccessReconcileRequired,
     GenerationExhausted,
     InvalidDurableState,
     SequenceOverflow,
@@ -2298,6 +2344,9 @@ impl fmt::Display for ManagedFabricRuntimeError {
             Self::ReplayConflict => formatter.write_str("managed Fabric replay conflict"),
             Self::ReplayCapacityReached => {
                 formatter.write_str("managed Fabric replay capacity reached")
+            }
+            Self::RemoteAgentAccessReconcileRequired => {
+                formatter.write_str("remote Agent access startup requires reconciliation")
             }
             Self::GenerationExhausted => formatter.write_str("managed Fabric generation exhausted"),
             Self::InvalidDurableState => formatter.write_str("invalid managed Fabric state"),

@@ -2432,6 +2432,16 @@ impl ManagedFabricStore {
         )
     }
 
+    /// Reports whether startup must classify the PXRS v2 slot before any
+    /// successor recovery or listener publication. A retained Agent-stack
+    /// authority needs an exact absent lease for first initialization, while
+    /// any existing PXRS final must be adjudicated even if the surrounding
+    /// stack ownership is malformed.
+    #[must_use]
+    pub(crate) const fn remote_agent_access_startup_required_v2(&self) -> bool {
+        self.managed_agent_stack_marker.is_some() || self.remote_agent_access_active.is_some()
+    }
+
     #[must_use]
     pub(crate) fn managed_model_agent_stack_projection_digest(&self) -> Option<Digest32> {
         self.managed_model_agent_stack_marker

@@ -154,6 +154,7 @@ use crate::{
         RemoteAgentDescriptorLiveFactsV1, RemoteAgentVerifiedDescriptorEvidenceV1,
         verify_remote_agent_descriptor_evidence_v1,
     },
+    remote_agent_access_state::RemoteAgentAccessStaticIdentityPinsV2,
     runtime_agent_provider::{
         RuntimeAgentProviderResolverV1, UnavailableRuntimeAgentProviderResolver,
     },
@@ -178,8 +179,8 @@ use crate::{
         RuntimeProvisioningError, RuntimeProvisioningV1, validate_canonical_absolute_path,
     },
     runtime_store::{
-        ManagedFabricStore, ManagedFabricStoreError, RuntimeStore, RuntimeStoreError,
-        RuntimeStoreOpenError,
+        ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessStartupSlotV2,
+        RuntimeStore, RuntimeStoreError, RuntimeStoreOpenError,
     },
 };
 
@@ -1554,7 +1555,7 @@ impl StartedManagedFabricService {
         expected_store_instance_id: [u8; 32],
         compiled: RuntimeCompiledInstallationFactsV1,
         provisioning: RuntimeProvisioningV1,
-        store: ManagedFabricStore,
+        mut store: ManagedFabricStore,
         dependencies: RuntimeManagedFabricServiceDependenciesV1,
     ) -> Result<Self, RuntimeBootstrapEndpointError> {
         let frozen = store.frozen_legacy_snapshot().clone();
@@ -1602,7 +1603,28 @@ impl StartedManagedFabricService {
             generation,
             1,
         );
-        let core = ManagedFabricRuntimeCore::from_preopened_store(
+        let remote_agent_access_startup_v2 = if store
+            .remote_agent_access_startup_required_v2()
+        {
+            let startup = store.adjudicate_remote_agent_access_startup_v2(
+                RemoteAgentAccessStaticIdentityPinsV2 {
+                    target: projection.target(),
+                    store_instance_id: expected_store_instance_id,
+                    owner_target_fingerprint: provisioning.owner_target_fingerprint(),
+                    transition_projection_digest: projection_digest,
+                },
+                runtime_host_epoch,
+            )?;
+            match startup {
+                RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
+                    return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired.into());
+                }
+                startup => Some(startup),
+            }
+        } else {
+            None
+        };
+        let mut core = ManagedFabricRuntimeCore::from_preopened_store(
             store,
             ManagedFabricOwnerConfig {
                 state_directory: state_directory.to_path_buf(),
@@ -1615,6 +1637,9 @@ impl StartedManagedFabricService {
                 response_signer: provisioning.response_signer().clone(),
             },
         )?;
+        if let Some(startup) = remote_agent_access_startup_v2 {
+            core.install_remote_agent_access_startup_v2(startup)?;
+        }
         let stack_projection =
             ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(projection)?;
         let handle_broker = RuntimeAgentHandleBroker::default();
@@ -3223,6 +3248,9 @@ pub(crate) fn run_runtime_bootstrap_process(
 /// PXBR.  Only a fully decoded, authenticated, channel-bound, and manifest-pin
 /// exact PXFB can consume that legacy owner and publish the one-way PXMS
 /// marker; the listener and socket identity remain unchanged across cutover.
+/// That predecessor listener is the deliberate startup-order exception: it
+/// cannot decode or dispatch PXRA v2, and the managed owner still runs the
+/// PXRS v2 gate before any managed recovery, capability, or remote listener.
 pub(crate) async fn serve_runtime_developer_local_until<F, R>(
     state_directory: &Path,
     expected_store_instance_id: [u8; 32],
@@ -3801,6 +3829,7 @@ async fn recover_managed_control_for_existing_channel(
         provisioning,
         dependencies,
     } = started;
+    core.require_remote_agent_access_startup_v2()?;
     let recovery_result = async {
         if let Some(distributed) = distributed.as_mut() {
             distributed
@@ -4328,6 +4357,8 @@ where
         provisioning,
         dependencies,
     } = started;
+
+    core.require_remote_agent_access_startup_v2()?;
 
     // Recovery is the readiness gate. No filesystem entry for the control
     // listener exists until the durable successor state and any required real
@@ -7140,6 +7171,66 @@ mod tests {
             7
         );
         assert!(!managed.contains(".and("));
+    }
+
+    #[test]
+    fn pxrs2_startup_gate_precedes_successor_recovery_and_listener_publication() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        let startup = section(
+            source,
+            "    fn try_start_from_store(",
+            "pub(crate) struct ManagedFabricControlService",
+        );
+        let adjudication = startup
+            .find(".adjudicate_remote_agent_access_startup_v2(")
+            .unwrap_or_else(|| panic!("PXRS v2 startup adjudication disappeared"));
+        let reconcile = startup
+            .find("RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)")
+            .unwrap_or_else(|| panic!("old-epoch PXRS v2 fail-stop disappeared"));
+        let core = startup
+            .find("ManagedFabricRuntimeCore::from_preopened_store(")
+            .unwrap_or_else(|| panic!("managed Fabric core construction disappeared"));
+        let stack = startup
+            .find("ManagedAgentStackRuntimeCore::open(")
+            .unwrap_or_else(|| panic!("managed Agent-stack construction disappeared"));
+        assert!(adjudication < reconcile && reconcile < core && core < stack);
+
+        let existing_channel = section(
+            source,
+            "async fn recover_managed_control_for_existing_channel",
+            "async fn shutdown_managed_successor_chain",
+        );
+        assert!(
+            existing_channel
+                .find("core.require_remote_agent_access_startup_v2()?")
+                .unwrap_or_else(|| panic!("existing-channel PXRS v2 gate disappeared"))
+                < existing_channel
+                    .find("let recovery_result = async")
+                    .unwrap_or_else(|| panic!("existing-channel recovery disappeared"))
+        );
+
+        let managed = section(
+            source,
+            "pub(crate) async fn serve_managed_fabric_until_with_ready",
+            "async fn runtime_shutdown_signal",
+        );
+        let gate = managed
+            .find("core.require_remote_agent_access_startup_v2()?")
+            .unwrap_or_else(|| panic!("managed PXRS v2 gate disappeared"));
+        let recovery = managed
+            .find("let recovery = async")
+            .unwrap_or_else(|| panic!("managed recovery disappeared"));
+        let bind = managed
+            .find("bind_control_socket(&provisioning)")
+            .unwrap_or_else(|| panic!("managed listener bind disappeared"));
+        assert!(gate < recovery && recovery < bind);
+
+        let developer_local = section(
+            source,
+            "pub(crate) async fn serve_runtime_developer_local_until",
+            "enum DeveloperLocalControlState",
+        );
+        assert!(developer_local.contains("cannot decode or dispatch PXRA v2"));
     }
 
     #[test]
