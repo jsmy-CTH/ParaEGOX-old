@@ -642,8 +642,8 @@ impl<'running> RemoteAgentAccessInitializedGenesisBundleV2<'running> {
 
 /// Move-only post-readback genesis authority. It retains the same restricted
 /// endpoint Pin, the exact pre/post live facts, and the sole SameEpoch lease.
-/// A later CurrentFinal binder must consume this complete value; this tranche
-/// intentionally exposes no binder and no active/S1 transition authority.
+/// The sole CurrentFinal binder below must consume this complete value; the
+/// bundle itself exposes no active/S1 transition authority.
 pub(crate) struct RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running> {
     readback: RemoteAgentAccessInitializedAbsentReadbackV2,
     precommit_live_lower: RemoteAgentLiveLowerProjectionV2<'running>,
