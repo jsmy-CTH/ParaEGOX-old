@@ -1014,8 +1014,7 @@ impl ManagedFabricRuntimeCore {
         let control = self
             .control_handle()
             .map_err(|_| ManagedFabricRuntimeError::InvalidDurableState)?;
-        if active.request.target_execution().execution_digest()
-            != expected_fabric_execution_digest
+        if active.request.target_execution().execution_digest() != expected_fabric_execution_digest
             || active.generation != expected_fabric_generation
             || control.generation() != expected_fabric_generation
         {
@@ -2829,18 +2828,20 @@ mod tests {
         );
         assert_eq!(core.snapshot.phase, ManagedFabricDurablePhase::ActiveReady);
         assert_eq!(core.snapshot.generation_high_water(), 1);
-        let generation_one = ManagedServiceGeneration::try_new(1)
-            .expect("first managed generation must be valid");
+        let generation_one =
+            ManagedServiceGeneration::try_new(1).expect("first managed generation must be valid");
         let retained_root = core
             .export_active_retained_root_v1(
                 active.target_execution().execution_digest(),
                 generation_one,
             )
             .expect("current active execution must export its correlated PXFT root");
-        assert_eq!(retained_root.active_pxft_digest, active_receipt.receipt_digest());
+        assert_eq!(
+            retained_root.active_pxft_digest,
+            active_receipt.receipt_digest()
+        );
         assert_eq!(retained_root.fabric_generation, generation_one);
-        let mut wrong_execution_digest =
-            *active.target_execution().execution_digest().as_bytes();
+        let mut wrong_execution_digest = *active.target_execution().execution_digest().as_bytes();
         wrong_execution_digest[0] ^= 1;
         assert!(matches!(
             core.export_active_retained_root_v1(
@@ -3283,11 +3284,7 @@ mod tests {
         .expect("Agent must install on the existing Fabric generation");
 
         let live_port = assembly
-            .export_live_conversation_port_descriptor_v1(
-                &handle,
-                &handle,
-                fabric_generation,
-            )
+            .export_live_conversation_port_descriptor_v1(&handle, &handle, fabric_generation)
             .await
             .expect("exact live owners and census must export PXAP facts");
         let descriptor = AgentConversationPortDescriptorV1::decode(&live_port.descriptor_wire)
@@ -3320,11 +3317,7 @@ mod tests {
         .expect("next test generation must be valid");
         assert!(matches!(
             assembly
-                .export_live_conversation_port_descriptor_v1(
-                    &handle,
-                    &handle,
-                    wrong_generation,
-                )
+                .export_live_conversation_port_descriptor_v1(&handle, &handle, wrong_generation,)
                 .await,
             Err(ManagedAgentAssemblyError::InstalledPortUnavailable)
         ));
@@ -3339,11 +3332,7 @@ mod tests {
             slot.owned_binding_count = 1;
         }
         let census_error = match assembly
-            .export_live_conversation_port_descriptor_v1(
-                &handle,
-                &handle,
-                fabric_generation,
-            )
+            .export_live_conversation_port_descriptor_v1(&handle, &handle, fabric_generation)
             .await
         {
             Err(error) => error,

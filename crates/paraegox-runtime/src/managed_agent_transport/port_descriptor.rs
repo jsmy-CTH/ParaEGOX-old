@@ -243,9 +243,7 @@ impl AgentConversationPort {
         let physical_binding_census = u16::try_from(AGENT_CONVERSATION_PORT_PHYSICAL_BINDINGS)
             .ok()
             .filter(|count| *count == 2)
-            .ok_or(
-                AgentConversationPortLiveOwnerExportErrorV1::InvalidPhysicalBindingCensus,
-            )?;
+            .ok_or(AgentConversationPortLiveOwnerExportErrorV1::InvalidPhysicalBindingCensus)?;
         Ok(AgentConversationPortLiveOwnerExportV1 {
             descriptor_wire,
             fabric_session_epoch: fabric.session_epoch(),
@@ -413,8 +411,7 @@ mod tests {
 
     use super::*;
     use crate::managed_agent_transport::{
-        AgentConversationPortSpec, install_agent_conversation_port,
-        retire_agent_conversation_port,
+        AgentConversationPortSpec, install_agent_conversation_port, retire_agent_conversation_port,
     };
 
     const GOLDEN_HEX: &str =
