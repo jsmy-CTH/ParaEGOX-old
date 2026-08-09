@@ -17,7 +17,7 @@ use paraegox_kernel::time::ClockReading;
 use paraegox_runtime_contracts::apply::ExpectedActive;
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     DistributedAgentStackTerminalOutcomeV1, DistributedAgentStackTerminalReceiptV1,
-    DistributedAgentStackTerminalReceiptV2,
+    DistributedAgentStackTerminalReceiptV2, DistributedFabricSessionEpochV1,
 };
 use paraegox_runtime_contracts::managed_agent_stack_plan::{
     ManagedAgentStackApplyRequestV1, ManagedAgentStackPlanError, ManagedAgentStackProjectionV1,
@@ -331,6 +331,14 @@ pub(crate) struct RuntimeAgentConversationPortExportV1 {
     pub(crate) descriptor_wire: Box<[u8]>,
     pub(crate) fabric_generation: ManagedServiceGeneration,
     pub(crate) agent_generation: ManagedServiceGeneration,
+    pub(crate) fabric_execution_digest: Digest32,
+    pub(crate) fabric_session_epoch: DistributedFabricSessionEpochV1,
+    pub(crate) descriptor_digest: Digest32,
+    pub(crate) request_binding_descriptor_digest: Digest32,
+    pub(crate) event_binding_descriptor_digest: Digest32,
+    pub(crate) submit_binding_epoch: u64,
+    pub(crate) control_binding_epoch: u64,
+    pub(crate) physical_binding_census: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -488,7 +496,7 @@ impl ManagedAgentStackRuntimeCore {
             .assembly
             .as_ref()
             .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
-        let descriptor_wire = assembly
+        let live_port = assembly
             .export_live_conversation_port_descriptor_v1(
                 owner_handle,
                 &broker_handle,
@@ -496,11 +504,28 @@ impl ManagedAgentStackRuntimeCore {
             )
             .await
             .map_err(|_| RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?;
+        if live_port.physical_binding_census != 2 {
+            return Err(RuntimeAgentConversationPortExportErrorV1::InternalInvariant);
+        }
+        let fabric_execution_digest = active
+            .request
+            .target_execution()
+            .fabric()
+            .ok_or(RuntimeAgentConversationPortExportErrorV1::InternalInvariant)?
+            .execution_digest();
         Ok(RuntimeAgentConversationPortExportV1 {
             active_pxst_digest: receipt.receipt_digest(),
-            descriptor_wire,
+            descriptor_wire: live_port.descriptor_wire,
             fabric_generation: active.fabric_generation,
             agent_generation: active.agent_generation,
+            fabric_execution_digest,
+            fabric_session_epoch: live_port.fabric_session_epoch,
+            descriptor_digest: live_port.descriptor_digest,
+            request_binding_descriptor_digest: live_port.request_binding_descriptor_digest,
+            event_binding_descriptor_digest: live_port.event_binding_descriptor_digest,
+            submit_binding_epoch: live_port.submit_binding_epoch,
+            control_binding_epoch: live_port.control_binding_epoch,
+            physical_binding_census: live_port.physical_binding_census,
         })
     }
 

@@ -10,9 +10,11 @@
 use core::fmt;
 
 use paraegox_fabric::{
-    MAX_PORT_BINDING_DESCRIPTOR_BYTES, PortBindingDescriptorError, PortBindingDescriptorV1,
+    FabricService, MAX_PORT_BINDING_DESCRIPTOR_BYTES, PortBindingDescriptorError,
+    PortBindingDescriptorV1,
 };
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
+use paraegox_runtime_contracts::distributed_agent_stack_plan::DistributedFabricSessionEpochV1;
 
 use super::AgentConversationClientPortV1;
 use super::{
@@ -41,6 +43,27 @@ pub struct AgentConversationPortDescriptorV1 {
     control: PortBindingDescriptorV1,
     descriptor_digest: Digest32,
     canonical_wire: Box<[u8]>,
+}
+
+/// One read-fenced observation of the exact owner-issued two-lane port on the
+/// exact live Fabric instance. It carries no raw route, Session, or mutation
+/// token.
+pub(crate) struct AgentConversationPortLiveOwnerExportV1 {
+    pub(crate) descriptor_wire: Box<[u8]>,
+    pub(crate) fabric_session_epoch: DistributedFabricSessionEpochV1,
+    pub(crate) descriptor_digest: Digest32,
+    pub(crate) request_binding_descriptor_digest: Digest32,
+    pub(crate) event_binding_descriptor_digest: Digest32,
+    pub(crate) submit_binding_epoch: u64,
+    pub(crate) control_binding_epoch: u64,
+    pub(crate) physical_binding_census: u16,
+}
+
+#[derive(Debug)]
+pub(crate) enum AgentConversationPortLiveOwnerExportErrorV1 {
+    BindingNotActive,
+    InvalidPhysicalBindingCensus,
+    Descriptor(AgentConversationPortDescriptorError),
 }
 
 impl AgentConversationPortDescriptorV1 {
@@ -140,6 +163,12 @@ impl AgentConversationPortDescriptorV1 {
         &self.canonical_wire
     }
 
+    /// Returns the digest committed by the complete canonical PXAP frame.
+    #[must_use]
+    pub(crate) const fn descriptor_digest(&self) -> Digest32 {
+        self.descriptor_digest
+    }
+
     /// Returns the exact request/submit lane descriptor digest observed at
     /// installation, including its `BindingId` and binding epoch.
     #[must_use]
@@ -191,6 +220,42 @@ impl AgentConversationPort {
         &self,
     ) -> Result<Box<[u8]>, AgentConversationPortDescriptorError> {
         Ok(self.export_descriptor_v1()?.canonical_wire.clone())
+    }
+
+    /// Observes the exact owner-issued lane tokens against the supplied live
+    /// Fabric and exports only strict descriptor and lifecycle facts. The
+    /// caller must hold the Fabric owner's read fence for the whole call.
+    pub(crate) fn export_live_owner_facts_v1(
+        &self,
+        fabric: &FabricService,
+    ) -> Result<AgentConversationPortLiveOwnerExportV1, AgentConversationPortLiveOwnerExportErrorV1>
+    {
+        if fabric.ingress_snapshot(&self.submit_binding).is_none()
+            || fabric.ingress_snapshot(&self.control_binding).is_none()
+        {
+            return Err(AgentConversationPortLiveOwnerExportErrorV1::BindingNotActive);
+        }
+        let descriptor_wire = self
+            .export_descriptor_wire_v1()
+            .map_err(AgentConversationPortLiveOwnerExportErrorV1::Descriptor)?;
+        let descriptor = AgentConversationPortDescriptorV1::decode(&descriptor_wire)
+            .map_err(AgentConversationPortLiveOwnerExportErrorV1::Descriptor)?;
+        let physical_binding_census = u16::try_from(AGENT_CONVERSATION_PORT_PHYSICAL_BINDINGS)
+            .ok()
+            .filter(|count| *count == 2)
+            .ok_or(
+                AgentConversationPortLiveOwnerExportErrorV1::InvalidPhysicalBindingCensus,
+            )?;
+        Ok(AgentConversationPortLiveOwnerExportV1 {
+            descriptor_wire,
+            fabric_session_epoch: fabric.session_epoch(),
+            descriptor_digest: descriptor.descriptor_digest(),
+            request_binding_descriptor_digest: descriptor.request_binding_descriptor_digest(),
+            event_binding_descriptor_digest: descriptor.event_binding_descriptor_digest(),
+            submit_binding_epoch: self.submit_binding.binding_epoch().value(),
+            control_binding_epoch: self.control_binding.binding_epoch().value(),
+            physical_binding_census,
+        })
     }
 }
 
@@ -339,11 +404,18 @@ impl std::error::Error for AgentConversationPortDescriptorError {}
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
+    use std::net::TcpListener;
 
-    use paraegox_fabric::{BindingEpoch, IngressLimits};
+    use paraegox_fabric::{
+        BindingEpoch, FabricService, FabricServiceConfig, IngressLimits, SessionEndpoint,
+    };
     use paraegox_runtime_contracts::assignment::BindingId;
 
     use super::*;
+    use crate::managed_agent_transport::{
+        AgentConversationPortSpec, install_agent_conversation_port,
+        retire_agent_conversation_port,
+    };
 
     const GOLDEN_HEX: &str =
         include_str!("../../tests/fixtures/agent_conversation_port_descriptor_v1.hex");
@@ -372,6 +444,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    fn available_tcp_endpoint() -> SessionEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral TCP listener");
+        let address = listener.local_addr().expect("ephemeral TCP address");
+        drop(listener);
+        SessionEndpoint::try_new(format!("tcp/{address}")).expect("loopback endpoint")
     }
 
     fn decode_hex_fixture(value: &str) -> Vec<u8> {
@@ -475,6 +554,65 @@ mod tests {
         assert_eq!(port.submit_binding.binding_epoch().value(), 3);
         assert_eq!(port.control_binding.binding_epoch().value(), 4);
         assert_eq!(format!("{port:?}"), "AgentConversationClientPortV1 { .. }");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_owner_export_binds_session_lanes_epochs_and_rejects_retired_tokens() {
+        let config = FabricServiceConfig::try_peer(vec![available_tcp_endpoint()], Vec::new())
+            .expect("one listener is a valid peer configuration");
+        let mut fabric = FabricService::start(config)
+            .await
+            .expect("test Fabric must start");
+        let limits =
+            IngressLimits::try_new(4, 16_384, 4_096, 4_096, Duration::from_secs(2)).unwrap();
+        let spec = AgentConversationPortSpec::try_new(
+            BindingId::from_bytes([0x41; 16]),
+            BindingId::from_bytes([0x42; 16]),
+            "paraegox/agent/live-owner/submit",
+            "paraegox/agent/live-owner/control",
+            limits,
+        )
+        .expect("two-lane test port must be valid");
+        let installed = install_agent_conversation_port(&mut fabric, &spec, None)
+            .await
+            .expect("two owner-issued bindings must install");
+        let (port, endpoint) = installed.into_parts();
+
+        let export = port
+            .export_live_owner_facts_v1(&fabric)
+            .expect("both exact owner tokens must be active");
+        let decoded = AgentConversationPortDescriptorV1::decode(&export.descriptor_wire)
+            .expect("exported PXAP must strictly decode");
+        assert_eq!(export.fabric_session_epoch, fabric.session_epoch());
+        assert_eq!(export.descriptor_digest, decoded.descriptor_digest());
+        assert_eq!(
+            export.request_binding_descriptor_digest,
+            decoded.request_binding_descriptor_digest()
+        );
+        assert_eq!(
+            export.event_binding_descriptor_digest,
+            decoded.event_binding_descriptor_digest()
+        );
+        assert_eq!(
+            export.submit_binding_epoch,
+            port.submit_binding.binding_epoch().value()
+        );
+        assert_eq!(
+            export.control_binding_epoch,
+            port.control_binding.binding_epoch().value()
+        );
+        assert_eq!(export.physical_binding_census, 2);
+
+        retire_agent_conversation_port(&mut fabric, &port)
+            .await
+            .expect("both exact owner-issued bindings must retire");
+        assert!(matches!(
+            port.export_live_owner_facts_v1(&fabric),
+            Err(AgentConversationPortLiveOwnerExportErrorV1::BindingNotActive)
+        ));
+
+        drop(endpoint);
+        fabric.shutdown().await.expect("test Fabric must stop");
     }
 
     #[test]

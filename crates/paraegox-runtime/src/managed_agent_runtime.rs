@@ -18,7 +18,8 @@ use std::time::Instant;
 use crate::managed_agent_transport::{
     AGENT_CONVERSATION_PORT_PHYSICAL_BINDINGS, AgentConversationClient,
     AgentConversationClientError, AgentConversationPort, AgentConversationPortDescriptorError,
-    AgentConversationPortError, AgentConversationPortMutationDispositionV1,
+    AgentConversationPortError, AgentConversationPortLiveOwnerExportErrorV1,
+    AgentConversationPortLiveOwnerExportV1, AgentConversationPortMutationDispositionV1,
     AgentConversationPortSpec, AgentConversationServeError, AgentConversationServeOutcome,
     install_agent_conversation_port, retire_agent_conversation_port,
 };
@@ -431,7 +432,7 @@ impl ManagedAgentAssembly {
         owner_handle: &RuntimeAgentConversationHandle,
         broker_handle: &RuntimeAgentConversationHandle,
         expected_fabric_generation: ManagedServiceGeneration,
-    ) -> Result<Box<[u8]>, ManagedAgentAssemblyError> {
+    ) -> Result<AgentConversationPortLiveOwnerExportV1, ManagedAgentAssemblyError> {
         let port = self
             .port
             .as_ref()
@@ -444,10 +445,12 @@ impl ManagedAgentAssembly {
             return Err(ManagedAgentAssemblyError::InstalledPortUnavailable);
         }
         let expected_census = physical_binding_count()?;
-        if self.fabric.binding_census().await? != expected_census {
-            return Err(ManagedAgentAssemblyError::InstalledPortUnavailable);
-        }
-        let descriptor_wire = port.export_descriptor_wire_v1()?;
+        let exported = self
+            .fabric
+            .observe_live_fabric_exact_census_once(expected_census, |live| {
+                port.export_live_owner_facts_v1(live)
+            })
+            .await??;
         if self.owner_state.load(Ordering::Acquire) != OWNER_READY
             || !self.owns_live_handle(owner_handle, port, expected_fabric_generation)
             || !self.owns_live_handle(broker_handle, port, expected_fabric_generation)
@@ -455,7 +458,7 @@ impl ManagedAgentAssembly {
         {
             return Err(ManagedAgentAssemblyError::InstalledPortUnavailable);
         }
-        Ok(descriptor_wire)
+        Ok(exported)
     }
 
     fn owns_live_handle(
@@ -758,6 +761,7 @@ pub(crate) enum ManagedAgentAssemblyError {
     Ingress(IngressLimitError),
     PortSpec(AgentConversationPortError),
     PortDescriptor(AgentConversationPortDescriptorError),
+    PortLiveExport(AgentConversationPortLiveOwnerExportErrorV1),
     FabricControl(ManagedFabricControlError),
     Server(AgentConversationServeError),
 }
@@ -789,6 +793,12 @@ impl From<ManagedFabricControlError> for ManagedAgentAssemblyError {
 impl From<AgentConversationPortDescriptorError> for ManagedAgentAssemblyError {
     fn from(value: AgentConversationPortDescriptorError) -> Self {
         Self::PortDescriptor(value)
+    }
+}
+
+impl From<AgentConversationPortLiveOwnerExportErrorV1> for ManagedAgentAssemblyError {
+    fn from(value: AgentConversationPortLiveOwnerExportErrorV1) -> Self {
+        Self::PortLiveExport(value)
     }
 }
 

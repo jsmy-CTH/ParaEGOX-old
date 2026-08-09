@@ -1214,6 +1214,15 @@ impl FabricService {
         })
     }
 
+    /// Returns the opaque nonzero epoch of this exact Fabric-owned Session.
+    ///
+    /// The value grants no access to the raw Session or any route and remains
+    /// stable only for this `FabricService` instance.
+    #[must_use]
+    pub fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {
+        self.session_epoch
+    }
+
     /// Reads and classifies the exact current link set from this live Session.
     ///
     /// TCP links are never accepted as remote proof. Every TLS link must carry
@@ -2532,7 +2541,7 @@ impl From<FabricContractError> for FabricError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{net::TcpListener, path::PathBuf};
 
     use paraegox_kernel::digest::Digest32;
     use paraegox_runtime_contracts::distributed_agent_stack_plan::DistributedFabricSessionEpochV1;
@@ -2541,9 +2550,9 @@ mod tests {
     use super::{
         ExperimentalPeerCommonNameV1, ExperimentalRawZenohLink,
         ExperimentalRemoteMtlsConfigErrorV1, ExperimentalRemoteMtlsObservationErrorV1,
-        ExperimentalRemoteMtlsPeerBindingV1, FabricConfigError, FabricError, FabricServiceConfig,
-        MAX_EXPERIMENTAL_OBSERVED_LINKS, MAX_KEY_EXPRESSION_BYTES, PrincipalRef,
-        REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES, RemoteTlsEndpoint,
+        ExperimentalRemoteMtlsPeerBindingV1, FabricConfigError, FabricError, FabricService,
+        FabricServiceConfig, MAX_EXPERIMENTAL_OBSERVED_LINKS, MAX_KEY_EXPRESSION_BYTES,
+        PrincipalRef, REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES, RemoteTlsEndpoint,
         ResolvedRemoteMtlsConnectorCredentialFilesV1, ResolvedRemoteMtlsCredentialFiles,
         ResolvedRemoteMtlsIdentityFiles, ResolvedRemoteMtlsListenerCredentialFilesV1,
         SessionEndpoint, classify_and_advance_experimental_remote_mtls_links,
@@ -2553,6 +2562,26 @@ mod tests {
 
     fn session_epoch(seed: u8) -> DistributedFabricSessionEpochV1 {
         DistributedFabricSessionEpochV1::try_from_bytes([seed; 16]).expect("session epoch")
+    }
+
+    fn available_tcp_endpoint() -> SessionEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral TCP listener");
+        let address = listener.local_addr().expect("ephemeral TCP address");
+        drop(listener);
+        SessionEndpoint::try_new(format!("tcp/{address}")).expect("loopback endpoint")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_service_session_epoch_getter_returns_the_owned_epoch() {
+        let config = FabricServiceConfig::try_peer(vec![available_tcp_endpoint()], Vec::new())
+            .expect("one listener is a valid peer configuration");
+        let service = FabricService::start(config)
+            .await
+            .expect("test Fabric must start");
+
+        assert_eq!(service.session_epoch(), service.session_epoch);
+
+        service.shutdown().await.expect("test Fabric must stop");
     }
 
     fn role_identity(role: &str) -> ResolvedRemoteMtlsIdentityFiles {

@@ -188,6 +188,41 @@ impl ManagedFabricControlHandle {
         }
     }
 
+    /// Performs one synchronous observation while holding the read fence for
+    /// this exact live generation and its exact owner-observed binding census.
+    /// The observation receives no ownership or mutation token, performs no
+    /// retry, and cannot outlive the slot guard.
+    pub(crate) async fn observe_live_fabric_exact_census_once<T>(
+        &self,
+        expected_binding_census: u32,
+        observation: impl FnOnce(&FabricService) -> T,
+    ) -> Result<T, ManagedFabricControlError> {
+        let shared = self
+            .shared
+            .upgrade()
+            .ok_or(ManagedFabricControlError::OwnerRetired)?;
+        let slot = shared.read().await;
+        if slot.generation != self.generation {
+            return Err(ManagedFabricControlError::GenerationFenced);
+        }
+        if !slot.binding_census_known {
+            return Err(ManagedFabricControlError::BindingCensusUnknown);
+        }
+        let service = match &slot.state {
+            ManagedFabricSlotState::Live(service) => service,
+            ManagedFabricSlotState::NotStarted => {
+                return Err(ManagedFabricControlError::NotReady);
+            }
+            ManagedFabricSlotState::Stopping | ManagedFabricSlotState::Stopped => {
+                return Err(ManagedFabricControlError::OwnerRetired);
+            }
+        };
+        if slot.owned_binding_count != expected_binding_census {
+            return Err(ManagedFabricControlError::BindingCensusMismatch);
+        }
+        Ok(observation(service))
+    }
+
     pub(crate) async fn with_live_fabric<T>(
         &self,
         operation: impl for<'fabric> FnOnce(
@@ -395,6 +430,7 @@ pub(crate) enum ManagedFabricControlError {
     GenerationFenced,
     OwnerRetired,
     BindingCensusUnknown,
+    BindingCensusMismatch,
     BindingCensusOverflow,
     BindingCensusUnderflow,
     InvalidBindingMutation,
@@ -496,6 +532,16 @@ pub(crate) struct ManagedFabricStackCutoverObservation {
     pub(crate) target_slice_digest: paraegox_runtime_contracts::provenance::TargetSliceDigest,
     pub(crate) generation: ManagedServiceGeneration,
     pub(crate) control: ManagedFabricControlHandle,
+}
+
+/// Exact durable PXFT root correlated with the currently live Fabric
+/// generation. Historical terminal generation remains intentionally absent:
+/// restart recovery can retain the exact receipt while rebuilding the live
+/// generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedFabricRetainedRootExportV1 {
+    pub(crate) active_pxft_digest: Digest32,
+    pub(crate) fabric_generation: ManagedServiceGeneration,
 }
 
 #[derive(Clone, Copy)]
@@ -946,6 +992,45 @@ impl ManagedFabricRuntimeCore {
             return Err(ManagedFabricRuntimeError::InvalidDurableState);
         }
         Ok(control)
+    }
+
+    /// Exports the exact correlated ActiveReady PXFT root only for the current
+    /// recovered execution and live control generation. The historical PXFT
+    /// generation is not compared with the rebuilt physical generation.
+    pub(crate) fn export_active_retained_root_v1(
+        &self,
+        expected_fabric_execution_digest: Digest32,
+        expected_fabric_generation: ManagedServiceGeneration,
+    ) -> Result<ManagedFabricRetainedRootExportV1, ManagedFabricRuntimeError> {
+        if !self.recovery_completed || self.snapshot.phase != ManagedFabricDurablePhase::ActiveReady
+        {
+            return Err(ManagedFabricRuntimeError::RecoveryNotCompleted);
+        }
+        let active = self
+            .snapshot
+            .active
+            .as_ref()
+            .ok_or(ManagedFabricRuntimeError::InvalidDurableState)?;
+        let control = self
+            .control_handle()
+            .map_err(|_| ManagedFabricRuntimeError::InvalidDurableState)?;
+        if active.request.target_execution().execution_digest()
+            != expected_fabric_execution_digest
+            || active.generation != expected_fabric_generation
+            || control.generation() != expected_fabric_generation
+        {
+            return Err(ManagedFabricRuntimeError::ExpectedActiveExecution);
+        }
+        let receipt = self
+            .lookup_terminal(&active.request, active.response_channel)?
+            .ok_or(ManagedFabricRuntimeError::InvalidDurableState)?;
+        if receipt.facts().outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady {
+            return Err(ManagedFabricRuntimeError::InvalidDurableState);
+        }
+        Ok(ManagedFabricRetainedRootExportV1 {
+            active_pxft_digest: receipt.receipt_digest(),
+            fabric_generation: expected_fabric_generation,
+        })
     }
 
     pub(crate) fn recovered_observation(
@@ -2458,7 +2543,10 @@ mod tests {
         ManagedFabricSlotState, next_generation, transition_projection_digest,
     };
     use crate::admission::VerifiedManagedFabricApplyIngressV1;
-    use crate::managed_agent_runtime::{ManagedAgentAssembly, RuntimeAgentConversationError};
+    use crate::managed_agent_runtime::{
+        ManagedAgentAssembly, ManagedAgentAssemblyError, RuntimeAgentConversationError,
+    };
+    use crate::managed_agent_transport::AgentConversationPortDescriptorV1;
     use crate::runtime_agent_provider::{
         RuntimeAgentProviderResolveError, RuntimeAgentProviderResolverV1,
         RuntimeResolvedAgentProviderV1,
@@ -2741,6 +2829,34 @@ mod tests {
         );
         assert_eq!(core.snapshot.phase, ManagedFabricDurablePhase::ActiveReady);
         assert_eq!(core.snapshot.generation_high_water(), 1);
+        let generation_one = ManagedServiceGeneration::try_new(1)
+            .expect("first managed generation must be valid");
+        let retained_root = core
+            .export_active_retained_root_v1(
+                active.target_execution().execution_digest(),
+                generation_one,
+            )
+            .expect("current active execution must export its correlated PXFT root");
+        assert_eq!(retained_root.active_pxft_digest, active_receipt.receipt_digest());
+        assert_eq!(retained_root.fabric_generation, generation_one);
+        let mut wrong_execution_digest =
+            *active.target_execution().execution_digest().as_bytes();
+        wrong_execution_digest[0] ^= 1;
+        assert!(matches!(
+            core.export_active_retained_root_v1(
+                Digest32::from_bytes(wrong_execution_digest),
+                generation_one,
+            ),
+            Err(ManagedFabricRuntimeError::ExpectedActiveExecution)
+        ));
+        assert!(matches!(
+            core.export_active_retained_root_v1(
+                active.target_execution().execution_digest(),
+                ManagedServiceGeneration::try_new(2)
+                    .expect("second managed generation must be valid"),
+            ),
+            Err(ManagedFabricRuntimeError::ExpectedActiveExecution)
+        ));
         assert!(
             TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_err(),
             "the one managed Fabric session must own the requested TCP port"
@@ -2905,15 +3021,19 @@ mod tests {
         first.recover().await.expect("fresh recovery must pass");
         let port = available_port();
         let request = active_request(port, ExpectedActive::None);
+        let fabric_execution_digest = request.target_execution().execution_digest();
         let response_channel = channel(&first.projection);
-        first
+        let ManagedFabricApplyOutcome::Committed(initial_receipt) = first
             .apply(
                 request,
                 verified(first.clock.reading().expect("clock must read"), 0xb4),
                 response_channel,
             )
             .await
-            .expect("initial active apply must pass");
+            .expect("initial active apply must pass")
+        else {
+            panic!("initial active apply must commit")
+        };
         first
             .shutdown()
             .await
@@ -2962,16 +3082,21 @@ mod tests {
             ManagedFabricDurablePhase::ActiveReady
         );
         assert_eq!(restarted.snapshot.generation_high_water(), 2);
+        let recovered_generation = restarted
+            .snapshot
+            .active
+            .as_ref()
+            .expect("recovered service must be active")
+            .generation;
+        assert_eq!(recovered_generation.value(), 2);
+        let retained_root = restarted
+            .export_active_retained_root_v1(fabric_execution_digest, recovered_generation)
+            .expect("restart must retain the correlated historical PXFT root");
         assert_eq!(
-            restarted
-                .snapshot
-                .active
-                .as_ref()
-                .expect("recovered service must be active")
-                .generation
-                .value(),
-            2
+            retained_root.active_pxft_digest,
+            initial_receipt.receipt_digest()
         );
+        assert_eq!(retained_root.fabric_generation, recovered_generation);
         assert!(
             TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_err(),
             "recovered generation must own the exact requested port"
@@ -3144,15 +3269,96 @@ mod tests {
             agent_plan,
         )
         .expect("signed Fabric-to-Agent execution must be valid");
+        let fabric_control = core
+            .control_handle()
+            .expect("ready Fabric generation must expose its fence");
+        let fabric_generation = fabric_control.generation();
         let (mut assembly, handle) = ManagedAgentAssembly::start_from_execution(
-            core.control_handle()
-                .expect("ready Fabric generation must expose its fence"),
+            fabric_control.clone(),
             &stack_execution,
             directory.path().to_path_buf(),
             &DeterministicFixtureResolver,
         )
         .await
         .expect("Agent must install on the existing Fabric generation");
+
+        let live_port = assembly
+            .export_live_conversation_port_descriptor_v1(
+                &handle,
+                &handle,
+                fabric_generation,
+            )
+            .await
+            .expect("exact live owners and census must export PXAP facts");
+        let descriptor = AgentConversationPortDescriptorV1::decode(&live_port.descriptor_wire)
+            .expect("exported PXAP must strictly decode");
+        assert_eq!(live_port.physical_binding_census, 2);
+        assert_eq!(live_port.descriptor_digest, descriptor.descriptor_digest());
+        assert_eq!(
+            live_port.request_binding_descriptor_digest,
+            descriptor.request_binding_descriptor_digest()
+        );
+        assert_eq!(
+            live_port.event_binding_descriptor_digest,
+            descriptor.event_binding_descriptor_digest()
+        );
+        assert_ne!(live_port.submit_binding_epoch, 0);
+        assert_ne!(live_port.control_binding_epoch, 0);
+        assert_eq!(
+            live_port.fabric_session_epoch,
+            fabric_control
+                .observe_live_fabric_exact_census_once(2, |fabric| fabric.session_epoch())
+                .await
+                .expect("same read fence must expose the live Session epoch")
+        );
+        let wrong_generation = ManagedServiceGeneration::try_new(
+            fabric_generation
+                .value()
+                .checked_add(1)
+                .expect("test generation must not overflow"),
+        )
+        .expect("next test generation must be valid");
+        assert!(matches!(
+            assembly
+                .export_live_conversation_port_descriptor_v1(
+                    &handle,
+                    &handle,
+                    wrong_generation,
+                )
+                .await,
+            Err(ManagedAgentAssemblyError::InstalledPortUnavailable)
+        ));
+
+        let shared = fabric_control
+            .shared
+            .upgrade()
+            .expect("live test control must retain its owner");
+        {
+            let mut slot = shared.write().await;
+            assert_eq!(slot.owned_binding_count, 2);
+            slot.owned_binding_count = 1;
+        }
+        let census_error = match assembly
+            .export_live_conversation_port_descriptor_v1(
+                &handle,
+                &handle,
+                fabric_generation,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("wrong exact census must fail before live observation"),
+        };
+        {
+            let mut slot = shared.write().await;
+            slot.owned_binding_count = 2;
+        }
+        assert!(matches!(
+            census_error,
+            ManagedAgentAssemblyError::FabricControl(
+                ManagedFabricControlError::BindingCensusMismatch
+            )
+        ));
 
         let deck_run_id = AgentConversationDeckRunId::try_from_bytes([0xb1; 16])
             .expect("DeckRun id must be valid");

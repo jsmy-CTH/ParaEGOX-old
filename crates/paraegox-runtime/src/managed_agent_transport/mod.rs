@@ -37,7 +37,10 @@ use paraegox_runtime_contracts::assignment::{BindingId, SchemaRef};
 mod port_descriptor;
 
 pub use port_descriptor::AgentConversationPortDescriptorError;
-pub(crate) use port_descriptor::AgentConversationPortDescriptorV1;
+pub(crate) use port_descriptor::{
+    AgentConversationPortDescriptorV1, AgentConversationPortLiveOwnerExportErrorV1,
+    AgentConversationPortLiveOwnerExportV1,
+};
 
 const PXAC_COMMAND_SCHEMA_ID: [u8; 16] = [
     0x50, 0x58, 0x41, 0x43, 0x2d, 0x43, 0x4f, 0x4d, 0x4d, 0x41, 0x4e, 0x44, 0x2d, 0x56, 0x31, 0x00,
