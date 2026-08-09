@@ -29,8 +29,7 @@ use crate::remote_agent_data_plane_plan::{
     RemoteAgentDataPlanePlanError, RemoteAgentDataPlaneProfileV1,
     RemoteAgentDataPlaneTerminalAuthClaimV1, RemoteAgentDataPlaneTerminalAuthClaimV2,
     RemoteAgentDataPlaneTerminalReceiptV1, RemoteAgentDataPlaneTerminalReceiptV2,
-    RemoteAgentRetainedS0CasV2,
-    RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1,
+    RemoteAgentRetainedS0CasV2, RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1,
     RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2,
 };
 use crate::wire::{
