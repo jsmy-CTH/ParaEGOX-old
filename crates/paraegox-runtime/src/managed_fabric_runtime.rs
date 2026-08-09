@@ -879,10 +879,8 @@ impl ManagedFabricRuntimeCore {
     pub(crate) fn initialize_remote_agent_access_and_latch_v2(
         &mut self,
         candidate: RemoteAgentAccessSnapshotV2,
-    ) -> Result<
-        RemoteAgentAccessInitializedAbsentBundleV2,
-        RemoteAgentAccessInitializeCommitErrorV2,
-    > {
+    ) -> Result<RemoteAgentAccessInitializedAbsentBundleV2, RemoteAgentAccessInitializeCommitErrorV2>
+    {
         let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
         let result = self
             .store
@@ -916,10 +914,8 @@ impl ManagedFabricRuntimeCore {
     fn finish_remote_agent_access_initialization_v2(
         &mut self,
         result: Result<RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessInitializeCommitErrorV2>,
-    ) -> Result<
-        RemoteAgentAccessInitializedAbsentBundleV2,
-        RemoteAgentAccessInitializeCommitErrorV2,
-    > {
+    ) -> Result<RemoteAgentAccessInitializedAbsentBundleV2, RemoteAgentAccessInitializeCommitErrorV2>
+    {
         match result {
             Ok(same_epoch) => {
                 self.latch_remote_agent_access_s0_mutation_freeze_v2();
@@ -958,8 +954,8 @@ impl ManagedFabricRuntimeCore {
                         ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
                     ));
                 }
-                let initial_absent_s1_cas =
-                    RemoteAgentActiveS1CasV2::try_expect_absent(0, 1).map_err(|_| {
+                let initial_absent_s1_cas = RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                    .map_err(|_| {
                         RemoteAgentAccessCommitErrorV2::OutcomeUncertain(
                             ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
                         )
@@ -985,10 +981,8 @@ impl ManagedFabricRuntimeCore {
         &mut self,
         candidate: RemoteAgentAccessSnapshotV2,
         failpoint: crate::runtime_store::RemoteAgentAccessCommitFailpointV2,
-    ) -> Result<
-        RemoteAgentAccessInitializedAbsentBundleV2,
-        RemoteAgentAccessInitializeCommitErrorV2,
-    > {
+    ) -> Result<RemoteAgentAccessInitializedAbsentBundleV2, RemoteAgentAccessInitializeCommitErrorV2>
+    {
         let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
         let result = self
             .store
@@ -3184,7 +3178,10 @@ mod tests {
             RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
                 .expect("fixed initial absent S1 CAS must be valid")
         );
-        assert_eq!(committed.committed_canonical_wire(), expected_wire.as_slice());
+        assert_eq!(
+            committed.committed_canonical_wire(),
+            expected_wire.as_slice()
+        );
         let snapshot = committed.committed_snapshot();
         assert_eq!(snapshot.snapshot_digest(), expected_digest);
         assert_eq!(
