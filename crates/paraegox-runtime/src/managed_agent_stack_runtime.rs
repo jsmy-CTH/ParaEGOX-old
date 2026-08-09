@@ -2604,7 +2604,7 @@ mod provider_resolver_tests {
             .find("if completion_runtime_host_epoch == self.runtime_host_epoch")
             .expect("missing current-epoch branch");
         let current_lookup = authenticated_replay
-            .find("self.lookup_terminal(request, response_channel)?")
+            .find(".lookup_terminal(request, response_channel)?")
             .expect("current replay bypasses strict terminal lookup");
         let historical = authenticated_replay
             .find("RuntimeVerifiedHistoricalManagedAgentStackReceiptV1::try_verify(")
@@ -2615,7 +2615,7 @@ mod provider_resolver_tests {
                 && current < current_lookup
                 && current_lookup < historical
         );
-        assert!(authenticated_replay.contains("self.lookup_terminal(request, response_channel)?"));
+        assert!(authenticated_replay.contains(".lookup_terminal(request, response_channel)?"));
         assert!(authenticated_replay.contains("|| signature.len() != 64"));
     }
 
