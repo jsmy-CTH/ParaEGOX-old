@@ -2419,16 +2419,12 @@ mod tests {
                 Digest32::from_bytes([0xf1; 32]),
             ),
             RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady => {
-                let (fabric, agent) = local_generations.map_or_else(
-                    || {
-                        let active =
-                            snapshot.predecessor.active.as_ref().unwrap_or_else(|| {
-                                panic!("LocalOnly predecessor must remain active")
-                            });
-                        (active.fabric_generation, active.agent_generation)
-                    },
-                    |generations| generations,
-                );
+                let (fabric, agent) = local_generations.unwrap_or_else(|| {
+                    let active = snapshot.predecessor.active.as_ref().unwrap_or_else(|| {
+                        panic!("LocalOnly predecessor must remain active")
+                    });
+                    (active.fabric_generation, active.agent_generation)
+                });
                 (
                     RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
                     RemoteAgentDataPlaneTerminalHeadV1::CommittedIncoming,
