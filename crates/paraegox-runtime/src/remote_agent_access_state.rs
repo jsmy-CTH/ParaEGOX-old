@@ -2600,9 +2600,7 @@ mod tests {
         authorized.try_terminal_successor(phase, generations, authenticated)
     }
 
-    fn no_effect_terminal(
-        options: PreparedOptions,
-    ) -> RemoteAgentAuthorizedAccessSnapshotV1 {
+    fn no_effect_terminal(options: PreparedOptions) -> RemoteAgentAuthorizedAccessSnapshotV1 {
         let prepared = prepared_result(options)
             .unwrap_or_else(|error| panic!("NoEffect Prepared fixture rejected: {error}"));
         terminal_successor(
@@ -3300,9 +3298,8 @@ mod tests {
             ));
         }
         for reading in invalid_readings {
-            let prepared = prepared_authorized(
-                RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-            );
+            let prepared =
+                prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
             let generations = prepared.snapshot().generations();
             assert!(matches!(
                 prepared.try_begin_effect_successor(
@@ -3346,8 +3343,7 @@ mod tests {
 
     #[test]
     fn recovery_reauthorization_requires_phase_exact_pxde_and_pxau_markers() {
-        let prepared =
-            prepared_authorized(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let prepared = prepared_authorized(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
         let raw_prepared = recovered(&prepared);
         assert!(matches!(
             raw_prepared.try_reauthorize(
@@ -3407,9 +3403,8 @@ mod tests {
             RemoteAgentAccessDurablePhaseV1::NoEffectTerminal
         );
 
-        let mut other_options = PreparedOptions::valid(
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-        );
+        let mut other_options =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
         other_options.operation_id = ApplyOperationId::from_bytes([0xa2; 16]);
         let other_terminal = no_effect_terminal(other_options);
         let other_raw = recovered(&other_terminal);
@@ -3427,9 +3422,8 @@ mod tests {
     #[test]
     fn recovery_reauthorization_requires_exact_outer_and_inner_authentication() {
         let primary = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
-        let mut alternate_options = PreparedOptions::valid(
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-        );
+        let mut alternate_options =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
         alternate_options.operation_id = ApplyOperationId::from_bytes([0xa2; 16]);
         let alternate = prepared_result(alternate_options)
             .unwrap_or_else(|error| panic!("alternate Prepared rejected: {error}"));
@@ -3461,23 +3455,17 @@ mod tests {
 
     #[test]
     fn replacement_requires_an_authorized_safe_terminal_and_a_fresh_operation_id() {
-        let default =
-            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let default = PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
         assert!(matches!(
             prepared_result_after(default, Some(no_effect_terminal(default)), None),
             Err(RemoteAgentAccessStateError::InvalidOperationReplacement)
         ));
 
-        let mut same_id_different = PreparedOptions::valid(
-            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-        );
+        let mut same_id_different =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
         same_id_different.operation_id = default.operation_id;
         assert!(matches!(
-            prepared_result_after(
-                same_id_different,
-                Some(no_effect_terminal(default)),
-                None,
-            ),
+            prepared_result_after(same_id_different, Some(no_effect_terminal(default)), None,),
             Err(RemoteAgentAccessStateError::InvalidOperationReplacement)
         ));
 
@@ -3536,18 +3524,16 @@ mod tests {
             Err(RemoteAgentAccessStateError::InvalidOperationReplacement)
         ));
 
-        let local_ready = ready_observation(
-            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-        );
+        let local_ready =
+            ready_observation(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
         let local_terminal = terminal_successor(
             local_ready,
             RemoteAgentAccessDurablePhaseV1::LocalOnlyReady,
             RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady,
         )
         .unwrap_or_else(|error| panic!("LocalOnly replacement fixture rejected: {error}"));
-        let mut fresh_local = PreparedOptions::valid(
-            RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate,
-        );
+        let mut fresh_local =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
         fresh_local.operation_id = ApplyOperationId::from_bytes([0xa2; 16]);
         prepared_result_after(fresh_local, Some(local_terminal), None)
             .unwrap_or_else(|error| panic!("LocalOnly safe replacement rejected: {error}"));
@@ -3791,12 +3777,14 @@ mod tests {
             decoded.phase(),
             RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
         );
-        assert!(decoded
-            .request()
-            .verify_controller_request(decoded.request().carrier(), |_, _, _, _, signature| {
-                signature == OUTER_SIGNATURE
-            })
-            .is_err());
+        assert!(
+            decoded
+                .request()
+                .verify_controller_request(decoded.request().carrier(), |_, _, _, _, signature| {
+                    signature == OUTER_SIGNATURE
+                })
+                .is_err()
+        );
         assert!(matches!(
             decoded.try_reauthorize(
                 authenticated_outer(&snapshot),
