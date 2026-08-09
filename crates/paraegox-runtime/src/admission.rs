@@ -2803,8 +2803,7 @@ mod tests {
     };
     use paraegox_runtime_contracts::remote_agent_access::{
         ControllerAuthenticatedRemoteAgentAccessRequestV2, RemoteAgentAccessRequestDraftV2,
-        RemoteAgentAccessRequestFieldsV2, RemoteAgentAccessRequestIdV2,
-        RemoteAgentAccessRequestV2,
+        RemoteAgentAccessRequestFieldsV2, RemoteAgentAccessRequestIdV2, RemoteAgentAccessRequestV2,
     };
     use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
         RemoteAgentDataPlaneApplyRequestDraftV1, RemoteAgentDataPlaneApplyRequestDraftV2,
@@ -3536,12 +3535,9 @@ mod tests {
             &tenure_signature,
         )
         .unwrap_or_else(|error| panic!("PXAR v11 tenure proof must build: {error}"));
-        let writer_context = PlanWriterContext::try_new(
-            writer_template.writer(),
-            writer_template.epoch(),
-            proof,
-        )
-        .unwrap_or_else(|error| panic!("PXAR v11 writer context must build: {error}"));
+        let writer_context =
+            PlanWriterContext::try_new(writer_template.writer(), writer_template.epoch(), proof)
+                .unwrap_or_else(|error| panic!("PXAR v11 writer context must build: {error}"));
         let control = RuntimeApplyControl::new(
             writer_context,
             control_template.expected_active(),
@@ -3566,8 +3562,19 @@ mod tests {
             .finalize(&inner_signature)
             .unwrap_or_else(|error| panic!("PXAR v11 must finalize: {error}"));
 
+        let trusted_controller_fingerprint = super::ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("production Controller fingerprint must build: {error}"));
         let carrier = controller_fingerprint_override.map_or_else(
-            || outer_template.carrier().clone(),
+            || {
+                remote_agent_access_carrier_with_controller_fingerprint(
+                    outer_template.carrier(),
+                    trusted_controller_fingerprint,
+                )
+            },
             |fingerprint| {
                 remote_agent_access_carrier_with_controller_fingerprint(
                     outer_template.carrier(),
@@ -5607,18 +5614,34 @@ mod tests {
 
     #[test]
     fn remote_agent_access_v2_mints_exact_move_only_ingress_facts_from_three_real_signatures() {
+        let golden = remote_agent_access_request_v2_template();
+        let production_controller_fingerprint = super::ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .expect("production Controller fingerprint must build");
         let (request, carrier) = signed_remote_agent_access_request_v2(
             PYTHON_FIXTURE_TENURE_SEED,
             PYTHON_FIXTURE_REQUEST_SEED,
             None,
+        );
+        assert_ne!(
+            golden.carrier().controller_request_key_fingerprint(),
+            production_controller_fingerprint,
+            "the historical Python golden predates the production fingerprint transcript",
+        );
+        assert_eq!(
+            carrier.controller_request_key_fingerprint(),
+            production_controller_fingerprint,
+            "the real-signature admission fixture must migrate to the production fingerprint",
         );
         let authenticated_outer = controller_authenticated_remote_agent_access_v2(
             &request,
             &carrier,
             PYTHON_FIXTURE_REQUEST_SEED,
         );
-        let (admission, _) =
-            python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
         let domain = ClockDomainRef::from_bytes([0x0a; 16]);
         let generation =
             ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero");
@@ -5725,18 +5748,14 @@ mod tests {
 
     #[test]
     fn remote_agent_access_v2_outer_marker_cannot_bypass_tenure_inner_or_carrier_key_policy() {
-        let (wrong_tenure, carrier) = signed_remote_agent_access_request_v2(
-            WRONG_SEED,
-            PYTHON_FIXTURE_REQUEST_SEED,
-            None,
-        );
+        let (wrong_tenure, carrier) =
+            signed_remote_agent_access_request_v2(WRONG_SEED, PYTHON_FIXTURE_REQUEST_SEED, None);
         let authenticated_wrong_tenure = controller_authenticated_remote_agent_access_v2(
             &wrong_tenure,
             &carrier,
             PYTHON_FIXTURE_REQUEST_SEED,
         );
-        let (admission, _) =
-            python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
         let reading = ClockReading::new(
             ClockDomainRef::from_bytes([0x0a; 16]),
             ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero"),
@@ -5755,11 +5774,8 @@ mod tests {
             "the public outer marker authenticates two Controller signatures, not writer tenure",
         );
 
-        let (wrong_inner_key, policy_carrier) = signed_remote_agent_access_request_v2(
-            PYTHON_FIXTURE_TENURE_SEED,
-            WRONG_SEED,
-            None,
-        );
+        let (wrong_inner_key, policy_carrier) =
+            signed_remote_agent_access_request_v2(PYTHON_FIXTURE_TENURE_SEED, WRONG_SEED, None);
         let authenticated_wrong_inner_key = controller_authenticated_remote_agent_access_v2(
             &wrong_inner_key,
             &policy_carrier,
@@ -5814,8 +5830,7 @@ mod tests {
             PYTHON_FIXTURE_REQUEST_SEED,
             None,
         );
-        let (admission, _) =
-            python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
         let correct_domain = ClockDomainRef::from_bytes([0x0a; 16]);
         let correct_generation =
             ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero");
