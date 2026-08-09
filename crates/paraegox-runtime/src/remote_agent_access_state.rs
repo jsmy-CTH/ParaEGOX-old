@@ -2251,17 +2251,16 @@ impl RemoteAgentAccessSnapshotV2 {
         {
             return Err(RemoteAgentAccessStateErrorV2::InvalidActiveHead);
         }
-        if self.self_head {
-            if self.phase != RemoteAgentAccessDurablePhaseV2::ActiveReady
+        if self.self_head
+            && (self.phase != RemoteAgentAccessDurablePhaseV2::ActiveReady
                 || self.head_kind != RemoteAgentAccessHeadKindV2::Active
                 || self.active_head.is_some()
                 || self.operation_request.is_none()
                 || self.operation_terminal.is_none()
                 || self.active_access_generation != self.candidate_access_generation
-                || self.active_proxy_session_epoch != self.candidate_proxy_session_epoch
-            {
-                return Err(RemoteAgentAccessStateErrorV2::InvalidActiveHead);
-            }
+                || self.active_proxy_session_epoch != self.candidate_proxy_session_epoch)
+        {
+            return Err(RemoteAgentAccessStateErrorV2::InvalidActiveHead);
         }
         if self.phase == RemoteAgentAccessDurablePhaseV2::InitializedAbsent {
             if self.sequence != 1

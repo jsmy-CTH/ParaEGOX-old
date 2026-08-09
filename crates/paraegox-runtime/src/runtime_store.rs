@@ -1284,18 +1284,18 @@ impl RestartReconcileRequiredV2 {
 
 pub(crate) enum RemoteAgentAccessStartupSlotV2 {
     Absent(RemoteAgentAccessAbsentLeaseV2),
-    SameEpoch(RemoteAgentAccessSameEpochLeaseV2),
+    SameEpoch(Box<RemoteAgentAccessSameEpochLeaseV2>),
     RestartReconcileRequired(RestartReconcileRequiredV2),
 }
 
 pub(crate) enum RemoteAgentAccessCommitErrorV2<Candidate> {
     Rejected {
         cause: ManagedFabricStoreError,
-        candidate: Candidate,
+        candidate: Box<Candidate>,
     },
     ProvenNotCommitted {
         cause: ManagedFabricStoreError,
-        candidate: Candidate,
+        candidate: Box<Candidate>,
     },
     OutcomeUncertain(ManagedFabricStoreError),
 }
@@ -1325,7 +1325,7 @@ impl<Candidate> RemoteAgentAccessCommitErrorV2<Candidate> {
     pub(crate) fn into_retry_candidate(self) -> Option<Candidate> {
         match self {
             Self::Rejected { candidate, .. } | Self::ProvenNotCommitted { candidate, .. } => {
-                Some(candidate)
+                Some(*candidate)
             }
             Self::OutcomeUncertain(_) => None,
         }
@@ -2470,7 +2470,7 @@ impl ManagedFabricStore {
             current_runtime_host_epoch,
         };
         self.remote_agent_access_active = Some(active);
-        Ok(RemoteAgentAccessStartupSlotV2::SameEpoch(lease))
+        Ok(RemoteAgentAccessStartupSlotV2::SameEpoch(Box::new(lease)))
     }
 
     /// Initializes the absent PXRS v2 chain with its canonical sequence-one
@@ -2497,7 +2497,7 @@ impl ManagedFabricStore {
         if let Err(cause) = self.ensure_operational() {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause,
-                candidate: snapshot,
+                candidate: Box::new(snapshot),
             });
         }
         if !self.remote_agent_access_startup_adjudicated
@@ -2506,7 +2506,7 @@ impl ManagedFabricStore {
         {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause: ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
-                candidate: snapshot,
+                candidate: Box::new(snapshot),
             });
         }
         if let Err(cause) = self.validate_remote_agent_access_startup_inputs(
@@ -2515,7 +2515,7 @@ impl ManagedFabricStore {
         ) {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause,
-                candidate: snapshot,
+                candidate: Box::new(snapshot),
             });
         }
         let candidate = match Self::validate_remote_agent_access_candidate(
@@ -2526,7 +2526,7 @@ impl ManagedFabricStore {
             Err(cause) => {
                 return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                     cause,
-                    candidate: snapshot,
+                    candidate: Box::new(snapshot),
                 });
             }
         };
@@ -2537,7 +2537,7 @@ impl ManagedFabricStore {
         {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
-                candidate: snapshot,
+                candidate: Box::new(snapshot),
             });
         }
         let encoded = candidate.canonical_wire().to_vec();
@@ -2552,7 +2552,7 @@ impl ManagedFabricStore {
             Err(RemoteAgentAccessPublishErrorV2::ProvenNotCommitted(cause)) => {
                 Err(RemoteAgentAccessCommitErrorV2::ProvenNotCommitted {
                     cause,
-                    candidate: snapshot,
+                    candidate: Box::new(snapshot),
                 })
             }
             Err(RemoteAgentAccessPublishErrorV2::OutcomeUncertain(cause)) => {
@@ -2584,7 +2584,7 @@ impl ManagedFabricStore {
         if let Err(cause) = self.ensure_operational() {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause,
-                candidate: pending,
+                candidate: Box::new(pending),
             });
         }
         if !self.remote_agent_access_startup_adjudicated
@@ -2600,7 +2600,7 @@ impl ManagedFabricStore {
         {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause: ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
-                candidate: pending,
+                candidate: Box::new(pending),
             });
         }
         if let Err(cause) = self.validate_remote_agent_access_startup_inputs(
@@ -2609,7 +2609,7 @@ impl ManagedFabricStore {
         ) {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause,
-                candidate: pending,
+                candidate: Box::new(pending),
             });
         }
         let recovered_current = match Self::validate_remote_agent_access_candidate(
@@ -2620,14 +2620,14 @@ impl ManagedFabricStore {
             Err(cause) => {
                 return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                     cause,
-                    candidate: pending,
+                    candidate: Box::new(pending),
                 });
             }
         };
         if recovered_current != current.snapshot {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause: ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
-                candidate: pending,
+                candidate: Box::new(pending),
             });
         }
         let candidate = match Self::validate_remote_agent_access_candidate(
@@ -2638,14 +2638,14 @@ impl ManagedFabricStore {
             Err(cause) => {
                 return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                     cause,
-                    candidate: pending,
+                    candidate: Box::new(pending),
                 });
             }
         };
         let Some(expected_sequence) = current.snapshot.sequence().checked_add(1) else {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
-                candidate: pending,
+                candidate: Box::new(pending),
             });
         };
         if candidate != *pending.snapshot()
@@ -2655,7 +2655,7 @@ impl ManagedFabricStore {
         {
             return Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
-                candidate: pending,
+                candidate: Box::new(pending),
             });
         }
         let encoded = candidate.canonical_wire().to_vec();
@@ -2670,7 +2670,7 @@ impl ManagedFabricStore {
             Err(RemoteAgentAccessPublishErrorV2::ProvenNotCommitted(cause)) => {
                 Err(RemoteAgentAccessCommitErrorV2::ProvenNotCommitted {
                     cause,
-                    candidate: pending,
+                    candidate: Box::new(pending),
                 })
             }
             Err(RemoteAgentAccessPublishErrorV2::OutcomeUncertain(cause)) => {
@@ -8488,7 +8488,7 @@ pub(crate) mod tests {
         slot: RemoteAgentAccessStartupSlotV2,
     ) -> RemoteAgentAccessSameEpochLeaseV2 {
         match slot {
-            RemoteAgentAccessStartupSlotV2::SameEpoch(lease) => lease,
+            RemoteAgentAccessStartupSlotV2::SameEpoch(lease) => *lease,
             RemoteAgentAccessStartupSlotV2::Absent(_)
             | RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
                 panic!("PXRS2 fixture expected a same-epoch final")
