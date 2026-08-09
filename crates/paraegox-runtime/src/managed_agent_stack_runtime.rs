@@ -2375,7 +2375,7 @@ mod provider_resolver_tests {
                     .clock_reading()
                     .unwrap_or_else(|error| panic!("Fabric clock read failed: {error}")),
             )
-            .unwrap_or_else(|error| panic!("managed Fabric admission failed: {error}"));
+            .unwrap_or_else(|error| panic!("managed Fabric admission failed: {error:?}"));
         let channel = response_channel(fabric_request.target());
         let ManagedFabricApplyOutcome::Committed(fabric_receipt) = fabric
             .apply(fabric_request, fabric_ingress, channel)
@@ -2396,7 +2396,7 @@ mod provider_resolver_tests {
                     .clock_reading()
                     .unwrap_or_else(|error| panic!("Agent stack clock read failed: {error}")),
             )
-            .unwrap_or_else(|error| panic!("Agent stack admission failed: {error}"));
+            .unwrap_or_else(|error| panic!("Agent stack admission failed: {error:?}"));
         let selection = stack_request
             .target_execution()
             .agent()
