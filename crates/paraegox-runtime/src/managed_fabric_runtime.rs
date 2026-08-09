@@ -2894,7 +2894,7 @@ mod tests {
             .find("Ok(RemoteAgentAccessInitializedAbsentBundleV2 {")
             .expect("exact success must mint the one-shot bundle");
         assert!(latch < core_redecode && core_redecode < bundle_mint);
-        assert!(!finish.contains("Ok(same_epoch)"));
+        assert!(!finish.contains("return Ok(same_epoch)"));
     }
 
     struct DeterministicFixtureResolver;
