@@ -9154,7 +9154,7 @@ mod tests {
         ));
 
         let unrelated_profile = restricted_transport_profile(
-            "paraegox/runtime/endpoint-stack/restricted/unrelated",
+            "paraegox/runtime/endpoint-stack/restricted/unrelated/apply",
             RESTRICTED_TLS_LISTENER,
             RESTRICTED_ENDPOINT_GENERATION + 1,
             RESTRICTED_OPERATION_TIMEOUT_NANOS,
@@ -9380,7 +9380,13 @@ mod tests {
             .unwrap_or_else(|| panic!("protected PXDE/PXAH reverify disappeared"));
         assert!(a0 < fabric && fabric < a1 && a1 < exact && exact < protected);
         assert!(observer.contains("carrier_pin: &RuntimeRestrictedApplyCarrierPinV1<'_>"));
-        assert!(!observer.contains("expected_active_pxst_digest"));
+        let observer_signature_end = observer
+            .find(") -> Result<RemoteAgentLiveLowerFactsV2, RuntimeControlRequestError> {")
+            .unwrap_or_else(|| panic!("live-lower observer signature disappeared"));
+        let observer_signature = &observer[..observer_signature_end];
+        assert!(!observer_signature.contains("expected_active"));
+        assert!(!observer_signature.contains("selector"));
+        assert!(!observer.contains(".export_active_conversation_port_v1("));
         assert!(!observer.contains("RemoteAgentAccessSnapshotV2"));
         assert!(!observer.contains("latest_verified_remote_agent_descriptor_evidence_v1"));
 
