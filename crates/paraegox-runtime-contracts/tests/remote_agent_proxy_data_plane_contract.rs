@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use paraegox_kernel::digest::Digest32;
 use paraegox_kernel::identity::PrincipalRef;
-use paraegox_kernel::time::{ClockDomainRef, ClockGeneration};
+use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
 
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     DistributedFabricCredentialRefV1, DistributedFabricSessionEpochV1,
@@ -32,6 +32,7 @@ use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
     RemoteAgentRetainedS0CasV2, remote_agent_proxy_topology_compatibility_digest_v2,
     verify_remote_agent_data_plane_durable_slice_v2,
 };
+use paraegox_runtime_contracts::temporal::ApplyTemporalConstraint;
 use paraegox_runtime_contracts::wire::{
     ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
 };
@@ -44,6 +45,7 @@ const PROXY_DATA_PLANE_V2_GOLDEN: &str =
     include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
 const EMPTY_PXTA: &[u8; 10] = b"PXTA\0\x01\0\0\0\0";
 const OPERATION_TIMEOUT_NANOS: u64 = 5_000_000_000;
+const ORIGINAL_BUDGET_NANOS: u64 = OPERATION_TIMEOUT_NANOS * 2;
 const ADMITTED_AT_NANOS: u64 = 1_000;
 const EXACT_ROUTE_BITMAP: u8 = 0b11;
 const FABRIC_GENERATION: u64 = 7;
@@ -113,6 +115,38 @@ fn fixture_u64_after(fixture: &str, section: &str, key: &str) -> u64 {
 fn fixture_section_after<'a>(fixture: &'a str, section: &str) -> &'a str {
     let section_start = fixture.find(section).expect("fixture section");
     &fixture[section_start..]
+}
+
+fn temporal_with_remaining(
+    authority: ApplyTemporalConstraint,
+    remaining_budget_nanos: u64,
+) -> ApplyTemporalConstraint {
+    ApplyTemporalConstraint::try_new(
+        authority.constraint_id(),
+        authority.target_clock_domain(),
+        authority.target_clock_generation(),
+        BoundedDuration::from_nanos(ORIGINAL_BUDGET_NANOS),
+        BoundedDuration::from_nanos(remaining_budget_nanos),
+    )
+    .expect("test temporal budget")
+}
+
+fn overwrite_pxar_envelope_u64_tlv(frame: &mut [u8], tag: u16, value: u64) {
+    let envelope_length = u32::from_be_bytes(
+        frame[6..10]
+            .try_into()
+            .expect("PXAR v11 envelope length"),
+    ) as usize;
+    let envelope = &mut frame[18..18 + envelope_length];
+    let mut header = [0_u8; 6];
+    header[..2].copy_from_slice(&tag.to_be_bytes());
+    header[2..].copy_from_slice(&8_u32.to_be_bytes());
+    let header_offset = envelope
+        .windows(header.len())
+        .position(|candidate| candidate == header)
+        .expect("PXAR v11 envelope u64 TLV");
+    let value_start = header_offset + header.len();
+    envelope[value_start..value_start + 8].copy_from_slice(&value.to_be_bytes());
 }
 
 fn managed_agent_request() -> ManagedAgentStackApplyRequestV1 {
@@ -256,11 +290,12 @@ fn data_plane_request_with_signature(
     signature: &[u8],
 ) -> RemoteAgentDataPlaneApplyRequestV2 {
     let predecessor = managed_agent_request();
+    let temporal = temporal_with_remaining(predecessor.temporal(), OPERATION_TIMEOUT_NANOS);
     RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
         target_execution_for(&predecessor, mode),
         predecessor.provenance(),
         predecessor.control_commitment().control().clone(),
-        predecessor.temporal(),
+        temporal,
         predecessor.expected_runtime_store_instance_id(),
         predecessor.authentication().claim().clone(),
     )
@@ -839,6 +874,63 @@ fn successor_decoders_reject_truncation_trailing_reserved_lengths_and_unknown_ta
 }
 
 #[test]
+fn pxar11_public_pipeline_enforces_profile_operation_timeout_budget() {
+    let predecessor = managed_agent_request();
+    let execution = target_execution_for(
+        &predecessor,
+        RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive,
+    );
+    assert_eq!(
+        execution.profile().operation_timeout_nanos(),
+        OPERATION_TIMEOUT_NANOS
+    );
+    let draft_with_temporal = |temporal| {
+        RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+            execution.clone(),
+            predecessor.provenance(),
+            predecessor.control_commitment().control().clone(),
+            temporal,
+            predecessor.expected_runtime_store_instance_id(),
+            predecessor.authentication().claim().clone(),
+        )
+    };
+
+    let short_temporal = temporal_with_remaining(
+        predecessor.temporal(),
+        OPERATION_TIMEOUT_NANOS - 1,
+    );
+    assert!(matches!(
+        draft_with_temporal(short_temporal),
+        Err(RemoteAgentDataPlanePlanError::InvalidShape)
+    ));
+    assert!(matches!(
+        draft_with_temporal(short_temporal).and_then(|draft| draft.finalize(&[0xc1; 64])),
+        Err(RemoteAgentDataPlanePlanError::InvalidShape)
+    ));
+
+    let exact_temporal = temporal_with_remaining(predecessor.temporal(), OPERATION_TIMEOUT_NANOS);
+    let request = draft_with_temporal(exact_temporal)
+        .expect("PXAR v11 draft at exact profile timeout")
+        .finalize(&[0xc1; 64])
+        .expect("PXAR v11 at exact profile timeout");
+    assert_eq!(
+        request.temporal().remaining_budget().value(),
+        OPERATION_TIMEOUT_NANOS
+    );
+    assert_eq!(
+        RemoteAgentDataPlaneApplyRequestV2::decode(request.canonical_wire()).unwrap(),
+        request
+    );
+
+    let mut short_wire = request.canonical_wire().to_vec();
+    overwrite_pxar_envelope_u64_tlv(&mut short_wire, 31, OPERATION_TIMEOUT_NANOS - 1);
+    assert!(matches!(
+        RemoteAgentDataPlaneApplyRequestV2::decode(&short_wire),
+        Err(RemoteAgentDataPlanePlanError::InvalidShape)
+    ));
+}
+
+#[test]
 fn pxau2_positive_outcome_matrix_is_round_trippable() {
     let active = data_plane_request(RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive);
     let local = data_plane_request(RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate);
@@ -1063,6 +1155,18 @@ fn pxau2_deadline_is_single_admission_derived_and_s0_identity_cannot_drift() {
     );
     assert!(terminal_draft(&request, active_ready_state(), valid).is_ok());
 
+    let mut selected_before_admission = valid;
+    selected_before_admission.selection_observed_at_nanos = valid.admitted_at_nanos - 1;
+    assert!(terminal_draft(&request, active_ready_state(), selected_before_admission).is_err());
+
+    let mut selected_before_deadline = valid;
+    selected_before_deadline.selection_observed_at_nanos = valid.absolute_deadline_nanos - 1;
+    assert!(terminal_draft(&request, active_ready_state(), selected_before_deadline).is_ok());
+
+    let mut selected_at_deadline = valid;
+    selected_at_deadline.selection_observed_at_nanos = valid.absolute_deadline_nanos;
+    assert!(terminal_draft(&request, active_ready_state(), selected_at_deadline).is_err());
+
     let mut reset_from_later_observation = valid;
     reset_from_later_observation.absolute_deadline_nanos =
         reset_from_later_observation.selection_observed_at_nanos + OPERATION_TIMEOUT_NANOS;
@@ -1071,6 +1175,12 @@ fn pxau2_deadline_is_single_admission_derived_and_s0_identity_cannot_drift() {
     let mut completed_after_deadline = valid;
     completed_after_deadline.selection_observed_at_nanos = valid.absolute_deadline_nanos + 1;
     assert!(terminal_draft(&request, active_ready_state(), completed_after_deadline).is_err());
+
+    let local = data_plane_request(RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate);
+    let mut local_after_deadline = local_only_ready_evidence(&local);
+    local_after_deadline.selection_observed_at_nanos =
+        local_after_deadline.absolute_deadline_nanos + 1;
+    assert!(terminal_draft(&local, local_only_ready_state(), local_after_deadline).is_ok());
 
     let mut census_drift = valid;
     census_drift.retained_s0_census_after_digest = Digest32::from_bytes([0xd4; 32]);
@@ -1219,7 +1329,7 @@ fn pxau2_hwm_revision_mode_drain_counts_and_observation_are_orthogonal_authority
     later_clock_generation.selection_clock_generation =
         ClockGeneration::try_new(active.temporal().target_clock_generation().value() + 1)
             .expect("later clock generation");
-    assert!(terminal_draft(&active, active_ready_state(), later_clock_generation).is_ok());
+    assert!(terminal_draft(&active, active_ready_state(), later_clock_generation).is_err());
 }
 
 #[test]
@@ -1237,10 +1347,33 @@ fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures
             "\"rust_source_freeze\"",
             "\"remote_agent_data_plane_plan.rs_sha256\"",
         ),
-        "8597f75ec6bb6b41a97fb3ebd2d8cdefcde431ceb0d32d6b125ed17f0a1a64e7"
+        "2649e0457c47e63a2132df2b8db9de52818b71645c54b656747c978fb2d882e7"
     );
 
     let semantic_constants = fixture_section_after(golden, "\"semantic_constants\"");
+    let golden_profile_timeout = fixture_u64_after(
+        semantic_constants,
+        "",
+        "\"profile_operation_timeout_nanos\"",
+    );
+    let golden_original_budget = fixture_u64_after(
+        semantic_constants,
+        "",
+        "\"envelope_original_budget_nanos\"",
+    );
+    let golden_remaining_budget = fixture_u64_after(
+        semantic_constants,
+        "",
+        "\"envelope_remaining_budget_nanos\"",
+    );
+    assert!(golden_remaining_budget >= golden_profile_timeout);
+    assert!(golden_original_budget >= golden_remaining_budget);
+    let temporal_authority_rule =
+        fixture_hex_after(semantic_constants, "", "\"temporal_authority_rule_hex\"");
+    assert_eq!(
+        temporal_authority_rule.as_slice(),
+        b"temporal-remaining>=operation-timeout;selection>=admitted;active-ready<deadline;local-cleanup-may-complete-after-deadline"
+    );
     assert_eq!(
         fixture_u64_after(semantic_constants, "", "\"retained_s0_cas_bytes\""),
         REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES as u64
@@ -1335,6 +1468,10 @@ fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures
             fixture_digest_after(pxte_scope, "", "\"digest_hex\"")
         );
         assert_eq!(pxte.mode(), expected_mode);
+        assert_eq!(
+            pxte.profile().operation_timeout_nanos(),
+            golden_profile_timeout
+        );
         assert_eq!(pxte.retained_s0_cas(), retained);
         assert_eq!(pxte.expected_s1_cas(), expected_s1);
         assert_eq!(pxte.proxy_topology_compatibility_digest(), topology_digest);
@@ -1356,6 +1493,14 @@ fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures
         assert_eq!(
             pxar.assignment_digest().value(),
             &fixture_digest_after(ready, "", "\"assignment_v11_digest_hex\"")
+        );
+        assert_eq!(
+            pxar.temporal().original_budget().value(),
+            golden_original_budget
+        );
+        assert_eq!(
+            pxar.temporal().remaining_budget().value(),
+            golden_remaining_budget
         );
 
         let envelope_scope = fixture_section_after(ready, "\"envelope_v2\"");
@@ -1412,6 +1557,36 @@ fn shared_python_v2_golden_decodes_with_exact_digests_transcripts_and_signatures
                 .outcome(),
             expected_outcome
         );
+        let temporal_evidence = pxau.facts().evidence().fields();
+        assert_eq!(
+            temporal_evidence.selection_clock_domain,
+            pxar.temporal().target_clock_domain()
+        );
+        assert_eq!(
+            temporal_evidence.selection_clock_generation,
+            pxar.temporal().target_clock_generation()
+        );
+        assert_eq!(
+            temporal_evidence
+                .absolute_deadline_nanos
+                .checked_sub(temporal_evidence.admitted_at_nanos),
+            Some(golden_profile_timeout)
+        );
+        assert!(
+            temporal_evidence.selection_observed_at_nanos
+                >= temporal_evidence.admitted_at_nanos
+        );
+        match expected_outcome {
+            RemoteAgentDataPlaneTerminalOutcomeV2::ActiveReady => assert!(
+                temporal_evidence.selection_observed_at_nanos
+                    < temporal_evidence.absolute_deadline_nanos
+            ),
+            RemoteAgentDataPlaneTerminalOutcomeV2::LocalOnlyReady => assert!(
+                temporal_evidence.selection_observed_at_nanos
+                    > temporal_evidence.absolute_deadline_nanos
+            ),
+            _ => unreachable!("shared golden covers only ready outcomes"),
+        }
         let terminal_transcript = fixture_hex_after(pxau_scope, "", "\"signing_transcript_hex\"");
         let terminal_signature = fixture_hex_after(pxau_scope, "", "\"signature_hex\"");
         assert_eq!(

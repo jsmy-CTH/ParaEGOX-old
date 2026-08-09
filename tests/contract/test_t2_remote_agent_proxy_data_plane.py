@@ -23,9 +23,9 @@ RUST_SOURCE_PATH = (
     REPO_ROOT / "crates/paraegox-runtime-contracts/src/remote_agent_data_plane_plan.rs"
 )
 
-RUST_SOURCE_REF = "build/mac-source-snapshot-20260809-r225-t2-b2-pxau2-review-fmt"
-RUST_SOURCE_COMMIT = "de97727002486921fc105a37f20232da009e76dd"
-RUST_SOURCE_SHA256 = "8597f75ec6bb6b41a97fb3ebd2d8cdefcde431ceb0d32d6b125ed17f0a1a64e7"
+RUST_SOURCE_REF = "r244"
+RUST_SOURCE_COMMIT = "e5f6c414e5f3450df4f86a7c0347ffc5ceb582bf"
+RUST_SOURCE_SHA256 = "2649e0457c47e63a2132df2b8db9de52818b71645c54b656747c978fb2d882e7"
 
 DIGEST_MAGIC = b"ParaEGOX\0canonical-digest"
 DIGEST_VERSION = 1
@@ -72,6 +72,9 @@ MAX_MESSAGE_BYTES = 1_114_220
 MAX_AGENT_FRAME_BYTES = 1_048_680
 MAX_AGENT_RESPONSE_BYTES = 1_048_576
 MAX_OPERATION_TIMEOUT_NANOS = 30_000_000_000
+PROFILE_OPERATION_TIMEOUT_NANOS = 20_000_000_000
+ENVELOPE_ORIGINAL_BUDGET_NANOS = 30_000_000_000
+ENVELOPE_REMAINING_BUDGET_NANOS = 25_000_000_000
 HARDENING_FEATURES = 0b11_1111_1111_1111_1111
 HARDENING_PROFILE = (
     b"tls-listener=1;tls-connector=0;plaintext=0;acl=default-deny;"
@@ -81,6 +84,10 @@ HARDENING_PROFILE = (
     b"deadline=single-admission-absolute-pxad-v1;shutdown=fence,drain,join,close"
 )
 DEADLINE_RULE = b"pxau-v2-deadline=admitted-at+pxad-operation-timeout;budget-reset=forbidden"
+TEMPORAL_AUTHORITY_RULE = (
+    b"temporal-remaining>=operation-timeout;selection>=admitted;"
+    b"active-ready<deadline;local-cleanup-may-complete-after-deadline"
+)
 
 PXTE_DOMAIN = b"paraegox.runtime.target-execution.sha256.v10"
 ASSIGNMENT_DOMAIN = b"paraegox.runtime.target-plan-assignments.sha256.v11"
@@ -96,6 +103,9 @@ MODE_REMOTE_ACCESS_ACTIVE = 1
 MODE_LOCAL_AGENT_ONLY_DEACTIVATE = 2
 OUTCOME_ACTIVE_READY = 1
 OUTCOME_LOCAL_ONLY_READY = 2
+OUTCOME_NO_EFFECT_REJECTED = 3
+OUTCOME_UNCERTAIN = 4
+OUTCOME_QUARANTINED = 5
 LIFECYCLE_MAY_HAVE_STARTED = 2
 PHASE_READY_OBSERVATION = 4
 PHASE_LOCAL_ONLY_OBSERVATION = 8
@@ -307,6 +317,7 @@ def _topology_compatibility_digest() -> bytes:
         _u32(HARDENING_FEATURES),
         HARDENING_PROFILE,
         DEADLINE_RULE,
+        TEMPORAL_AUTHORITY_RULE,
         _u16(KNOWN_FLAGS),
         *[_u16(value) for value in (1, 2, 4, 8, 16, 32, 64)],
         *[_u16(value) for value in range(1, 10)],
@@ -631,6 +642,8 @@ def _parse_pxar(wire: bytes) -> dict[str, Any]:
     assignment = _assignment_digest(execution["wire"])
     if envelope[7] != assignment or envelope[2] != execution["profile"]["target"]:
         raise ContractReject("PXAR11 commitment")
+    if int.from_bytes(envelope[31], "big") < execution["profile"]["operation_timeout_nanos"]:
+        raise ContractReject("PXAR11 remaining budget shorter than operation timeout")
     return {
         "wire": wire,
         "envelope": envelope,
@@ -752,7 +765,7 @@ def _terminal_values(request: dict[str, Any], outcome: int) -> dict[str, Any]:
             "completion_snapshot_sequence": 74,
             "completion_owner_slot_revision": LOCAL_OWNER_SLOT_REVISION,
             "admitted_at_nanos": admitted_at,
-            "selection_observed_at_nanos": admitted_at + 19_000_000_000,
+            "selection_observed_at_nanos": admitted_at + 21_000_000_000,
             "queryable_declared_bitmap": EXACT_ROUTE_BITMAP,
             "ingress_fenced_bitmap": EXACT_ROUTE_BITMAP,
             "worker_joined_bitmap": EXACT_ROUTE_BITMAP,
@@ -991,6 +1004,24 @@ def _parse_terminal_body(body: bytes) -> dict[str, Any]:
     return values
 
 
+def _terminal_selection_time_is_valid(
+    outcome: int,
+    admitted_at_nanos: int,
+    absolute_deadline_nanos: int,
+    selection_observed_at_nanos: int,
+) -> bool:
+    if selection_observed_at_nanos < admitted_at_nanos:
+        return False
+    if outcome == OUTCOME_ACTIVE_READY:
+        return selection_observed_at_nanos < absolute_deadline_nanos
+    return outcome in {
+        OUTCOME_LOCAL_ONLY_READY,
+        OUTCOME_NO_EFFECT_REJECTED,
+        OUTCOME_UNCERTAIN,
+        OUTCOME_QUARANTINED,
+    }
+
+
 def _validate_terminal_values(values: dict[str, Any], request: dict[str, Any]) -> None:
     execution = request["execution"]
     retained = execution["retained_s0_cas"]
@@ -1042,12 +1073,17 @@ def _validate_terminal_values(values: dict[str, Any], request: dict[str, Any]) -
         or evidence["completion_owner_slot_revision"] == 0
         or evidence["selection_clock_domain"] == bytes(16)
         or evidence["selection_clock_domain"] != request["envelope"][28]
-        or evidence["selection_clock_generation"] < int.from_bytes(request["envelope"][29], "big")
+        or evidence["selection_clock_generation"] != int.from_bytes(request["envelope"][29], "big")
         or evidence["admitted_at_nanos"] == 0
         or evidence["absolute_deadline_nanos"]
         != evidence["admitted_at_nanos"] + execution["profile"]["operation_timeout_nanos"]
         or evidence["selection_observed_at_nanos"] == 0
-        or evidence["selection_observed_at_nanos"] > evidence["absolute_deadline_nanos"]
+        or not _terminal_selection_time_is_valid(
+            state["outcome"],
+            evidence["admitted_at_nanos"],
+            evidence["absolute_deadline_nanos"],
+            evidence["selection_observed_at_nanos"],
+        )
         or evidence["physical_binding_census"] != 2
         or evidence["queryable_declared_bitmap"] & ~EXACT_ROUTE_BITMAP
         or evidence["ingress_fenced_bitmap"] & ~EXACT_ROUTE_BITMAP
@@ -1162,6 +1198,37 @@ def _resign_pxau(wire: bytes) -> bytes:
     return wire[:683] + signature
 
 
+def _retime_envelope(
+    envelope: dict[str, bytes],
+    *,
+    original_budget_nanos: int = ENVELOPE_ORIGINAL_BUDGET_NANOS,
+    remaining_budget_nanos: int = ENVELOPE_REMAINING_BUDGET_NANOS,
+) -> dict[str, bytes]:
+    legacy = V1.S7.FABRIC.LEGACY
+    wire = legacy._rebuild_envelope_after_field_changes(
+        envelope["wire"],
+        {
+            30: _u64(original_budget_nanos),
+            31: _u64(remaining_budget_nanos),
+        },
+    )
+    values = legacy._decode_envelope(wire)
+    signing_transcript = legacy._signing_transcript(
+        2,
+        legacy.AUTH_SIGNING_DOMAIN,
+        [(tag, values[tag]) for tag in range(1, 38)],
+    )
+    return {
+        **envelope,
+        "wire": wire,
+        "target_slice_digest": values[8],
+        "control_digest": values[25],
+        "request_signature": values[38],
+        "signing_transcript": signing_transcript,
+        "request_digest": _digest(legacy.REQUEST_DIGEST_DOMAIN, [wire]),
+    }
+
+
 def _build_request(
     *,
     mode: int,
@@ -1190,6 +1257,7 @@ def _build_request(
         temporal_byte=temporal_byte,
         auth_nonce=auth_nonce,
     )
+    envelope = _retime_envelope(envelope)
     Ed25519PublicKey.from_public_bytes(envelope["request_public_key"]).verify(
         envelope["request_signature"],
         envelope["signing_transcript"],
@@ -1347,7 +1415,11 @@ def _generated_fixture() -> dict[str, Any]:
             "proxy_max_sessions": MAX_SESSIONS,
             "proxy_max_links": MAX_LINKS,
             "proxy_max_message_bytes": MAX_MESSAGE_BYTES,
+            "profile_operation_timeout_nanos": PROFILE_OPERATION_TIMEOUT_NANOS,
+            "envelope_original_budget_nanos": ENVELOPE_ORIGINAL_BUDGET_NANOS,
+            "envelope_remaining_budget_nanos": ENVELOPE_REMAINING_BUDGET_NANOS,
             "hardening_features": HARDENING_FEATURES,
+            "temporal_authority_rule_hex": TEMPORAL_AUTHORITY_RULE.hex(),
             "retained_s0_offsets": {
                 "active_pxft_digest": 0,
                 "active_pxst_digest": 32,
@@ -1416,7 +1488,7 @@ def _generated_fixture() -> dict[str, Any]:
     }
 
 
-def test_semantic_constants_and_r225_source_freeze() -> None:
+def test_semantic_constants_and_r244_source_freeze() -> None:
     assert hashlib.sha256(RUST_SOURCE_PATH.read_bytes()).hexdigest() == RUST_SOURCE_SHA256
     assert PXTE_PREFIX_BYTES == 320
     assert MAX_PXTE_BYTES == 320 + 1_465 + 200 + 152 + 439
@@ -1426,9 +1498,11 @@ def test_semantic_constants_and_r225_source_freeze() -> None:
     assert MAX_PXAU_SIGNATURE_BYTES == 512
     assert MAX_CANONICAL_PXAU_BYTES == PXAU_FIXED_BYTES + MAX_PXAU_SIGNATURE_BYTES
     assert MAX_CANONICAL_PXAU_BYTES < MAX_PXAU_CARRIER_BYTES
+    assert PROFILE_OPERATION_TIMEOUT_NANOS == 20_000_000_000
+    assert ENVELOPE_REMAINING_BUDGET_NANOS >= PROFILE_OPERATION_TIMEOUT_NANOS
     assert len(PXAU_SIGNING_MAGIC + _u16(2) + bytes(675)) == 732
     assert _topology_compatibility_digest().hex() == (
-        "20e2d991048fd0c0fcb38551bcc40cbe351376ad2b6113ee4ddc456f77f70e18"
+        "b3e79f480ecf52b1bcbde52d53c092a5814b5c9e344eb336b3ca0977e3ab243a"
     )
 
 
@@ -1454,6 +1528,16 @@ def test_active_ready_and_local_only_ready_round_trip_and_signatures() -> None:
             value["terminal"]["public_key"],
         )
         assert parsed_request["execution"]["mode"] == expected_mode
+        assert (
+            int.from_bytes(parsed_request["envelope"][30], "big") == ENVELOPE_ORIGINAL_BUDGET_NANOS
+        )
+        assert (
+            int.from_bytes(parsed_request["envelope"][31], "big") == ENVELOPE_REMAINING_BUDGET_NANOS
+        )
+        assert (
+            parsed_request["execution"]["profile"]["operation_timeout_nanos"]
+            == PROFILE_OPERATION_TIMEOUT_NANOS
+        )
         assert parsed_terminal["values"]["state"]["outcome"] == expected_outcome
         assert len(parsed_terminal["wire"]) == PXAU_CANONICAL_BYTES
         Ed25519PublicKey.from_public_bytes(value["envelope"]["request_public_key"]).verify(
@@ -1464,6 +1548,38 @@ def test_active_ready_and_local_only_ready_round_trip_and_signatures() -> None:
             value["terminal"]["signature"],
             value["terminal"]["transcript"],
         )
+    local_evidence = vectors["local_only_ready"]["terminal"]["values"]["evidence"]
+    assert (
+        local_evidence["selection_observed_at_nanos"]
+        == local_evidence["admitted_at_nanos"] + 21_000_000_000
+        > local_evidence["absolute_deadline_nanos"]
+    )
+
+
+def test_pxar_v11_remaining_budget_must_cover_operation_timeout() -> None:
+    value = _vectors()["active_ready"]
+    legacy = V1.S7.FABRIC.LEGACY
+
+    def with_remaining_budget(remaining_budget_nanos: int) -> bytes:
+        envelope = legacy._rebuild_envelope_after_field_changes(
+            value["envelope"]["wire"],
+            {31: _u64(remaining_budget_nanos)},
+        )
+        assert len(envelope) == len(value["envelope"]["wire"])
+        return _replace(value["pxar"], PXAR_HEADER_BYTES, envelope)
+
+    _parse_pxar(with_remaining_budget(PROFILE_OPERATION_TIMEOUT_NANOS))
+    short_budget = with_remaining_budget(PROFILE_OPERATION_TIMEOUT_NANOS - 1)
+    short_envelope_length = struct.unpack_from(">I", short_budget, 6)[0]
+    short_envelope = short_budget[PXAR_HEADER_BYTES : PXAR_HEADER_BYTES + short_envelope_length]
+    short_values = legacy._decode_envelope(short_envelope)
+    legacy._verify_envelope_signatures(
+        short_values,
+        value["envelope"]["tenure_public_key"],
+        value["envelope"]["request_public_key"],
+    )
+    with pytest.raises(ContractReject):
+        _parse_pxar(short_budget)
 
 
 def test_cas_width_revision_high_water_and_retained_s0_are_strict() -> None:
@@ -1510,16 +1626,61 @@ def test_terminal_hwm_revision_deadline_and_s0_drift_fail_closed(name: str) -> N
         tampered = _resign_pxau(_replace(wire, offset, replacement))
         with pytest.raises(ContractReject):
             _parse_pxau(tampered, request, public)
-    deadline = struct.unpack_from(">Q", wire, PXAU_OFFSETS["absolute_deadline_nanos"])[0]
-    observed_late = _resign_pxau(
+
+
+def test_terminal_temporal_authority_is_exact_and_outcome_sensitive() -> None:
+    vectors = _vectors()
+    for name in ("active_ready", "local_only_ready"):
+        value = vectors[name]
+        wire = value["terminal"]["wire"]
+        evidence = value["terminal"]["values"]["evidence"]
+        request_generation = int.from_bytes(value["parsed"]["envelope"][29], "big")
+        assert evidence["selection_clock_generation"] == request_generation
+        before_admitted = _resign_pxau(
+            _replace(
+                wire,
+                PXAU_OFFSETS["selection_observed_at_nanos"],
+                _u64(evidence["admitted_at_nanos"] - 1),
+            )
+        )
+        later_generation = _resign_pxau(
+            _replace(
+                wire,
+                PXAU_OFFSETS["selection_clock_generation"],
+                _u64(request_generation + 1),
+            )
+        )
+        for tampered in (before_admitted, later_generation):
+            with pytest.raises(ContractReject):
+                _parse_pxau(tampered, value["pxar"], value["terminal"]["public_key"])
+
+    active = vectors["active_ready"]
+    active_evidence = active["terminal"]["values"]["evidence"]
+    active_at_deadline = _resign_pxau(
         _replace(
-            wire,
+            active["terminal"]["wire"],
             PXAU_OFFSETS["selection_observed_at_nanos"],
-            _u64(deadline + 1),
+            _u64(active_evidence["absolute_deadline_nanos"]),
         )
     )
     with pytest.raises(ContractReject):
-        _parse_pxau(observed_late, request, public)
+        _parse_pxau(
+            active_at_deadline,
+            active["pxar"],
+            active["terminal"]["public_key"],
+        )
+
+    local = vectors["local_only_ready"]
+    local_evidence = local["terminal"]["values"]["evidence"]
+    assert local_evidence["selection_observed_at_nanos"] > local_evidence["absolute_deadline_nanos"]
+    _parse_pxau(local["terminal"]["wire"], local["pxar"], local["terminal"]["public_key"])
+    for cleanup_outcome in (
+        OUTCOME_LOCAL_ONLY_READY,
+        OUTCOME_NO_EFFECT_REJECTED,
+        OUTCOME_UNCERTAIN,
+        OUTCOME_QUARANTINED,
+    ):
+        assert _terminal_selection_time_is_valid(cleanup_outcome, 100, 200, 250)
 
 
 def test_local_only_drain_bitmaps_and_counters_fail_closed() -> None:
