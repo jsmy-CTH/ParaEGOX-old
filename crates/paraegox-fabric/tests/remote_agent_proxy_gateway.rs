@@ -856,9 +856,9 @@ fn classify_response_status(status: ResponseStatus) -> ForwardTerminal {
         ResponseStatus::MalformedRequest
         | ResponseStatus::StaleBinding
         | ResponseStatus::IngressOverloaded => ForwardTerminal::NoEffect,
-        ResponseStatus::Ok
-        | ResponseStatus::HandlerRejected
-        | ResponseStatus::ResponseTooLarge => ForwardTerminal::EffectCompleted,
+        ResponseStatus::Ok | ResponseStatus::HandlerRejected | ResponseStatus::ResponseTooLarge => {
+            ForwardTerminal::EffectCompleted
+        }
         ResponseStatus::HandlerUnavailable | ResponseStatus::HandlerTimeout => {
             ForwardTerminal::OutcomeUncertain
         }
@@ -1515,10 +1515,8 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     let stop_admitted = Arc::clone(&proxy.admitted[0]);
     let stop_forwarded = Arc::clone(&proxy.forwarded[0]);
     let (admission_closed_sender, admission_closed_receiver) = oneshot::channel();
-    let proxy_shutdown = tokio::spawn(proxy.shutdown(
-        deadline_after(OPERATION_BUDGET),
-        admission_closed_sender,
-    ));
+    let proxy_shutdown =
+        tokio::spawn(proxy.shutdown(deadline_after(OPERATION_BUDGET), admission_closed_sender));
     finish_before(
         deadline_after(OPERATION_BUDGET),
         admission_closed_receiver,
