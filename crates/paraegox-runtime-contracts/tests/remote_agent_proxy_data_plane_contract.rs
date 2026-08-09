@@ -13,12 +13,10 @@ use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
 use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
     MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES,
     MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES,
-    MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES,
-    REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES, REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_VERSION,
-    REMOTE_AGENT_DATA_PLANE_PROXY_ROUTE_COUNT_V2,
-    REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_VERSION,
-    REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES, RemoteAgentActiveS1CasV2,
-    RemoteAgentActiveS1FieldsV2, RemoteAgentDataPlaneApplyRequestDraftV2,
+    MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES, REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES,
+    REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_VERSION, REMOTE_AGENT_DATA_PLANE_PROXY_ROUTE_COUNT_V2,
+    REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_VERSION, REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES,
+    RemoteAgentActiveS1CasV2, RemoteAgentActiveS1FieldsV2, RemoteAgentDataPlaneApplyRequestDraftV2,
     RemoteAgentDataPlaneApplyRequestV1, RemoteAgentDataPlaneApplyRequestV2,
     RemoteAgentDataPlaneDrainOutcomeV2, RemoteAgentDataPlanePlanError,
     RemoteAgentDataPlaneProfileFieldsV1, RemoteAgentDataPlaneProfileV1,
@@ -354,9 +352,7 @@ fn quarantined_state(
         outcome: RemoteAgentDataPlaneTerminalOutcomeV2::Quarantined,
         lifecycle_effect: RemoteAgentDataPlaneTerminalLifecycleEffectV2::MayHaveStarted,
         phase: RemoteAgentDataPlaneTerminalPhaseV2::QuarantineIntent,
-        head: RemoteAgentDataPlaneTerminalHeadV2::PreservedExisting(
-            request.target_slice_digest(),
-        ),
+        head: RemoteAgentDataPlaneTerminalHeadV2::PreservedExisting(request.target_slice_digest()),
         fabric_generation: Some(FABRIC_GENERATION),
         agent_generation: Some(AGENT_GENERATION),
         access_generation: Some(LOCAL_PRIOR_HIGH_WATER),
@@ -747,9 +743,7 @@ fn successor_decoders_reject_truncation_trailing_reserved_lengths_and_unknown_ta
     assert!(RemoteAgentDataPlaneTargetExecutionV2::decode(&unknown_mode).is_err());
     let mut unknown_profile_presence = execution.canonical_wire().to_vec();
     unknown_profile_presence[mode_offset + 1] = 0xff;
-    assert!(
-        RemoteAgentDataPlaneTargetExecutionV2::decode(&unknown_profile_presence).is_err()
-    );
+    assert!(RemoteAgentDataPlaneTargetExecutionV2::decode(&unknown_profile_presence).is_err());
     let mut wrong_compatibility = execution.canonical_wire().to_vec();
     wrong_compatibility[6 + execution.projection().canonical_wire().len()] ^= 1;
     assert!(RemoteAgentDataPlaneTargetExecutionV2::decode(&wrong_compatibility).is_err());
@@ -765,17 +759,14 @@ fn successor_decoders_reject_truncation_trailing_reserved_lengths_and_unknown_ta
     assert!(RemoteAgentDataPlaneApplyRequestV2::decode(&request_trailing).is_err());
     let mut wrong_empty_assignment_length = request.canonical_wire().to_vec();
     wrong_empty_assignment_length[10..14].copy_from_slice(&11_u32.to_be_bytes());
-    assert!(
-        RemoteAgentDataPlaneApplyRequestV2::decode(&wrong_empty_assignment_length).is_err()
-    );
+    assert!(RemoteAgentDataPlaneApplyRequestV2::decode(&wrong_empty_assignment_length).is_err());
     let mut wrong_execution_length = request.canonical_wire().to_vec();
     let execution_length = u32::from_be_bytes(
         wrong_execution_length[14..18]
             .try_into()
             .expect("PXAR v11 execution length"),
     );
-    wrong_execution_length[14..18]
-        .copy_from_slice(&(execution_length + 1).to_be_bytes());
+    wrong_execution_length[14..18].copy_from_slice(&(execution_length + 1).to_be_bytes());
     assert!(RemoteAgentDataPlaneApplyRequestV2::decode(&wrong_execution_length).is_err());
 
     let receipt = terminal_receipt(
@@ -903,8 +894,7 @@ fn pxau2_freezes_fixed_body_signed_length_runtime_verification_and_version_isola
         maximum
     );
 
-    let oversized_signature =
-        [0xe4; MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES + 1];
+    let oversized_signature = [0xe4; MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES + 1];
     assert!(
         terminal_draft(&request, state, fields)
             .unwrap()
@@ -976,14 +966,10 @@ fn pxau2_raw_decode_never_substitutes_for_signer_and_request_correlation() {
     let wrong_signer_verifier_called = Cell::new(false);
     assert!(
         decoded
-            .verify_runtime_terminal(
-                &request,
-                wrong_terminal_auth(),
-                |_, _, _, _, _, _| {
-                    wrong_signer_verifier_called.set(true);
-                    true
-                },
-            )
+            .verify_runtime_terminal(&request, wrong_terminal_auth(), |_, _, _, _, _, _| {
+                wrong_signer_verifier_called.set(true);
+                true
+            },)
             .is_err()
     );
     assert!(!wrong_signer_verifier_called.get());
@@ -991,21 +977,16 @@ fn pxau2_raw_decode_never_substitutes_for_signer_and_request_correlation() {
     let mut correlation_tamper_with_replaced_signature = receipt.canonical_wire().to_vec();
     correlation_tamper_with_replaced_signature[118] ^= 1;
     correlation_tamper_with_replaced_signature[683..].fill(0xf1);
-    let raw_tamper = RemoteAgentDataPlaneTerminalReceiptV2::decode(
-        &correlation_tamper_with_replaced_signature,
-    )
-    .expect("canonical but request-uncorrelated PXAU v2");
+    let raw_tamper =
+        RemoteAgentDataPlaneTerminalReceiptV2::decode(&correlation_tamper_with_replaced_signature)
+            .expect("canonical but request-uncorrelated PXAU v2");
     let correlation_verifier_called = Cell::new(false);
     assert!(
         raw_tamper
-            .verify_runtime_terminal(
-                &request,
-                terminal_auth(),
-                |_, _, _, _, _, _| {
-                    correlation_verifier_called.set(true);
-                    true
-                },
-            )
+            .verify_runtime_terminal(&request, terminal_auth(), |_, _, _, _, _, _| {
+                correlation_verifier_called.set(true);
+                true
+            },)
             .is_err()
     );
     assert!(!correlation_verifier_called.get());
@@ -1020,21 +1001,16 @@ fn pxau2_raw_decode_never_substitutes_for_signer_and_request_correlation() {
         active_ready_state(),
         active_ready_evidence(&resigned_request),
     );
-    let decoded_resigned_request = RemoteAgentDataPlaneTerminalReceiptV2::decode(
-        resigned_request_receipt.canonical_wire(),
-    )
-    .expect("PXAU v2 for independently signed PXAR v11");
+    let decoded_resigned_request =
+        RemoteAgentDataPlaneTerminalReceiptV2::decode(resigned_request_receipt.canonical_wire())
+            .expect("PXAU v2 for independently signed PXAR v11");
     let resigned_request_verifier_called = Cell::new(false);
     assert!(
         decoded_resigned_request
-            .verify_runtime_terminal(
-                &request,
-                terminal_auth(),
-                |_, _, _, _, _, _| {
-                    resigned_request_verifier_called.set(true);
-                    true
-                },
-            )
+            .verify_runtime_terminal(&request, terminal_auth(), |_, _, _, _, _, _| {
+                resigned_request_verifier_called.set(true);
+                true
+            },)
             .is_err()
     );
     assert!(!resigned_request_verifier_called.get());
