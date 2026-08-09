@@ -8775,9 +8775,16 @@ mod tests {
             assert!(!marker_declaration.contains("#[derive(Clone"));
             assert!(!marker_declaration.contains("#[derive(Copy"));
 
+            let current_final_impl = source
+                .split_once("impl RemoteAgentCurrentFinalAccessSnapshotV2 {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl RemoteAgentPendingAccessSnapshotV2 {")
+                        .map(|(implementation, _)| implementation)
+                })
+                .unwrap_or_else(|| panic!("CurrentFinal implementation missing"));
             let constructor_name = "pub(crate) fn from_revalidated_genesis_v2(";
-            assert_eq!(source.matches(constructor_name).count(), 1);
-            let constructor_tail = source
+            assert_eq!(current_final_impl.matches(constructor_name).count(), 1);
+            let constructor_tail = current_final_impl
                 .split_once(constructor_name)
                 .map(|(_, tail)| tail)
                 .unwrap_or_else(|| panic!("sealed CurrentFinal constructor missing"));
@@ -8808,7 +8815,10 @@ mod tests {
             ] {
                 assert!(constructor.contains(&format!("parts.{field}")));
             }
-            assert!(source.contains("#[cfg(test)]\n    fn from_exact_readback_for_test("));
+            assert!(
+                current_final_impl
+                    .contains("#[cfg(test)]\n    fn from_exact_readback_for_test(")
+            );
         }
 
         #[test]
