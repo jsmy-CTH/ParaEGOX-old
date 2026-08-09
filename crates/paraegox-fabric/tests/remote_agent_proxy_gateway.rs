@@ -588,7 +588,6 @@ struct AdmittedQuery {
 struct TestProxyGateway {
     session: Option<zenoh::Session>,
     queryables: [Option<Queryable<()>>; 2],
-    cancel: watch::Sender<bool>,
     workers: [Option<JoinHandle<()>>; 2],
     admission_observers: [watch::Receiver<usize>; 2],
     observed: [Arc<AtomicUsize>; 2],
@@ -607,7 +606,6 @@ impl TestProxyGateway {
         let session = finish_before(deadline, zenoh::open(config), "open raw TLS proxy session")
             .await
             .expect("raw TLS proxy session must open");
-        let (cancel, cancel_receiver) = watch::channel(false);
         let observed = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
         let admitted = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
         let forwarded = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
@@ -652,7 +650,6 @@ impl TestProxyGateway {
             submit,
             Arc::from(SUBMIT_ROUTE),
             submit_receiver,
-            cancel_receiver.clone(),
             Arc::clone(&forwarded[0]),
         ));
         let control_worker = tokio::spawn(run_proxy_forwarder(
@@ -660,13 +657,11 @@ impl TestProxyGateway {
             control,
             Arc::from(CONTROL_ROUTE),
             control_receiver,
-            cancel_receiver,
             Arc::clone(&forwarded[1]),
         ));
         Self {
             session: Some(session),
             queryables: [Some(submit_queryable), Some(control_queryable)],
-            cancel,
             workers: [Some(submit_worker), Some(control_worker)],
             admission_observers: [submit_admission_observer, control_admission_observer],
             observed,
@@ -719,7 +714,6 @@ impl TestProxyGateway {
                     .expect("proxy queryable must undeclare");
             }
         }
-        let _ = self.cancel.send(true);
         for worker in &mut self.workers {
             if let Some(worker) = worker.take() {
                 finish_before(deadline, worker, "join proxy forwarder")
@@ -740,24 +734,10 @@ async fn run_proxy_forwarder(
     binding: PortBinding,
     route: Arc<str>,
     mut receiver: mpsc::Receiver<AdmittedQuery>,
-    mut cancel: watch::Receiver<bool>,
     forwarded: Arc<AtomicUsize>,
 ) {
-    loop {
-        let admitted = tokio::select! {
-            biased;
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() {
-                    break;
-                }
-                continue;
-            }
-            admitted = receiver.recv() => match admitted {
-                Some(admitted) => admitted,
-                None => break,
-            }
-        };
-        forward_one_query(&fabric, &binding, &route, admitted, &mut cancel, &forwarded).await;
+    while let Some(admitted) = receiver.recv().await {
+        forward_one_query(&fabric, &binding, &route, admitted, &forwarded).await;
     }
 }
 
@@ -766,63 +746,60 @@ async fn forward_one_query(
     binding: &PortBinding,
     route: &str,
     admitted: AdmittedQuery,
-    cancel: &mut watch::Receiver<bool>,
     forwarded: &AtomicUsize,
 ) {
     let AdmittedQuery { query, deadline } = admitted;
+    if Instant::now() >= deadline {
+        reply_proxy_error(&query, "proxy admission deadline expired").await;
+        return;
+    }
     let Some(payload) = query.payload() else {
         return;
     };
     let bytes = payload.to_bytes();
     let Ok(request) = BindingRequestEnvelopeV1::decode(bytes.as_ref(), MAX_TEST_FRAME_BYTES) else {
-        let _ = finish_before(
-            deadline,
-            query.reply_err("proxy malformed request"),
-            "reject malformed proxy request",
-        )
-        .await;
+        reply_proxy_error(&query, "proxy malformed request").await;
         return;
     };
     if request.binding_id() != binding.binding_id()
         || request.binding_epoch() != binding.binding_epoch()
         || request.schema() != binding.request_schema()
     {
-        let _ = finish_before(
-            deadline,
-            query.reply_err("proxy route mismatch"),
-            "reject mismatched proxy request",
-        )
-        .await;
+        reply_proxy_error(&query, "proxy route mismatch").await;
         return;
     }
-    forwarded.fetch_add(1, Ordering::SeqCst);
-    let remaining = remaining_budget(deadline);
-    let response = tokio::select! {
-        biased;
-        changed = cancel.changed() => {
-            let _ = changed;
-            None
-        }
-        response = tokio::time::timeout_at(
-            deadline,
-            fabric.request(binding, request.request_id(), request.body().to_vec(), remaining),
-        ) => response.ok().and_then(Result::ok),
-    };
-    let Some(response) = response else {
-        let _ = finish_before(
-            deadline,
-            query.reply_err("proxy stopped"),
-            "reply proxy stop",
-        )
-        .await;
+    let Some(remaining) = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        reply_proxy_error(&query, "proxy admission deadline expired").await;
         return;
     };
-    let _ = finish_before(
+    forwarded.fetch_add(1, Ordering::SeqCst);
+    let response = tokio::time::timeout_at(
+        deadline,
+        fabric.request(binding, request.request_id(), request.body().to_vec(), remaining),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let Some(response) = response else {
+        reply_proxy_error(&query, "proxy downstream outcome uncertain").await;
+        return;
+    };
+    let reply = tokio::time::timeout_at(
         deadline,
         query.reply(route.to_owned(), response.encode()),
-        "reply proxied response",
     )
     .await;
+    if !matches!(reply, Ok(Ok(()))) {
+        reply_proxy_error(&query, "proxy response deadline expired").await;
+    }
+}
+
+async fn reply_proxy_error(query: &Query, message: &'static str) {
+    let terminal_deadline = deadline_after(Duration::from_secs(1));
+    let _ = tokio::time::timeout_at(terminal_deadline, query.reply_err(message)).await;
 }
 
 fn request_frame(binding: &PortBinding, marker: u8, body: &[u8]) -> Vec<u8> {
@@ -1449,20 +1426,25 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     .await
     .expect("raw proxy link observer must undeclare");
 
-    proxy.shutdown(deadline_after(OPERATION_BUDGET)).await;
+    let proxy_shutdown = tokio::spawn(proxy.shutdown(deadline_after(OPERATION_BUDGET)));
+    tokio::task::yield_now().await;
+    assert!(
+        !proxy_shutdown.is_finished(),
+        "graceful proxy shutdown must wait for the admitted S0 effect"
+    );
     in_flight_release
         .send(true)
-        .expect("release the admitted S0 effect after proxy stop");
+        .expect("release the admitted S0 effect during proxy drain");
     let responder_was_closed = finish_before(
         deadline_after(OPERATION_BUDGET),
         in_flight_completed,
-        "complete admitted S0 effect after proxy stop",
+        "complete admitted S0 effect during proxy drain",
     )
     .await
     .expect("gated S0 effect must report completion");
     assert!(
-        responder_was_closed,
-        "proxy stop must drop the downstream response receiver"
+        !responder_was_closed,
+        "graceful drain must retain the downstream response receiver"
     );
     let in_flight_outcome = finish_before(
         deadline_after(OPERATION_BUDGET),
@@ -1471,10 +1453,19 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     )
     .await
     .expect("in-handler stop caller task must join");
-    assert!(
-        matches!(&in_flight_outcome, RawQueryOutcome::RemoteError),
-        "in-handler stop caller used unexpected terminal: {in_flight_outcome:?}"
-    );
+    let in_flight_response = match in_flight_outcome {
+        RawQueryOutcome::Response(response) => response,
+        outcome => panic!("in-handler drain caller used unexpected terminal: {outcome:?}"),
+    };
+    assert_eq!(in_flight_response.status(), ResponseStatus::Ok);
+    assert_eq!(in_flight_response.body(), IN_FLIGHT_STOP_BODY);
+    finish_before(
+        deadline_after(OPERATION_BUDGET),
+        proxy_shutdown,
+        "join graceful proxy shutdown",
+    )
+    .await
+    .expect("graceful proxy shutdown task must join");
     assert_eq!(submit_callbacks.load(Ordering::SeqCst), 2);
     finish_before(
         deadline_after(OPERATION_BUDGET),
