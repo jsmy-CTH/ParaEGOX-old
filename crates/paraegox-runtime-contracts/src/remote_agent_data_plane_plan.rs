@@ -2486,6 +2486,7 @@ const TERMINAL_V2_FIXED_BYTES: usize = 4
     + 8
     + 16
     + 8
+    + (2 * 8)
     + 8
     + 2
     + 6
@@ -2702,17 +2703,16 @@ impl RemoteAgentActiveS1CasV2 {
         if owner_slot_revision == 0 {
             return Err(RemoteAgentDataPlanePlanError::InvalidBootstrapCas);
         }
-        if let Some(active) = active {
-            if access_generation_high_water == 0
+        if let Some(active) = active
+            && (access_generation_high_water == 0
                 || digest_is_zero(active.active_pxau_digest)
                 || digest_is_zero(active.active_request_digest)
                 || digest_is_zero(active.active_snapshot_digest)
                 || active.active_snapshot_sequence == 0
                 || active.active_access_generation.value() != access_generation_high_water
-                || bytes_are_zero(&active.active_proxy_session_epoch)
-            {
-                return Err(RemoteAgentDataPlanePlanError::InvalidBootstrapCas);
-            }
+                || bytes_are_zero(&active.active_proxy_session_epoch))
+        {
+            return Err(RemoteAgentDataPlanePlanError::InvalidBootstrapCas);
         }
         let canonical_wire =
             encode_active_s1_cas_v2(access_generation_high_water, owner_slot_revision, active);
@@ -2909,6 +2909,9 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32,
     builder.field_u64(MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS)?;
     builder.field_bytes(&REMOTE_AGENT_PROXY_HARDENING_FEATURES_V2.to_be_bytes())?;
     builder.field_bytes(REMOTE_AGENT_PROXY_HARDENING_PROFILE_V2)?;
+    builder.field_bytes(
+        b"pxau-v2-deadline=admitted-at+pxad-operation-timeout;budget-reset=forbidden",
+    )?;
     builder.field_u16(TERMINAL_V2_EVIDENCE_KNOWN_FLAGS)?;
     for phase in [
         RemoteAgentDataPlaneTerminalPhaseV2::PreparedNoEffects,
@@ -3781,6 +3784,8 @@ pub struct RemoteAgentDataPlaneTerminalEvidenceFieldsV2 {
     pub completion_owner_slot_revision: u64,
     pub selection_clock_domain: ClockDomainRef,
     pub selection_clock_generation: ClockGeneration,
+    pub admitted_at_nanos: u64,
+    pub absolute_deadline_nanos: u64,
     pub selection_observed_at_nanos: u64,
     pub physical_binding_census: u16,
     pub queryable_declared_bitmap: u8,
@@ -3816,6 +3821,8 @@ impl RemoteAgentDataPlaneTerminalEvidenceV2 {
             || fields.completion_snapshot_sequence == 0
             || fields.completion_owner_slot_revision == 0
             || bytes_are_zero(fields.selection_clock_domain.as_bytes())
+            || fields.admitted_at_nanos == 0
+            || fields.absolute_deadline_nanos <= fields.admitted_at_nanos
             || fields.selection_observed_at_nanos == 0
             || fields.physical_binding_census > RETAINED_LOCAL_AGENT_BINDING_CENSUS
             || fields.queryable_declared_bitmap & !REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP != 0
@@ -3841,6 +3848,16 @@ impl RemoteAgentDataPlaneTerminalEvidenceV2 {
     #[must_use]
     pub const fn fields(self) -> RemoteAgentDataPlaneTerminalEvidenceFieldsV2 {
         self.fields
+    }
+
+    #[must_use]
+    pub const fn admitted_at_nanos(self) -> u64 {
+        self.fields.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub const fn absolute_deadline_nanos(self) -> u64 {
+        self.fields.absolute_deadline_nanos
     }
 }
 
@@ -4352,6 +4369,7 @@ fn validate_terminal_facts_shape_v2(
                 && fields.ingress_fenced_bitmap == 0
                 && fields.worker_joined_bitmap == 0
                 && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::NotStarted
+                && fields.selection_observed_at_nanos <= fields.absolute_deadline_nanos
                 && fields.s1_tls_ready
                 && fields.s1_acl_ready
                 && !fields.s1_closed
@@ -4368,6 +4386,7 @@ fn validate_terminal_facts_shape_v2(
                 && fields.ingress_fenced_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
                 && fields.worker_joined_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
                 && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::Drained
+                && fields.selection_observed_at_nanos <= fields.absolute_deadline_nanos
                 && fields.submit_admitted_count == fields.submit_terminalized_count
                 && fields.control_admitted_count == fields.control_terminalized_count
                 && !fields.s1_tls_ready
@@ -4462,6 +4481,10 @@ fn validate_terminal_facts_against_execution_v2(
     if fields.proxy_topology_compatibility_digest != execution.proxy_topology_compatibility_digest()
         || (!digest_is_zero(fields.retained_s0_current_cas_digest)
             && fields.retained_s0_current_cas_digest != execution.retained_s0_cas().cas_digest())
+        || fields
+            .admitted_at_nanos
+            .checked_add(execution.profile().operation_timeout_nanos())
+            != Some(fields.absolute_deadline_nanos)
     {
         return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
     }
@@ -4629,6 +4652,8 @@ fn append_terminal_body_v2(
     wire.extend_from_slice(&evidence.completion_owner_slot_revision.to_be_bytes());
     wire.extend_from_slice(evidence.selection_clock_domain.as_bytes());
     wire.extend_from_slice(&evidence.selection_clock_generation.value().to_be_bytes());
+    wire.extend_from_slice(&evidence.admitted_at_nanos.to_be_bytes());
+    wire.extend_from_slice(&evidence.absolute_deadline_nanos.to_be_bytes());
     wire.extend_from_slice(&evidence.selection_observed_at_nanos.to_be_bytes());
     wire.extend_from_slice(&evidence.physical_binding_census.to_be_bytes());
     wire.push(evidence.queryable_declared_bitmap);
@@ -4755,6 +4780,8 @@ fn decode_terminal_facts_v2(
     let selection_clock_domain = ClockDomainRef::from_bytes(cursor.array()?);
     let selection_clock_generation = ClockGeneration::try_new(cursor.u64()?)
         .map_err(|_| RemoteAgentDataPlanePlanError::InvalidTerminalFacts)?;
+    let admitted_at_nanos = cursor.u64()?;
+    let absolute_deadline_nanos = cursor.u64()?;
     let selection_observed_at_nanos = cursor.u64()?;
     let physical_binding_census = cursor.u16()?;
     let queryable_declared_bitmap = cursor.u8()?;
@@ -4798,6 +4825,8 @@ fn decode_terminal_facts_v2(
             completion_owner_slot_revision,
             selection_clock_domain,
             selection_clock_generation,
+            admitted_at_nanos,
+            absolute_deadline_nanos,
             selection_observed_at_nanos,
             physical_binding_census,
             queryable_declared_bitmap,
