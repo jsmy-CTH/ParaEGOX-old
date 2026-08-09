@@ -36,11 +36,9 @@ use paraegox_fabric::{
     RestrictedRuntimeControlEndpointV1, RestrictedRuntimeControlInboundV1,
     RestrictedRuntimeControlReceiverV1,
 };
-#[cfg(test)]
-use paraegox_kernel::identity::PrincipalRef;
 use paraegox_kernel::{
-    digest::Digest32,
-    identity::RuntimeHostId,
+    digest::{Digest32, Digest32Builder, DigestBuildError},
+    identity::{PrincipalRef, RuntimeHostId},
     time::{ClockDomainRef, ClockGeneration},
 };
 use paraegox_runtime_contracts::{
@@ -51,7 +49,8 @@ use paraegox_runtime_contracts::{
         DistributedAgentStackPlanError, DistributedAgentStackProjectionV1,
         DistributedAgentStackRestrictedApplyRequestV1, DistributedAgentStackTerminalFactsV1,
         DistributedAgentStackTerminalOutcomeV1, DistributedAgentStackTerminalReceiptDraftV2,
-        DistributedAgentStackTerminalReceiptV1, MAX_DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_BYTES,
+        DistributedAgentStackTerminalReceiptV1, DistributedFabricSessionEpochV1,
+        MAX_DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_BYTES,
         MAX_DISTRIBUTED_AGENT_STACK_RESTRICTED_APPLY_REQUEST_BYTES,
         MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
         MAX_DISTRIBUTED_AGENT_STACK_TERMINAL_RECEIPT_V2_BYTES,
@@ -79,6 +78,7 @@ use paraegox_runtime_contracts::{
         MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
         ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
     },
+    managed_service::ManagedServiceGeneration,
     managed_serving_bootstrap::{
         ControllerAuthenticatedRuntimeAgentControlRequestV1,
         ControllerAuthenticatedRuntimeControlCarrierV1,
@@ -113,6 +113,7 @@ use paraegox_runtime_contracts::{
         reference_local_control_endpoint_identity_digest_v1,
         reference_runtime_peer_credentials_digest_v1, verify_reference_durable_slice_v1,
     },
+    remote_agent_data_plane_plan::{RemoteAgentRetainedS0CasFieldsV2, RemoteAgentRetainedS0CasV2},
     wire::ApplyAuthAlgorithm,
 };
 #[cfg(test)]
@@ -134,11 +135,13 @@ use crate::{
     managed_agent_stack_runtime::{
         ManagedAgentStackApplyOutcome, ManagedAgentStackOwnerConfig, ManagedAgentStackRuntimeCore,
         ManagedAgentStackRuntimeError, RuntimeAgentConversationPortExportErrorV1,
-        RuntimeAgentHandleBroker,
+        RuntimeAgentCurrentConversationPortExportV2, RuntimeAgentHandleBroker,
     },
+    managed_agent_transport::AgentConversationPortDescriptorV1,
     managed_fabric_runtime::{
         ManagedFabricApplyOutcome, ManagedFabricOwnerConfig, ManagedFabricRuntimeCore,
-        ManagedFabricRuntimeError, transition_projection_digest,
+        ManagedFabricRuntimeError, RemoteAgentAccessGenesisInitializeErrorV2,
+        RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2, transition_projection_digest,
     },
     managed_fabric_state::{ManagedFabricSnapshot, ManagedFabricStateError},
     managed_model_agent_stack_runtime::{
@@ -179,8 +182,8 @@ use crate::{
         RuntimeProvisioningError, RuntimeProvisioningV1, validate_canonical_absolute_path,
     },
     runtime_store::{
-        ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessStartupSlotV2, RuntimeStore,
-        RuntimeStoreError, RuntimeStoreOpenError,
+        ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessCommitErrorV2,
+        RemoteAgentAccessStartupSlotV2, RuntimeStore, RuntimeStoreError, RuntimeStoreOpenError,
     },
 };
 
@@ -196,6 +199,10 @@ const BOOTSTRAP_REQUEST_MAGIC: &[u8; 4] = b"PXBR";
 const MANAGED_BOOTSTRAP_REQUEST_MAGIC: &[u8; 4] = b"PXFB";
 const QUERY_REQUEST_MAGIC: &[u8; 4] = b"PXQR";
 const APPLY_REQUEST_MAGIC: &[u8; 4] = b"PXAR";
+const REMOTE_AGENT_LOWER_CAPABILITY_PROJECTION_DIGEST_DOMAIN_V2: &[u8] =
+    b"paraegox.runtime.remote-agent-lower-capability-projection.sha256.v2";
+const REMOTE_AGENT_RETAINED_S0_CENSUS_DIGEST_DOMAIN_V2: &[u8] =
+    b"paraegox.runtime.remote-agent-retained-s0-census.sha256.v2";
 const MODE_MASK: u32 = 0o7777;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_REQUEST_BYTES: usize = maximum_eight([
@@ -400,6 +407,236 @@ impl<'running> RuntimeRestrictedApplyCarrierPinV1<'running> {
 /// consumed at the state transition boundary.
 impl Drop for RuntimeRestrictedApplyCarrierPinV1<'_> {
     fn drop(&mut self) {}
+}
+
+/// Exact owner-current Agent facts captured without accepting a caller-selected
+/// PXST or recovered PXRS root. The two observations surrounding the Fabric
+/// read fence must compare byte-for-byte before either can contribute to a
+/// live-lower projection.
+#[derive(Eq, PartialEq)]
+struct RemoteAgentCurrentOwnerObservationV2 {
+    active_request_wire: Box<[u8]>,
+    active_terminal_receipt_wire: Box<[u8]>,
+    target: RuntimeHostId,
+    expected_runtime_store_instance_id: [u8; 32],
+    active_pxst_digest: Digest32,
+    exact_pxap: Box<[u8]>,
+    fabric_generation: ManagedServiceGeneration,
+    agent_generation: ManagedServiceGeneration,
+    fabric_execution_digest: Digest32,
+    fabric_session_epoch: DistributedFabricSessionEpochV1,
+    pxap_descriptor_digest: Digest32,
+    request_binding_descriptor_digest: Digest32,
+    event_binding_descriptor_digest: Digest32,
+    submit_binding_epoch: u64,
+    control_binding_epoch: u64,
+    physical_binding_census: u16,
+}
+
+/// Fully correlated live S0 facts retained on both sides of the exact PXRS
+/// genesis publication. This is owned and intentionally non-Clone: equality
+/// is a one-shot freshness check, not a reusable authority constructor.
+#[derive(Eq, PartialEq)]
+pub(crate) struct RemoteAgentLiveLowerFactsV2 {
+    active_request_wire: Box<[u8]>,
+    active_terminal_receipt_wire: Box<[u8]>,
+    target: RuntimeHostId,
+    store_instance_id: [u8; 32],
+    owner_target_fingerprint: Digest32,
+    transition_projection_digest: Digest32,
+    runtime_host_epoch: u64,
+    carrier_binding_digest: Digest32,
+    intended_client: PrincipalRef,
+    fabric_execution_digest: Digest32,
+    active_pxft_digest: Digest32,
+    active_pxst_digest: Digest32,
+    descriptor_evidence_wire: Box<[u8]>,
+    descriptor_evidence_record_digest: Digest32,
+    descriptor_evidence_record_sequence: u64,
+    descriptor_receipt_digest: Digest32,
+    descriptor_payload_digest: Digest32,
+    fabric_session_epoch: DistributedFabricSessionEpochV1,
+    fabric_generation: ManagedServiceGeneration,
+    agent_generation: ManagedServiceGeneration,
+    exact_pxap: Box<[u8]>,
+    pxap_descriptor_digest: Digest32,
+    request_binding_descriptor_digest: Digest32,
+    event_binding_descriptor_digest: Digest32,
+    submit_binding_epoch: u64,
+    control_binding_epoch: u64,
+    physical_binding_census: u16,
+    retained_s0_cas: RemoteAgentRetainedS0CasV2,
+    lower_capability_projection_digest: Digest32,
+    retained_s0_census_digest: Digest32,
+}
+
+impl RemoteAgentLiveLowerFactsV2 {
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn store_instance_id(&self) -> [u8; 32] {
+        self.store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn owner_target_fingerprint(&self) -> Digest32 {
+        self.owner_target_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn transition_projection_digest(&self) -> Digest32 {
+        self.transition_projection_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_host_epoch(&self) -> u64 {
+        self.runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn retained_s0_cas(&self) -> RemoteAgentRetainedS0CasV2 {
+        self.retained_s0_cas
+    }
+
+    #[must_use]
+    pub(crate) const fn lower_capability_projection_digest(&self) -> Digest32 {
+        self.lower_capability_projection_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn retained_s0_census_digest(&self) -> Digest32 {
+        self.retained_s0_census_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn submit_binding_epoch(&self) -> u64 {
+        self.submit_binding_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn control_binding_epoch(&self) -> u64 {
+        self.control_binding_epoch
+    }
+
+    #[must_use]
+    pub(crate) fn exact_pxap(&self) -> &[u8] {
+        &self.exact_pxap
+    }
+
+    #[must_use]
+    pub(crate) const fn intended_client(&self) -> PrincipalRef {
+        self.intended_client
+    }
+}
+
+/// Precommit proof of one complete live-lower observation. The same endpoint
+/// Pin is retained by value and crosses exact store initialization/readback;
+/// no raw carrier or PXRS-selected root can mint this value.
+pub(crate) struct RemoteAgentLiveLowerProjectionV2<'running> {
+    carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    facts: RemoteAgentLiveLowerFactsV2,
+}
+
+impl<'running> RemoteAgentLiveLowerProjectionV2<'running> {
+    #[must_use]
+    pub(crate) const fn exact_facts(&self) -> &RemoteAgentLiveLowerFactsV2 {
+        &self.facts
+    }
+
+    fn carrier_pin(&self) -> &RuntimeRestrictedApplyCarrierPinV1<'running> {
+        &self.carrier_pin
+    }
+}
+
+impl RemoteAgentCurrentOwnerObservationV2 {
+    fn try_from_owner_export(
+        export: &RuntimeAgentCurrentConversationPortExportV2,
+    ) -> Result<Self, RuntimeControlRequestError> {
+        let live = export.live_port();
+        let descriptor = AgentConversationPortDescriptorV1::decode(&live.descriptor_wire)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        if live.physical_binding_census != 2
+            || live.submit_binding_epoch == 0
+            || live.control_binding_epoch == 0
+            || descriptor.canonical_wire() != live.descriptor_wire.as_ref()
+            || descriptor.descriptor_digest() != live.descriptor_digest
+            || descriptor.request_binding_descriptor_digest()
+                != live.request_binding_descriptor_digest
+            || descriptor.event_binding_descriptor_digest() != live.event_binding_descriptor_digest
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        Ok(Self {
+            active_request_wire: export.active_request().canonical_wire().into(),
+            active_terminal_receipt_wire: export.active_terminal_receipt().canonical_wire().into(),
+            target: export.active_request().target(),
+            expected_runtime_store_instance_id: export
+                .active_request()
+                .expected_runtime_store_instance_id(),
+            active_pxst_digest: live.active_pxst_digest,
+            exact_pxap: live.descriptor_wire.clone(),
+            fabric_generation: live.fabric_generation,
+            agent_generation: live.agent_generation,
+            fabric_execution_digest: live.fabric_execution_digest,
+            fabric_session_epoch: live.fabric_session_epoch,
+            pxap_descriptor_digest: live.descriptor_digest,
+            request_binding_descriptor_digest: live.request_binding_descriptor_digest,
+            event_binding_descriptor_digest: live.event_binding_descriptor_digest,
+            submit_binding_epoch: live.submit_binding_epoch,
+            control_binding_epoch: live.control_binding_epoch,
+            physical_binding_census: live.physical_binding_census,
+        })
+    }
+}
+
+fn remote_agent_lower_capability_projection_digest_v2(
+    observation: &RemoteAgentCurrentOwnerObservationV2,
+) -> Result<Digest32, DigestBuildError> {
+    let mut builder =
+        Digest32Builder::try_new(REMOTE_AGENT_LOWER_CAPABILITY_PROJECTION_DIGEST_DOMAIN_V2)?;
+    builder.field_bytes(observation.fabric_session_epoch.as_bytes())?;
+    builder.field_u16(observation.physical_binding_census)?;
+    builder.field_bytes(&observation.exact_pxap)?;
+    Ok(builder.finish())
+}
+
+struct RemoteAgentRetainedS0CensusContextV2<'observation> {
+    target: RuntimeHostId,
+    store_instance_id: [u8; 32],
+    owner_target_fingerprint: Digest32,
+    transition_projection_digest: Digest32,
+    runtime_host_epoch: u64,
+    carrier_binding_digest: Digest32,
+    intended_client: PrincipalRef,
+    observation: &'observation RemoteAgentCurrentOwnerObservationV2,
+    retained_s0_cas: RemoteAgentRetainedS0CasV2,
+    lower_capability_projection_digest: Digest32,
+}
+
+fn remote_agent_retained_s0_census_digest_v2(
+    context: RemoteAgentRetainedS0CensusContextV2<'_>,
+) -> Result<Digest32, DigestBuildError> {
+    let mut builder = Digest32Builder::try_new(REMOTE_AGENT_RETAINED_S0_CENSUS_DIGEST_DOMAIN_V2)?;
+    builder.field_bytes(context.target.as_bytes())?;
+    builder.field_bytes(&context.store_instance_id)?;
+    builder.field_digest(&context.owner_target_fingerprint)?;
+    builder.field_digest(&context.transition_projection_digest)?;
+    builder.field_u64(context.runtime_host_epoch)?;
+    builder.field_digest(&context.carrier_binding_digest)?;
+    builder.field_bytes(context.intended_client.as_bytes())?;
+    builder.field_digest(&context.observation.fabric_execution_digest)?;
+    builder.field_digest(&context.retained_s0_cas.cas_digest())?;
+    builder.field_digest(&context.lower_capability_projection_digest)?;
+    builder.field_digest(&context.observation.pxap_descriptor_digest)?;
+    builder.field_digest(&context.observation.request_binding_descriptor_digest)?;
+    builder.field_digest(&context.observation.event_binding_descriptor_digest)?;
+    builder.field_u64(context.observation.submit_binding_epoch)?;
+    builder.field_u64(context.observation.control_binding_epoch)?;
+    builder.field_u16(context.observation.physical_binding_census)?;
+    Ok(builder.finish())
 }
 
 impl RuntimeRestrictedApplyEndpointDependenciesV1 {
@@ -1810,6 +2047,265 @@ pub(crate) struct ManagedFabricControlService {
 }
 
 impl ManagedFabricControlService {
+    /// Sole production mint for a precommit live-lower projection. Selection
+    /// comes only from the current Agent owner and the complete live endpoint
+    /// Pin; no raw carrier or recovered PXRS selector enters this API.
+    async fn observe_remote_agent_live_lower_projection_v2<'running>(
+        &self,
+        carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    ) -> Result<RemoteAgentLiveLowerProjectionV2<'running>, RuntimeControlRequestError> {
+        let facts = self
+            .observe_remote_agent_live_lower_facts_v2(
+                &carrier_pin,
+                #[cfg(test)]
+                None,
+            )
+            .await?;
+        Ok(RemoteAgentLiveLowerProjectionV2 { carrier_pin, facts })
+    }
+
+    async fn observe_remote_agent_live_lower_facts_from_projection_v2(
+        &self,
+        projection: &RemoteAgentLiveLowerProjectionV2<'_>,
+    ) -> Result<RemoteAgentLiveLowerFactsV2, RuntimeControlRequestError> {
+        self.observe_remote_agent_live_lower_facts_v2(
+            projection.carrier_pin(),
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    /// One full A0/Fabric/A1/protected-PXDE observation. A0 and A1 are both
+    /// no-selector exports selected by the Agent owner itself. Only exact A0
+    /// == A1 can be correlated with the live Fabric root and the latest PXDE.
+    async fn observe_remote_agent_live_lower_facts_v2(
+        &self,
+        carrier_pin: &RuntimeRestrictedApplyCarrierPinV1<'_>,
+        #[cfg(test)] mutate_a1_for_test: Option<fn(&mut RemoteAgentCurrentOwnerObservationV2)>,
+    ) -> Result<RemoteAgentLiveLowerFactsV2, RuntimeControlRequestError> {
+        let carrier = carrier_pin
+            .exact_carrier()
+            .ok_or(RuntimeControlRequestError::Rejected)?;
+        let stack = self
+            .stack
+            .as_ref()
+            .ok_or(RuntimeControlRequestError::Unavailable)?;
+
+        let a0_export = stack
+            .export_current_conversation_port_v2()
+            .await
+            .map_err(map_runtime_agent_port_export_error)?;
+        let a0 = RemoteAgentCurrentOwnerObservationV2::try_from_owner_export(&a0_export)?;
+        if a0.target != self.provisioning.target()
+            || a0.expected_runtime_store_instance_id != self.core.store_instance_id()
+            || a0_export.active_request().target_execution().projection() != &self.stack_projection
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+
+        let retained_root = self
+            .core
+            .export_active_retained_root_v1(a0.fabric_execution_digest, a0.fabric_generation)
+            .await
+            .map_err(map_managed_fabric_error)?;
+
+        let a1_export = stack
+            .export_current_conversation_port_v2()
+            .await
+            .map_err(map_runtime_agent_port_export_error)?;
+        let a1 = RemoteAgentCurrentOwnerObservationV2::try_from_owner_export(&a1_export)?;
+        #[cfg(test)]
+        let a1 = {
+            let mut a1 = a1;
+            if let Some(mutate) = mutate_a1_for_test {
+                mutate(&mut a1);
+            }
+            a1
+        };
+        if a0 != a1
+            || retained_root.fabric_generation != a1.fabric_generation
+            || a1.target != self.provisioning.target()
+            || a1.expected_runtime_store_instance_id != self.core.store_instance_id()
+            || a1_export.active_request().target_execution().projection() != &self.stack_projection
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+
+        let evidence = self
+            .core
+            .latest_remote_agent_descriptor_evidence()
+            .ok_or(RuntimeControlRequestError::Unavailable)?;
+        let verified = verify_remote_agent_descriptor_evidence_v1(
+            evidence,
+            RemoteAgentDescriptorLiveFactsV1 {
+                carrier,
+                target: self.provisioning.target(),
+                store_instance_id: self.core.store_instance_id(),
+                runtime_host_epoch: self.core.runtime_host_epoch(),
+                active_pxst_digest: a1.active_pxst_digest,
+                descriptor: &a1.exact_pxap,
+                fabric_generation: a1.fabric_generation,
+                agent_generation: a1.agent_generation,
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                if principal != self.provisioning.controller_principal()
+                    || key != self.provisioning.controller_request_key_ref()
+                    || fingerprint != self.provisioning.controller_key_fingerprint()
+                    || signature.len() != ED25519_SIGNATURE_BYTES
+                {
+                    return false;
+                }
+                let Ok(signature) = Signature::from_slice(signature) else {
+                    return false;
+                };
+                self.provisioning
+                    .controller_key()
+                    .verify_strict(transcript, &signature)
+                    .is_ok()
+            },
+            |principal, key, fingerprint, transcript, signature| {
+                verify_runtime_agent_response_with_provisioning(
+                    &self.provisioning,
+                    principal,
+                    key,
+                    fingerprint,
+                    transcript,
+                    signature,
+                )
+            },
+        )
+        .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let evidence = verified.evidence();
+        let core_observation = self
+            .core
+            .recovered_observation()
+            .map_err(map_managed_fabric_error)?;
+        if core_observation.target != self.provisioning.target()
+            || core_observation.store_instance_id != self.core.store_instance_id()
+            || core_observation.runtime_host_epoch != self.core.runtime_host_epoch()
+            || &core_observation.projection != self.stack_projection.managed_fabric_projection()
+        {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let owner_target_fingerprint = self.core.owner_target_fingerprint();
+        let transition_projection_digest = core_observation.transition_projection_digest;
+        let retained_s0_cas =
+            RemoteAgentRetainedS0CasV2::try_new(RemoteAgentRetainedS0CasFieldsV2 {
+                expected_active_pxft_digest: retained_root.active_pxft_digest,
+                expected_active_pxst_digest: a1.active_pxst_digest,
+                expected_descriptor_evidence_record_digest: evidence.record_digest(),
+                expected_descriptor_evidence_record_sequence: evidence.record_sequence(),
+                expected_descriptor_receipt_digest: evidence.receipt_digest(),
+                expected_descriptor_payload_digest: evidence.descriptor_payload_digest(),
+                expected_fabric_session_epoch: a1.fabric_session_epoch,
+                expected_fabric_generation: a1.fabric_generation,
+                expected_agent_generation: a1.agent_generation,
+            })
+            .map_err(|_| {
+                RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::InvalidStartedState,
+                )
+            })?;
+        let lower_capability_projection_digest =
+            remote_agent_lower_capability_projection_digest_v2(&a1).map_err(|_| {
+                RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::InvalidStartedState,
+                )
+            })?;
+        let retained_s0_census_digest =
+            remote_agent_retained_s0_census_digest_v2(RemoteAgentRetainedS0CensusContextV2 {
+                target: self.provisioning.target(),
+                store_instance_id: self.core.store_instance_id(),
+                owner_target_fingerprint,
+                transition_projection_digest,
+                runtime_host_epoch: self.core.runtime_host_epoch(),
+                carrier_binding_digest: carrier.binding_digest(),
+                intended_client: evidence.intended_client(),
+                observation: &a1,
+                retained_s0_cas,
+                lower_capability_projection_digest,
+            })
+            .map_err(|_| {
+                RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::InvalidStartedState,
+                )
+            })?;
+
+        Ok(RemoteAgentLiveLowerFactsV2 {
+            active_request_wire: a1.active_request_wire,
+            active_terminal_receipt_wire: a1.active_terminal_receipt_wire,
+            target: self.provisioning.target(),
+            store_instance_id: self.core.store_instance_id(),
+            owner_target_fingerprint,
+            transition_projection_digest,
+            runtime_host_epoch: self.core.runtime_host_epoch(),
+            carrier_binding_digest: carrier.binding_digest(),
+            intended_client: evidence.intended_client(),
+            fabric_execution_digest: a1.fabric_execution_digest,
+            active_pxft_digest: retained_root.active_pxft_digest,
+            active_pxst_digest: a1.active_pxst_digest,
+            descriptor_evidence_wire: evidence.canonical_wire().into(),
+            descriptor_evidence_record_digest: evidence.record_digest(),
+            descriptor_evidence_record_sequence: evidence.record_sequence(),
+            descriptor_receipt_digest: evidence.receipt_digest(),
+            descriptor_payload_digest: evidence.descriptor_payload_digest(),
+            fabric_session_epoch: a1.fabric_session_epoch,
+            fabric_generation: a1.fabric_generation,
+            agent_generation: a1.agent_generation,
+            exact_pxap: a1.exact_pxap,
+            pxap_descriptor_digest: a1.pxap_descriptor_digest,
+            request_binding_descriptor_digest: a1.request_binding_descriptor_digest,
+            event_binding_descriptor_digest: a1.event_binding_descriptor_digest,
+            submit_binding_epoch: a1.submit_binding_epoch,
+            control_binding_epoch: a1.control_binding_epoch,
+            physical_binding_census: a1.physical_binding_census,
+            retained_s0_cas,
+            lower_capability_projection_digest,
+            retained_s0_census_digest,
+        })
+    }
+
+    #[cfg(test)]
+    async fn observe_remote_agent_live_lower_projection_with_a1_mutation_for_test_v2<'running>(
+        &self,
+        carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+        mutate_a1: fn(&mut RemoteAgentCurrentOwnerObservationV2),
+    ) -> Result<RemoteAgentLiveLowerProjectionV2<'running>, RuntimeControlRequestError> {
+        let facts = self
+            .observe_remote_agent_live_lower_facts_v2(&carrier_pin, Some(mutate_a1))
+            .await?;
+        Ok(RemoteAgentLiveLowerProjectionV2 { carrier_pin, facts })
+    }
+
+    /// Initializes PXRS genesis between two complete live-lower observations.
+    /// The returned authority remains move-only and retains both the exact
+    /// SameEpoch lease and this same endpoint Pin for the future binder.
+    pub(crate) async fn initialize_remote_agent_access_genesis_v2<'running>(
+        &mut self,
+        carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    ) -> Result<
+        RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running>,
+        RuntimeControlRequestError,
+    > {
+        let precommit = self
+            .observe_remote_agent_live_lower_projection_v2(carrier_pin)
+            .await?;
+        let initialized = self
+            .core
+            .initialize_remote_agent_access_from_live_lower_v2(precommit)
+            .map_err(map_remote_agent_access_genesis_initialize_error_v2)?;
+        let post_readback = self
+            .observe_remote_agent_live_lower_facts_from_projection_v2(
+                initialized.precommit_live_lower(),
+            )
+            .await
+            .map_err(|_| RuntimeControlRequestError::Unavailable)?;
+        initialized
+            .try_verify_post_readback_v2(post_readback)
+            .map_err(|_| RuntimeControlRequestError::Unavailable)
+    }
+
     async fn handle_request(
         &mut self,
         frame: &[u8],
@@ -3183,6 +3679,23 @@ fn authenticate_managed_serving_request(
         .map_err(|_| RuntimeControlRequestError::Rejected)
 }
 
+// Compile-only boundary for the latent move-only genesis chain and the exact
+// facts consumed by its future binder. Referencing function items keeps the
+// complete production types checked without minting a carrier Pin or
+// dispatching initialization.
+const _: () = {
+    fn typecheck_remote_agent_access_genesis_boundary_v2() {
+        let _initialize_remote_agent_access_genesis_v2 =
+            ManagedFabricControlService::initialize_remote_agent_access_genesis_v2;
+        let _retained_s0_census_digest_v2 =
+            RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;
+        let _exact_pxap_v2 = RemoteAgentLiveLowerFactsV2::exact_pxap;
+        let _intended_client_v2 = RemoteAgentLiveLowerFactsV2::intended_client;
+    }
+
+    let _ = typecheck_remote_agent_access_genesis_boundary_v2;
+};
+
 fn managed_terminal_response_wire(
     receipt: &paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricApplyTerminalReceiptV1,
 ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
@@ -3263,6 +3776,24 @@ fn map_managed_fabric_error(error: ManagedFabricRuntimeError) -> RuntimeControlR
         RuntimeControlRequestError::Rejected
     } else {
         RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedFabric(error))
+    }
+}
+
+fn map_remote_agent_access_genesis_initialize_error_v2(
+    error: RemoteAgentAccessGenesisInitializeErrorV2,
+) -> RuntimeControlRequestError {
+    match error {
+        RemoteAgentAccessGenesisInitializeErrorV2::Core(error) => map_managed_fabric_error(error),
+        RemoteAgentAccessGenesisInitializeErrorV2::Commit(
+            RemoteAgentAccessCommitErrorV2::ProvenNotCommitted { .. }
+            | RemoteAgentAccessCommitErrorV2::OutcomeUncertain(_),
+        ) => RuntimeControlRequestError::Unavailable,
+        RemoteAgentAccessGenesisInitializeErrorV2::State(_)
+        | RemoteAgentAccessGenesisInitializeErrorV2::Commit(
+            RemoteAgentAccessCommitErrorV2::Rejected { .. },
+        ) => {
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidStartedState)
+        }
     }
 }
 
@@ -6053,7 +6584,8 @@ mod tests {
         RuntimeModelBackendResolveError, RuntimeResolvedModelBackendV1,
     };
     use crate::remote_agent_access_state::{
-        RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
+        RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessSnapshotIdentityPinsV2,
+        RemoteAgentAccessSnapshotV2,
     };
     use crate::runtime_agent_provider::{
         RuntimeAgentProviderResolveError, RuntimeResolvedAgentProviderV1,
@@ -8550,6 +9082,329 @@ mod tests {
         assert!(control.stack.is_some());
         assert!(control.distributed.is_none());
         (state_directory, control, stack_request)
+    }
+
+    async fn managed_control_with_descriptor_evidence_v2(
+        socket_path: PathBuf,
+    ) -> (
+        TestDirectory,
+        ManagedFabricControlService,
+        RuntimeRestrictedApplyEndpointDependenciesV1,
+        PrincipalRef,
+    ) {
+        let (state_directory, mut control, stack_request) =
+            managed_control_with_active_stack(socket_path).await;
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let active_wire = control
+            .handle_request(stack_request.canonical_wire(), control.channel)
+            .await
+            .unwrap_or_else(|error| panic!("live-lower PXST replay failed: {error:?}"));
+        let active = ManagedAgentStackTerminalReceiptV1::decode(&active_wire)
+            .unwrap_or_else(|error| panic!("live-lower PXST decode failed: {error}"));
+        let intended_client = PrincipalRef::from_bytes([0xb6; 16]);
+        let describe = signed_runtime_agent_describe(
+            carrier,
+            control.core.runtime_host_epoch(),
+            RuntimeAgentDescribeFixtureV1 {
+                request_id_byte: 0xb7,
+                expected_active_pxst_digest: active.receipt_digest(),
+                intended_client,
+                algorithm: ED25519_ALGORITHM,
+                algorithm_version: ED25519_ALGORITHM_VERSION,
+                signature_length: ED25519_SIGNATURE_BYTES,
+            },
+        );
+        control
+            .handle_restricted_runtime_control_frame_v1(
+                describe.canonical_wire(),
+                describe.carrier(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("live-lower Describe failed: {error:?}"));
+        let dependencies =
+            restricted_endpoint_dependencies_from_profile(&profile, RESTRICTED_PROFILE_REF);
+        (state_directory, control, dependencies, intended_client)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_lower_rejects_a0_a1_field_drift_and_an_unrelated_live_pin() {
+        fn flip_submit_epoch(observation: &mut RemoteAgentCurrentOwnerObservationV2) {
+            observation.submit_binding_epoch = observation.submit_binding_epoch.saturating_add(1);
+        }
+
+        let socket_directory = TestSocketDirectory::create();
+        let (_state_directory, mut control, dependencies, _intended_client) =
+            managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
+        let drift_pin =
+            runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
+                .unwrap_or_else(|error| panic!("live-lower drift Pin rejected: {error}"));
+        assert!(matches!(
+            control
+                .observe_remote_agent_live_lower_projection_with_a1_mutation_for_test_v2(
+                    drift_pin,
+                    flip_submit_epoch,
+                )
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+
+        let unrelated_profile = restricted_transport_profile(
+            "paraegox/runtime/endpoint-stack/restricted/unrelated",
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION + 1,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let unrelated_dependencies =
+            restricted_endpoint_dependencies_from_profile(&unrelated_profile, [0xb8; 16]);
+        let unrelated_pin = runtime_restricted_apply_carrier_pin_for_test(
+            &unrelated_dependencies,
+            &control.provisioning,
+        )
+        .unwrap_or_else(|error| panic!("unrelated live Pin rejected: {error}"));
+        assert!(matches!(
+            control
+                .observe_remote_agent_live_lower_projection_v2(unrelated_pin)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert!(!control.core.remote_agent_access_s0_mutation_frozen_v2());
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("live-lower rejection cleanup failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_lower_genesis_is_exact_post_readback_and_second_initialize_is_unavailable() {
+        let socket_directory = TestSocketDirectory::create();
+        let (state_directory, mut control, dependencies, intended_client) =
+            managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
+        let pin =
+            runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
+                .unwrap_or_else(|error| panic!("genesis live-lower Pin rejected: {error}"));
+        let bundle = control
+            .initialize_remote_agent_access_genesis_v2(pin)
+            .await
+            .unwrap_or_else(|error| panic!("sealed live-lower genesis failed: {error:?}"));
+
+        assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
+        assert_eq!(bundle.target(), TARGET);
+        assert_eq!(bundle.store_instance_id(), STORE_INSTANCE_ID);
+        assert_eq!(
+            bundle.runtime_host_epoch(),
+            control.core.runtime_host_epoch()
+        );
+        assert_eq!(
+            bundle.initial_absent_s1_cas(),
+            RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                .unwrap_or_else(|error| panic!("fixed absent S1 CAS rejected: {error}")),
+        );
+        assert!(bundle.precommit_live_lower().exact_facts() == bundle.post_readback_live_lower());
+        let live = bundle.precommit_live_lower().exact_facts();
+        assert_eq!(live.intended_client(), intended_client);
+        assert!(live.exact_pxap().starts_with(b"PXAP\0\x01"));
+        let mut expected_lower =
+            Digest32Builder::try_new(REMOTE_AGENT_LOWER_CAPABILITY_PROJECTION_DIGEST_DOMAIN_V2)
+                .unwrap_or_else(|error| panic!("lower digest domain rejected: {error}"));
+        expected_lower
+            .field_bytes(live.fabric_session_epoch.as_bytes())
+            .unwrap_or_else(|error| panic!("lower session epoch rejected: {error}"));
+        expected_lower
+            .field_u16(live.physical_binding_census)
+            .unwrap_or_else(|error| panic!("lower census rejected: {error}"));
+        expected_lower
+            .field_bytes(&live.exact_pxap)
+            .unwrap_or_else(|error| panic!("lower PXAP rejected: {error}"));
+        assert_eq!(
+            live.lower_capability_projection_digest(),
+            expected_lower.finish(),
+        );
+
+        let mut expected_census =
+            Digest32Builder::try_new(REMOTE_AGENT_RETAINED_S0_CENSUS_DIGEST_DOMAIN_V2)
+                .unwrap_or_else(|error| panic!("retained census domain rejected: {error}"));
+        expected_census
+            .field_bytes(live.target.as_bytes())
+            .and_then(|_| expected_census.field_bytes(&live.store_instance_id))
+            .and_then(|_| expected_census.field_digest(&live.owner_target_fingerprint))
+            .and_then(|_| expected_census.field_digest(&live.transition_projection_digest))
+            .and_then(|_| expected_census.field_u64(live.runtime_host_epoch))
+            .and_then(|_| expected_census.field_digest(&live.carrier_binding_digest))
+            .and_then(|_| expected_census.field_bytes(live.intended_client.as_bytes()))
+            .and_then(|_| expected_census.field_digest(&live.fabric_execution_digest))
+            .and_then(|_| expected_census.field_digest(&live.retained_s0_cas.cas_digest()))
+            .and_then(|_| expected_census.field_digest(&live.lower_capability_projection_digest))
+            .and_then(|_| expected_census.field_digest(&live.pxap_descriptor_digest))
+            .and_then(|_| expected_census.field_digest(&live.request_binding_descriptor_digest))
+            .and_then(|_| expected_census.field_digest(&live.event_binding_descriptor_digest))
+            .and_then(|_| expected_census.field_u64(live.submit_binding_epoch))
+            .and_then(|_| expected_census.field_u64(live.control_binding_epoch))
+            .and_then(|_| expected_census.field_u16(live.physical_binding_census))
+            .unwrap_or_else(|error| panic!("retained census field rejected: {error}"));
+        assert_eq!(live.retained_s0_census_digest(), expected_census.finish());
+        assert!(
+            live.lower_capability_projection_digest()
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        assert!(
+            live.retained_s0_census_digest()
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        let committed = bundle.committed_snapshot();
+        assert_eq!(
+            committed.phase(),
+            RemoteAgentAccessDurablePhaseV2::InitializedAbsent
+        );
+        assert_eq!(committed.sequence(), 1);
+        assert_eq!(committed.previous_snapshot_digest(), None);
+        assert_eq!(
+            committed.writer_runtime_host_epoch(),
+            control.core.runtime_host_epoch()
+        );
+        assert_eq!(committed.access_generation_high_water(), 0);
+        assert_eq!(committed.owner_slot_revision(), 1);
+        let stored_genesis = fs::read(
+            state_directory
+                .path()
+                .join("remote-agent-access.snapshot-v2"),
+        )
+        .unwrap_or_else(|error| panic!("genesis PXRS readback failed: {error}"));
+        assert_eq!(stored_genesis.as_slice(), bundle.committed_canonical_wire(),);
+        drop(bundle);
+
+        let second_pin =
+            runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
+                .unwrap_or_else(|error| panic!("second genesis Pin rejected: {error}"));
+        assert!(matches!(
+            control
+                .initialize_remote_agent_access_genesis_v2(second_pin)
+                .await,
+            Err(RuntimeControlRequestError::Unavailable)
+        ));
+        assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("sealed genesis cleanup failed: {error}"));
+    }
+
+    #[test]
+    fn live_lower_source_has_no_raw_selector_and_orders_both_full_observations() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        let marker = section(
+            source,
+            "pub(crate) struct RemoteAgentLiveLowerProjectionV2<'running> {",
+            "impl RemoteAgentCurrentOwnerObservationV2 {",
+        );
+        assert!(marker.contains("carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>"));
+        assert!(marker.contains("facts: RemoteAgentLiveLowerFactsV2"));
+        assert!(!marker.contains("#[derive"));
+        assert!(!marker.contains("impl Clone"));
+        assert!(!marker.contains("impl Copy"));
+        assert!(!marker.contains("fn try_new"));
+
+        let observer = section(
+            source,
+            "    async fn observe_remote_agent_live_lower_facts_v2(",
+            "    #[cfg(test)]\n    async fn observe_remote_agent_live_lower_projection_with_a1_mutation_for_test_v2",
+        );
+        assert_eq!(
+            observer
+                .match_indices(".export_current_conversation_port_v2()")
+                .count(),
+            2
+        );
+        let a0 = observer
+            .find("let a0_export")
+            .unwrap_or_else(|| panic!("A0 current-owner export disappeared"));
+        let fabric = observer
+            .find(".export_active_retained_root_v1(")
+            .unwrap_or_else(|| panic!("live Fabric retained-root export disappeared"));
+        let a1 = observer
+            .find("let a1_export")
+            .unwrap_or_else(|| panic!("A1 current-owner export disappeared"));
+        let exact = observer
+            .find("if a0 != a1")
+            .unwrap_or_else(|| panic!("A0/A1 exact equality disappeared"));
+        let protected = observer
+            .find("verify_remote_agent_descriptor_evidence_v1(")
+            .unwrap_or_else(|| panic!("protected PXDE/PXAH reverify disappeared"));
+        assert!(a0 < fabric && fabric < a1 && a1 < exact && exact < protected);
+        assert!(observer.contains("carrier_pin: &RuntimeRestrictedApplyCarrierPinV1<'_>"));
+        assert!(!observer.contains("expected_active_pxst_digest"));
+        assert!(!observer.contains("RemoteAgentAccessSnapshotV2"));
+        assert!(!observer.contains("latest_verified_remote_agent_descriptor_evidence_v1"));
+
+        let orchestrator = section(
+            source,
+            "    pub(crate) async fn initialize_remote_agent_access_genesis_v2<'running>(",
+            "    async fn handle_request(",
+        );
+        let pre = orchestrator
+            .find("observe_remote_agent_live_lower_projection_v2(carrier_pin)")
+            .unwrap_or_else(|| panic!("precommit LiveLower disappeared"));
+        let initialize = orchestrator
+            .find("initialize_remote_agent_access_from_live_lower_v2(precommit)")
+            .unwrap_or_else(|| panic!("sealed exact initialize disappeared"));
+        let post = orchestrator
+            .find("observe_remote_agent_live_lower_facts_from_projection_v2(")
+            .unwrap_or_else(|| panic!("post-readback full observation disappeared"));
+        let compare = orchestrator
+            .find("try_verify_post_readback_v2(post_readback)")
+            .unwrap_or_else(|| panic!("pre/post exact comparison disappeared"));
+        assert!(pre < initialize && initialize < post && post < compare);
+        assert_eq!(
+            orchestrator
+                .match_indices("RuntimeControlRequestError::Unavailable")
+                .count(),
+            2,
+            "post-commit drift/failure must be retryable-reconcile, never no-effect rejection",
+        );
+        assert!(!orchestrator.contains("RuntimeControlRequestError::Rejected"));
+
+        let compile_boundary = section(
+            source,
+            "// Compile-only boundary for the latent move-only genesis chain",
+            "fn managed_terminal_response_wire(",
+        );
+        for function_item in [
+            "ManagedFabricControlService::initialize_remote_agent_access_genesis_v2;",
+            "RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;",
+            "RemoteAgentLiveLowerFactsV2::exact_pxap;",
+            "RemoteAgentLiveLowerFactsV2::intended_client;",
+        ] {
+            assert!(
+                compile_boundary.contains(function_item),
+                "latent production compile boundary lost {function_item}",
+            );
+        }
+        assert!(compile_boundary.contains("const _: () = {"));
+        assert!(
+            compile_boundary
+                .contains("let _ = typecheck_remote_agent_access_genesis_boundary_v2;")
+        );
+        assert!(!compile_boundary.contains(".await"));
+        assert!(!compile_boundary.contains("RuntimeRestrictedApplyCarrierPinV1::"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

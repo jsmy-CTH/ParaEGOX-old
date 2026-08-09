@@ -64,6 +64,7 @@ use crate::{
         MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES, RemoteAgentDescriptorEvidenceError,
         RemoteAgentDescriptorEvidenceV1, RemoteAgentVerifiedDescriptorEvidenceV1,
     },
+    runtime_control_endpoint::RemoteAgentLiveLowerProjectionV2,
 };
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PXRS";
@@ -1728,6 +1729,83 @@ pub(crate) struct RemoteAgentAccessStaticIdentityPinsV2 {
     pub(crate) transition_projection_digest: Digest32,
 }
 
+/// Private ingredients used only while sealing a live-lower observation into
+/// the one production genesis candidate.
+struct RemoteAgentAccessGenesisInputV2 {
+    identity: RemoteAgentAccessSnapshotIdentityPinsV2,
+    writer_runtime_host_epoch: u64,
+    retained_s0_cas: RemoteAgentRetainedS0CasV2,
+    submit_binding_epoch: u64,
+    control_binding_epoch: u64,
+}
+
+impl RemoteAgentAccessGenesisInputV2 {
+    fn try_from_live_lower_v2(
+        live_lower: &RemoteAgentLiveLowerProjectionV2<'_>,
+    ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
+        let facts = live_lower.exact_facts();
+        let input = Self {
+            identity: RemoteAgentAccessSnapshotIdentityPinsV2 {
+                target: facts.target(),
+                store_instance_id: facts.store_instance_id(),
+                owner_target_fingerprint: facts.owner_target_fingerprint(),
+                transition_projection_digest: facts.transition_projection_digest(),
+                lower_capability_projection_digest: facts.lower_capability_projection_digest(),
+            },
+            writer_runtime_host_epoch: facts.runtime_host_epoch(),
+            retained_s0_cas: facts.retained_s0_cas(),
+            submit_binding_epoch: facts.submit_binding_epoch(),
+            control_binding_epoch: facts.control_binding_epoch(),
+        };
+        if input.writer_runtime_host_epoch == 0
+            || input.submit_binding_epoch == 0
+            || input.control_binding_epoch == 0
+            || digest_is_zero(input.identity.owner_target_fingerprint)
+            || digest_is_zero(input.identity.transition_projection_digest)
+            || digest_is_zero(input.identity.lower_capability_projection_digest)
+        {
+            return Err(RemoteAgentAccessStateErrorV2::InvalidInitialState);
+        }
+        Ok(input)
+    }
+}
+
+/// Opaque, move-only sequence-one candidate minted solely from an endpoint
+/// live-lower marker. The raw snapshot remains private so production store
+/// initialization must retain this proof token through publication errors.
+pub(crate) struct RemoteAgentAccessGenesisCandidateV2 {
+    snapshot: RemoteAgentAccessSnapshotV2,
+}
+
+impl RemoteAgentAccessGenesisCandidateV2 {
+    pub(crate) fn try_from_live_lower_v2(
+        live_lower: &RemoteAgentLiveLowerProjectionV2<'_>,
+    ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
+        let input = RemoteAgentAccessGenesisInputV2::try_from_live_lower_v2(live_lower)?;
+        let expected_s1_cas = RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+            .map_err(RemoteAgentAccessStateErrorV2::Contract)?;
+        let snapshot = RemoteAgentAccessSnapshotV2::try_initialize_absent_inner(
+            input.identity,
+            input.writer_runtime_host_epoch,
+            input.retained_s0_cas,
+            expected_s1_cas,
+            input.submit_binding_epoch,
+            input.control_binding_epoch,
+        )?;
+        Ok(Self { snapshot })
+    }
+
+    #[must_use]
+    pub(crate) const fn snapshot(&self) -> &RemoteAgentAccessSnapshotV2 {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub(crate) fn into_snapshot(self) -> RemoteAgentAccessSnapshotV2 {
+        self.snapshot
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RemoteAgentAccessAdmissionFactsV2 {
     clock_domain: ClockDomainRef,
@@ -1862,9 +1940,28 @@ pub(crate) struct RemoteAgentAuthorizedTransitionV2 {
 }
 
 impl RemoteAgentAccessSnapshotV2 {
-    /// Builds the structural sequence-one absent slot. Persistence and exact
-    /// readback remain D2 responsibilities; this value alone has no authority.
+    /// Raw fixture constructor retained only for structural state/store tests.
+    /// Production callers must supply `RemoteAgentAccessGenesisCandidateV2`.
+    #[cfg(test)]
     pub(crate) fn try_initialize_absent(
+        identity: RemoteAgentAccessSnapshotIdentityPinsV2,
+        writer_runtime_host_epoch: u64,
+        retained_s0_cas: RemoteAgentRetainedS0CasV2,
+        expected_s1_cas: RemoteAgentActiveS1CasV2,
+        submit_binding_epoch: u64,
+        control_binding_epoch: u64,
+    ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
+        Self::try_initialize_absent_inner(
+            identity,
+            writer_runtime_host_epoch,
+            retained_s0_cas,
+            expected_s1_cas,
+            submit_binding_epoch,
+            control_binding_epoch,
+        )
+    }
+
+    fn try_initialize_absent_inner(
         identity: RemoteAgentAccessSnapshotIdentityPinsV2,
         writer_runtime_host_epoch: u64,
         retained_s0_cas: RemoteAgentRetainedS0CasV2,
