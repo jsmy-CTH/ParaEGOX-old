@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    future::Future,
+    future::{Future, IntoFuture},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -862,11 +862,11 @@ fn remaining_budget(deadline: Instant) -> Duration {
         .expect("absolute test deadline exhausted")
 }
 
-async fn finish_before<F>(deadline: Instant, future: F, context: &str) -> F::Output
+async fn finish_before<F>(deadline: Instant, operation: F, context: &str) -> F::Output
 where
-    F: Future,
+    F: IntoFuture,
 {
-    tokio::time::timeout_at(deadline, future)
+    tokio::time::timeout_at(deadline, operation.into_future())
         .await
         .unwrap_or_else(|_| panic!("{context} exceeded its absolute deadline"))
 }
