@@ -8815,8 +8815,9 @@ mod tests {
             ] {
                 assert!(constructor.contains(&format!("parts.{field}")));
             }
-            assert!(current_final_impl
-                .contains("#[cfg(test)]\n    fn from_exact_readback_for_test("));
+            assert!(
+                current_final_impl.contains("#[cfg(test)]\n    fn from_exact_readback_for_test(")
+            );
         }
 
         #[test]
