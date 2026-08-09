@@ -18,7 +18,7 @@ use core::{fmt, time::Duration};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
 use paraegox_evidence::{
     EvidenceCommitReceiptV1, EvidenceContractError, EvidenceKindV1, EvidenceOwnerRefV1,
     EvidencePayloadV1, EvidenceRecordIdV1, EvidenceRecordInputV1, EvidenceRecordV1,
@@ -561,6 +561,7 @@ impl DistributedAgentStackRuntimeCore {
         {
             return Err(DistributedAgentStackRuntimeError::RequestRejected);
         }
+        owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         observe_deadline(config.clock, verified)?;
         let predecessor_observation = predecessor.distributed_cutover_observation()?;
         if request.target_execution().predecessor() != &predecessor_observation.execution
@@ -675,6 +676,7 @@ impl DistributedAgentStackRuntimeCore {
         validate_request(owner, &self.projection, request, response_channel)?;
         let receipt = self.lookup_terminal(request, response_channel)?;
         if self.handle_publication_pending {
+            owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
             let active = receipt
                 .as_ref()
                 .filter(|receipt| {
@@ -727,6 +729,7 @@ impl DistributedAgentStackRuntimeCore {
         if let Some(receipt) = self.lookup_terminal(&request, response_channel)? {
             return Ok(DistributedAgentStackApplyOutcome::Replayed(receipt));
         }
+        owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         observe_deadline(self.clock, verified)?;
         let mut transition = self.admit_transition(&request, verified)?;
         if request.target_execution().mode() == DistributedAgentStackTargetModeV1::EmptyDeactivate {
@@ -2115,6 +2118,24 @@ impl DistributedAgentStackRuntimeCore {
                 {
                     return Err(DistributedAgentStackRuntimeError::OperationConflict);
                 }
+                let signature_bytes = record.receipt.authentication_signature();
+                if record.receipt.authentication_key() != self.response_key_ref
+                    || record.receipt.authentication_algorithm().value() != 1
+                    || record.receipt.authentication_algorithm_version() != 1
+                    || signature_bytes.len() != 64
+                {
+                    return Err(DistributedAgentStackRuntimeError::TerminalCorrelation);
+                }
+                let signature = Signature::from_slice(signature_bytes)
+                    .map_err(|_| DistributedAgentStackRuntimeError::TerminalCorrelation)?;
+                let transcript = record
+                    .receipt
+                    .signing_transcript()
+                    .map_err(|_| DistributedAgentStackRuntimeError::TerminalCorrelation)?;
+                self.response_signer
+                    .verifying_key()
+                    .verify_strict(transcript.as_bytes(), &signature)
+                    .map_err(|_| DistributedAgentStackRuntimeError::TerminalCorrelation)?;
                 Ok(Some(record.receipt.clone()))
             }
             Err(_) => Ok(None),
@@ -2960,6 +2981,7 @@ pub(crate) enum DistributedAgentStackRuntimeError {
     ReplayConflict,
     ReplayCapacityReached,
     OperationConflict,
+    TerminalCorrelation,
     GenerationExhausted,
     SequenceOverflow,
     SignerConfiguration,
@@ -2988,6 +3010,13 @@ pub(crate) enum DistributedAgentStackRuntimeError {
 }
 
 impl DistributedAgentStackRuntimeError {
+    pub(crate) const fn is_request_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Fabric(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+        )
+    }
+
     pub(crate) const fn is_request_rejection(&self) -> bool {
         matches!(
             self,
@@ -3001,6 +3030,7 @@ impl DistributedAgentStackRuntimeError {
                 | Self::StaleRevision
                 | Self::ReplayConflict
                 | Self::OperationConflict
+                | Self::TerminalCorrelation
         )
     }
 }
@@ -4369,6 +4399,180 @@ mod tests {
                 && verify_bindings < commit_ready
                 && commit_ready < publish
         );
+    }
+
+    #[test]
+    fn retained_terminal_and_s0_freeze_guards_precede_distributed_mutation() {
+        let source = include_str!("distributed_agent_stack_runtime.rs");
+        let lookup = source
+            .split_once("    fn lookup_terminal(")
+            .and_then(|(_, tail)| tail.split_once("    fn validate_historical_active_terminal("))
+            .map(|(lookup, _)| lookup)
+            .expect("missing distributed terminal lookup boundary");
+        for required in [
+            ".validate_against_request(request, response_channel)",
+            "authentication_key() != self.response_key_ref",
+            "authentication_algorithm().value() != 1",
+            "authentication_algorithm_version() != 1",
+            "signature_bytes.len() != 64",
+            "Signature::from_slice(signature_bytes)",
+            ".signing_transcript()",
+            ".verify_strict(transcript.as_bytes(), &signature)",
+        ] {
+            assert!(lookup.contains(required), "missing distributed terminal check: {required}");
+        }
+
+        let cutover = source
+            .split_once("    pub(crate) async fn cutover(")
+            .and_then(|(_, tail)| {
+                tail.split_once("    pub(crate) fn authenticated_terminal_replay(")
+            })
+            .map(|(cutover, _)| cutover)
+            .expect("missing distributed cutover boundary");
+        let dependency_validation = cutover
+            .find("validate_owner_dependency_pair(&config)?")
+            .expect("missing dependency validation");
+        let request_validation = cutover
+            .find("validate_request(owner, &config.projection, &request, response_channel)?")
+            .expect("missing request validation");
+        let mode_validation = cutover
+            .find("owner.distributed_agent_stack_projection_digest().is_some()")
+            .expect("missing mode/owner validation");
+        let gate = cutover
+            .find("owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("missing cutover freeze gate");
+        let deadline = cutover.find("observe_deadline(").expect("missing deadline observation");
+        let predecessor = cutover
+            .find("predecessor.distributed_cutover_observation()?")
+            .expect("missing predecessor observation");
+        let evidence_open = cutover
+            .find("open_evidence_store(config.evidence_store_config.as_ref())?")
+            .expect("missing Evidence store open");
+        let initialize = cutover
+            .find("owner.initialize_distributed_agent_stack(")
+            .expect("missing distributed owner initialization");
+        assert!(
+            dependency_validation < request_validation
+                && request_validation < mode_validation
+                && mode_validation < gate
+                && gate < deadline
+                && deadline < predecessor
+                && predecessor < evidence_open
+                && evidence_open < initialize
+        );
+
+        let replay = source
+            .split_once("    pub(crate) fn authenticated_terminal_replay(")
+            .and_then(|(_, tail)| tail.split_once("    #[cfg(test)]"))
+            .map(|(replay, _)| replay)
+            .expect("missing distributed authenticated replay boundary");
+        let lookup = replay.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let pending = replay
+            .find("if self.handle_publication_pending")
+            .expect("missing pending-publication branch");
+        let gate = replay
+            .find("owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("pending publication bypasses freeze");
+        let publish = replay
+            .find(".publish_distributed(handle.clone(), active)")
+            .expect("missing handle publication");
+        let clear = replay
+            .find("self.handle_publication_pending = false")
+            .expect("missing pending clear");
+        assert!(lookup < pending && pending < gate && gate < publish && publish < clear);
+
+        let apply = source
+            .split_once("    pub(crate) async fn apply(")
+            .and_then(|(_, tail)| tail.split_once("    async fn apply_empty("))
+            .map(|(apply, _)| apply)
+            .expect("missing distributed apply boundary");
+        let lookup = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let gate = apply
+            .find("owner.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("missing apply freeze gate");
+        let deadline = apply.find("observe_deadline(").expect("missing deadline check");
+        let admission = apply.find("self.admit_transition(").expect("missing admission");
+        assert!(lookup < gate && gate < deadline && deadline < admission);
+
+        let shutdown = source
+            .split_once("    pub(crate) async fn shutdown(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nfn validate_evidence_configuration"))
+            .map(|(shutdown, _)| shutdown)
+            .expect("missing distributed shutdown boundary");
+        assert!(!shutdown.contains("require_remote_agent_access_s0_mutation_unfrozen_v2"));
+    }
+
+    #[test]
+    fn frozen_distributed_replay_never_publishes_pending_handle() {
+        let fixture = persist_active_fixture(false);
+        let mut owner = reopen_managed_owner(
+            &fixture.directory,
+            &fixture.projection,
+            &fixture.request,
+            INITIAL_RUNTIME_EPOCH + 1,
+        );
+        let mut distributed = open_distributed_owner(
+            &owner,
+            &fixture.directory,
+            &fixture.projection,
+            &fixture.request,
+            INITIAL_RUNTIME_EPOCH + 1,
+        );
+        owner.latch_remote_agent_access_s0_mutation_freeze_v2();
+
+        let exact = distributed
+            .authenticated_terminal_replay(&owner, &fixture.request, fixture.channel)
+            .expect("verified exact replay must remain available")
+            .expect("persisted exact terminal disappeared");
+        assert_eq!(exact.canonical_wire(), fixture.historical.canonical_wire());
+
+        distributed.handle_publication_pending = true;
+        let error = distributed
+            .authenticated_terminal_replay(&owner, &fixture.request, fixture.channel)
+            .expect_err("pending publication must be unavailable after S0 freeze");
+        assert!(error.is_request_unavailable());
+        assert!(distributed.handle_publication_pending);
+        assert!(
+            distributed
+                .handle_broker
+                .try_claim_distributed(fixture.historical.canonical_wire())
+                .expect("broker observation failed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retained_distributed_terminal_with_bad_owner_signature_is_not_replay_authority() {
+        let fixture = persist_active_fixture(false);
+        let owner = reopen_managed_owner(
+            &fixture.directory,
+            &fixture.projection,
+            &fixture.request,
+            INITIAL_RUNTIME_EPOCH + 1,
+        );
+        let mut distributed = open_distributed_owner(
+            &owner,
+            &fixture.directory,
+            &fixture.projection,
+            &fixture.request,
+            INITIAL_RUNTIME_EPOCH + 1,
+        );
+        let record = distributed
+            .snapshot
+            .terminals
+            .first_mut()
+            .expect("persisted distributed terminal disappeared");
+        let mut tampered = record.receipt.canonical_wire().to_vec();
+        *tampered
+            .last_mut()
+            .expect("distributed terminal signature disappeared") ^= 1;
+        record.receipt = DistributedAgentStackTerminalReceiptV1::decode(&tampered)
+            .expect("opaque bad distributed signature must remain canonical");
+
+        assert!(matches!(
+            distributed.authenticated_terminal_replay(&owner, &fixture.request, fixture.channel),
+            Err(DistributedAgentStackRuntimeError::TerminalCorrelation)
+        ));
     }
 
     #[test]

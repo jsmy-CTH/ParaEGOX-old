@@ -702,6 +702,7 @@ impl ManagedAgentStackRuntimeCore {
         {
             return Err(ManagedAgentStackRuntimeError::RequestRejected);
         }
+        fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         let provider = request
             .target_execution()
             .agent()
@@ -1015,29 +1016,21 @@ impl ManagedAgentStackRuntimeCore {
         response_channel: ReferenceChannelBindingV1,
     ) -> Result<Option<ManagedAgentStackApplyOutcome>, ManagedAgentStackRuntimeError> {
         self.validate_request(request, response_channel)?;
-        let Some(record) = self.terminal_record(request)? else {
+        let Some(receipt) = self.lookup_terminal(request, response_channel)? else {
             return Ok(None);
         };
-        let completion_runtime_host_epoch = record
-            .receipt
+        let completion_runtime_host_epoch = receipt
             .facts()
             .evidence()
             .fields()
             .completion_runtime_host_epoch;
-        if completion_runtime_host_epoch == self.runtime_host_epoch
-            && record
-                .receipt
-                .validate_against_request(request, response_channel)
-                .is_ok()
-        {
-            return Ok(Some(ManagedAgentStackApplyOutcome::Replayed(
-                record.receipt.clone(),
-            )));
+        if completion_runtime_host_epoch == self.runtime_host_epoch {
+            return Ok(Some(ManagedAgentStackApplyOutcome::Replayed(receipt)));
         }
         let verified = RuntimeVerifiedHistoricalManagedAgentStackReceiptV1::try_verify(
             request,
             self.runtime_host_epoch,
-            record.receipt.clone(),
+            receipt,
             |key, algorithm, version, transcript, signature| {
                 if key != self.response_key_ref
                     || algorithm.value() != ED25519_ALGORITHM
@@ -1074,6 +1067,7 @@ impl ManagedAgentStackRuntimeCore {
         if let Some(receipt) = self.lookup_terminal(&request, response_channel)? {
             return Ok(ManagedAgentStackApplyOutcome::Replayed(receipt));
         }
+        fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         if !matches!(
             self.snapshot.phase,
             ManagedAgentStackDurablePhase::ActiveReady | ManagedAgentStackDurablePhase::ExactZero
@@ -1420,6 +1414,24 @@ impl ManagedAgentStackRuntimeCore {
         record
             .receipt
             .validate_against_request(request, response_channel)
+            .map_err(|_| ManagedAgentStackRuntimeError::TerminalCorrelation)?;
+        let signature_bytes = record.receipt.authentication_signature();
+        if record.receipt.authentication_key() != self.response_key_ref
+            || record.receipt.authentication_algorithm().value() != ED25519_ALGORITHM
+            || record.receipt.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
+            || signature_bytes.len() != 64
+        {
+            return Err(ManagedAgentStackRuntimeError::TerminalCorrelation);
+        }
+        let signature = Signature::from_slice(signature_bytes)
+            .map_err(|_| ManagedAgentStackRuntimeError::TerminalCorrelation)?;
+        let transcript = record
+            .receipt
+            .signing_transcript()
+            .map_err(|_| ManagedAgentStackRuntimeError::TerminalCorrelation)?;
+        self.response_signer
+            .verifying_key()
+            .verify_strict(transcript.as_bytes(), &signature)
             .map_err(|_| ManagedAgentStackRuntimeError::TerminalCorrelation)?;
         Ok(Some(record.receipt.clone()))
     }
@@ -2491,6 +2503,9 @@ mod provider_resolver_tests {
             .find("    pub(crate) async fn recover(")
             .expect("missing first-cutover boundary");
         let cutover = &tail[..end];
+        let freeze = cutover
+            .find("fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("missing owner-level S0 freeze gate");
         let marker = cutover
             .find("fabric.initialize_managed_agent_stack(")
             .expect("missing exact marker publication");
@@ -2502,7 +2517,12 @@ mod provider_resolver_tests {
             .expect("missing provider resolution");
         let start_agent = cutover.find(".start_agent(").expect("missing Agent start");
 
-        assert!(marker < adjudication && adjudication < resolver && resolver < start_agent);
+        assert!(
+            freeze < marker
+                && marker < adjudication
+                && adjudication < resolver
+                && resolver < start_agent
+        );
         assert_eq!(
             cutover[..adjudication]
                 .match_indices("prepare_agent_provider(")
@@ -2521,6 +2541,82 @@ mod provider_resolver_tests {
                 .count(),
             0
         );
+
+        let apply = source
+            .split_once("    pub(crate) async fn apply(")
+            .and_then(|(_, tail)| tail.split_once("    async fn apply_empty("))
+            .map(|(apply, _)| apply)
+            .expect("missing Agent-stack apply boundary");
+        let replay = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let gate = apply
+            .find("fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("missing Agent-stack S0 freeze gate");
+        let phase = apply.find("self.snapshot.phase").expect("missing phase check");
+        let deadline = apply.find("observe_deadline(").expect("missing deadline check");
+        let admission = apply.find("self.admit_transition(").expect("missing admission");
+        assert!(replay < gate && gate < phase && phase < deadline && deadline < admission);
+
+        let lookup = source
+            .split_once("    fn lookup_terminal(")
+            .and_then(|(_, tail)| tail.split_once("    fn terminal_record("))
+            .map(|(lookup, _)| lookup)
+            .expect("missing Agent-stack terminal lookup boundary");
+        for required in [
+            ".validate_against_request(request, response_channel)",
+            "authentication_key() != self.response_key_ref",
+            "authentication_algorithm().value() != ED25519_ALGORITHM",
+            "authentication_algorithm_version() != ED25519_ALGORITHM_VERSION",
+            "signature_bytes.len() != 64",
+            "Signature::from_slice(signature_bytes)",
+            ".signing_transcript()",
+            ".verify_strict(transcript.as_bytes(), &signature)",
+        ] {
+            assert!(lookup.contains(required), "missing Agent terminal check: {required}");
+        }
+        let authenticated_replay = source
+            .split_once("    pub(crate) fn authenticated_terminal_replay(")
+            .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn apply("))
+            .map(|(replay, _)| replay)
+            .expect("missing authenticated replay boundary");
+        assert!(authenticated_replay.contains("self.lookup_terminal(request, response_channel)?"));
+        assert!(!authenticated_replay.contains("self.terminal_record(request)?"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_epoch_agent_replay_requires_owner_signature_and_survives_s0_freeze() {
+        let mut fixture = live_current_agent_fixture().await;
+        let channel = response_channel(fixture.request.target());
+        let operation_id = fixture.request.operation_id();
+        fixture
+            .fabric
+            .latch_remote_agent_access_s0_mutation_freeze_v2();
+        assert!(matches!(
+            fixture
+                .stack
+                .authenticated_terminal_replay(&fixture.request, channel)
+                .expect("verified exact replay must remain available"),
+            Some(ManagedAgentStackApplyOutcome::Replayed(receipt))
+                if receipt.canonical_wire() == fixture.receipt.canonical_wire()
+        ));
+
+        let record = fixture
+            .stack
+            .snapshot
+            .terminals
+            .iter_mut()
+            .find(|record| record.operation_id == operation_id)
+            .expect("committed Agent terminal disappeared");
+        let mut tampered = record.receipt.canonical_wire().to_vec();
+        *tampered.last_mut().expect("Agent terminal signature disappeared") ^= 1;
+        record.receipt = ManagedAgentStackTerminalReceiptV1::decode(&tampered)
+            .expect("opaque bad Agent signature must remain canonical");
+        assert!(matches!(
+            fixture
+                .stack
+                .authenticated_terminal_replay(&fixture.request, channel),
+            Err(ManagedAgentStackRuntimeError::TerminalCorrelation)
+        ));
+        fixture.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

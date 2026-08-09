@@ -12,7 +12,7 @@ use core::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::time::ClockReading;
 use paraegox_runtime_contracts::apply::ExpectedActive;
@@ -245,6 +245,7 @@ impl ManagedModelAgentStackRuntimeCore {
         response_channel: ReferenceChannelBindingV1,
     ) -> Result<ManagedModelAgentStackCutoverOutcome, ManagedModelAgentStackRuntimeError> {
         validate_cutover_request(fabric, &config, &request, response_channel)?;
+        fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         let predecessor = fabric.stack_cutover_observation().await?;
         match observe_deadline(config.clock, verified) {
             Ok(()) => {}
@@ -557,6 +558,7 @@ impl ManagedModelAgentStackRuntimeCore {
         if let Some(receipt) = self.lookup_terminal(&request, response_channel)? {
             return Ok(ManagedModelAgentStackApplyOutcome::Replayed(receipt));
         }
+        fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         if !matches!(
             self.snapshot.phase,
             ManagedModelAgentStackDurablePhase::ActiveReady
@@ -1131,6 +1133,24 @@ impl ManagedModelAgentStackRuntimeCore {
         record
             .receipt
             .validate_against_request(request, response_channel)
+            .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)?;
+        let signature_bytes = record.receipt.authentication_signature();
+        if record.receipt.authentication_key() != self.response_key_ref
+            || record.receipt.authentication_algorithm().value() != 1
+            || record.receipt.authentication_algorithm_version() != 1
+            || signature_bytes.len() != 64
+        {
+            return Err(ManagedModelAgentStackRuntimeError::TerminalCorrelation);
+        }
+        let signature = Signature::from_slice(signature_bytes)
+            .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)?;
+        let transcript = record
+            .receipt
+            .signing_transcript()
+            .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)?;
+        self.response_signer
+            .verifying_key()
+            .verify_strict(transcript.as_bytes(), &signature)
             .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)?;
         Ok(Some(record.receipt.clone()))
     }
@@ -1995,6 +2015,13 @@ pub(crate) enum ManagedModelAgentStackRuntimeError {
 }
 
 impl ManagedModelAgentStackRuntimeError {
+    pub(crate) const fn is_request_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Fabric(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+        )
+    }
+
     pub(crate) const fn is_request_rejection(&self) -> bool {
         matches!(
             self,
@@ -2112,5 +2139,75 @@ mod tests {
         let ready = resource_census_digest(selection(true)).expect("digest must build");
         let not_ready = resource_census_digest(selection(false)).expect("digest must build");
         assert_ne!(ready, not_ready);
+    }
+
+    #[test]
+    fn retained_terminal_and_s0_freeze_guards_precede_model_stack_mutation() {
+        let source = include_str!("managed_model_agent_stack_runtime.rs");
+        let lookup = source
+            .split_once("    fn lookup_terminal(")
+            .and_then(|(_, tail)| tail.split_once("    fn admit_transition("))
+            .map(|(lookup, _)| lookup)
+            .expect("missing Model+Agent terminal lookup boundary");
+        for required in [
+            ".validate_against_request(request, response_channel)",
+            "authentication_key() != self.response_key_ref",
+            "authentication_algorithm().value() != 1",
+            "authentication_algorithm_version() != 1",
+            "signature_bytes.len() != 64",
+            "Signature::from_slice(signature_bytes)",
+            ".signing_transcript()",
+            ".verify_strict(transcript.as_bytes(), &signature)",
+        ] {
+            assert!(lookup.contains(required), "missing Model terminal check: {required}");
+        }
+
+        let cutover = source
+            .split_once("    pub(crate) async fn cutover(")
+            .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn recover("))
+            .map(|(cutover, _)| cutover)
+            .expect("missing Model+Agent cutover boundary");
+        let validation = cutover
+            .find("validate_cutover_request(fabric, &config, &request, response_channel)?")
+            .expect("missing pure cutover validation");
+        let gate = cutover
+            .find("fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("missing cutover freeze gate");
+        let predecessor = cutover
+            .find("fabric.stack_cutover_observation().await?")
+            .expect("missing predecessor observation");
+        let deadline = cutover.find("observe_deadline(").expect("missing deadline observation");
+        let initialize = cutover
+            .find("initialize_managed_model_agent_stack")
+            .expect("missing PXMA initialization");
+        let start = cutover.find(".start_model(").expect("missing Model start");
+        assert!(
+            validation < gate
+                && gate < predecessor
+                && predecessor < deadline
+                && deadline < initialize
+                && initialize < start
+        );
+
+        let apply = source
+            .split_once("    pub(crate) async fn apply(")
+            .and_then(|(_, tail)| tail.split_once("    async fn apply_empty("))
+            .map(|(apply, _)| apply)
+            .expect("missing Model+Agent apply boundary");
+        let replay = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let gate = apply
+            .find("fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("missing apply freeze gate");
+        let phase = apply.find("self.snapshot.phase").expect("missing phase gate");
+        let deadline = apply.find("observe_deadline(").expect("missing deadline gate");
+        let admission = apply.find("self.admit_transition(").expect("missing admission");
+        assert!(replay < gate && gate < phase && phase < deadline && deadline < admission);
+
+        let shutdown = source
+            .split_once("    pub(crate) async fn shutdown(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nfn build_pre_cutover_no_effect_terminal"))
+            .map(|(shutdown, _)| shutdown)
+            .expect("missing Model+Agent shutdown boundary");
+        assert!(!shutdown.contains("require_remote_agent_access_s0_mutation_unfrozen_v2"));
     }
 }

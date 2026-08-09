@@ -1888,11 +1888,36 @@ impl ManagedFabricControlService {
         // broker. An ActiveReady outer receipt is not returned unless its
         // exact inner PXDS1 is still the currently published capability root.
         if receipt.facts().outcome() == DistributedAgentStackTerminalOutcomeV1::ActiveReady {
-            self.handle_broker
-                .register_restricted_distributed_alias(&terminal_v1_wire, wire)
-                .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)?;
+            self.ensure_restricted_distributed_alias_v1(&terminal_v1_wire, wire)?;
         }
         Ok(wire.into())
+    }
+
+    /// Installs no new S0 carrier capability after the core freeze. The
+    /// caller holds the endpoint's exclusive mutable borrow and this policy
+    /// contains no await, so the monotonic core check and broker decision
+    /// cannot race another handler-side freeze transition.
+    fn ensure_restricted_distributed_alias_v1(
+        &mut self,
+        committed_inner_receipt_wire: &[u8],
+        committed_outer_receipt_wire: &[u8],
+    ) -> Result<(), RuntimeRestrictedRemoteApplyErrorV1> {
+        if self.core.remote_agent_access_s0_mutation_frozen_v2() {
+            return match self
+                .handle_broker
+                .try_claim_restricted_distributed(committed_outer_receipt_wire)
+            {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable),
+                Err(_) => Err(RuntimeRestrictedRemoteApplyErrorV1::Internal),
+            };
+        }
+        self.handle_broker
+            .register_restricted_distributed_alias(
+                committed_inner_receipt_wire,
+                committed_outer_receipt_wire,
+            )
+            .map_err(|_| RuntimeRestrictedRemoteApplyErrorV1::Internal)
     }
 
     /// Dispatches the additive PXAG carrier on the same restricted Runtime
@@ -2411,6 +2436,9 @@ impl ManagedFabricControlService {
             Ok(None) => {}
             Err(error) => return Err(map_managed_fabric_error(error)),
         }
+        self.core
+            .require_remote_agent_access_s0_mutation_unfrozen_v2()
+            .map_err(map_managed_fabric_error)?;
 
         let reading = self
             .core
@@ -2454,6 +2482,9 @@ impl ManagedFabricControlService {
                 Err(error) => return Err(map_managed_agent_stack_error(error)),
             }
         }
+        self.core
+            .require_remote_agent_access_s0_mutation_unfrozen_v2()
+            .map_err(map_managed_fabric_error)?;
         let reading = self
             .core
             .clock_reading()
@@ -2544,6 +2575,9 @@ impl ManagedFabricControlService {
                 Err(error) => return Err(map_managed_model_agent_stack_error(error)),
             }
         }
+        self.core
+            .require_remote_agent_access_s0_mutation_unfrozen_v2()
+            .map_err(map_managed_fabric_error)?;
         let reading = self
             .core
             .clock_reading()
@@ -2620,6 +2654,9 @@ impl ManagedFabricControlService {
                 Err(error) => return Err(map_distributed_agent_stack_error(error)),
             }
         }
+        self.core
+            .require_remote_agent_access_s0_mutation_unfrozen_v2()
+            .map_err(map_managed_fabric_error)?;
         let reading = self
             .core
             .clock_reading()
@@ -3220,7 +3257,9 @@ fn distributed_agent_stack_apply_response_wire(
 }
 
 fn map_managed_fabric_error(error: ManagedFabricRuntimeError) -> RuntimeControlRequestError {
-    if error.is_request_rejection() {
+    if error.is_request_unavailable() {
+        RuntimeControlRequestError::Unavailable
+    } else if error.is_request_rejection() {
         RuntimeControlRequestError::Rejected
     } else {
         RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedFabric(error))
@@ -3262,7 +3301,9 @@ fn map_runtime_agent_port_export_error(
 fn map_managed_model_agent_stack_error(
     error: ManagedModelAgentStackRuntimeError,
 ) -> RuntimeControlRequestError {
-    if error.is_request_rejection() {
+    if error.is_request_unavailable() {
+        RuntimeControlRequestError::Unavailable
+    } else if error.is_request_rejection() {
         RuntimeControlRequestError::Rejected
     } else {
         RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedModelAgentStack(
@@ -3274,10 +3315,12 @@ fn map_managed_model_agent_stack_error(
 fn map_distributed_agent_stack_error(
     error: DistributedAgentStackRuntimeError,
 ) -> RuntimeControlRequestError {
-    if matches!(
-        &error,
-        DistributedAgentStackRuntimeError::HandlePublicationPending
-    ) {
+    if error.is_request_unavailable()
+        || matches!(
+            &error,
+            DistributedAgentStackRuntimeError::HandlePublicationPending
+        )
+    {
         RuntimeControlRequestError::Unavailable
     } else if error.is_request_rejection() {
         RuntimeControlRequestError::Rejected
@@ -7008,15 +7051,48 @@ mod tests {
             seam.find(".finalize(&signature)")
                 .unwrap_or_else(|| panic!("missing signed PXDS2 finalization"))
                 < seam
-                    .find(".register_restricted_distributed_alias")
-                    .unwrap_or_else(|| panic!("missing exact PXDS2 alias registration"))
+                    .find(".ensure_restricted_distributed_alias_v1")
+                    .unwrap_or_else(|| panic!("missing freeze-aware PXDS2 alias policy"))
         );
         assert!(
-            seam.find(".register_restricted_distributed_alias")
-                .unwrap_or_else(|| panic!("missing exact PXDS2 alias registration"))
+            seam.find(".ensure_restricted_distributed_alias_v1")
+                .unwrap_or_else(|| panic!("missing freeze-aware PXDS2 alias policy"))
                 < seam
                     .find("Ok(wire.into())")
                     .unwrap_or_else(|| panic!("missing restricted response return"))
+        );
+        let alias_policy = section(
+            source,
+            "    fn ensure_restricted_distributed_alias_v1(",
+            "    /// Dispatches the additive PXAG carrier",
+        );
+        let frozen = alias_policy
+            .find("self.core.remote_agent_access_s0_mutation_frozen_v2()")
+            .unwrap_or_else(|| panic!("missing monotonic S0 alias freeze check"));
+        let frozen_return = alias_policy
+            .find("return match self")
+            .unwrap_or_else(|| panic!("frozen alias path no longer returns early"));
+        let exact_claim = alias_policy
+            .find(".try_claim_restricted_distributed(committed_outer_receipt_wire)")
+            .unwrap_or_else(|| panic!("missing exact preexisting alias claim"));
+        let unavailable = alias_policy
+            .find("Ok(None) => Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable)")
+            .unwrap_or_else(|| panic!("missing-alias freeze no longer reports Unavailable"));
+        let register = alias_policy
+            .find(".register_restricted_distributed_alias(")
+            .unwrap_or_else(|| panic!("missing unfrozen exact alias registration"));
+        assert!(
+            frozen < frozen_return
+                && frozen_return < exact_claim
+                && exact_claim < unavailable
+                && unavailable < register,
+            "frozen alias handling must return before the sole registration path",
+        );
+        assert_eq!(
+            alias_policy
+                .match_indices(".register_restricted_distributed_alias(")
+                .count(),
+            1,
         );
 
         let outer_authentication = section(
@@ -12982,6 +13058,129 @@ mod tests {
     }
 
     #[test]
+    fn protected_apply_authentication_and_replay_precede_every_fresh_s0_guard() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        let assert_order =
+            |name: &str,
+             handler: &str,
+             authentication: &str,
+             fresh_admission: &str,
+             first_owner_mutation: &str| {
+                let authentication = handler
+                    .find(authentication)
+                    .unwrap_or_else(|| {
+                        panic!("{name} protected request authentication disappeared")
+                    });
+                let replay = handler
+                    .find("authenticated_terminal_replay")
+                    .unwrap_or_else(|| panic!("{name} authenticated terminal replay disappeared"));
+                let fresh_guard = handler
+                    .find("require_remote_agent_access_s0_mutation_unfrozen_v2")
+                    .unwrap_or_else(|| panic!("{name} endpoint S0 freeze guard disappeared"));
+                let fresh_clock = handler
+                    .find(".clock_reading()")
+                    .unwrap_or_else(|| panic!("{name} fresh admission clock disappeared"));
+                let fresh_admission = handler
+                    .find(fresh_admission)
+                    .unwrap_or_else(|| panic!("{name} fresh request admission disappeared"));
+                let first_owner_mutation = handler
+                    .find(first_owner_mutation)
+                    .unwrap_or_else(|| panic!("{name} mutation owner handoff disappeared"));
+                assert!(
+                    authentication < replay
+                        && replay < fresh_guard
+                        && fresh_guard < fresh_clock
+                        && fresh_clock < fresh_admission
+                        && fresh_admission < first_owner_mutation,
+                    "{name} must authenticate, replay, freeze-gate, freshly admit, then hand off",
+                );
+                assert_eq!(
+                    handler
+                        .match_indices("require_remote_agent_access_s0_mutation_unfrozen_v2")
+                        .count(),
+                    1,
+                    "{name} must have one endpoint fresh-path guard",
+                );
+            };
+
+        let fabric = section(
+            source,
+            "    async fn handle_managed_fabric_apply(",
+            "    async fn handle_managed_agent_stack_apply(",
+        );
+        assert_order(
+            "managed Fabric",
+            fabric,
+            "authenticate_managed_fabric_apply_request",
+            "verify_managed_fabric_apply_request",
+            ".apply(request, verified, self.channel)",
+        );
+
+        let agent = section(
+            source,
+            "    async fn handle_managed_agent_stack_apply(",
+            "    fn observe_remote_agent_access_same_epoch_freeze(",
+        );
+        assert_order(
+            "managed Agent stack",
+            agent,
+            "authenticate_managed_agent_stack_apply_request",
+            "verify_managed_agent_stack_apply_request",
+            ".apply(&mut self.core, request, verified, self.channel)",
+        );
+        assert!(
+            agent
+                .find("verify_managed_agent_stack_apply_request")
+                .unwrap_or_else(|| panic!("managed Agent-stack fresh admission disappeared"))
+                < agent
+                    .find("ManagedAgentStackRuntimeCore::cutover(")
+                    .unwrap_or_else(|| panic!("managed Agent-stack cutover disappeared")),
+        );
+
+        let model = section(
+            source,
+            "    async fn handle_managed_model_agent_stack_apply(",
+            "    async fn handle_distributed_agent_stack_apply(",
+        );
+        assert_order(
+            "managed Model+Agent stack",
+            model,
+            "authenticate_managed_model_agent_stack_apply_request",
+            "verify_managed_model_agent_stack_apply_request",
+            ".apply(&mut self.core, request, verified, self.channel)",
+        );
+        assert!(
+            model
+                .find("verify_managed_model_agent_stack_apply_request")
+                .unwrap_or_else(|| panic!("managed Model+Agent fresh admission disappeared"))
+                < model
+                    .find("ManagedModelAgentStackRuntimeCore::cutover(")
+                    .unwrap_or_else(|| panic!("managed Model+Agent cutover disappeared")),
+        );
+
+        let distributed = section(
+            source,
+            "    async fn handle_distributed_agent_stack_apply(",
+            "pub(crate) fn validate_restricted_runtime_apply_carrier_pins",
+        );
+        assert_order(
+            "distributed Agent stack",
+            distributed,
+            "authenticate_distributed_agent_stack_apply_request",
+            "verify_distributed_agent_stack_apply_request",
+            ".apply(&mut self.core, request, verified, self.channel)",
+        );
+        assert!(
+            distributed
+                .find("verify_distributed_agent_stack_apply_request")
+                .unwrap_or_else(|| panic!("distributed fresh admission disappeared"))
+                < distributed
+                    .find("DistributedAgentStackRuntimeCore::cutover(")
+                    .unwrap_or_else(|| panic!("distributed cutover disappeared")),
+        );
+    }
+
+    #[test]
     fn unavailable_is_nonfatal_in_every_endpoint_service_loop() {
         let source = include_str!("runtime_control_endpoint.rs");
         let developer = section(
@@ -13047,9 +13246,25 @@ mod tests {
     }
 
     #[test]
-    fn same_process_pxrs2_freeze_maps_to_nonfatal_unavailable() {
+    fn same_process_pxrs2_freeze_maps_every_s0_owner_to_nonfatal_unavailable() {
+        assert!(matches!(
+            map_managed_fabric_error(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen),
+            RuntimeControlRequestError::Unavailable
+        ));
         assert!(matches!(
             map_managed_agent_stack_error(ManagedAgentStackRuntimeError::Fabric(
+                ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen,
+            )),
+            RuntimeControlRequestError::Unavailable
+        ));
+        assert!(matches!(
+            map_managed_model_agent_stack_error(ManagedModelAgentStackRuntimeError::Fabric(
+                ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen,
+            )),
+            RuntimeControlRequestError::Unavailable
+        ));
+        assert!(matches!(
+            map_distributed_agent_stack_error(DistributedAgentStackRuntimeError::Fabric(
                 ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen,
             )),
             RuntimeControlRequestError::Unavailable
@@ -13364,6 +13579,65 @@ mod tests {
                 .try_claim_restricted_distributed(pxds1.canonical_wire()),
             Err(ManagedAgentStackRuntimeError::RequestRejected)
         ));
+
+        // Reuse the already-authenticated ActiveReady fixture to exercise the
+        // endpoint's monotonic alias policy without constructing another
+        // distributed owner. Both brokers retain the same exact published
+        // inner receipt before the core freeze; only one already has PXDS2.
+        let exact_handle = control
+            .handle_broker
+            .try_claim_distributed(pxds1.canonical_wire())
+            .unwrap_or_else(|error| panic!("freeze fixture PXDS1 claim failed: {error}"))
+            .unwrap_or_else(|| panic!("freeze fixture lost its published PXDS1"));
+        let missing_alias = RuntimeAgentHandleBroker::default();
+        missing_alias
+            .publish_distributed(exact_handle.clone(), &pxds1)
+            .unwrap_or_else(|error| panic!("missing-alias fixture publish failed: {error}"));
+        let existing_alias = RuntimeAgentHandleBroker::default();
+        existing_alias
+            .publish_distributed(exact_handle, &pxds1)
+            .unwrap_or_else(|error| panic!("existing-alias fixture publish failed: {error}"));
+        existing_alias
+            .register_restricted_distributed_alias(
+                pxds1.canonical_wire(),
+                pxds2.canonical_wire(),
+            )
+            .unwrap_or_else(|error| panic!("existing-alias fixture register failed: {error}"));
+        control
+            .core
+            .latch_remote_agent_access_s0_mutation_freeze_v2();
+
+        let original_broker = std::mem::replace(&mut control.handle_broker, missing_alias.clone());
+        assert!(matches!(
+            control.ensure_restricted_distributed_alias_v1(
+                pxds1.canonical_wire(),
+                pxds2.canonical_wire(),
+            ),
+            Err(RuntimeRestrictedRemoteApplyErrorV1::Unavailable)
+        ));
+        assert!(
+            missing_alias
+                .try_claim_restricted_distributed(pxds2.canonical_wire())
+                .unwrap_or_else(|error| panic!("missing-alias frozen claim failed: {error}"))
+                .is_none(),
+            "freeze must not install a first restricted alias",
+        );
+
+        control.handle_broker = existing_alias.clone();
+        control
+            .ensure_restricted_distributed_alias_v1(
+                pxds1.canonical_wire(),
+                pxds2.canonical_wire(),
+            )
+            .unwrap_or_else(|error| panic!("existing-alias frozen replay failed: {error}"));
+        assert!(
+            existing_alias
+                .try_claim_restricted_distributed(pxds2.canonical_wire())
+                .unwrap_or_else(|error| panic!("existing-alias frozen claim failed: {error}"))
+                .is_some(),
+            "freeze must preserve an already registered exact restricted alias",
+        );
+        control.handle_broker = original_broker;
 
         shutdown_managed_successor_chain(
             &mut control.distributed,

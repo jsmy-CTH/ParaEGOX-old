@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
 use paraegox_fabric::{
     ExperimentalRemoteMtlsLinkSnapshotV1, ExperimentalRemoteMtlsObservationErrorV1, FabricService,
     FabricServiceConfig, SessionEndpoint,
@@ -782,6 +782,24 @@ impl ManagedFabricRuntimeCore {
             .receipt
             .validate_against_request(request, channel)
             .map_err(|_| ManagedFabricRuntimeError::TerminalCorrelation)?;
+        let signature_bytes = record.receipt.authentication_signature();
+        if record.receipt.authentication_key() != self.response_key_ref
+            || record.receipt.authentication_algorithm().value() != 1
+            || record.receipt.authentication_algorithm_version() != 1
+            || signature_bytes.len() != 64
+        {
+            return Err(ManagedFabricRuntimeError::TerminalCorrelation);
+        }
+        let signature = Signature::from_slice(signature_bytes)
+            .map_err(|_| ManagedFabricRuntimeError::TerminalCorrelation)?;
+        let transcript = record
+            .receipt
+            .signing_transcript()
+            .map_err(|_| ManagedFabricRuntimeError::TerminalCorrelation)?;
+        self.response_signer
+            .verifying_key()
+            .verify_strict(transcript.as_bytes(), &signature)
+            .map_err(|_| ManagedFabricRuntimeError::TerminalCorrelation)?;
         Ok(Some(record.receipt.clone()))
     }
 
@@ -1094,6 +1112,7 @@ impl ManagedFabricRuntimeCore {
         &mut self,
         evidence: RemoteAgentDescriptorEvidenceV1,
     ) -> Result<(), ManagedFabricRuntimeError> {
+        self.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         let sequence_matches = match self.remote_agent_descriptor_evidence.as_ref() {
             Some(previous) => {
                 previous
@@ -1340,6 +1359,7 @@ impl ManagedFabricRuntimeCore {
         if let Some(receipt) = self.lookup_terminal(&request, response_channel)? {
             return Ok(ManagedFabricApplyOutcome::Replayed(receipt));
         }
+        self.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
         if matches!(
             self.snapshot.phase,
             ManagedFabricDurablePhase::Quarantined
@@ -2631,6 +2651,10 @@ pub(crate) enum ManagedFabricRuntimeError {
 }
 
 impl ManagedFabricRuntimeError {
+    pub(crate) const fn is_request_unavailable(&self) -> bool {
+        matches!(self, Self::RemoteAgentAccessSameEpochFrozen)
+    }
+
     pub(crate) const fn is_request_rejection(&self) -> bool {
         matches!(
             self,
@@ -2794,8 +2818,9 @@ mod tests {
     };
     use paraegox_runtime_contracts::managed_fabric_plan::{
         ManagedFabricApplyRequestDraftV1, ManagedFabricApplyRequestV1,
-        ManagedFabricApplyTerminalOutcomeV1, ManagedFabricListenEndpointV1,
-        ManagedFabricManifestProjectionV1, ManagedFabricTargetExecutionV1,
+        ManagedFabricApplyTerminalOutcomeV1, ManagedFabricApplyTerminalReceiptV1,
+        ManagedFabricListenEndpointV1, ManagedFabricManifestProjectionV1,
+        ManagedFabricTargetExecutionV1,
     };
     use paraegox_runtime_contracts::managed_service::{
         ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
@@ -2995,6 +3020,65 @@ mod tests {
                     .find("take_remote_agent_access_absent_lease_v2(candidate)")
                     .expect("failpoint path lost the Absent lease take")
         );
+    }
+
+    #[test]
+    fn s0_freeze_and_retained_terminal_authority_are_ordered_at_owner_entrypoints() {
+        let source = include_str!("managed_fabric_runtime.rs");
+        let lookup = source
+            .split_once("    fn lookup_terminal(")
+            .and_then(|(_, tail)| tail.split_once("    /// Returns an already committed terminal"))
+            .map(|(lookup, _)| lookup)
+            .expect("missing managed Fabric terminal lookup boundary");
+        for required in [
+            ".validate_against_request(request, channel)",
+            "authentication_key() != self.response_key_ref",
+            "authentication_algorithm().value() != 1",
+            "authentication_algorithm_version() != 1",
+            "signature_bytes.len() != 64",
+            "Signature::from_slice(signature_bytes)",
+            ".signing_transcript()",
+            ".verify_strict(transcript.as_bytes(), &signature)",
+        ] {
+            assert!(lookup.contains(required), "missing retained-terminal check: {required}");
+        }
+
+        let apply = source
+            .split_once("    pub(crate) async fn apply(")
+            .and_then(|(_, tail)| tail.split_once("    /// Reconciles a successor snapshot"))
+            .map(|(apply, _)| apply)
+            .expect("missing managed Fabric apply boundary");
+        let replay = apply.find("self.lookup_terminal(").expect("missing exact replay lookup");
+        let gate = apply
+            .find("self.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+            .expect("missing S0 freeze gate");
+        let phase = apply.find("self.snapshot.phase").expect("missing phase gate");
+        let deadline = apply.find("self.observe_deadline(").expect("missing deadline observation");
+        let admission = apply.find("self.admit_transition(").expect("missing transition admission");
+        assert!(replay < gate && gate < phase && phase < deadline && deadline < admission);
+
+        let descriptor_commit = source
+            .split_once("    pub(crate) fn commit_remote_agent_descriptor_evidence(")
+            .and_then(|(_, tail)| {
+                tail.split_once("    pub(crate) fn managed_agent_stack_projection_digest(")
+            })
+            .map(|(commit, _)| commit)
+            .expect("missing PXDE commit boundary");
+        assert!(
+            descriptor_commit
+                .find("self.require_remote_agent_access_s0_mutation_unfrozen_v2()?")
+                .expect("PXDE commit bypasses freeze")
+                < descriptor_commit
+                    .find("let sequence_matches")
+                    .expect("missing PXDE sequence validation")
+        );
+
+        let shutdown = source
+            .split_once("    pub(crate) async fn shutdown(&mut self)")
+            .and_then(|(_, tail)| tail.split_once("\n}\n\nimpl ManagedServiceImplementation"))
+            .map(|(shutdown, _)| shutdown)
+            .expect("missing managed Fabric shutdown boundary");
+        assert!(!shutdown.contains("require_remote_agent_access_s0_mutation_unfrozen_v2"));
     }
 
     struct DeterministicFixtureResolver;
@@ -3721,6 +3805,76 @@ mod tests {
         core.shutdown()
             .await
             .expect("exact-zero shutdown must pass");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_s0_replays_verified_terminal_rejects_fresh_mutation_and_allows_shutdown() {
+        let (_directory, mut core) = fresh_core(1, 3);
+        core.recover().await.expect("fresh recovery must pass");
+        let port = available_port();
+        let request = active_request(port, ExpectedActive::None);
+        let response_channel = channel(&core.projection);
+        let ingress = verified(core.clock.reading().expect("clock must read"), 0xd0);
+        let ManagedFabricApplyOutcome::Committed(receipt) = core
+            .apply(request.clone(), ingress, response_channel)
+            .await
+            .expect("active Fabric apply must commit")
+        else {
+            panic!("first Fabric apply must commit")
+        };
+        core.latch_remote_agent_access_s0_mutation_freeze_v2();
+        let frozen_sequence = core.snapshot.sequence();
+
+        assert!(matches!(
+            core.apply(request.clone(), ingress, response_channel)
+                .await
+                .expect("verified exact replay must remain available"),
+            ManagedFabricApplyOutcome::Replayed(replayed)
+                if replayed.canonical_wire() == receipt.canonical_wire()
+        ));
+        let empty = empty_request(ExpectedActive::Exact(request.target_slice_digest()));
+        let empty_ingress = verified(core.clock.reading().expect("clock must read"), 0xd2);
+        let error = core
+            .apply(empty, empty_ingress, response_channel)
+            .await
+            .expect_err("fresh S0 mutation must be unavailable after freeze");
+        assert!(error.is_request_unavailable());
+        assert_eq!(core.snapshot.sequence(), frozen_sequence);
+        assert!(TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_err());
+
+        core.shutdown().await.expect("ordered shutdown must ignore S0 freeze");
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+            .expect("ordered shutdown must release the Fabric endpoint");
+        drop(listener);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_fabric_terminal_with_bad_owner_signature_is_not_replay_authority() {
+        let (_directory, mut core) = fresh_core(1, 3);
+        core.recover().await.expect("fresh recovery must pass");
+        let request = active_request(available_port(), ExpectedActive::None);
+        let response_channel = channel(&core.projection);
+        let ingress = verified(core.clock.reading().expect("clock must read"), 0xe0);
+        core.apply(request.clone(), ingress, response_channel)
+            .await
+            .expect("active Fabric apply must commit");
+
+        let record = core
+            .snapshot
+            .terminals
+            .iter_mut()
+            .find(|record| record.operation_id == request.operation_id())
+            .expect("committed terminal disappeared");
+        let mut tampered = record.receipt.canonical_wire().to_vec();
+        *tampered.last_mut().expect("terminal signature disappeared") ^= 1;
+        record.receipt = ManagedFabricApplyTerminalReceiptV1::decode(&tampered)
+            .expect("opaque bad signature must remain structurally canonical");
+
+        assert!(matches!(
+            core.authenticated_terminal_replay(&request, response_channel),
+            Err(ManagedFabricRuntimeError::TerminalCorrelation)
+        ));
+        core.shutdown().await.expect("bad retained bytes must not block shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
