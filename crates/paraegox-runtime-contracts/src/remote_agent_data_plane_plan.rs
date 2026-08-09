@@ -2894,9 +2894,7 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32,
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNING_V2_VERSION)?;
     builder.field_bytes(&(TERMINAL_V2_FIXED_BYTES as u32).to_be_bytes())?;
     builder.field_u16(MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES as u16)?;
-    builder.field_u16(
-        MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES as u16,
-    )?;
+    builder.field_u16(MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES as u16)?;
     builder.field_u16(MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNATURE_V2_BYTES as u16)?;
     builder.field_bytes(&EMPTY_PXTA)?;
     builder.field_u16(REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES as u16)?;
@@ -4124,9 +4122,7 @@ impl RemoteAgentDataPlaneTerminalReceiptV2 {
         append_terminal_body_v2(&mut canonical_wire, facts, auth_claim);
         canonical_wire.extend_from_slice(&signature_length.to_be_bytes());
         canonical_wire.extend_from_slice(signature);
-        if canonical_wire.len()
-            > MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES
-        {
+        if canonical_wire.len() > MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES {
             return Err(RemoteAgentDataPlanePlanError::FrameTooLarge);
         }
         let receipt_digest = digest_wire(TERMINAL_V2_DIGEST_DOMAIN, &canonical_wire)?;
