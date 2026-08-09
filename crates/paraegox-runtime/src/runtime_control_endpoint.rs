@@ -1733,6 +1733,10 @@ pub(crate) struct ManagedFabricControlService {
     provisioning: RuntimeProvisioningV1,
     channel: ReferenceChannelBindingV1,
     dependencies: RuntimeManagedFabricServiceDependenciesV1,
+    /// Monotonic process-local observation that the store owner structurally
+    /// classified an exact same-epoch PXRS v2 final. The raw snapshot is not
+    /// retained here and cannot authorize replay or any transition.
+    remote_agent_access_same_epoch_frozen: bool,
 }
 
 impl ManagedFabricControlService {
@@ -1912,6 +1916,11 @@ impl ManagedFabricControlService {
                 }
             }
             RuntimeAgentControlKindV1::DescribeConversationPort => {
+                if self.remote_agent_access_same_epoch_frozen {
+                    return self
+                        .replay_frozen_runtime_agent_descriptor_v1(authenticated)
+                        .await;
+                }
                 let exported = self
                     .stack
                     .as_ref()
@@ -1994,6 +2003,29 @@ impl ManagedFabricControlService {
             )
         })?;
         runtime_agent_control_receipt_response(&self.provisioning, draft)
+    }
+
+    /// Frozen Describe permits only an exact, independently reverified replay
+    /// of the latest retained PXAH. It never signs or writes and treats PXRS
+    /// only as the process-local freeze signal captured above.
+    async fn replay_frozen_runtime_agent_descriptor_v1(
+        &mut self,
+        authenticated: ControllerAuthenticatedRuntimeAgentControlRequestV1<'_>,
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        let request = authenticated.request();
+        let retained_request = self
+            .core
+            .latest_remote_agent_descriptor_evidence()
+            .ok_or(RuntimeControlRequestError::Rejected)?
+            .request();
+        if retained_request.canonical_wire() != request.canonical_wire() {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let verified = self
+            .latest_verified_remote_agent_descriptor_evidence_v1(request.carrier())
+            .await
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        Ok(verified.exact_receipt_canonical_wire().into())
     }
 
     /// Revalidates the latest durable Describe record for a future PXRA-v10
@@ -2362,14 +2394,20 @@ impl ManagedFabricControlService {
             .verify_managed_agent_stack_apply_request(&request, reading)
             .map_err(|_| RuntimeControlRequestError::Rejected)?;
         let outcome = match self.stack.as_mut() {
-            Some(stack) => stack
+            Some(stack) => match stack
                 .apply(&mut self.core, request, verified, self.channel)
                 .await
-                .map_err(map_managed_agent_stack_error)?,
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.observe_remote_agent_access_same_epoch_freeze(&error);
+                    return Err(map_managed_agent_stack_error(error));
+                }
+            },
             None => {
                 let runtime_host_epoch = self.core.runtime_host_epoch();
                 let clock = self.core.stack_clock();
-                let (stack, outcome) = ManagedAgentStackRuntimeCore::cutover(
+                let cutover = ManagedAgentStackRuntimeCore::cutover(
                     &mut self.core,
                     ManagedAgentStackOwnerConfig {
                         state_directory: self.state_directory.clone(),
@@ -2385,13 +2423,33 @@ impl ManagedFabricControlService {
                     verified,
                     self.channel,
                 )
-                .await
-                .map_err(map_managed_agent_stack_error)?;
+                .await;
+                let (stack, outcome) = match cutover {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.observe_remote_agent_access_same_epoch_freeze(&error);
+                        return Err(map_managed_agent_stack_error(error));
+                    }
+                };
                 self.stack = Some(stack);
                 outcome
             }
         };
         Ok(outcome)
+    }
+
+    fn observe_remote_agent_access_same_epoch_freeze(
+        &mut self,
+        error: &ManagedAgentStackRuntimeError,
+    ) {
+        if matches!(
+            error,
+            ManagedAgentStackRuntimeError::Fabric(
+                ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen
+            )
+        ) {
+            self.remote_agent_access_same_epoch_frozen = true;
+        }
     }
 
     async fn handle_managed_model_agent_stack_apply(
@@ -3890,6 +3948,7 @@ async fn recover_managed_control_for_existing_channel(
         provisioning,
         channel,
         dependencies,
+        remote_agent_access_same_epoch_frozen: false,
     })
 }
 
@@ -4453,6 +4512,7 @@ where
         provisioning,
         channel,
         dependencies,
+        remote_agent_access_same_epoch_frozen: false,
     };
     let listener = match UnixListener::from_std(standard) {
         Ok(listener) => listener,
@@ -7549,6 +7609,7 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
+            remote_agent_access_same_epoch_frozen: false,
         };
         let cutover_distributed = control
             .dependencies
@@ -8215,6 +8276,7 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
+            remote_agent_access_same_epoch_frozen: false,
         };
         let profile = restricted_transport_profile(
             RESTRICTED_APPLY_ROUTE,
@@ -9679,6 +9741,235 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("Agent-control cleanup failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_pxag_describe_replays_exact_pxde_without_self_drift() {
+        let socket_directory = TestSocketDirectory::create();
+        let (state_directory, mut control, stack_request) =
+            managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let active_wire = control
+            .handle_request(stack_request.canonical_wire(), control.channel)
+            .await
+            .unwrap_or_else(|error| panic!("active PXST replay failed: {error:?}"));
+        let active = ManagedAgentStackTerminalReceiptV1::decode(&active_wire)
+            .unwrap_or_else(|error| panic!("active PXST decode failed: {error}"));
+        let intended_client = PrincipalRef::from_bytes([0xa7; 16]);
+        let describe = signed_runtime_agent_describe(
+            carrier.clone(),
+            control.core.runtime_host_epoch(),
+            RuntimeAgentDescribeFixtureV1 {
+                request_id_byte: 0xa8,
+                expected_active_pxst_digest: active.receipt_digest(),
+                intended_client,
+                algorithm: ED25519_ALGORITHM,
+                algorithm_version: ED25519_ALGORITHM_VERSION,
+                signature_length: ED25519_SIGNATURE_BYTES,
+            },
+        );
+        let retained_pxah = control
+            .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
+            .await
+            .unwrap_or_else(|error| panic!("initial Describe failed: {error:?}"));
+        let evidence_path = state_directory
+            .path()
+            .join("remote-agent-descriptor-evidence-v1");
+        let before_wire =
+            fs::read(&evidence_path).unwrap_or_else(|error| panic!("PXDE read failed: {error}"));
+        let before_metadata = fs::metadata(&evidence_path)
+            .unwrap_or_else(|error| panic!("PXDE metadata failed: {error}"));
+        let before_evidence = control
+            .core
+            .latest_remote_agent_descriptor_evidence()
+            .unwrap_or_else(|| panic!("initial Describe did not retain PXDE"))
+            .clone();
+        let before_successor_sequence = control
+            .core
+            .recovered_observation()
+            .unwrap_or_else(|error| panic!("pre-freeze observation failed: {error}"))
+            .successor_snapshot_sequence;
+
+        control.observe_remote_agent_access_same_epoch_freeze(
+            &ManagedAgentStackRuntimeError::Fabric(
+                ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen,
+            ),
+        );
+        assert!(control.remote_agent_access_same_epoch_frozen);
+        assert_eq!(
+            control
+                .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
+                .await
+                .unwrap_or_else(|error| panic!("frozen exact Describe failed: {error:?}")),
+            retained_pxah,
+            "frozen exact replay must return the retained canonical PXAH bytes",
+        );
+
+        let different = signed_runtime_agent_describe(
+            carrier.clone(),
+            control.core.runtime_host_epoch(),
+            RuntimeAgentDescribeFixtureV1 {
+                request_id_byte: 0xa9,
+                expected_active_pxst_digest: active.receipt_digest(),
+                intended_client,
+                algorithm: ED25519_ALGORITHM,
+                algorithm_version: ED25519_ALGORITHM_VERSION,
+                signature_length: ED25519_SIGNATURE_BYTES,
+            },
+        );
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(different.canonical_wire(), &carrier)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert_eq!(
+            control
+                .core
+                .recovered_observation()
+                .unwrap_or_else(|error| panic!("post-freeze observation failed: {error}"))
+                .successor_snapshot_sequence,
+            before_successor_sequence,
+        );
+        assert_eq!(
+            control
+                .core
+                .latest_remote_agent_descriptor_evidence()
+                .unwrap_or_else(|| panic!("frozen replay lost PXDE"))
+                .record_sequence(),
+            before_evidence.record_sequence(),
+        );
+        assert_eq!(
+            control
+                .core
+                .latest_remote_agent_descriptor_evidence()
+                .unwrap_or_else(|| panic!("frozen replay lost PXDE"))
+                .record_digest(),
+            before_evidence.record_digest(),
+        );
+        assert_eq!(
+            fs::read(&evidence_path)
+                .unwrap_or_else(|error| panic!("frozen PXDE reread failed: {error}")),
+            before_wire,
+        );
+        let after_metadata = fs::metadata(&evidence_path)
+            .unwrap_or_else(|error| panic!("frozen PXDE metadata failed: {error}"));
+        assert_eq!(after_metadata.dev(), before_metadata.dev());
+        assert_eq!(after_metadata.ino(), before_metadata.ino());
+
+        control
+            .handle_broker
+            .revoke()
+            .unwrap_or_else(|error| panic!("stale-live fixture revoke failed: {error}"));
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert_eq!(
+            fs::read(&evidence_path)
+                .unwrap_or_else(|error| panic!("stale-live PXDE reread failed: {error}")),
+            before_wire,
+        );
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("frozen Describe cleanup failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_pxag_describe_without_latest_pxde_rejects_without_creation() {
+        let socket_directory = TestSocketDirectory::create();
+        let (state_directory, started) =
+            managed_started_service(socket_directory.socket_path.clone());
+        let channel = ReferenceChannelBindingV1::try_new(
+            TARGET,
+            RUNTIME_PRINCIPAL,
+            digest(0xaa),
+            digest(0xab),
+        )
+        .unwrap_or_else(|error| panic!("missing-PXDE channel rejected: {error}"));
+        let mut control = recover_managed_control_for_existing_channel(started, channel)
+            .await
+            .unwrap_or_else(|error| panic!("missing-PXDE recovery failed: {error}"));
+        let profile = restricted_transport_profile(
+            RESTRICTED_APPLY_ROUTE,
+            RESTRICTED_TLS_LISTENER,
+            RESTRICTED_ENDPOINT_GENERATION,
+            RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        );
+        let carrier = restricted_carrier_for_profile(&profile, RESTRICTED_PROFILE_REF);
+        let describe = signed_runtime_agent_describe(
+            carrier.clone(),
+            control.core.runtime_host_epoch(),
+            RuntimeAgentDescribeFixtureV1 {
+                request_id_byte: 0xac,
+                expected_active_pxst_digest: digest(0xad),
+                intended_client: PrincipalRef::from_bytes([0xae; 16]),
+                algorithm: ED25519_ALGORITHM,
+                algorithm_version: ED25519_ALGORITHM_VERSION,
+                signature_length: ED25519_SIGNATURE_BYTES,
+            },
+        );
+        control.observe_remote_agent_access_same_epoch_freeze(
+            &ManagedAgentStackRuntimeError::Fabric(
+                ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen,
+            ),
+        );
+        assert!(matches!(
+            control
+                .handle_restricted_runtime_control_frame_v1(describe.canonical_wire(), &carrier)
+                .await,
+            Err(RuntimeControlRequestError::Rejected)
+        ));
+        assert!(
+            control
+                .core
+                .latest_remote_agent_descriptor_evidence()
+                .is_none()
+        );
+        assert!(
+            !state_directory
+                .path()
+                .join("remote-agent-descriptor-evidence-v1")
+                .exists()
+        );
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("missing-PXDE cleanup failed: {error}"));
+    }
+
+    #[test]
+    fn frozen_descriptor_replay_has_no_sign_or_store_path() {
+        let source = include_str!("runtime_control_endpoint.rs");
+        let replay = section(
+            source,
+            "    async fn replay_frozen_runtime_agent_descriptor_v1(",
+            "    /// Revalidates the latest durable Describe record",
+        );
+        assert!(replay.contains("exact_receipt_canonical_wire"));
+        assert!(!replay.contains(".sign("));
+        assert!(!replay.contains("finalize_runtime_agent_control_receipt"));
+        assert!(!replay.contains("commit_remote_agent_descriptor_evidence"));
+        assert!(!replay.contains("try_next"));
     }
 
     #[derive(Clone, Copy)]
@@ -12071,6 +12362,7 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
+            remote_agent_access_same_epoch_frozen: false,
         };
         let fabric_wire = control
             .handle_request(fabric_request.canonical_wire(), channel)
@@ -12195,6 +12487,7 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
+            remote_agent_access_same_epoch_frozen: false,
         };
         let fabric_wire = control
             .handle_request(fabric_request.canonical_wire(), channel)
@@ -12369,6 +12662,7 @@ mod tests {
             provisioning,
             channel,
             dependencies,
+            remote_agent_access_same_epoch_frozen: false,
         };
         assert_eq!(
             restarted_control
@@ -13283,6 +13577,7 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
+            remote_agent_access_same_epoch_frozen: false,
         };
 
         let mut bad_signature = request.canonical_wire().to_vec();
@@ -13387,6 +13682,7 @@ mod tests {
             provisioning: started.provisioning,
             channel,
             dependencies: started.dependencies,
+            remote_agent_access_same_epoch_frozen: false,
         };
         let mut legacy_version = [0_u8; 18];
         legacy_version[..4].copy_from_slice(APPLY_REQUEST_MAGIC);

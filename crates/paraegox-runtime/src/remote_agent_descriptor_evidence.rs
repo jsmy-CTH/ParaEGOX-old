@@ -334,6 +334,13 @@ impl<'a> RemoteAgentVerifiedDescriptorEvidenceV1<'a> {
     pub(crate) const fn evidence(&self) -> &'a RemoteAgentDescriptorEvidenceV1 {
         self.evidence
     }
+
+    /// Exposes the exact retained Runtime-signed PXAH only after both retained
+    /// signatures and all current live facts have been reverified.
+    #[must_use]
+    pub(crate) fn exact_receipt_canonical_wire(&self) -> &'a [u8] {
+        self.evidence.receipt.canonical_wire()
+    }
 }
 
 /// Rechecks both retained signatures and every caller-supplied live fence.
