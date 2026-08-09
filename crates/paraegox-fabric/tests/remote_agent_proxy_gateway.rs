@@ -348,7 +348,10 @@ fn raw_remote_agent_config(
             "transport/link/tls/root_ca_certificate",
             json_string(&path_text(&pki.root_ca)),
         ),
-        (certificate_key, json_string(&path_text(&identity.certificate))),
+        (
+            certificate_key,
+            json_string(&path_text(&identity.certificate)),
+        ),
         (private_key, json_string(&path_text(&identity.private_key))),
     ] {
         config
@@ -414,8 +417,14 @@ fn binding_spec(marker: u8, route: &str) -> RequestResponseBindingSpec {
         route,
         schema(marker.wrapping_add(0x40)),
         schema(marker.wrapping_add(0x60)),
-        IngressLimits::try_new(4, 16_384, MAX_TEST_FRAME_BYTES, MAX_TEST_FRAME_BYTES, Duration::from_secs(2))
-            .expect("test ingress limits"),
+        IngressLimits::try_new(
+            4,
+            16_384,
+            MAX_TEST_FRAME_BYTES,
+            MAX_TEST_FRAME_BYTES,
+            Duration::from_secs(2),
+        )
+        .expect("test ingress limits"),
     )
     .expect("test binding spec")
 }
@@ -496,14 +505,8 @@ impl TestProxyGateway {
             .await
             .expect("raw TLS proxy session must open");
         let (cancel, cancel_receiver) = watch::channel(false);
-        let admitted = [
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(0)),
-        ];
-        let forwarded = [
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(0)),
-        ];
+        let admitted = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let forwarded = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
         let (submit_sender, submit_receiver) = mpsc::channel(PROXY_QUEUE_CAPACITY);
         let submit_ingress = ProxyRouteIngress {
             route: Arc::from(SUBMIT_ROUTE),
@@ -622,15 +625,7 @@ async fn run_proxy_forwarder(
                 None => break,
             }
         };
-        forward_one_query(
-            &fabric,
-            &binding,
-            &route,
-            query,
-            &mut cancel,
-            &forwarded,
-        )
-        .await;
+        forward_one_query(&fabric, &binding, &route, query, &mut cancel, &forwarded).await;
     }
 }
 
@@ -648,14 +643,24 @@ async fn forward_one_query(
     };
     let bytes = payload.to_bytes();
     let Ok(request) = BindingRequestEnvelopeV1::decode(bytes.as_ref(), MAX_TEST_FRAME_BYTES) else {
-        let _ = finish_before(deadline, query.reply_err("proxy malformed request"), "reject malformed proxy request").await;
+        let _ = finish_before(
+            deadline,
+            query.reply_err("proxy malformed request"),
+            "reject malformed proxy request",
+        )
+        .await;
         return;
     };
     if request.binding_id() != binding.binding_id()
         || request.binding_epoch() != binding.binding_epoch()
         || request.schema() != binding.request_schema()
     {
-        let _ = finish_before(deadline, query.reply_err("proxy route mismatch"), "reject mismatched proxy request").await;
+        let _ = finish_before(
+            deadline,
+            query.reply_err("proxy route mismatch"),
+            "reject mismatched proxy request",
+        )
+        .await;
         return;
     }
     forwarded.fetch_add(1, Ordering::SeqCst);
@@ -672,7 +677,12 @@ async fn forward_one_query(
         ) => response.ok().and_then(Result::ok),
     };
     let Some(response) = response else {
-        let _ = finish_before(deadline, query.reply_err("proxy stopped"), "reply proxy stop").await;
+        let _ = finish_before(
+            deadline,
+            query.reply_err("proxy stopped"),
+            "reply proxy stop",
+        )
+        .await;
         return;
     };
     let _ = finish_before(
@@ -769,9 +779,13 @@ async fn raw_query_once(
         Ok(Err(_)) | Err(_) => RawQueryOutcome::NoReply,
     };
     let cleanup_deadline = deadline_after(OPERATION_BUDGET);
-    finish_before(cleanup_deadline, querier.undeclare(), "undeclare raw querier")
-        .await
-        .expect("raw querier must undeclare");
+    finish_before(
+        cleanup_deadline,
+        querier.undeclare(),
+        "undeclare raw querier",
+    )
+    .await
+    .expect("raw querier must undeclare");
     outcome
 }
 
@@ -818,12 +832,7 @@ async fn expect_denied_route(
     );
 }
 
-async fn expect_local_echo(
-    fabric: &FabricService,
-    binding: &PortBinding,
-    marker: u8,
-    body: &[u8],
-) {
+async fn expect_local_echo(fabric: &FabricService, binding: &PortBinding, marker: u8, body: &[u8]) {
     let response = finish_before(
         deadline_after(OPERATION_BUDGET),
         fabric.request(
@@ -1046,12 +1055,7 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
     )
     .await
     .expect("same-CA wrong-CN S2 must complete real TLS open");
-    expect_link_event(
-        &mut link_events,
-        SampleKind::Put,
-        &wrong_client_common_name,
-    )
-    .await;
+    expect_link_event(&mut link_events, SampleKind::Put, &wrong_client_common_name).await;
     expect_denied_route(&wrong_client, SUBMIT_ROUTE, &submit, 0x57).await;
     expect_denied_route(&wrong_client, CONTROL_ROUTE, &control, 0x58).await;
     assert_eq!(proxy.admitted(), [1, 1]);
@@ -1104,5 +1108,10 @@ async fn remote_agent_proxy_gateway_forwards_exact_routes_without_a_second_fabri
 
     let (entered_sender, entered_receiver) = oneshot::channel();
     let (release_sender, release_receiver) = watch::channel(false);
-    drop((entered_sender, entered_receiver, release_sender, release_receiver));
+    drop((
+        entered_sender,
+        entered_receiver,
+        release_sender,
+        release_receiver,
+    ));
 }
