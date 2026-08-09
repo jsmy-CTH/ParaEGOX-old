@@ -64,6 +64,12 @@ const OWNER_FAILED: u8 = 5;
 const AGENT_JOURNAL_PREFIX: &str = "managed-agent-service-";
 const AGENT_JOURNAL_SUFFIX: &str = "-v1";
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ReadyPublicationTestInterlock {
+    RetireOwnerAfterFinishedProbe,
+}
+
 /// Fully resolved, already-admitted Runtime inputs for one Agent service.
 ///
 /// No constructor derives values or supplies defaults. A production caller
@@ -189,6 +195,33 @@ impl ManagedAgentAssembly {
         Self::start_resolved_provider(fabric, config, resolved).await
     }
 
+    /// Deterministically places a terminal owner state after the server-task
+    /// finished probe and before Ready publication. This crosses the real
+    /// startup-cleanup seam without exposing a production scheduling hook.
+    #[cfg(test)]
+    pub(crate) async fn start_with_terminal_ready_race_for_test(
+        fabric: ManagedFabricControlHandle,
+        execution: &ManagedAgentStackTargetExecutionV1,
+        runtime_state_root: PathBuf,
+        provider_resolver: &dyn RuntimeAgentProviderResolverV1,
+    ) -> Result<(Self, RuntimeAgentConversationHandle), ManagedAgentAssemblyError> {
+        let config = ManagedAgentAssemblyConfig::try_from_execution(execution, runtime_state_root)?;
+        let selection = config.provider;
+        let resolved = provider_resolver
+            .resolve(selection)
+            .map_err(|_| ManagedAgentAssemblyError::ProviderResolutionFailed)?;
+        if config.provider != resolved.selection() {
+            return Err(ManagedAgentAssemblyError::ProviderSelectionMismatch);
+        }
+        Self::start_with_provider(
+            fabric,
+            config,
+            resolved,
+            Some(ReadyPublicationTestInterlock::RetireOwnerAfterFinishedProbe),
+        )
+        .await
+    }
+
     /// Starts one provider only after its resolver repeats the exact signed
     /// selection it resolved. This binds the profile, provider ref,
     /// configuration digest, and optional secret ref without exposing any of
@@ -201,7 +234,14 @@ impl ManagedAgentAssembly {
         if config.provider != provider.selection() {
             return Err(ManagedAgentAssemblyError::ProviderSelectionMismatch);
         }
-        Self::start_with_provider(fabric, config, provider).await
+        Self::start_with_provider(
+            fabric,
+            config,
+            provider,
+            #[cfg(test)]
+            None,
+        )
+        .await
     }
 
     /// Starts the Agent only from the exact Ready Model generation selected by
@@ -223,13 +263,21 @@ impl ManagedAgentAssembly {
         {
             return Err(ManagedAgentAssemblyError::ProviderSelectionMismatch);
         }
-        Self::start_with_provider(fabric, config, provider).await
+        Self::start_with_provider(
+            fabric,
+            config,
+            provider,
+            #[cfg(test)]
+            None,
+        )
+        .await
     }
 
     async fn start_with_provider<P>(
         fabric: ManagedFabricControlHandle,
         config: ManagedAgentAssemblyConfig,
         provider: P,
+        #[cfg(test)] ready_publication_interlock: Option<ReadyPublicationTestInterlock>,
     ) -> Result<(Self, RuntimeAgentConversationHandle), ManagedAgentAssemblyError>
     where
         P: AgentConversationModelProvider + 'static,
@@ -323,7 +371,12 @@ impl ManagedAgentAssembly {
         }
         tokio::task::yield_now().await;
         if server.is_finished() {
-            owner_state.store(OWNER_FAILED, Ordering::Release);
+            let _ = owner_state.compare_exchange(
+                OWNER_STARTING,
+                OWNER_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             let retirement = retire_port(
                 &fabric,
                 &port,
@@ -346,7 +399,34 @@ impl ManagedAgentAssembly {
                 Err(_) => Err(ManagedAgentAssemblyError::ServerTaskFailed),
             };
         }
-        owner_state.store(OWNER_READY, Ordering::Release);
+        #[cfg(test)]
+        if matches!(
+            ready_publication_interlock,
+            Some(ReadyPublicationTestInterlock::RetireOwnerAfterFinishedProbe)
+        ) {
+            owner_state.store(OWNER_RETIRED, Ordering::Release);
+        }
+        if let Err(terminal_state) = owner_state.compare_exchange(
+            OWNER_STARTING,
+            OWNER_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            let failure = if terminal_state == OWNER_RETIRED {
+                ManagedAgentAssemblyError::ServerStoppedBeforeReady
+            } else {
+                ManagedAgentAssemblyError::ServerTaskFailed
+            };
+            cleanup_unready_server(
+                &fabric,
+                &port,
+                config.budget(ManagedServiceLifecycleStage::Drain),
+                config.budget(ManagedServiceLifecycleStage::Stop),
+                server,
+            )
+            .await?;
+            return Err(failure);
+        }
         let handle = RuntimeAgentConversationHandle {
             fabric: fabric.clone(),
             port: port.clone(),

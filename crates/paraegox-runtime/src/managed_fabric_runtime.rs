@@ -1031,7 +1031,7 @@ impl ManagedFabricRuntimeCore {
     /// Exports the exact correlated ActiveReady PXFT root only for the current
     /// recovered execution and live control generation. The historical PXFT
     /// generation is not compared with the rebuilt physical generation.
-    pub(crate) fn export_active_retained_root_v1(
+    pub(crate) async fn export_active_retained_root_v1(
         &self,
         expected_fabric_execution_digest: Digest32,
         expected_fabric_generation: ManagedServiceGeneration,
@@ -1060,10 +1060,14 @@ impl ManagedFabricRuntimeCore {
         if receipt.facts().outcome() != ManagedFabricApplyTerminalOutcomeV1::ActiveReady {
             return Err(ManagedFabricRuntimeError::InvalidDurableState);
         }
-        Ok(ManagedFabricRetainedRootExportV1 {
+        let export = ManagedFabricRetainedRootExportV1 {
             active_pxft_digest: receipt.receipt_digest(),
             fabric_generation: expected_fabric_generation,
-        })
+        };
+        control
+            .with_live_fabric(move |_| Box::pin(async move { export }))
+            .await
+            .map_err(|_| ManagedFabricRuntimeError::InvalidDurableState)
     }
 
     pub(crate) fn recovered_observation(
@@ -2815,6 +2819,59 @@ mod tests {
         (directory, core)
     }
 
+    fn agent_stack_execution(
+        fabric_execution: ManagedFabricTargetExecutionV1,
+    ) -> ManagedAgentStackTargetExecutionV1 {
+        let lifecycle_budget = BoundedDuration::from_nanos(5_000_000_000);
+        let lifecycle_budgets = ManagedServiceLifecycleBudgetsV1::try_new(
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+        )
+        .expect("Agent lifecycle budgets must be valid");
+        let agent_service =
+            ManagedServiceSpecV1::new(ManagedServiceId::from_bytes([0xa1; 16]), lifecycle_budgets);
+        let semantic_limits = ManagedAgentSemanticLimitsV1::try_new(8, 16, 16, 32)
+            .expect("signed Agent semantic limits must be valid");
+        let ingress_limits = ManagedAgentIngressLimitsV1::try_new(
+            8,
+            512 * 1024,
+            64 * 1024,
+            64 * 1024,
+            2_000_000_000,
+        )
+        .expect("signed Agent ingress limits must be valid");
+        let port_plan = ManagedAgentPortPlanV1::try_new(
+            BindingId::from_bytes([0xa2; 16]),
+            BindingId::from_bytes([0xa3; 16]),
+            "paraegox/runtime/managed-agent/test/submit",
+            "paraegox/runtime/managed-agent/test/control",
+            ingress_limits,
+        )
+        .expect("signed two-lane Agent port must be valid");
+        let provider = ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+            ManagedAgentProviderRefV1::try_from_bytes([0xa4; 16])
+                .expect("fixture provider ref must be valid"),
+            Digest32::from_bytes([0xa5; 32]),
+        )
+        .expect("fixture provider must be explicitly selected");
+        let agent_plan =
+            ManagedAgentServicePlanV1::try_new(agent_service, semantic_limits, port_plan, provider)
+                .expect("signed Agent service plan must be valid");
+        let stack_projection = ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(
+            fabric_execution.projection().clone(),
+        )
+        .expect("stack projection must preserve the Fabric projection");
+        ManagedAgentStackTargetExecutionV1::try_fabric_and_agent(
+            stack_projection,
+            fabric_execution,
+            agent_plan,
+        )
+        .expect("signed Fabric-to-Agent execution must be valid")
+    }
+
     #[tokio::test]
     async fn experimental_snapshot_handle_enforces_deadline_and_generation_before_session_access() {
         let owner_generation = ManagedServiceGeneration::try_new(1)
@@ -2902,6 +2959,7 @@ mod tests {
                 active.target_execution().execution_digest(),
                 generation_one,
             )
+            .await
             .expect("current active execution must export its correlated PXFT root");
         assert_eq!(
             retained_root.active_pxft_digest,
@@ -2914,7 +2972,8 @@ mod tests {
             core.export_active_retained_root_v1(
                 Digest32::from_bytes(wrong_execution_digest),
                 generation_one,
-            ),
+            )
+            .await,
             Err(ManagedFabricRuntimeError::ExpectedActiveExecution)
         ));
         assert!(matches!(
@@ -2922,7 +2981,8 @@ mod tests {
                 active.target_execution().execution_digest(),
                 ManagedServiceGeneration::try_new(2)
                     .expect("second managed generation must be valid"),
-            ),
+            )
+            .await,
             Err(ManagedFabricRuntimeError::ExpectedActiveExecution)
         ));
         assert!(
@@ -2969,6 +3029,58 @@ mod tests {
         core.shutdown()
             .await
             .expect("exact-zero shutdown must pass");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_retained_root_rejects_stopped_live_slot_with_durable_active_retained() {
+        let (_directory, mut core) = fresh_core(1, 3);
+        core.recover().await.expect("fresh recovery must pass");
+        let port = available_port();
+        let active = active_request(port, ExpectedActive::None);
+        let execution_digest = active.target_execution().execution_digest();
+        let response_channel = channel(&core.projection);
+        let ingress = verified(core.clock.reading().expect("clock must read"), 0xc1);
+        let ManagedFabricApplyOutcome::Committed(_) = core
+            .apply(active, ingress, response_channel)
+            .await
+            .expect("managed Fabric must become ready")
+        else {
+            panic!("first active Fabric apply must commit")
+        };
+        let control = core
+            .control_handle()
+            .expect("ready generation must expose its fence");
+        let generation = control.generation();
+        core.export_active_retained_root_v1(execution_digest, generation)
+            .await
+            .expect("live generation must initially export its retained root");
+
+        let shared = control
+            .shared
+            .upgrade()
+            .expect("durable owner must retain the test slot");
+        let live_service = {
+            let mut slot = shared.write().await;
+            assert_eq!(slot.generation, generation);
+            match std::mem::replace(&mut slot.state, ManagedFabricSlotState::Stopped) {
+                ManagedFabricSlotState::Live(service) => service,
+                _ => panic!("active durable state must retain one live physical service"),
+            }
+        };
+        live_service
+            .shutdown()
+            .await
+            .expect("test must release the physical Fabric service");
+        assert_eq!(core.snapshot.phase, ManagedFabricDurablePhase::ActiveReady);
+        assert!(core.recovery_completed);
+        assert!(matches!(
+            core.export_active_retained_root_v1(execution_digest, generation)
+                .await,
+            Err(ManagedFabricRuntimeError::InvalidDurableState)
+        ));
+        core.shutdown()
+            .await
+            .expect("stopped-slot owner cleanup must complete");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3159,6 +3271,7 @@ mod tests {
         assert_eq!(recovered_generation.value(), 2);
         let retained_root = restarted
             .export_active_retained_root_v1(fabric_execution_digest, recovered_generation)
+            .await
             .expect("restart must retain the correlated historical PXFT root");
         assert_eq!(
             retained_root.active_pxft_digest,
@@ -3268,6 +3381,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_between_finished_probe_and_ready_cas_cannot_publish_agent_owner() {
+        let (directory, mut core) = fresh_core(1, 3);
+        core.recover().await.expect("fresh recovery must pass");
+        let fabric_port = available_port();
+        let active = active_request(fabric_port, ExpectedActive::None);
+        let execution_digest = active.target_execution().execution_digest();
+        let stack_execution = agent_stack_execution(active.target_execution().clone());
+        let response_channel = channel(&core.projection);
+        let ingress = verified(core.clock.reading().expect("clock must read"), 0xcf);
+        let ManagedFabricApplyOutcome::Committed(_) = core
+            .apply(active, ingress, response_channel)
+            .await
+            .expect("managed Fabric must become ready")
+        else {
+            panic!("first active Fabric apply must commit")
+        };
+        let fabric_control = core
+            .control_handle()
+            .expect("ready Fabric generation must expose its fence");
+        let fabric_generation = fabric_control.generation();
+
+        let startup_error = match ManagedAgentAssembly::start_with_terminal_ready_race_for_test(
+            fabric_control.clone(),
+            &stack_execution,
+            directory.path().to_path_buf(),
+            &DeterministicFixtureResolver,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("terminal owner state must prevent assembly and handle publication"),
+        };
+        assert!(matches!(
+            startup_error,
+            ManagedAgentAssemblyError::ServerStoppedBeforeReady
+        ));
+        assert_eq!(
+            fabric_control
+                .binding_census()
+                .await
+                .expect("failed Agent startup must retain the live Fabric generation"),
+            0,
+            "failed publication must retire both Agent bindings exactly"
+        );
+        core.export_active_retained_root_v1(execution_digest, fabric_generation)
+            .await
+            .expect("failed Agent publication must not retire the live Fabric owner");
+        core.shutdown()
+            .await
+            .expect("test Fabric owner must stop exactly");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn managed_agent_uses_live_fabric_for_two_turns_then_retires_to_exact_zero() {
         let (directory, mut core) = fresh_core(1, 3);
         core.recover().await.expect("fresh recovery must pass");
@@ -3289,54 +3455,7 @@ mod tests {
             ManagedFabricApplyTerminalOutcomeV1::ActiveReady
         );
 
-        let lifecycle_budget = BoundedDuration::from_nanos(5_000_000_000);
-        let lifecycle_budgets = ManagedServiceLifecycleBudgetsV1::try_new(
-            lifecycle_budget,
-            lifecycle_budget,
-            lifecycle_budget,
-            lifecycle_budget,
-            lifecycle_budget,
-        )
-        .expect("Agent lifecycle budgets must be valid");
-        let agent_service =
-            ManagedServiceSpecV1::new(ManagedServiceId::from_bytes([0xa1; 16]), lifecycle_budgets);
-        let semantic_limits = ManagedAgentSemanticLimitsV1::try_new(8, 16, 16, 32)
-            .expect("signed Agent semantic limits must be valid");
-        let ingress_limits = ManagedAgentIngressLimitsV1::try_new(
-            8,
-            512 * 1024,
-            64 * 1024,
-            64 * 1024,
-            2_000_000_000,
-        )
-        .expect("signed Agent ingress limits must be valid");
-        let port_plan = ManagedAgentPortPlanV1::try_new(
-            BindingId::from_bytes([0xa2; 16]),
-            BindingId::from_bytes([0xa3; 16]),
-            "paraegox/runtime/managed-agent/test/submit",
-            "paraegox/runtime/managed-agent/test/control",
-            ingress_limits,
-        )
-        .expect("signed two-lane Agent port must be valid");
-        let provider = ManagedAgentProviderSelectionV1::try_deterministic_fixture(
-            ManagedAgentProviderRefV1::try_from_bytes([0xa4; 16])
-                .expect("fixture provider ref must be valid"),
-            Digest32::from_bytes([0xa5; 32]),
-        )
-        .expect("fixture provider must be explicitly selected");
-        let agent_plan =
-            ManagedAgentServicePlanV1::try_new(agent_service, semantic_limits, port_plan, provider)
-                .expect("signed Agent service plan must be valid");
-        let stack_projection = ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(
-            fabric_execution.projection().clone(),
-        )
-        .expect("stack projection must preserve the Fabric projection");
-        let stack_execution = ManagedAgentStackTargetExecutionV1::try_fabric_and_agent(
-            stack_projection,
-            fabric_execution,
-            agent_plan,
-        )
-        .expect("signed Fabric-to-Agent execution must be valid");
+        let stack_execution = agent_stack_execution(fabric_execution);
         let fabric_control = core
             .control_handle()
             .expect("ready Fabric generation must expose its fence");
