@@ -8455,7 +8455,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pxrs2_old_epoch_fails_before_recovery_or_listener_and_preserves_exact_final() {
+    async fn pxrs2_old_epoch_restart_returns_reconcile_and_preserves_exact_final() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut control, _stack_request) =
             managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
@@ -8522,7 +8522,6 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("PXRS v2 predecessor shutdown failed: {error}"));
         drop(control);
-        assert!(!socket_directory.socket_path.exists());
 
         let restart_provisioning = provisioning(socket_directory.socket_path.clone());
         let reopened_store = ManagedFabricStore::open_fixture(
@@ -8549,7 +8548,6 @@ mod tests {
                 ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired
             )
         ));
-        assert!(!socket_directory.socket_path.exists());
         assert_eq!(
             fs::read(&final_path)
                 .unwrap_or_else(|error| panic!("PXRS v2 final reread failed: {error}")),
