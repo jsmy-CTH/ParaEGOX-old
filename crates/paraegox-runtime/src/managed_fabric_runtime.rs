@@ -871,21 +871,67 @@ impl ManagedFabricRuntimeCore {
     /// never returned separately. OutcomeUncertain also latches before return
     /// because publication may have occurred.
     ///
-    /// Rejected and ProvenNotCommitted do not claim a commit and therefore do
-    /// not latch. The store API consumes the absent lease on every attempt;
-    /// even when it returns the candidate, retry requires reopening the store
-    /// and obtaining a fresh startup adjudication rather than recreating the
-    /// consumed lease in memory.
+    /// A structurally rejected candidate returns before the Absent slot is
+    /// consumed, so the same core may retry with its canonical initial value.
+    /// After prevalidation succeeds, the store API consumes the absent lease
+    /// on every attempt. Rejected and ProvenNotCommitted store outcomes do not
+    /// claim a commit and therefore do not latch, but retry then requires
+    /// reopening the store and obtaining a fresh startup adjudication rather
+    /// than recreating the consumed lease in memory.
     pub(crate) fn initialize_remote_agent_access_and_latch_v2(
         &mut self,
         candidate: RemoteAgentAccessSnapshotV2,
     ) -> Result<RemoteAgentAccessInitializedAbsentBundleV2, RemoteAgentAccessInitializeCommitErrorV2>
     {
+        if let Err(cause) = self.verify_remote_agent_access_initialized_absent_candidate_v2(
+            &candidate,
+            candidate.canonical_wire(),
+        ) {
+            return Err(RemoteAgentAccessCommitErrorV2::Rejected {
+                cause,
+                candidate: Box::new(candidate),
+            });
+        }
         let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
         let result = self
             .store
             .initialize_remote_agent_access_v2(absent, candidate);
         self.finish_remote_agent_access_initialization_v2(result)
+    }
+
+    /// Strictly proves the candidate is this core's canonical sequence-one
+    /// InitializedAbsent value. This check is pure and must run before the
+    /// retained Absent lease is taken or any store publication is attempted.
+    /// `RemoteAgentAccessSnapshotV2::decode` also enforces the phase-specific
+    /// expected-S1 shape: absent, generation high-water zero, revision one.
+    fn verify_remote_agent_access_initialized_absent_candidate_v2(
+        &self,
+        candidate: &RemoteAgentAccessSnapshotV2,
+        canonical_wire: &[u8],
+    ) -> Result<RemoteAgentActiveS1CasV2, ManagedFabricStoreError> {
+        let current_transition_projection_digest = transition_projection_digest(&self.projection)
+            .map_err(|_| ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch)?;
+        let current_static_identity = RemoteAgentAccessStaticIdentityPinsV2 {
+            target: self.projection.target(),
+            store_instance_id: self.store_instance_id(),
+            owner_target_fingerprint: self.owner_target_fingerprint(),
+            transition_projection_digest: current_transition_projection_digest,
+        };
+        let current_snapshot =
+            RemoteAgentAccessSnapshotV2::decode(canonical_wire, current_static_identity)
+                .map_err(|_| ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch)?;
+        if &current_snapshot != candidate
+            || current_snapshot.phase() != RemoteAgentAccessDurablePhaseV2::InitializedAbsent
+            || current_snapshot.sequence() != 1
+            || current_snapshot.previous_snapshot_digest().is_some()
+            || current_snapshot.writer_runtime_host_epoch() != self.runtime_host_epoch
+            || current_snapshot.access_generation_high_water() != 0
+            || current_snapshot.owner_slot_revision() != 1
+        {
+            return Err(ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch);
+        }
+        RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+            .map_err(|_| ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch)
     }
 
     fn take_remote_agent_access_absent_lease_v2(
@@ -919,47 +965,12 @@ impl ManagedFabricRuntimeCore {
         match result {
             Ok(same_epoch) => {
                 self.latch_remote_agent_access_s0_mutation_freeze_v2();
-                let Ok(current_transition_projection_digest) =
-                    transition_projection_digest(&self.projection)
-                else {
-                    return Err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain(
-                        ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
-                    ));
-                };
-                let current_static_identity = RemoteAgentAccessStaticIdentityPinsV2 {
-                    target: self.projection.target(),
-                    store_instance_id: self.store_instance_id(),
-                    owner_target_fingerprint: self.owner_target_fingerprint(),
-                    transition_projection_digest: current_transition_projection_digest,
-                };
-                let Ok(current_snapshot) = RemoteAgentAccessSnapshotV2::decode(
-                    same_epoch.canonical_wire(),
-                    current_static_identity,
-                ) else {
-                    return Err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain(
-                        ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
-                    ));
-                };
-                let snapshot = same_epoch.snapshot();
-                if &current_snapshot != snapshot
-                    || current_snapshot.phase()
-                        != RemoteAgentAccessDurablePhaseV2::InitializedAbsent
-                    || current_snapshot.sequence() != 1
-                    || current_snapshot.previous_snapshot_digest().is_some()
-                    || current_snapshot.writer_runtime_host_epoch() != self.runtime_host_epoch
-                    || current_snapshot.access_generation_high_water() != 0
-                    || current_snapshot.owner_slot_revision() != 1
-                {
-                    return Err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain(
-                        ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
-                    ));
-                }
-                let initial_absent_s1_cas = RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
-                    .map_err(|_| {
-                        RemoteAgentAccessCommitErrorV2::OutcomeUncertain(
-                            ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
-                        )
-                    })?;
+                let initial_absent_s1_cas = self
+                    .verify_remote_agent_access_initialized_absent_candidate_v2(
+                        same_epoch.snapshot(),
+                        same_epoch.canonical_wire(),
+                    )
+                    .map_err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain)?;
                 Ok(RemoteAgentAccessInitializedAbsentBundleV2 {
                     same_epoch,
                     target: self.projection.target(),
@@ -983,6 +994,15 @@ impl ManagedFabricRuntimeCore {
         failpoint: crate::runtime_store::RemoteAgentAccessCommitFailpointV2,
     ) -> Result<RemoteAgentAccessInitializedAbsentBundleV2, RemoteAgentAccessInitializeCommitErrorV2>
     {
+        if let Err(cause) = self.verify_remote_agent_access_initialized_absent_candidate_v2(
+            &candidate,
+            candidate.canonical_wire(),
+        ) {
+            return Err(RemoteAgentAccessCommitErrorV2::Rejected {
+                cause,
+                candidate: Box::new(candidate),
+            });
+        }
         let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
         let result = self
             .store
@@ -2785,6 +2805,7 @@ mod tests {
         RemoteAgentActiveS1CasV2, RemoteAgentRetainedS0CasFieldsV2, RemoteAgentRetainedS0CasV2,
     };
     use paraegox_runtime_contracts::wire::ApplyAuthKeyRef;
+    use sha2::{Digest as _, Sha256};
     use tokio::sync::{Barrier, RwLock};
     use tokio::time::Instant;
 
@@ -2803,6 +2824,7 @@ mod tests {
     use crate::remote_agent_access_state::{
         RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessSnapshotIdentityPinsV2,
         RemoteAgentAccessSnapshotV2, RemoteAgentAccessStaticIdentityPinsV2,
+        remote_agent_access_prepared_fixture_v2,
     };
     use crate::runtime_agent_provider::{
         RuntimeAgentProviderResolveError, RuntimeAgentProviderResolverV1,
@@ -2810,8 +2832,8 @@ mod tests {
     };
     use crate::runtime_clock::RuntimeClock;
     use crate::runtime_store::{
-        ManagedFabricStore, RemoteAgentAccessCommitErrorV2, RemoteAgentAccessCommitFailpointV2,
-        tests::managed_fabric_store_fixture,
+        ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessCommitErrorV2,
+        RemoteAgentAccessCommitFailpointV2, tests::managed_fabric_store_fixture,
     };
 
     const FIXTURE_JSON: &str =
@@ -2888,13 +2910,87 @@ mod tests {
             .find("self.latch_remote_agent_access_s0_mutation_freeze_v2();")
             .expect("exact success must latch before returning authority");
         let core_redecode = finish
-            .find("RemoteAgentAccessSnapshotV2::decode(")
+            .find("verify_remote_agent_access_initialized_absent_candidate_v2(")
             .expect("exact success must rebind named-final bytes to current core pins");
         let bundle_mint = finish
             .find("Ok(RemoteAgentAccessInitializedAbsentBundleV2 {")
             .expect("exact success must mint the one-shot bundle");
         assert!(latch < core_redecode && core_redecode < bundle_mint);
         assert!(!finish.contains("return Ok(same_epoch)"));
+    }
+
+    #[test]
+    fn initialized_absent_prevalidation_precedes_lease_take_store_write_and_latch() {
+        let source = include_str!("managed_fabric_runtime.rs");
+        let initialize_start = source
+            .find("    pub(crate) fn initialize_remote_agent_access_and_latch_v2(")
+            .expect("missing PXRS2 initializer");
+        let initialize_tail = &source[initialize_start..];
+        let initialize_end = initialize_tail
+            .find("\n    /// Strictly proves the candidate")
+            .expect("missing PXRS2 prevalidation boundary");
+        let initialize = &initialize_tail[..initialize_end];
+        let prevalidation = initialize
+            .find("verify_remote_agent_access_initialized_absent_candidate_v2(")
+            .expect("missing PXRS2 prevalidation");
+        let lease_take = initialize
+            .find("take_remote_agent_access_absent_lease_v2(candidate)")
+            .expect("missing PXRS2 Absent lease take");
+        let store_write = initialize
+            .find(".initialize_remote_agent_access_v2(absent, candidate)")
+            .expect("missing PXRS2 store initialization");
+        let finish = initialize
+            .find("finish_remote_agent_access_initialization_v2(result)")
+            .expect("missing PXRS2 post-readback binder");
+        assert!(prevalidation < lease_take && lease_take < store_write && store_write < finish);
+        assert!(!initialize[..lease_take].contains("self.store"));
+        assert!(!initialize[..lease_take].contains("latch_remote_agent_access_s0_mutation"));
+
+        let validator_start = source
+            .find("    fn verify_remote_agent_access_initialized_absent_candidate_v2(")
+            .expect("missing PXRS2 initial-only validator");
+        let validator_tail = &source[validator_start..];
+        let validator_end = validator_tail
+            .find("\n    fn take_remote_agent_access_absent_lease_v2(")
+            .expect("missing PXRS2 validator boundary");
+        let validator = &validator_tail[..validator_end];
+        for required in [
+            "transition_projection_digest(&self.projection)",
+            "target: self.projection.target()",
+            "store_instance_id: self.store_instance_id()",
+            "owner_target_fingerprint: self.owner_target_fingerprint()",
+            "RemoteAgentAccessSnapshotV2::decode(canonical_wire, current_static_identity)",
+            "&current_snapshot != candidate",
+            "RemoteAgentAccessDurablePhaseV2::InitializedAbsent",
+            "current_snapshot.sequence() != 1",
+            "current_snapshot.previous_snapshot_digest().is_some()",
+            "current_snapshot.writer_runtime_host_epoch() != self.runtime_host_epoch",
+            "current_snapshot.access_generation_high_water() != 0",
+            "current_snapshot.owner_slot_revision() != 1",
+            "RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)",
+        ] {
+            assert!(validator.contains(required), "missing validator pin: {required}");
+        }
+        assert!(!validator.contains("self.store"));
+        assert!(!validator.contains("remote_agent_access_startup_v2.take()"));
+        assert!(!validator.contains("latch_remote_agent_access_s0_mutation"));
+
+        let failpoint_start = source
+            .find("    fn initialize_remote_agent_access_and_latch_at_failpoint_v2(")
+            .expect("missing PXRS2 failpoint initializer");
+        let failpoint_tail = &source[failpoint_start..];
+        let failpoint_end = failpoint_tail
+            .find("\n    /// After the first PXAR-v7 marker")
+            .expect("missing PXRS2 failpoint boundary");
+        let failpoint = &failpoint_tail[..failpoint_end];
+        assert!(
+            failpoint
+                .find("verify_remote_agent_access_initialized_absent_candidate_v2(")
+                .expect("failpoint path bypasses initial-only prevalidation")
+                < failpoint
+                    .find("take_remote_agent_access_absent_lease_v2(candidate)")
+                    .expect("failpoint path lost the Absent lease take")
+        );
     }
 
     struct DeterministicFixtureResolver;
@@ -3140,6 +3236,86 @@ mod tests {
         .unwrap_or_else(|error| panic!("initial PXRS2 fixture rejected: {error}"))
     }
 
+    fn remote_agent_access_noninitial_sequence_one_candidate_v2(
+        core: &ManagedFabricRuntimeCore,
+    ) -> RemoteAgentAccessSnapshotV2 {
+        const FLAGS_OFFSET: usize = 12;
+        const SEQUENCE_OFFSET: usize = 42;
+        const OWNER_TARGET_FINGERPRINT_OFFSET: usize = 290;
+        const TRANSITION_PROJECTION_DIGEST_OFFSET: usize = 322;
+        const PREVIOUS_SNAPSHOT_DIGEST_OFFSET: usize = 386;
+        const DIGEST_BYTES: usize = 32;
+        const SNAPSHOT_DIGEST_DOMAIN: &[u8] =
+            b"paraegox.runtime.remote-agent-access-snapshot.sha256.v2";
+
+        let (_, prepared, fixture_static_identity, fixture_runtime_host_epoch) =
+            remote_agent_access_prepared_fixture_v2();
+        assert_eq!(
+            prepared.snapshot().phase(),
+            RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+        );
+        assert_eq!(prepared.snapshot().sequence(), 2);
+        assert!(prepared.snapshot().previous_snapshot_digest().is_some());
+        assert_eq!(fixture_static_identity.target, core.projection.target());
+        assert_eq!(
+            fixture_static_identity.store_instance_id,
+            core.store_instance_id()
+        );
+        assert_eq!(fixture_runtime_host_epoch, core.runtime_host_epoch);
+
+        let mut wire = prepared.canonical_wire().to_vec();
+        assert_eq!(&wire[..4], b"PXRS");
+        assert_eq!(u16::from_be_bytes([wire[4], wire[5]]), 2);
+        assert_eq!(u16::from_be_bytes([wire[6], wire[7]]), 1_314);
+
+        let flags = u16::from_be_bytes([wire[FLAGS_OFFSET], wire[FLAGS_OFFSET + 1]]);
+        assert_ne!(flags & 1, 0);
+        wire[FLAGS_OFFSET..FLAGS_OFFSET + 2].copy_from_slice(&(flags & !1).to_be_bytes());
+        wire[SEQUENCE_OFFSET..SEQUENCE_OFFSET + 8].copy_from_slice(&1_u64.to_be_bytes());
+        wire[OWNER_TARGET_FINGERPRINT_OFFSET..OWNER_TARGET_FINGERPRINT_OFFSET + DIGEST_BYTES]
+            .copy_from_slice(core.owner_target_fingerprint().as_bytes());
+        let transition_projection_digest = transition_projection_digest(&core.projection)
+            .expect("PXRS2 transition projection digest must build");
+        wire[TRANSITION_PROJECTION_DIGEST_OFFSET
+            ..TRANSITION_PROJECTION_DIGEST_OFFSET + DIGEST_BYTES]
+            .copy_from_slice(transition_projection_digest.as_bytes());
+        wire[PREVIOUS_SNAPSHOT_DIGEST_OFFSET
+            ..PREVIOUS_SNAPSHOT_DIGEST_OFFSET + DIGEST_BYTES]
+            .fill(0);
+
+        let digest_offset = wire
+            .len()
+            .checked_sub(DIGEST_BYTES)
+            .expect("PXRS2 fixture must contain its digest");
+        let mut hasher = Sha256::new();
+        hasher.update(SNAPSHOT_DIGEST_DOMAIN);
+        hasher.update((digest_offset as u64).to_be_bytes());
+        hasher.update(&wire[..digest_offset]);
+        let digest: [u8; DIGEST_BYTES] = hasher.finalize().into();
+        wire[digest_offset..].copy_from_slice(&digest);
+
+        let candidate = RemoteAgentAccessSnapshotV2::decode(
+            &wire,
+            remote_agent_access_static_identity_v2(&core.projection),
+        )
+        .unwrap_or_else(|error| {
+            panic!("canonical non-initial sequence-one PXRS2 rejected: {error}")
+        });
+        assert_eq!(
+            candidate.phase(),
+            RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+        );
+        assert_eq!(candidate.sequence(), 1);
+        assert_eq!(candidate.previous_snapshot_digest(), None);
+        assert_eq!(
+            candidate.writer_runtime_host_epoch(),
+            core.runtime_host_epoch
+        );
+        assert_eq!(candidate.access_generation_high_water(), 0);
+        assert_eq!(candidate.owner_slot_revision(), 1);
+        candidate
+    }
+
     fn retain_remote_agent_access_absent_startup_v2(core: &mut ManagedFabricRuntimeCore) {
         core.store
             .initialize_managed_agent_stack(
@@ -3150,6 +3326,44 @@ mod tests {
         core.adjudicate_remote_agent_access_after_first_stack_marker_v2()
             .unwrap_or_else(|error| panic!("absent PXRS2 startup rejected: {error}"));
         assert!(!core.remote_agent_access_s0_mutation_frozen_v2());
+    }
+
+    #[test]
+    fn noninitial_sequence_one_is_rejected_before_store_write_without_burning_absent_lease() {
+        let (_, _, _, fixture_runtime_host_epoch) = remote_agent_access_prepared_fixture_v2();
+        let (directory, mut core) = fresh_core(fixture_runtime_host_epoch, 3);
+        retain_remote_agent_access_absent_startup_v2(&mut core);
+        let candidate = remote_agent_access_noninitial_sequence_one_candidate_v2(&core);
+
+        let rejected = core.initialize_remote_agent_access_and_latch_v2(candidate);
+        assert!(matches!(
+            rejected,
+            Err(RemoteAgentAccessCommitErrorV2::Rejected {
+                cause: ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
+                ..
+            })
+        ));
+        assert!(matches!(
+            core.remote_agent_access_startup_v2.as_ref(),
+            Some(crate::runtime_store::RemoteAgentAccessStartupSlotV2::Absent(_))
+        ));
+        assert!(!core.remote_agent_access_s0_mutation_frozen_v2());
+        let final_path = directory.path().join("remote-agent-access.snapshot-v2");
+        assert!(!final_path.exists());
+
+        let valid = remote_agent_access_initial_snapshot_v2(
+            &core.projection,
+            fixture_runtime_host_epoch,
+        );
+        let committed = core
+            .initialize_remote_agent_access_and_latch_v2(valid)
+            .expect("retained Absent lease must permit exact legal initialization");
+        assert_eq!(
+            committed.committed_snapshot().phase(),
+            RemoteAgentAccessDurablePhaseV2::InitializedAbsent
+        );
+        assert!(final_path.exists());
+        assert!(core.remote_agent_access_s0_mutation_frozen_v2());
     }
 
     #[test]
