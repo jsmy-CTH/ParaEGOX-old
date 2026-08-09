@@ -39,12 +39,12 @@ use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 use crate::admission::{
     ED25519_ALGORITHM, ED25519_ALGORITHM_VERSION, VerifiedManagedAgentStackApplyIngressV1,
 };
+#[cfg(test)]
+use crate::managed_agent_runtime::LiveConversationPortExportTestInterlockV1;
 use crate::managed_agent_runtime::{
     ManagedAgentAssembly, ManagedAgentAssemblyConfig, ManagedAgentAssemblyError,
     RuntimeAgentConversationHandle,
 };
-#[cfg(test)]
-use crate::managed_agent_runtime::LiveConversationPortExportTestInterlockV1;
 use crate::managed_agent_stack_state::{
     ManagedAgentStackDurableActive, ManagedAgentStackDurablePending, ManagedAgentStackDurablePhase,
     ManagedAgentStackPendingKind, ManagedAgentStackReplayRecord,
@@ -180,10 +180,8 @@ impl RuntimeAgentHandleBroker {
             .read()
             .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)?;
         Ok(guard.as_ref().is_some_and(|published| {
-            Arc::ptr_eq(
-                &published.publication_identity,
-                &claim.publication_identity,
-            ) && published.committed_receipt_wire.as_ref() == committed_receipt_wire
+            Arc::ptr_eq(&published.publication_identity, &claim.publication_identity)
+                && published.committed_receipt_wire.as_ref() == committed_receipt_wire
         }))
     }
 
@@ -259,11 +257,9 @@ impl RuntimeAgentHandleBroker {
         *self
             .inner
             .write()
-            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? =
-            Some(PublishedRuntimeAgentHandle::new(
-                handle,
-                receipt.canonical_wire(),
-            ));
+            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? = Some(
+            PublishedRuntimeAgentHandle::new(handle, receipt.canonical_wire()),
+        );
         Ok(())
     }
 
@@ -278,11 +274,9 @@ impl RuntimeAgentHandleBroker {
         *self
             .inner
             .write()
-            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? =
-            Some(PublishedRuntimeAgentHandle::new(
-                handle,
-                receipt.canonical_wire(),
-            ));
+            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? = Some(
+            PublishedRuntimeAgentHandle::new(handle, receipt.canonical_wire()),
+        );
         Ok(())
     }
 
@@ -338,11 +332,9 @@ impl RuntimeAgentHandleBroker {
         *self
             .inner
             .write()
-            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? =
-            Some(PublishedRuntimeAgentHandle::new(
-                handle,
-                receipt.canonical_wire(),
-            ));
+            .map_err(|_| ManagedAgentStackRuntimeError::HandleBrokerUnavailable)? = Some(
+            PublishedRuntimeAgentHandle::new(handle, receipt.canonical_wire()),
+        );
         Ok(())
     }
 
@@ -554,8 +546,10 @@ impl ManagedAgentStackRuntimeCore {
     /// live PXAP facts without accepting a caller-selected PXST or PXRS value.
     pub(crate) async fn export_current_conversation_port_v2(
         &self,
-    ) -> Result<RuntimeAgentCurrentConversationPortExportV2, RuntimeAgentConversationPortExportErrorV1>
-    {
+    ) -> Result<
+        RuntimeAgentCurrentConversationPortExportV2,
+        RuntimeAgentConversationPortExportErrorV1,
+    > {
         self.export_current_conversation_port_inner_v2(
             None,
             #[cfg(test)]
@@ -568,8 +562,10 @@ impl ManagedAgentStackRuntimeCore {
     async fn export_current_conversation_port_with_interlock_v2(
         &self,
         interlock: &LiveConversationPortExportTestInterlockV1,
-    ) -> Result<RuntimeAgentCurrentConversationPortExportV2, RuntimeAgentConversationPortExportErrorV1>
-    {
+    ) -> Result<
+        RuntimeAgentCurrentConversationPortExportV2,
+        RuntimeAgentConversationPortExportErrorV1,
+    > {
         self.export_current_conversation_port_inner_v2(None, Some(interlock))
             .await
     }
@@ -578,8 +574,10 @@ impl ManagedAgentStackRuntimeCore {
         &self,
         expected_active_pxst_digest: Option<Digest32>,
         #[cfg(test)] interlock: Option<&LiveConversationPortExportTestInterlockV1>,
-    ) -> Result<RuntimeAgentCurrentConversationPortExportV2, RuntimeAgentConversationPortExportErrorV1>
-    {
+    ) -> Result<
+        RuntimeAgentCurrentConversationPortExportV2,
+        RuntimeAgentConversationPortExportErrorV1,
+    > {
         if !self.recovery_completed
             || self.snapshot.phase != ManagedAgentStackDurablePhase::ActiveReady
         {
@@ -604,8 +602,7 @@ impl ManagedAgentStackRuntimeCore {
         if receipt.facts().state().outcome() != ManagedAgentStackTerminalOutcomeV1::ActiveReady {
             return Err(RuntimeAgentConversationPortExportErrorV1::InternalInvariant);
         }
-        if expected_active_pxst_digest
-            .is_some_and(|expected| receipt.receipt_digest() != expected)
+        if expected_active_pxst_digest.is_some_and(|expected| receipt.receipt_digest() != expected)
         {
             return Err(RuntimeAgentConversationPortExportErrorV1::ExpectedActiveReceiptMismatch);
         }
@@ -1995,8 +1992,7 @@ mod provider_resolver_tests {
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
     use paraegox_kernel::time::BoundedDuration;
     use paraegox_runtime_contracts::apply::{
-        PlanWriterRef, RuntimeApplyControl, TenureAuthorityRef, TenureKeyRef,
-        TenureProofAlgorithm,
+        PlanWriterRef, RuntimeApplyControl, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
     };
     use paraegox_runtime_contracts::assignment::BindingId;
     use paraegox_runtime_contracts::managed_agent_stack_plan::{
@@ -2103,10 +2099,8 @@ mod provider_resolver_tests {
             .find('"')
             .map(|offset| field_start + offset)
             .unwrap_or_else(|| panic!("unterminated managed Fabric request fixture"));
-        ManagedFabricApplyRequestV1::decode(&decode_hex(
-            &FABRIC_FIXTURE[field_start..field_end],
-        ))
-        .unwrap_or_else(|error| panic!("managed Fabric request fixture must decode: {error}"))
+        ManagedFabricApplyRequestV1::decode(&decode_hex(&FABRIC_FIXTURE[field_start..field_end]))
+            .unwrap_or_else(|error| panic!("managed Fabric request fixture must decode: {error}"))
     }
 
     fn available_port() -> u16 {
@@ -2117,9 +2111,7 @@ mod provider_resolver_tests {
             .port()
     }
 
-    fn long_temporal(
-        basis: &ManagedFabricApplyRequestV1,
-    ) -> ApplyTemporalConstraint {
+    fn long_temporal(basis: &ManagedFabricApplyRequestV1) -> ApplyTemporalConstraint {
         let budget = BoundedDuration::from_nanos(60_000_000_000);
         ApplyTemporalConstraint::try_new(
             basis.temporal().constraint_id(),
@@ -2295,9 +2287,7 @@ mod provider_resolver_tests {
         .unwrap_or_else(|error| panic!("admission policy rejected: {error}"))
     }
 
-    fn response_channel(
-        target: RuntimeHostId,
-    ) -> ReferenceChannelBindingV1 {
+    fn response_channel(target: RuntimeHostId) -> ReferenceChannelBindingV1 {
         ReferenceChannelBindingV1::try_new(
             target,
             PrincipalRef::from_bytes([0xe1; 16]),
@@ -2331,11 +2321,9 @@ mod provider_resolver_tests {
 
     async fn live_current_agent_fixture() -> LiveCurrentAgentFixture {
         let basis = fabric_basis_request();
-        let endpoint = ManagedFabricListenEndpointV1::try_new(&format!(
-            "tcp/127.0.0.1:{}",
-            available_port()
-        ))
-        .unwrap_or_else(|error| panic!("ephemeral Fabric endpoint rejected: {error}"));
+        let endpoint =
+            ManagedFabricListenEndpointV1::try_new(&format!("tcp/127.0.0.1:{}", available_port()))
+                .unwrap_or_else(|error| panic!("ephemeral Fabric endpoint rejected: {error}"));
         let fabric_execution = ManagedFabricTargetExecutionV1::try_one_managed_fabric_service(
             basis.target_execution().projection().clone(),
             basis
@@ -2354,11 +2342,8 @@ mod provider_resolver_tests {
         let projection = basis.target_execution().projection().clone();
         let projection_digest = transition_projection_digest(&projection)
             .unwrap_or_else(|error| panic!("Fabric projection digest failed: {error}"));
-        let (directory, store) = managed_fabric_store_fixture(
-            STORE_BYTE,
-            TARGET_FINGERPRINT_BYTE,
-            projection_digest,
-        );
+        let (directory, store) =
+            managed_fabric_store_fixture(STORE_BYTE, TARGET_FINGERPRINT_BYTE, projection_digest);
         let clock = RuntimeClock::new(
             fabric_request.temporal().target_clock_domain(),
             fabric_request.temporal().target_clock_generation(),
@@ -2581,7 +2566,12 @@ mod provider_resolver_tests {
             fixture.receipt.receipt_digest()
         );
         assert_eq!(current.live_port().physical_binding_census, 2);
-        assert!(current.live_port().descriptor_wire.starts_with(b"PXAP\0\x01"));
+        assert!(
+            current
+                .live_port()
+                .descriptor_wire
+                .starts_with(b"PXAP\0\x01")
+        );
 
         let observation_completed = Arc::new(Barrier::new(2));
         let broker_mutation_completed = Arc::new(Barrier::new(2));
