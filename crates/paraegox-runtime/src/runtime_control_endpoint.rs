@@ -5809,6 +5809,10 @@ mod tests {
             ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
             ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
         },
+        remote_agent_data_plane_plan::{
+            RemoteAgentActiveS1CasV2, RemoteAgentRetainedS0CasFieldsV2,
+            RemoteAgentRetainedS0CasV2,
+        },
         managed_service::{
             ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleBudgetsV1,
             ManagedServiceSpecV1,
@@ -5842,6 +5846,9 @@ mod tests {
     };
     use crate::runtime_agent_provider::{
         RuntimeAgentProviderResolveError, RuntimeResolvedAgentProviderV1,
+    };
+    use crate::remote_agent_access_state::{
+        RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
     };
     use crate::runtime_control_state::runtime_reference_apply::{
         RuntimeEmptyRetireOwnerPlan, RuntimeOneSourceOwnerPlan, RuntimeReferenceApplyStoreError,
@@ -8446,6 +8453,113 @@ mod tests {
         drop(restarted_control);
         drop(listener_b);
         drop(guard_b);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pxrs2_old_epoch_fails_before_recovery_or_listener_and_preserves_exact_final() {
+        let socket_directory = TestSocketDirectory::create();
+        let (state_directory, mut control, _stack_request) =
+            managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
+        let projection = control.stack_projection.managed_fabric_projection().clone();
+        let projection_digest = transition_projection_digest(&projection)
+            .unwrap_or_else(|error| panic!("PXRS v2 projection digest failed: {error}"));
+        let writer_runtime_host_epoch = control.core.runtime_host_epoch();
+        let snapshot = RemoteAgentAccessSnapshotV2::try_initialize_absent(
+            RemoteAgentAccessSnapshotIdentityPinsV2 {
+                target: TARGET,
+                store_instance_id: STORE_INSTANCE_ID,
+                owner_target_fingerprint: control.core.owner_target_fingerprint(),
+                transition_projection_digest: projection_digest,
+                lower_capability_projection_digest: digest(0xd7),
+            },
+            writer_runtime_host_epoch,
+            RemoteAgentRetainedS0CasV2::try_new(RemoteAgentRetainedS0CasFieldsV2 {
+                expected_active_pxft_digest: digest(0xd8),
+                expected_active_pxst_digest: digest(0xd9),
+                expected_descriptor_evidence_record_digest: digest(0xda),
+                expected_descriptor_evidence_record_sequence: 1,
+                expected_descriptor_receipt_digest: digest(0xdb),
+                expected_descriptor_payload_digest: digest(0xdc),
+                expected_fabric_session_epoch:
+                    DistributedFabricSessionEpochV1::try_from_bytes([0xdd; 16]).unwrap_or_else(
+                        |error| panic!("PXRS v2 Fabric session epoch rejected: {error}"),
+                    ),
+                expected_fabric_generation: ManagedServiceGeneration::try_new(1)
+                    .unwrap_or_else(|error| panic!("PXRS v2 Fabric generation rejected: {error}")),
+                expected_agent_generation: ManagedServiceGeneration::try_new(1)
+                    .unwrap_or_else(|error| panic!("PXRS v2 Agent generation rejected: {error}")),
+            })
+            .unwrap_or_else(|error| panic!("PXRS v2 retained-S0 CAS rejected: {error}")),
+            RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                .unwrap_or_else(|error| panic!("PXRS v2 absent-S1 CAS rejected: {error}")),
+            1,
+            2,
+        )
+        .unwrap_or_else(|error| panic!("PXRS v2 sequence-one snapshot rejected: {error}"));
+        let final_path = state_directory
+            .path()
+            .join("remote-agent-access.snapshot-v2");
+        fs::write(&final_path, snapshot.canonical_wire())
+            .unwrap_or_else(|error| panic!("PXRS v2 final write failed: {error}"));
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|error| panic!("PXRS v2 final chmod failed: {error}"));
+        File::open(&final_path)
+            .and_then(|file| file.sync_all())
+            .unwrap_or_else(|error| panic!("PXRS v2 final sync failed: {error}"));
+        File::open(state_directory.path())
+            .and_then(|directory| directory.sync_all())
+            .unwrap_or_else(|error| panic!("PXRS v2 directory sync failed: {error}"));
+        let expected_wire = fs::read(&final_path)
+            .unwrap_or_else(|error| panic!("PXRS v2 final read failed: {error}"));
+        let expected_metadata = fs::metadata(&final_path)
+            .unwrap_or_else(|error| panic!("PXRS v2 final metadata failed: {error}"));
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("PXRS v2 predecessor shutdown failed: {error}"));
+        drop(control);
+        assert!(!socket_directory.socket_path.exists());
+
+        let restart_provisioning = provisioning(socket_directory.socket_path.clone());
+        let reopened_store = ManagedFabricStore::open_fixture(
+            state_directory.path(),
+            STORE_INSTANCE_ID,
+            restart_provisioning.owner_target_fingerprint(),
+            projection_digest,
+        )
+        .unwrap_or_else(|error| panic!("PXRS v2 restart store reopen failed: {error}"));
+        let restart_error = match StartedManagedFabricService::try_start_from_store(
+            state_directory.path(),
+            STORE_INSTANCE_ID,
+            compiled_facts(),
+            restart_provisioning,
+            reopened_store,
+            deterministic_fixture_service_dependencies(),
+        ) {
+            Ok(_) => panic!("old-epoch PXRS v2 unexpectedly restarted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            restart_error,
+            RuntimeBootstrapEndpointError::ManagedFabric(
+                ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired
+            )
+        ));
+        assert!(!socket_directory.socket_path.exists());
+        assert_eq!(
+            fs::read(&final_path)
+                .unwrap_or_else(|error| panic!("PXRS v2 final reread failed: {error}")),
+            expected_wire,
+        );
+        let actual_metadata = fs::metadata(&final_path)
+            .unwrap_or_else(|error| panic!("PXRS v2 final re-metadata failed: {error}"));
+        assert_eq!(actual_metadata.dev(), expected_metadata.dev());
+        assert_eq!(actual_metadata.ino(), expected_metadata.ino());
     }
 
     struct MockStore {
