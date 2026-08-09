@@ -3038,6 +3038,7 @@ impl RemoteAgentDataPlaneTargetExecutionV2 {
             || profile.target() != projection.target()
             || predecessor.fabric().listen_endpoint()
                 != Some(profile.base_loopback_listen_endpoint())
+            || expected_s1_cas.owner_slot_revision() == u64::MAX
             || matches!(
                 (mode, expected_s1_cas.active()),
                 (
@@ -3610,6 +3611,7 @@ pub enum RemoteAgentDataPlaneTerminalPhaseV2 {
 pub enum RemoteAgentDataPlaneTerminalOutcomeV2 {
     ActiveReady = 1,
     LocalOnlyReady = 2,
+    /// Rejected after all CAS checks but before any effect; CAS mismatch has no PXAU v2.
     NoEffectRejected = 3,
     Uncertain = 4,
     Quarantined = 5,
@@ -3831,14 +3833,6 @@ impl RemoteAgentDataPlaneTerminalEvidenceV2 {
             || (fields.s1_acl_ready && !fields.s1_tls_ready)
             || (fields.s1_listener_released && !fields.s1_closed)
             || (fields.s1_closed && (fields.s1_tls_ready || fields.s1_acl_ready))
-        {
-            return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
-        }
-        let before_zero = digest_is_zero(fields.retained_s0_census_before_digest);
-        let after_zero = digest_is_zero(fields.retained_s0_census_after_digest);
-        if !before_zero
-            && !after_zero
-            && fields.retained_s0_census_before_digest != fields.retained_s0_census_after_digest
         {
             return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
         }
@@ -4354,6 +4348,37 @@ fn validate_terminal_facts_shape_v2(
         && fields.submit_terminalized_count == 0
         && fields.control_admitted_count == 0
         && fields.control_terminalized_count == 0;
+    let exact_s1_ready_shape = facts.state.access_generation().is_some()
+        && facts.state.proxy_session_epoch().is_some()
+        && fields.s1_tls_ready
+        && fields.s1_acl_ready
+        && fields.queryable_declared_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+        && !fields.s1_closed
+        && !fields.s1_listener_released;
+    let exact_s1_absent_shape = facts.state.access_generation().is_none()
+        && facts.state.proxy_session_epoch().is_none()
+        && !fields.s1_tls_ready
+        && !fields.s1_acl_ready
+        && fields.s1_closed
+        && fields.s1_listener_released;
+    let unresolved_s1_observation_consistent = match fields.remote_observation {
+        RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady => exact_s1_ready_shape,
+        RemoteAgentDataPlaneRemoteObservationV2::S1Absent => exact_s1_absent_shape,
+        RemoteAgentDataPlaneRemoteObservationV2::Unknown => {
+            !fields.s1_tls_ready
+                && !fields.s1_acl_ready
+                && !fields.s1_closed
+                && !fields.s1_listener_released
+        }
+        RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting => {
+            !exact_s1_ready_shape && !exact_s1_absent_shape
+        }
+    };
+    let drain_proof_consistent = fields.drain_outcome != RemoteAgentDataPlaneDrainOutcomeV2::Drained
+        || (fields.ingress_fenced_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+            && fields.worker_joined_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
+            && fields.submit_admitted_count == fields.submit_terminalized_count
+            && fields.control_admitted_count == fields.control_terminalized_count);
     use RemoteAgentDataPlaneTerminalOutcomeV2::{
         ActiveReady, LocalOnlyReady, NoEffectRejected, Quarantined, Uncertain,
     };
@@ -4397,6 +4422,8 @@ fn validate_terminal_facts_shape_v2(
         }
         NoEffectRejected => {
             no_admitted_work
+                && (!fields.retained_s0_ready
+                    || (current_s0_cas_known && exact_retained_census))
                 && fields.ingress_fenced_bitmap == 0
                 && fields.worker_joined_bitmap == 0
                 && fields.drain_outcome == RemoteAgentDataPlaneDrainOutcomeV2::NotStarted
@@ -4433,21 +4460,15 @@ fn validate_terminal_facts_shape_v2(
         }
         Uncertain => {
             !fields.quarantined
-                && fields.drain_outcome != RemoteAgentDataPlaneDrainOutcomeV2::Drained
-                && matches!(
-                    fields.remote_observation,
-                    RemoteAgentDataPlaneRemoteObservationV2::Unknown
-                        | RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting
-                )
+                && !fields.retained_s0_ready
+                && unresolved_s1_observation_consistent
+                && drain_proof_consistent
         }
         Quarantined => {
             fields.quarantined
-                && fields.drain_outcome != RemoteAgentDataPlaneDrainOutcomeV2::Drained
-                && matches!(
-                    fields.remote_observation,
-                    RemoteAgentDataPlaneRemoteObservationV2::Unknown
-                        | RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting
-                )
+                && !fields.retained_s0_ready
+                && unresolved_s1_observation_consistent
+                && drain_proof_consistent
         }
     };
     if !valid {
@@ -4491,13 +4512,13 @@ fn validate_terminal_facts_against_execution_v2(
     let expected_s1 = execution.expected_s1_cas();
     let prior_high_water = expected_s1.access_generation_high_water();
     let prior_slot_revision = expected_s1.owner_slot_revision();
+    let next_high_water = prior_high_water.checked_add(1);
+    let next_slot_revision = prior_slot_revision.checked_add(1);
     use RemoteAgentDataPlaneTerminalOutcomeV2::{
         ActiveReady, LocalOnlyReady, NoEffectRejected, Quarantined, Uncertain,
     };
     let valid = match state.outcome() {
         ActiveReady => {
-            let next_high_water = prior_high_water.checked_add(1);
-            let next_slot_revision = prior_slot_revision.checked_add(1);
             execution.mode() == RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive
                 && expected_s1.active().is_none()
                 && next_high_water == Some(fields.access_generation_high_water)
@@ -4520,37 +4541,67 @@ fn validate_terminal_facts_against_execution_v2(
         NoEffectRejected => {
             fields.access_generation_high_water == prior_high_water
                 && fields.completion_owner_slot_revision == prior_slot_revision
-                && match fields.remote_observation {
-                    RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady => {
-                        expected_s1.active().is_some_and(|active| {
-                            state.access_generation() == Some(active.active_access_generation)
-                                && state.proxy_session_epoch()
-                                    == Some(active.active_proxy_session_epoch)
-                        })
+                && match (execution.mode(), expected_s1.active()) {
+                    (RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive, None) => {
+                        state.access_generation().is_none()
+                            && state.proxy_session_epoch().is_none()
+                            && matches!(
+                                fields.remote_observation,
+                                RemoteAgentDataPlaneRemoteObservationV2::S1Absent
+                                    | RemoteAgentDataPlaneRemoteObservationV2::Unknown
+                            )
                     }
-                    RemoteAgentDataPlaneRemoteObservationV2::S1Absent => {
-                        state.access_generation().is_none() && state.proxy_session_epoch().is_none()
+                    (
+                        RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate,
+                        Some(active),
+                    ) => {
+                        state.access_generation() == Some(active.active_access_generation)
+                            && state.proxy_session_epoch()
+                                == Some(active.active_proxy_session_epoch)
+                            && matches!(
+                                fields.remote_observation,
+                                RemoteAgentDataPlaneRemoteObservationV2::S1TlsExactRoutesReady
+                                    | RemoteAgentDataPlaneRemoteObservationV2::Unknown
+                            )
                     }
-                    RemoteAgentDataPlaneRemoteObservationV2::Unknown => {
-                        match (state.access_generation(), expected_s1.active()) {
-                            (None, _) => true,
-                            (Some(actual), Some(expected)) => {
-                                actual == expected.active_access_generation
-                                    && state.proxy_session_epoch()
-                                        == Some(expected.active_proxy_session_epoch)
-                            }
-                            (Some(_), None) => false,
-                        }
-                    }
-                    RemoteAgentDataPlaneRemoteObservationV2::PartialOrConflicting => false,
+                    _ => false,
                 }
         }
         Uncertain | Quarantined => {
-            fields.access_generation_high_water >= prior_high_water
-                && fields.completion_owner_slot_revision >= prior_slot_revision
-                && state
-                    .access_generation()
-                    .is_none_or(|value| value.value() == fields.access_generation_high_water)
+            let revision_valid = fields.completion_owner_slot_revision == prior_slot_revision
+                || next_slot_revision == Some(fields.completion_owner_slot_revision);
+            revision_valid
+                && match (execution.mode(), expected_s1.active()) {
+                    (RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive, None) => {
+                        match state.access_generation() {
+                            None => {
+                                state.proxy_session_epoch().is_none()
+                                    && fields.access_generation_high_water == prior_high_water
+                            }
+                            Some(generation) => {
+                                next_high_water == Some(generation.value())
+                                    && next_high_water
+                                        == Some(fields.access_generation_high_water)
+                                    && state.proxy_session_epoch().is_some()
+                            }
+                        }
+                    }
+                    (
+                        RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate,
+                        Some(active),
+                    ) => {
+                        fields.access_generation_high_water == prior_high_water
+                            && match state.access_generation() {
+                                None => state.proxy_session_epoch().is_none(),
+                                Some(generation) => {
+                                    generation == active.active_access_generation
+                                        && state.proxy_session_epoch()
+                                            == Some(active.active_proxy_session_epoch)
+                                }
+                            }
+                    }
+                    _ => false,
+                }
         }
     };
     if !valid {
