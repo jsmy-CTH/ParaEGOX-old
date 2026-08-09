@@ -29,9 +29,9 @@ use paraegox_runtime_contracts::{
     managed_service::ManagedServiceGeneration,
     remote_agent_access::{
         ControllerAuthenticatedRemoteAgentAccessRequestV1,
-        ControllerAuthenticatedRemoteAgentAccessRequestV2, MAX_REMOTE_AGENT_ACCESS_REQUEST_BYTES,
-        MAX_REMOTE_AGENT_ACCESS_REQUEST_V2_BYTES, RemoteAgentAccessKindV1, RemoteAgentAccessKindV2,
-        RemoteAgentAccessRequestV1, RemoteAgentAccessRequestV2,
+        MAX_REMOTE_AGENT_ACCESS_REQUEST_BYTES, MAX_REMOTE_AGENT_ACCESS_REQUEST_V2_BYTES,
+        RemoteAgentAccessKindV1, RemoteAgentAccessKindV2, RemoteAgentAccessRequestV1,
+        RemoteAgentAccessRequestV2,
     },
     remote_agent_data_plane_plan::{
         MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES,
@@ -50,7 +50,9 @@ use paraegox_runtime_contracts::{
 use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::{
-    admission::VerifiedRemoteAgentDataPlaneApplyIngressV1,
+    admission::{
+        VerifiedRemoteAgentAccessApplyIngressV2, VerifiedRemoteAgentDataPlaneApplyIngressV1,
+    },
     managed_agent_stack_state::{
         MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES, ManagedAgentStackDurablePhase,
         ManagedAgentStackSnapshot, ManagedAgentStackStateError,
@@ -1855,7 +1857,7 @@ pub(crate) struct RemoteAgentPendingAccessSnapshotV2 {
 }
 
 /// Non-cloneable D1 typestate. Its only input is a future D2 current-final
-/// marker plus the composite inner+outer Controller authentication marker.
+/// marker plus the complete Runtime-private PXAR11 admission marker.
 pub(crate) struct RemoteAgentAuthorizedTransitionV2 {
     snapshot: RemoteAgentAccessSnapshotV2,
 }
@@ -2474,18 +2476,13 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
     /// has no state write and PXAU v2 has no producer input on that path.
     pub(crate) fn try_authorize_fresh(
         self,
-        authenticated_request: ControllerAuthenticatedRemoteAgentAccessRequestV2<'_>,
-        fresh_clock: ClockReading,
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'_>,
         durable_replay_checked: RemoteAgentDurableReplayCheckedV2,
     ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
         self.validate_marker()?;
         let current = self.snapshot;
-        let request = authenticated_request.request();
-        let fresh = bind_fresh_request_v2(
-            authenticated_request,
-            self.current_runtime_host_epoch,
-            fresh_clock,
-        )?;
+        let fresh = bind_fresh_request_v2(verified_ingress, self.current_runtime_host_epoch)?;
+        let request = fresh.request;
         if request.kind() != RemoteAgentAccessKindV2::ApplyRemoteAccess
             || request.target() != current.identity.target
             || request.expected_runtime_store_instance_id() != current.identity.store_instance_id
@@ -2984,17 +2981,13 @@ fn validate_fresh_replay_fence_v2(
 }
 
 fn bind_fresh_request_v2<'request>(
-    authenticated_request: ControllerAuthenticatedRemoteAgentAccessRequestV2<'request>,
+    verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request>,
     current_runtime_host_epoch: u64,
-    fresh_clock: ClockReading,
 ) -> Result<RemoteAgentFreshAccessRequestV2<'request>, RemoteAgentAccessStateErrorV2> {
-    if authenticated_request.kind() != RemoteAgentAccessKindV2::ApplyRemoteAccess {
-        return Err(RemoteAgentAccessStateErrorV2::NotApplyRequest);
-    }
-    let request = authenticated_request.request();
+    let request = verified_ingress.request();
     let inner = inner_request_v2(request)?;
     let temporal = inner.temporal();
-    let admitted_at_nanos = fresh_clock.now().value();
+    let admitted_at_nanos = verified_ingress.admitted_at_nanos();
     let operation_timeout = inner.target_execution().profile().operation_timeout_nanos();
     if current_runtime_host_epoch == 0
         || request.expected_runtime_host_epoch() != current_runtime_host_epoch
@@ -3003,16 +2996,29 @@ fn bind_fresh_request_v2<'request>(
             != inner.expected_runtime_store_instance_id()
         || request.retained_s0_cas() != inner.target_execution().retained_s0_cas()
         || request.expected_s1_cas() != inner.target_execution().expected_s1_cas()
-        || temporal.target_clock_domain() != fresh_clock.domain()
-        || temporal.target_clock_generation() != fresh_clock.generation()
         || admitted_at_nanos == 0
         || temporal.remaining_budget().value() < operation_timeout
     {
         return Err(RemoteAgentAccessStateErrorV2::InvalidFreshRequest);
     }
     let admission = derive_admission_facts_v2(request, admitted_at_nanos)?;
-    if admitted_at_nanos >= admission.absolute_deadline_nanos {
-        return Err(RemoteAgentAccessStateErrorV2::DeadlineExpired);
+    let verified_admission = RemoteAgentAccessAdmissionFactsV2 {
+        clock_domain: verified_ingress.clock_domain(),
+        clock_generation: verified_ingress.clock_generation(),
+        admitted_at_nanos,
+        absolute_deadline_nanos: verified_ingress.deadline_nanos(),
+        outer_request_digest: verified_ingress.outer_request_digest(),
+        outer_auth_transcript_digest: verified_ingress.outer_auth_transcript_digest(),
+        inner_request_digest: verified_ingress.inner_request_digest(),
+        inner_envelope_request_digest: verified_ingress.inner_envelope_request_digest(),
+        inner_proof_envelope_digest: verified_ingress.proof_envelope_digest(),
+        tenure_nonce_identity: verified_ingress.tenure_nonce_identity(),
+        request_nonce_identity: verified_ingress.request_nonce_identity(),
+        temporal_lineage_identity: verified_ingress.temporal_lineage_identity(),
+        carrier_binding_digest: verified_ingress.carrier_binding_digest(),
+    };
+    if admission != verified_admission {
+        return Err(RemoteAgentAccessStateErrorV2::InvalidFreshRequest);
     }
     Ok(RemoteAgentFreshAccessRequestV2 { request, admission })
 }
@@ -4409,8 +4415,8 @@ mod tests {
     use crate::{
         admission::{
             AdmissionStateLimits, ApplyAdmissionPolicy, ED25519_ALGORITHM,
-            ED25519_ALGORITHM_VERSION, TrustedApplyIdentity, TrustedApplyKey,
-            TrustedTenureIdentity, TrustedTenureKey,
+            ED25519_ALGORITHM_VERSION, ManagedFabricApplyAdmissionError, TrustedApplyIdentity,
+            TrustedApplyKey, TrustedTenureIdentity, TrustedTenureKey,
         },
         managed_agent_stack_state::{
             ManagedAgentStackDurableActive, ManagedAgentStackSnapshot,
@@ -6651,7 +6657,9 @@ mod tests {
         use super::*;
         use paraegox_runtime_contracts::{
             apply::{PlanWriterContext, WriterTenureProof},
+            reference_control::ed25519_control_key_fingerprint,
             remote_agent_access::{
+                ControllerAuthenticatedRemoteAgentAccessRequestV2,
                 RemoteAgentAccessRequestDraftV2, RemoteAgentAccessRequestFieldsV2,
                 RemoteAgentAccessRequestIdV2,
             },
@@ -6670,8 +6678,6 @@ mod tests {
             include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
         const ACCESS_V2_FIXTURE: &str =
             include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v2.json");
-        const ACTIVE_INNER_SIGNATURE_V2: [u8; 64] = [0xa4; 64];
-        const ACTIVE_OUTER_SIGNATURE_V2: [u8; 64] = [0xa5; 64];
         const TERMINAL_SIGNATURE_V2: [u8; 64] = [0xa6; 64];
         const ACTIVE_PROXY_SESSION_EPOCH_V2: [u8; 16] = [0xa7; 16];
         const OBSERVED_RESOURCE_CENSUS_V2: Digest32 = Digest32::from_bytes([0xa8; 32]);
@@ -6719,6 +6725,103 @@ mod tests {
             let section = fixture_tail_after(fixture, section);
             let item = fixture_tail_after(section, item);
             fixture_hex_after(item, "", "\"wire_hex\"")
+        }
+
+        fn controller_carrier_v2(
+            template: &RestrictedRuntimeApplyCarrierBindingV1,
+        ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+            let controller_key = SigningKey::from_bytes(&INNER_SIGNING_SEED).verifying_key();
+            RestrictedRuntimeApplyCarrierBindingV1::try_new(
+                RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                    target: template.target(),
+                    runtime_principal: template.runtime_principal(),
+                    controller_principal: template.controller_principal(),
+                    endpoint_ref: template.endpoint_ref(),
+                    endpoint_generation: template.endpoint_generation(),
+                    route: template.route(),
+                    controller_request_key: template.controller_request_key(),
+                    controller_request_key_fingerprint: ed25519_control_key_fingerprint(
+                        controller_key.as_bytes(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("Controller request key fingerprint rejected: {error}")
+                    }),
+                    runtime_response_key: template.runtime_response_key(),
+                    runtime_response_key_fingerprint: template.runtime_response_key_fingerprint(),
+                    control_transport_profile_ref: template.control_transport_profile_ref(),
+                    control_transport_profile_digest: template.control_transport_profile_digest(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("Controller carrier rejected: {error}"))
+        }
+
+        fn signed_tenure_proof_v2(
+            template: &WriterTenureProof,
+            nonce: &[u8],
+        ) -> WriterTenureProof {
+            let unsigned = WriterTenureProof::try_new(
+                template.authority(),
+                template.claim(),
+                nonce,
+                &[0; 64],
+            )
+            .unwrap_or_else(|error| panic!("unsigned tenure proof rejected: {error}"));
+            let transcript = unsigned
+                .signing_transcript()
+                .unwrap_or_else(|error| panic!("tenure transcript rejected: {error}"));
+            let signature = SigningKey::from_bytes(&TENURE_SIGNING_SEED)
+                .sign(transcript.as_bytes())
+                .to_bytes();
+            WriterTenureProof::try_new(
+                template.authority(),
+                template.claim(),
+                nonce,
+                &signature,
+            )
+            .unwrap_or_else(|error| panic!("signed tenure proof rejected: {error}"))
+        }
+
+        fn signed_control_v2(
+            template: &RuntimeApplyControl,
+            operation_id: ApplyOperationId,
+            tenure_nonce: &[u8],
+        ) -> RuntimeApplyControl {
+            let writer_template = template.writer_context();
+            let writer = PlanWriterContext::try_new(
+                writer_template.writer(),
+                writer_template.epoch(),
+                signed_tenure_proof_v2(writer_template.proof(), tenure_nonce),
+            )
+            .unwrap_or_else(|error| panic!("signed writer context rejected: {error}"));
+            RuntimeApplyControl::new(writer, template.expected_active(), operation_id)
+        }
+
+        fn finalize_inner_v2(
+            draft: RemoteAgentDataPlaneApplyRequestDraftV2,
+        ) -> RemoteAgentDataPlaneApplyRequestV2 {
+            let transcript = draft
+                .signing_transcript()
+                .unwrap_or_else(|error| panic!("PXAR v11 transcript rejected: {error}"));
+            let signature = SigningKey::from_bytes(&INNER_SIGNING_SEED)
+                .sign(transcript.as_bytes())
+                .to_bytes();
+            draft
+                .finalize(&signature)
+                .unwrap_or_else(|error| panic!("signed PXAR v11 rejected: {error}"))
+        }
+
+        fn finalize_outer_v2(
+            draft: RemoteAgentAccessRequestDraftV2,
+        ) -> RemoteAgentAccessRequestV2 {
+            let transcript = draft
+                .signing_transcript()
+                .unwrap_or_else(|error| panic!("PXRA v2 transcript rejected: {error}"));
+            let signature = SigningKey::from_bytes(&INNER_SIGNING_SEED)
+                .sign(transcript.as_bytes())
+                .to_bytes();
+            draft
+                .finalize(&signature)
+                .unwrap_or_else(|error| panic!("signed PXRA v2 rejected: {error}"))
         }
 
         fn active_inner_request_v2() -> RemoteAgentDataPlaneApplyRequestV2 {
@@ -6806,35 +6909,45 @@ mod tests {
                 execution_template.profile().clone(),
             )
             .unwrap_or_else(|error| panic!("rebuilt Active PXTE v10 rejected: {error}"));
-            let inner = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
-                execution,
-                inner_template.provenance(),
-                inner_template.control_commitment().control().clone(),
-                temporal.unwrap_or_else(|| inner_template.temporal()),
-                inner_template.expected_runtime_store_instance_id(),
-                inner_template.authentication().claim().clone(),
-            )
-            .unwrap_or_else(|error| panic!("rebuilt Active PXAR v11 draft rejected: {error}"))
-            .finalize(&ACTIVE_INNER_SIGNATURE_V2)
-            .unwrap_or_else(|error| panic!("rebuilt Active PXAR v11 rejected: {error}"));
+            let control_template = inner_template.control_commitment().control();
+            let inner = finalize_inner_v2(
+                RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+                    execution,
+                    inner_template.provenance(),
+                    signed_control_v2(
+                        control_template,
+                        control_template.operation_id(),
+                        control_template.writer_context().proof().nonce(),
+                    ),
+                    temporal.unwrap_or_else(|| inner_template.temporal()),
+                    inner_template.expected_runtime_store_instance_id(),
+                    inner_template.authentication().claim().clone(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("rebuilt Active PXAR v11 draft rejected: {error}")
+                }),
+            );
             let outer_template = outer_request_template_v2();
-            RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
-                RemoteAgentAccessRequestFieldsV2 {
-                    request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
-                        *inner.operation_id().as_bytes(),
-                    )
-                    .unwrap_or_else(|error| panic!("PXRA v2 request id rejected: {error}")),
-                    carrier: outer_template.carrier().clone(),
-                    target: inner.target(),
-                    expected_runtime_store_instance_id: inner.expected_runtime_store_instance_id(),
-                    expected_runtime_host_epoch,
-                    auth_claim: outer_template.authentication().claim().clone(),
-                },
-                inner,
+            finalize_outer_v2(
+                RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+                    RemoteAgentAccessRequestFieldsV2 {
+                        request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
+                            *inner.operation_id().as_bytes(),
+                        )
+                        .unwrap_or_else(|error| panic!("PXRA v2 request id rejected: {error}")),
+                        carrier: controller_carrier_v2(outer_template.carrier()),
+                        target: inner.target(),
+                        expected_runtime_store_instance_id: inner
+                            .expected_runtime_store_instance_id(),
+                        expected_runtime_host_epoch,
+                        auth_claim: outer_template.authentication().claim().clone(),
+                    },
+                    inner,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("rebuilt Active PXRA v2 draft rejected: {error}")
+                }),
             )
-            .unwrap_or_else(|error| panic!("rebuilt Active PXRA v2 draft rejected: {error}"))
-            .finalize(&ACTIVE_OUTER_SIGNATURE_V2)
-            .unwrap_or_else(|error| panic!("rebuilt Active PXRA v2 rejected: {error}"))
         }
 
         fn active_request_v2() -> RemoteAgentAccessRequestV2 {
@@ -6864,55 +6977,45 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("fresh Active PXTE v10 rejected: {error}"));
             let control_template = template.control_commitment().control();
-            let writer_template = control_template.writer_context();
-            let proof_template = writer_template.proof();
-            let proof = WriterTenureProof::try_new(
-                proof_template.authority(),
-                proof_template.claim(),
-                tenure_nonce,
-                &[0x7a; 64],
-            )
-            .unwrap_or_else(|error| panic!("fresh Active tenure proof rejected: {error}"));
-            let writer = PlanWriterContext::try_new(
-                writer_template.writer(),
-                writer_template.epoch(),
-                proof,
-            )
-            .unwrap_or_else(|error| panic!("fresh Active writer context rejected: {error}"));
-            let control =
-                RuntimeApplyControl::new(writer, control_template.expected_active(), operation_id);
-            let inner = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
-                execution,
-                template.provenance(),
-                control,
-                template.temporal(),
-                template.expected_runtime_store_instance_id(),
-                auth_claim_with_nonce_v2(template.authentication().claim(), request_nonce),
-            )
-            .unwrap_or_else(|error| panic!("fresh Active PXAR v11 draft rejected: {error}"))
-            .finalize(&[0x7b; 64])
-            .unwrap_or_else(|error| panic!("fresh Active PXAR v11 rejected: {error}"));
+            let inner = finalize_inner_v2(
+                RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+                    execution,
+                    template.provenance(),
+                    signed_control_v2(control_template, operation_id, tenure_nonce),
+                    template.temporal(),
+                    template.expected_runtime_store_instance_id(),
+                    auth_claim_with_nonce_v2(template.authentication().claim(), request_nonce),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("fresh Active PXAR v11 draft rejected: {error}")
+                }),
+            );
             let outer_template = outer_request_template_v2();
-            RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
-                RemoteAgentAccessRequestFieldsV2 {
-                    request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
-                        *inner.operation_id().as_bytes(),
-                    )
-                    .unwrap_or_else(|error| panic!("fresh Active request id rejected: {error}")),
-                    carrier: outer_template.carrier().clone(),
-                    target: inner.target(),
-                    expected_runtime_store_instance_id: inner.expected_runtime_store_instance_id(),
-                    expected_runtime_host_epoch: RUNTIME_EPOCH,
-                    auth_claim: auth_claim_with_nonce_v2(
-                        outer_template.authentication().claim(),
-                        outer_nonce,
-                    ),
-                },
-                inner,
+            finalize_outer_v2(
+                RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+                    RemoteAgentAccessRequestFieldsV2 {
+                        request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
+                            *inner.operation_id().as_bytes(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("fresh Active request id rejected: {error}")
+                        }),
+                        carrier: controller_carrier_v2(outer_template.carrier()),
+                        target: inner.target(),
+                        expected_runtime_store_instance_id: inner
+                            .expected_runtime_store_instance_id(),
+                        expected_runtime_host_epoch: RUNTIME_EPOCH,
+                        auth_claim: auth_claim_with_nonce_v2(
+                            outer_template.authentication().claim(),
+                            outer_nonce,
+                        ),
+                    },
+                    inner,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("fresh Active PXRA v2 draft rejected: {error}")
+                }),
             )
-            .unwrap_or_else(|error| panic!("fresh Active PXRA v2 draft rejected: {error}"))
-            .finalize(&[0x7c; 64])
-            .unwrap_or_else(|error| panic!("fresh Active PXRA v2 rejected: {error}"))
         }
 
         fn auth_claim_with_nonce_v2(
@@ -6947,55 +7050,45 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("rebuilt Local PXTE v10 rejected: {error}"));
             let control_template = template.control_commitment().control();
-            let writer_template = control_template.writer_context();
-            let proof_template = writer_template.proof();
-            let proof = WriterTenureProof::try_new(
-                proof_template.authority(),
-                proof_template.claim(),
-                tenure_nonce,
-                &[0x72; 64],
-            )
-            .unwrap_or_else(|error| panic!("fresh Local tenure proof rejected: {error}"));
-            let writer = PlanWriterContext::try_new(
-                writer_template.writer(),
-                writer_template.epoch(),
-                proof,
-            )
-            .unwrap_or_else(|error| panic!("fresh Local writer context rejected: {error}"));
-            let control =
-                RuntimeApplyControl::new(writer, control_template.expected_active(), operation_id);
-            let inner = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
-                execution,
-                template.provenance(),
-                control,
-                template.temporal(),
-                template.expected_runtime_store_instance_id(),
-                auth_claim_with_nonce_v2(template.authentication().claim(), request_nonce),
-            )
-            .unwrap_or_else(|error| panic!("rebuilt Local PXAR v11 draft rejected: {error}"))
-            .finalize(&[0x75; 64])
-            .unwrap_or_else(|error| panic!("rebuilt Local PXAR v11 rejected: {error}"));
+            let inner = finalize_inner_v2(
+                RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+                    execution,
+                    template.provenance(),
+                    signed_control_v2(control_template, operation_id, tenure_nonce),
+                    template.temporal(),
+                    template.expected_runtime_store_instance_id(),
+                    auth_claim_with_nonce_v2(template.authentication().claim(), request_nonce),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("rebuilt Local PXAR v11 draft rejected: {error}")
+                }),
+            );
             let outer_template = outer_request_template_v2();
-            RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
-                RemoteAgentAccessRequestFieldsV2 {
-                    request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
-                        *inner.operation_id().as_bytes(),
-                    )
-                    .unwrap_or_else(|error| panic!("Local PXRA v2 request id rejected: {error}")),
-                    carrier: outer_template.carrier().clone(),
-                    target: inner.target(),
-                    expected_runtime_store_instance_id: inner.expected_runtime_store_instance_id(),
-                    expected_runtime_host_epoch: RUNTIME_EPOCH,
-                    auth_claim: auth_claim_with_nonce_v2(
-                        outer_template.authentication().claim(),
-                        outer_nonce,
-                    ),
-                },
-                inner,
+            finalize_outer_v2(
+                RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+                    RemoteAgentAccessRequestFieldsV2 {
+                        request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
+                            *inner.operation_id().as_bytes(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("Local PXRA v2 request id rejected: {error}")
+                        }),
+                        carrier: controller_carrier_v2(outer_template.carrier()),
+                        target: inner.target(),
+                        expected_runtime_store_instance_id: inner
+                            .expected_runtime_store_instance_id(),
+                        expected_runtime_host_epoch: RUNTIME_EPOCH,
+                        auth_claim: auth_claim_with_nonce_v2(
+                            outer_template.authentication().claim(),
+                            outer_nonce,
+                        ),
+                    },
+                    inner,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("rebuilt Local PXRA v2 draft rejected: {error}")
+                }),
             )
-            .unwrap_or_else(|error| panic!("rebuilt Local PXRA v2 draft rejected: {error}"))
-            .finalize(&[0x77; 64])
-            .unwrap_or_else(|error| panic!("rebuilt Local PXRA v2 rejected: {error}"))
         }
 
         fn fresh_local_request_v2(
@@ -7023,13 +7116,101 @@ mod tests {
         fn authenticate_request_v2(
             request: &RemoteAgentAccessRequestV2,
         ) -> ControllerAuthenticatedRemoteAgentAccessRequestV2<'_> {
+            let carrier = request.carrier();
             request
                 .verify_controller_apply_request(
-                    request.carrier(),
-                    |_, _, _, _, _, _| true,
-                    |_, _, _, _, _| true,
+                    carrier,
+                    |principal, key, algorithm, version, transcript, signature| {
+                        principal == carrier.controller_principal()
+                            && key == carrier.controller_request_key()
+                            && algorithm.value() == ED25519_ALGORITHM
+                            && version == ED25519_ALGORITHM_VERSION
+                            && signature
+                                == SigningKey::from_bytes(&INNER_SIGNING_SEED)
+                                    .sign(transcript)
+                                    .to_bytes()
+                    },
+                    |principal, key, fingerprint, transcript, signature| {
+                        principal == carrier.controller_principal()
+                            && key == carrier.controller_request_key()
+                            && fingerprint == carrier.controller_request_key_fingerprint()
+                            && signature
+                                == SigningKey::from_bytes(&INNER_SIGNING_SEED)
+                                    .sign(transcript)
+                                    .to_bytes()
+                    },
                 )
-                .unwrap_or_else(|error| panic!("composite PXRA v2 auth rejected: {error}"))
+                .unwrap_or_else(|error| panic!("real composite PXRA v2 auth rejected: {error}"))
+        }
+
+        fn admission_policy_v2(request: &RemoteAgentAccessRequestV2) -> ApplyAdmissionPolicy {
+            let inner = inner_request_v2(request)
+                .unwrap_or_else(|error| panic!("PXRA v2 inner request rejected: {error}"));
+            let control = inner.control_commitment().control();
+            let writer = control.writer_context();
+            let proof = writer.proof();
+            let proof_authority = proof.authority();
+            let claim = inner.authentication().claim();
+            let tenure_key = TrustedTenureKey::try_new(
+                TrustedTenureIdentity::new(
+                    inner.provenance().source_scope(),
+                    PrincipalRef::from_bytes([0x06; 16]),
+                    1_001,
+                    1_002,
+                    proof_authority.authority(),
+                ),
+                proof_authority.key(),
+                proof_authority.algorithm(),
+                proof_authority.algorithm_version(),
+                SigningKey::from_bytes(&TENURE_SIGNING_SEED)
+                    .verifying_key()
+                    .to_bytes(),
+            )
+            .unwrap_or_else(|error| panic!("PXAR v11 tenure trust rejected: {error}"));
+            let apply_key = TrustedApplyKey::try_new(
+                TrustedApplyIdentity::new(
+                    inner.provenance().source_scope(),
+                    inner.target(),
+                    claim.principal(),
+                    writer.writer(),
+                ),
+                claim.key(),
+                claim.algorithm(),
+                claim.algorithm_version(),
+                SigningKey::from_bytes(&INNER_SIGNING_SEED)
+                    .verifying_key()
+                    .to_bytes(),
+            )
+            .unwrap_or_else(|error| panic!("PXAR v11 Apply trust rejected: {error}"));
+            ApplyAdmissionPolicy::try_new(
+                BoundedDuration::from_nanos(inner.temporal().original_budget().value()),
+                AdmissionStateLimits::try_new(4, 4, 4)
+                    .unwrap_or_else(|error| panic!("PXAR v11 admission limits rejected: {error}")),
+                [tenure_key],
+                [apply_key],
+            )
+            .unwrap_or_else(|error| panic!("PXAR v11 admission policy rejected: {error}"))
+        }
+
+        fn verified_ingress_v2<'request>(
+            request: &'request RemoteAgentAccessRequestV2,
+            clock: ClockReading,
+        ) -> Result<VerifiedRemoteAgentAccessApplyIngressV2<'request>, RemoteAgentAccessStateErrorV2>
+        {
+            admission_policy_v2(request)
+                .verify_remote_agent_access_apply_ingress_v2(
+                    authenticate_request_v2(request),
+                    request.carrier(),
+                    clock,
+                )
+                .map_err(|error| match error {
+                    ManagedFabricApplyAdmissionError::DeadlineOverflow
+                        if clock.now().value() != 0 =>
+                    {
+                        RemoteAgentAccessStateErrorV2::DeadlineOverflow
+                    }
+                    _ => RemoteAgentAccessStateErrorV2::InvalidFreshRequest,
+                })
         }
 
         #[derive(Clone, Copy)]
@@ -7093,21 +7274,18 @@ mod tests {
             seen_request_nonce_identities: &[Digest32],
             mutate: impl FnOnce(&mut CurrentFinalFactsV2),
         ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
+            let verified_ingress = verified_ingress_v2(request, clock)?;
             let durable_replay_checked =
                 RemoteAgentDurableReplayCheckedV2::from_durable_replay_ledger_for_test(
                     &snapshot,
                     request,
-                    clock.now().value(),
+                    verified_ingress.admitted_at_nanos(),
                     seen_operation_ids,
                     seen_tenure_nonce_identities,
                     seen_request_nonce_identities,
                 )?;
             let current = current_final_v2(snapshot, mutate)?;
-            current.try_authorize_fresh(
-                authenticate_request_v2(request),
-                clock,
-                durable_replay_checked,
-            )
+            current.try_authorize_fresh(verified_ingress, durable_replay_checked)
         }
 
         fn readback_pending_v2(
@@ -8145,6 +8323,86 @@ mod tests {
                     |_| {},
                 ),
                 Err(RemoteAgentAccessStateErrorV2::CasMismatch)
+            ));
+        }
+
+        #[test]
+        fn pxrs2_public_outer_marker_and_raw_clock_cannot_bypass_private_apply_admission() {
+            let source = include_str!("remote_agent_access_state.rs");
+            let signature_start = source
+                .find("pub(crate) fn try_authorize_fresh(")
+                .unwrap_or_else(|| panic!("PXRS2 fresh authority entrypoint must exist"));
+            let signature_tail = &source[signature_start..];
+            let signature_end = signature_tail
+                .find(") -> Result<RemoteAgentPendingAccessSnapshotV2")
+                .unwrap_or_else(|| panic!("PXRS2 fresh authority signature must terminate"));
+            let signature = &signature_tail[..signature_end];
+            assert!(signature.contains("VerifiedRemoteAgentAccessApplyIngressV2<'_>"));
+            assert!(signature.contains("RemoteAgentDurableReplayCheckedV2"));
+            assert!(!signature.contains("ControllerAuthenticatedRemoteAgentAccessRequestV2"));
+            assert!(!signature.contains("ClockReading"));
+
+            let historical = outer_request_template_v2();
+            let public_outer = historical
+                .verify_controller_apply_request(
+                    historical.carrier(),
+                    |_, _, _, _, _, _| true,
+                    |_, _, _, _, _| true,
+                )
+                .unwrap_or_else(|error| panic!("public outer marker rejected: {error}"));
+            let reading = clock_for_request_v2(&historical, 1);
+            assert!(
+                admission_policy_v2(&historical)
+                    .verify_remote_agent_access_apply_ingress_v2(
+                        public_outer,
+                        historical.carrier(),
+                        reading,
+                    )
+                    .is_err(),
+                "a public composite marker and raw caller clock must not mint Runtime admission",
+            );
+        }
+
+        #[test]
+        fn pxrs2_real_apply_admission_facts_equal_state_framing_before_pending() {
+            let request = active_request_v2();
+            let clock = clock_for_request_v2(&request, 9);
+            let marker = verified_ingress_v2(&request, clock)
+                .unwrap_or_else(|error| panic!("real PXAR11 admission rejected: {error}"));
+            let expected = derive_admission_facts_v2(&request, clock.now().value())
+                .unwrap_or_else(|error| panic!("state admission framing rejected: {error}"));
+            let fresh = bind_fresh_request_v2(marker, RUNTIME_EPOCH)
+                .unwrap_or_else(|error| panic!("exact admission/state pairing rejected: {error}"));
+            assert_eq!(fresh.request, &request);
+            assert_eq!(fresh.admission, expected);
+
+            let other_request = rebuilt_active_request_with_identities_v2(
+                RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                    .unwrap_or_else(|error| panic!("initial absent S1 CAS rejected: {error}")),
+                ApplyOperationId::from_bytes([0xe3; 16]),
+                &[0xe4; 16],
+                &[0xe5; 16],
+                &[0xe6; 16],
+            );
+            let other_clock = clock_for_request_v2(&other_request, 9);
+            let other_marker = verified_ingress_v2(&other_request, other_clock)
+                .unwrap_or_else(|error| panic!("other PXAR11 admission rejected: {error}"));
+            let initial = initial_snapshot_v2();
+            let mismatched_replay =
+                RemoteAgentDurableReplayCheckedV2::from_durable_replay_ledger_for_test(
+                    &initial,
+                    &request,
+                    clock.now().value(),
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap_or_else(|error| panic!("durable replay marker rejected: {error}"));
+            assert!(matches!(
+                current_final_v2(initial, |_| {}).and_then(|current| {
+                    current.try_authorize_fresh(other_marker, mismatched_replay)
+                }),
+                Err(RemoteAgentAccessStateErrorV2::InvalidReplayAuthority)
             ));
         }
 
