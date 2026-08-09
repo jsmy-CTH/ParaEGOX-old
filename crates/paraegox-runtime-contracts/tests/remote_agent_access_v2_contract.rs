@@ -690,9 +690,15 @@ fn outer_apply_enforces_inner_temporal_budget_clock_and_outcome_boundaries() {
     let active_terminal = active_inner_terminal();
     let active_temporal = active.temporal();
     let active_evidence = active_terminal.facts().evidence().fields();
-    let operation_timeout = active.target_execution().profile().operation_timeout_nanos();
+    let operation_timeout = active
+        .target_execution()
+        .profile()
+        .operation_timeout_nanos();
 
-    assert_eq!(active_temporal.original_budget().value(), ORIGINAL_BUDGET_NANOS);
+    assert_eq!(
+        active_temporal.original_budget().value(),
+        ORIGINAL_BUDGET_NANOS
+    );
     assert_eq!(
         active_temporal.remaining_budget().value(),
         FORWARDED_BUDGET_NANOS
@@ -804,9 +810,8 @@ fn outer_apply_enforces_inner_temporal_budget_clock_and_outcome_boundaries() {
     );
 
     let mut later_generation_wire = active_terminal.canonical_wire().to_vec();
-    later_generation_wire[SELECTION_GENERATION_OFFSET..ADMITTED_AT_OFFSET].copy_from_slice(
-        &(active_evidence.selection_clock_generation.value() + 1).to_be_bytes(),
-    );
+    later_generation_wire[SELECTION_GENERATION_OFFSET..ADMITTED_AT_OFFSET]
+        .copy_from_slice(&(active_evidence.selection_clock_generation.value() + 1).to_be_bytes());
     let later_generation = RemoteAgentDataPlaneTerminalReceiptV2::decode(&later_generation_wire)
         .expect("later-generation terminal remains structurally canonical");
     assert!(later_generation.validate_against_request(&active).is_err());
@@ -875,8 +880,7 @@ fn outer_apply_enforces_inner_temporal_budget_clock_and_outcome_boundaries() {
         .expect("LocalOnlyReady cleanup may complete after its admission deadline");
 
     let local_carrier = carrier_for(&local, &local_terminal);
-    let local_outer_request =
-        apply_access_request(&local, &local_terminal, local_carrier.clone());
+    let local_outer_request = apply_access_request(&local, &local_terminal, local_carrier.clone());
     let local_inner_controller_transcript = local.signing_transcript().unwrap();
     let local_outer_controller_transcript = local_outer_request.signing_transcript().unwrap();
     local_outer_request

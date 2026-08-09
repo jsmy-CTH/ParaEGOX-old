@@ -1156,14 +1156,11 @@ fn pxau2_deadline_is_single_admission_derived_and_s0_identity_cannot_drift() {
 
     let mut selected_at_admission = valid;
     selected_at_admission.selection_observed_at_nanos = valid.admitted_at_nanos;
-    let selected_at_admission_receipt = terminal_draft(
-        &request,
-        active_ready_state(),
-        selected_at_admission,
-    )
-    .expect("PXAU v2 draft selected exactly at admission")
-    .finalize(&[0xe1; 64])
-    .expect("PXAU v2 selected exactly at admission");
+    let selected_at_admission_receipt =
+        terminal_draft(&request, active_ready_state(), selected_at_admission)
+            .expect("PXAU v2 draft selected exactly at admission")
+            .finalize(&[0xe1; 64])
+            .expect("PXAU v2 selected exactly at admission");
     let selected_at_admission_decoded = RemoteAgentDataPlaneTerminalReceiptV2::decode(
         selected_at_admission_receipt.canonical_wire(),
     )
