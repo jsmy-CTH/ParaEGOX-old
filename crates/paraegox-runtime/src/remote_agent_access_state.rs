@@ -28,10 +28,9 @@ use paraegox_runtime_contracts::{
     managed_fabric_plan::ManagedFabricApplyTerminalOutcomeV1,
     managed_service::ManagedServiceGeneration,
     remote_agent_access::{
-        ControllerAuthenticatedRemoteAgentAccessRequestV1,
-        MAX_REMOTE_AGENT_ACCESS_REQUEST_BYTES, MAX_REMOTE_AGENT_ACCESS_REQUEST_V2_BYTES,
-        RemoteAgentAccessKindV1, RemoteAgentAccessKindV2, RemoteAgentAccessRequestV1,
-        RemoteAgentAccessRequestV2,
+        ControllerAuthenticatedRemoteAgentAccessRequestV1, MAX_REMOTE_AGENT_ACCESS_REQUEST_BYTES,
+        MAX_REMOTE_AGENT_ACCESS_REQUEST_V2_BYTES, RemoteAgentAccessKindV1, RemoteAgentAccessKindV2,
+        RemoteAgentAccessRequestV1, RemoteAgentAccessRequestV2,
     },
     remote_agent_data_plane_plan::{
         MAX_CANONICAL_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES,
@@ -6659,9 +6658,8 @@ mod tests {
             apply::{PlanWriterContext, WriterTenureProof},
             reference_control::ed25519_control_key_fingerprint,
             remote_agent_access::{
-                ControllerAuthenticatedRemoteAgentAccessRequestV2,
-                RemoteAgentAccessRequestDraftV2, RemoteAgentAccessRequestFieldsV2,
-                RemoteAgentAccessRequestIdV2,
+                ControllerAuthenticatedRemoteAgentAccessRequestV2, RemoteAgentAccessRequestDraftV2,
+                RemoteAgentAccessRequestFieldsV2, RemoteAgentAccessRequestIdV2,
             },
             remote_agent_data_plane_plan::{
                 RemoteAgentDataPlaneApplyRequestDraftV2, RemoteAgentDataPlaneTargetExecutionV2,
@@ -6755,30 +6753,18 @@ mod tests {
             .unwrap_or_else(|error| panic!("Controller carrier rejected: {error}"))
         }
 
-        fn signed_tenure_proof_v2(
-            template: &WriterTenureProof,
-            nonce: &[u8],
-        ) -> WriterTenureProof {
-            let unsigned = WriterTenureProof::try_new(
-                template.authority(),
-                template.claim(),
-                nonce,
-                &[0; 64],
-            )
-            .unwrap_or_else(|error| panic!("unsigned tenure proof rejected: {error}"));
+        fn signed_tenure_proof_v2(template: &WriterTenureProof, nonce: &[u8]) -> WriterTenureProof {
+            let unsigned =
+                WriterTenureProof::try_new(template.authority(), template.claim(), nonce, &[0; 64])
+                    .unwrap_or_else(|error| panic!("unsigned tenure proof rejected: {error}"));
             let transcript = unsigned
                 .signing_transcript()
                 .unwrap_or_else(|error| panic!("tenure transcript rejected: {error}"));
             let signature = SigningKey::from_bytes(&TENURE_SIGNING_SEED)
                 .sign(transcript.as_bytes())
                 .to_bytes();
-            WriterTenureProof::try_new(
-                template.authority(),
-                template.claim(),
-                nonce,
-                &signature,
-            )
-            .unwrap_or_else(|error| panic!("signed tenure proof rejected: {error}"))
+            WriterTenureProof::try_new(template.authority(), template.claim(), nonce, &signature)
+                .unwrap_or_else(|error| panic!("signed tenure proof rejected: {error}"))
         }
 
         fn signed_control_v2(
@@ -6810,9 +6796,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("signed PXAR v11 rejected: {error}"))
         }
 
-        fn finalize_outer_v2(
-            draft: RemoteAgentAccessRequestDraftV2,
-        ) -> RemoteAgentAccessRequestV2 {
+        fn finalize_outer_v2(draft: RemoteAgentAccessRequestDraftV2) -> RemoteAgentAccessRequestV2 {
             let transcript = draft
                 .signing_transcript()
                 .unwrap_or_else(|error| panic!("PXRA v2 transcript rejected: {error}"));
@@ -6923,9 +6907,7 @@ mod tests {
                     inner_template.expected_runtime_store_instance_id(),
                     inner_template.authentication().claim().clone(),
                 )
-                .unwrap_or_else(|error| {
-                    panic!("rebuilt Active PXAR v11 draft rejected: {error}")
-                }),
+                .unwrap_or_else(|error| panic!("rebuilt Active PXAR v11 draft rejected: {error}")),
             );
             let outer_template = outer_request_template_v2();
             finalize_outer_v2(
@@ -6944,9 +6926,7 @@ mod tests {
                     },
                     inner,
                 )
-                .unwrap_or_else(|error| {
-                    panic!("rebuilt Active PXRA v2 draft rejected: {error}")
-                }),
+                .unwrap_or_else(|error| panic!("rebuilt Active PXRA v2 draft rejected: {error}")),
             )
         }
 
@@ -6986,9 +6966,7 @@ mod tests {
                     template.expected_runtime_store_instance_id(),
                     auth_claim_with_nonce_v2(template.authentication().claim(), request_nonce),
                 )
-                .unwrap_or_else(|error| {
-                    panic!("fresh Active PXAR v11 draft rejected: {error}")
-                }),
+                .unwrap_or_else(|error| panic!("fresh Active PXAR v11 draft rejected: {error}")),
             );
             let outer_template = outer_request_template_v2();
             finalize_outer_v2(
@@ -7012,9 +6990,7 @@ mod tests {
                     },
                     inner,
                 )
-                .unwrap_or_else(|error| {
-                    panic!("fresh Active PXRA v2 draft rejected: {error}")
-                }),
+                .unwrap_or_else(|error| panic!("fresh Active PXRA v2 draft rejected: {error}")),
             )
         }
 
@@ -7059,9 +7035,7 @@ mod tests {
                     template.expected_runtime_store_instance_id(),
                     auth_claim_with_nonce_v2(template.authentication().claim(), request_nonce),
                 )
-                .unwrap_or_else(|error| {
-                    panic!("rebuilt Local PXAR v11 draft rejected: {error}")
-                }),
+                .unwrap_or_else(|error| panic!("rebuilt Local PXAR v11 draft rejected: {error}")),
             );
             let outer_template = outer_request_template_v2();
             finalize_outer_v2(
@@ -7085,9 +7059,7 @@ mod tests {
                     },
                     inner,
                 )
-                .unwrap_or_else(|error| {
-                    panic!("rebuilt Local PXRA v2 draft rejected: {error}")
-                }),
+                .unwrap_or_else(|error| panic!("rebuilt Local PXRA v2 draft rejected: {error}")),
             )
         }
 
