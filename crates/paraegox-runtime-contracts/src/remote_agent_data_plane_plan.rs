@@ -3831,8 +3831,7 @@ impl RemoteAgentDataPlaneTerminalEvidenceV2 {
         let after_zero = digest_is_zero(fields.retained_s0_census_after_digest);
         if !before_zero
             && !after_zero
-            && fields.retained_s0_census_before_digest
-                != fields.retained_s0_census_after_digest
+            && fields.retained_s0_census_before_digest != fields.retained_s0_census_after_digest
         {
             return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts);
         }
@@ -4364,8 +4363,7 @@ fn validate_terminal_facts_shape_v2(
                 && current_s0_cas_known
                 && exact_retained_census
                 && fields.retained_s0_ready
-                && fields.remote_observation
-                    == RemoteAgentDataPlaneRemoteObservationV2::S1Absent
+                && fields.remote_observation == RemoteAgentDataPlaneRemoteObservationV2::S1Absent
                 && fields.queryable_declared_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
                 && fields.ingress_fenced_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
                 && fields.worker_joined_bitmap == REMOTE_AGENT_PROXY_EXACT_ROUTE_BITMAP
@@ -4461,8 +4459,7 @@ fn validate_terminal_facts_against_execution_v2(
         return Err(RemoteAgentDataPlanePlanError::TerminalCorrelationMismatch);
     }
     let fields = facts.evidence.fields();
-    if fields.proxy_topology_compatibility_digest
-        != execution.proxy_topology_compatibility_digest()
+    if fields.proxy_topology_compatibility_digest != execution.proxy_topology_compatibility_digest()
         || (!digest_is_zero(fields.retained_s0_current_cas_digest)
             && fields.retained_s0_current_cas_digest != execution.retained_s0_cas().cas_digest())
     {
@@ -4482,7 +4479,9 @@ fn validate_terminal_facts_against_execution_v2(
                 && expected_s1.active().is_none()
                 && next_high_water == Some(fields.access_generation_high_water)
                 && next_slot_revision == Some(fields.completion_owner_slot_revision)
-                && state.access_generation().map(ManagedServiceGeneration::value)
+                && state
+                    .access_generation()
+                    .map(ManagedServiceGeneration::value)
                     == next_high_water
         }
         LocalOnlyReady => {
@@ -4507,8 +4506,7 @@ fn validate_terminal_facts_against_execution_v2(
                         })
                     }
                     RemoteAgentDataPlaneRemoteObservationV2::S1Absent => {
-                        state.access_generation().is_none()
-                            && state.proxy_session_epoch().is_none()
+                        state.access_generation().is_none() && state.proxy_session_epoch().is_none()
                     }
                     RemoteAgentDataPlaneRemoteObservationV2::Unknown => {
                         match (state.access_generation(), expected_s1.active()) {
@@ -4527,9 +4525,9 @@ fn validate_terminal_facts_against_execution_v2(
         Uncertain | Quarantined => {
             fields.access_generation_high_water >= prior_high_water
                 && fields.completion_owner_slot_revision >= prior_slot_revision
-                && state.access_generation().is_none_or(|value| {
-                    value.value() == fields.access_generation_high_water
-                })
+                && state
+                    .access_generation()
+                    .is_none_or(|value| value.value() == fields.access_generation_high_water)
         }
     };
     if !valid {
@@ -4647,8 +4645,7 @@ fn append_terminal_body_v2(
 }
 
 fn terminal_evidence_flags_v2(fields: RemoteAgentDataPlaneTerminalEvidenceFieldsV2) -> u16 {
-    (u16::from(fields.retained_s0_census_complete)
-        * TERMINAL_V2_RETAINED_S0_CENSUS_COMPLETE)
+    (u16::from(fields.retained_s0_census_complete) * TERMINAL_V2_RETAINED_S0_CENSUS_COMPLETE)
         | (u16::from(fields.retained_s0_ready) * TERMINAL_V2_RETAINED_S0_READY)
         | (u16::from(fields.s1_tls_ready) * TERMINAL_V2_S1_TLS_READY)
         | (u16::from(fields.s1_acl_ready) * TERMINAL_V2_S1_ACL_READY)
@@ -4729,8 +4726,8 @@ fn decode_terminal_facts_v2(
         (3, Some(_)) => RemoteAgentDataPlaneTerminalHeadV2::CommittedIncoming,
         _ => return Err(RemoteAgentDataPlanePlanError::InvalidTerminalFacts),
     };
-    let state = RemoteAgentDataPlaneTerminalStateV2::try_new(
-        RemoteAgentDataPlaneTerminalStateFieldsV2 {
+    let state =
+        RemoteAgentDataPlaneTerminalStateV2::try_new(RemoteAgentDataPlaneTerminalStateFieldsV2 {
             outcome,
             lifecycle_effect,
             phase,
@@ -4740,8 +4737,7 @@ fn decode_terminal_facts_v2(
             access_generation: decode_generation(cursor)?,
             fabric_session_epoch: decode_fabric_session_epoch_v2(cursor)?,
             proxy_session_epoch: decode_proxy_session_epoch_v2(cursor)?,
-        },
-    )?;
+        })?;
     let retained_s0_current_cas_digest = Digest32::from_bytes(cursor.array()?);
     let retained_s0_census_before_digest = Digest32::from_bytes(cursor.array()?);
     let retained_s0_census_after_digest = Digest32::from_bytes(cursor.array()?);
