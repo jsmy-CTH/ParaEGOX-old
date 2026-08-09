@@ -1913,6 +1913,19 @@ pub(crate) struct RemoteAgentCurrentFinalAccessSnapshotV2 {
     current_s1_cas: RemoteAgentActiveS1CasV2,
 }
 
+#[cfg(test)]
+struct RemoteAgentCurrentFinalFactsForTestV2 {
+    identity: RemoteAgentAccessSnapshotIdentityPinsV2,
+    runtime_host_epoch: u64,
+    retained_s0_cas: RemoteAgentRetainedS0CasV2,
+    retained_s0_census_digest: Digest32,
+    submit_binding_epoch: u64,
+    control_binding_epoch: u64,
+    carrier_binding_digest: Digest32,
+    intended_client: PrincipalRef,
+    current_s1_cas: RemoteAgentActiveS1CasV2,
+}
+
 /// Fresh-only authenticated request marker retained inside one authorized
 /// transition. It is intentionally non-Clone and never comes from PXRS decode.
 struct RemoteAgentFreshAccessRequestV2<'request> {
@@ -2619,16 +2632,19 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
     #[cfg(test)]
     fn from_exact_readback_for_test(
         snapshot: RemoteAgentAccessSnapshotV2,
-        current_identity: RemoteAgentAccessSnapshotIdentityPinsV2,
-        current_runtime_host_epoch: u64,
-        current_retained_s0_cas: RemoteAgentRetainedS0CasV2,
-        current_retained_s0_census_digest: Digest32,
-        current_submit_binding_epoch: u64,
-        current_control_binding_epoch: u64,
-        current_carrier_binding_digest: Digest32,
-        current_intended_client: PrincipalRef,
-        current_s1_cas: RemoteAgentActiveS1CasV2,
+        facts: RemoteAgentCurrentFinalFactsForTestV2,
     ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
+        let RemoteAgentCurrentFinalFactsForTestV2 {
+            identity: current_identity,
+            runtime_host_epoch: current_runtime_host_epoch,
+            retained_s0_cas: current_retained_s0_cas,
+            retained_s0_census_digest: current_retained_s0_census_digest,
+            submit_binding_epoch: current_submit_binding_epoch,
+            control_binding_epoch: current_control_binding_epoch,
+            carrier_binding_digest: current_carrier_binding_digest,
+            intended_client: current_intended_client,
+            current_s1_cas,
+        } = facts;
         if current_runtime_host_epoch == 0
             || current_identity
                 .target
@@ -7526,27 +7542,14 @@ mod tests {
                 })
         }
 
-        #[derive(Clone, Copy)]
-        struct CurrentFinalFactsV2 {
-            identity: RemoteAgentAccessSnapshotIdentityPinsV2,
-            runtime_host_epoch: u64,
-            retained_s0_cas: RemoteAgentRetainedS0CasV2,
-            retained_s0_census_digest: Digest32,
-            submit_binding_epoch: u64,
-            control_binding_epoch: u64,
-            carrier_binding_digest: Digest32,
-            intended_client: PrincipalRef,
-            current_s1_cas: RemoteAgentActiveS1CasV2,
-        }
-
         fn current_final_v2(
             snapshot: RemoteAgentAccessSnapshotV2,
-            mutate: impl FnOnce(&mut CurrentFinalFactsV2),
+            mutate: impl FnOnce(&mut RemoteAgentCurrentFinalFactsForTestV2),
         ) -> Result<RemoteAgentCurrentFinalAccessSnapshotV2, RemoteAgentAccessStateErrorV2>
         {
             let live_request = active_request_v2();
             let current_s1_cas = snapshot.resolved_current_s1_for_current_final_marker_v2()?;
-            let mut facts = CurrentFinalFactsV2 {
+            let mut facts = RemoteAgentCurrentFinalFactsForTestV2 {
                 identity: snapshot.identity,
                 runtime_host_epoch: snapshot.writer_runtime_host_epoch,
                 retained_s0_cas: snapshot.retained_s0_cas,
@@ -7561,25 +7564,14 @@ mod tests {
                 current_s1_cas,
             };
             mutate(&mut facts);
-            RemoteAgentCurrentFinalAccessSnapshotV2::from_exact_readback_for_test(
-                snapshot,
-                facts.identity,
-                facts.runtime_host_epoch,
-                facts.retained_s0_cas,
-                facts.retained_s0_census_digest,
-                facts.submit_binding_epoch,
-                facts.control_binding_epoch,
-                facts.carrier_binding_digest,
-                facts.intended_client,
-                facts.current_s1_cas,
-            )
+            RemoteAgentCurrentFinalAccessSnapshotV2::from_exact_readback_for_test(snapshot, facts)
         }
 
         fn authorize_on_snapshot_v2(
             snapshot: RemoteAgentAccessSnapshotV2,
             request: &RemoteAgentAccessRequestV2,
             clock: ClockReading,
-            mutate: impl FnOnce(&mut CurrentFinalFactsV2),
+            mutate: impl FnOnce(&mut RemoteAgentCurrentFinalFactsForTestV2),
         ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
             authorize_on_snapshot_with_replay_ledger_v2(
                 snapshot,
@@ -7599,7 +7591,7 @@ mod tests {
             seen_operation_ids: &[[u8; 16]],
             seen_tenure_nonce_identities: &[Digest32],
             seen_request_nonce_identities: &[Digest32],
-            mutate: impl FnOnce(&mut CurrentFinalFactsV2),
+            mutate: impl FnOnce(&mut RemoteAgentCurrentFinalFactsForTestV2),
         ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
             let provisioning = terminal_provisioning_v2(request);
             let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
@@ -8818,6 +8810,26 @@ mod tests {
             assert!(
                 current_final_impl.contains("#[cfg(test)]\n    fn from_exact_readback_for_test(")
             );
+            let raw_signature = current_final_impl
+                .split_once("#[cfg(test)]\n    fn from_exact_readback_for_test(")
+                .and_then(|(_, tail)| {
+                    tail.split_once(") -> Result<Self")
+                        .map(|(signature, _)| signature)
+                })
+                .unwrap_or_else(|| panic!("test-only CurrentFinal constructor signature missing"));
+            let normalized_raw_signature = raw_signature
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(normalized_raw_signature.contains(
+                "snapshot: RemoteAgentAccessSnapshotV2, facts: RemoteAgentCurrentFinalFactsForTestV2,"
+            ));
+            assert_eq!(raw_signature.matches(':').count(), 2);
+            let facts_name = "struct RemoteAgentCurrentFinalFactsForTestV2";
+            let facts_offset = source
+                .find(facts_name)
+                .unwrap_or_else(|| panic!("test-only CurrentFinal facts aggregate missing"));
+            assert!(source[..facts_offset].ends_with("#[cfg(test)]\n"));
         }
 
         #[test]
