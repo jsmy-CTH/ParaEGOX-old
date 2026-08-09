@@ -905,7 +905,10 @@ fn independent_python_golden_locks_apply_describe_and_historical_consumer_wires(
     let carrier = RestrictedRuntimeApplyCarrierBindingV1::decode(&carrier_wire)
         .expect("independent-golden PXCB");
     assert_eq!(carrier.canonical_wire(), carrier_wire);
-    assert_eq!(carrier.route(), "paraegox/runtime/t2/remote-agent-access/v2/apply");
+    assert_eq!(
+        carrier.route(),
+        "paraegox/runtime/t2/remote-agent-access/v2/apply"
+    );
     assert_eq!(
         carrier.binding_digest(),
         fixture_digest_after(carrier_scope, "\"digest_hex\"")
