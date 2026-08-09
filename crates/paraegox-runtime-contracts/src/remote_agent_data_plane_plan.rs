@@ -22,9 +22,8 @@ use crate::assignment::TargetAssignments;
 use crate::distributed_agent_stack_plan::{
     DistributedAgentStackPlanError, DistributedFabricCredentialRefV1,
     DistributedFabricSessionEpochV1, DistributedFabricTlsEndpointV1,
-    DistributedFabricTrustAnchorRefV1,
-    DistributedFabricTrustDomainRefV1, MAX_DISTRIBUTED_FABRIC_ENDPOINT_BYTES,
-    MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS,
+    DistributedFabricTrustAnchorRefV1, DistributedFabricTrustDomainRefV1,
+    MAX_DISTRIBUTED_FABRIC_ENDPOINT_BYTES, MAX_RESTRICTED_RUNTIME_APPLY_OPERATION_TIMEOUT_NANOS,
 };
 use crate::managed_agent_stack_plan::{
     MANAGED_AGENT_STACK_PROJECTION_BYTES, MAX_MANAGED_AGENT_FRAME_BYTES,
@@ -2434,8 +2433,7 @@ impl std::error::Error for RemoteAgentDataPlanePlanError {}
 // Additive S0-retaining/S1-proxy successor (PXTE v10 / PXAR v11 / PXAU v2).
 // -----------------------------------------------------------------------------
 
-const TARGET_EXECUTION_V2_DIGEST_DOMAIN: &[u8] =
-    b"paraegox.runtime.target-execution.sha256.v10";
+const TARGET_EXECUTION_V2_DIGEST_DOMAIN: &[u8] = b"paraegox.runtime.target-execution.sha256.v10";
 const TARGET_ASSIGNMENTS_V2_DIGEST_DOMAIN: &[u8] =
     b"paraegox.runtime.target-plan-assignments.sha256.v11";
 const APPLY_REQUEST_V2_DIGEST_DOMAIN: &[u8] =
@@ -2453,8 +2451,7 @@ const TERMINAL_V2_RESULT_REF_DOMAIN: &[u8] =
 const TERMINAL_V2_DIGEST_DOMAIN: &[u8] =
     b"paraegox.runtime.remote-agent-proxy-data-plane-terminal.sha256.v2";
 
-const TARGET_EXECUTION_V2_PREFIX_BYTES: usize =
-    4 + 2 + PROJECTION_BYTES + 32 + 2 + 1 + 1 + 4 + 4;
+const TARGET_EXECUTION_V2_PREFIX_BYTES: usize = 4 + 2 + PROJECTION_BYTES + 32 + 2 + 1 + 1 + 4 + 4;
 const TARGET_EXECUTION_V2_PROFILE_PRESENT: u8 = 1;
 const ACTIVE_S1_CAS_V2_PRESENT: u8 = 1;
 const ACTIVE_S1_CAS_V2_ABSENT: u8 = 0;
@@ -2534,11 +2531,10 @@ pub const MAX_REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_BYTES: usize =
 pub const MAX_REMOTE_AGENT_DATA_PLANE_PLAN_SLICE_V2_BYTES: usize =
     EMPTY_PXTA.len() + MAX_REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_BYTES;
 /// Maximum canonical PXAR v11 bytes.
-pub const MAX_REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_BYTES: usize =
-    APPLY_REQUEST_HEADER_BYTES
-        + MAX_RUNTIME_APPLY_ENVELOPE_V2_BYTES
-        + EMPTY_PXTA.len()
-        + MAX_REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_BYTES;
+pub const MAX_REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_BYTES: usize = APPLY_REQUEST_HEADER_BYTES
+    + MAX_RUNTIME_APPLY_ENVELOPE_V2_BYTES
+    + EMPTY_PXTA.len()
+    + MAX_REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_BYTES;
 /// Maximum canonical PXAU v2 bytes.
 pub const MAX_REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_BYTES: usize = 2_048;
 /// Maximum Runtime signature retained by PXAU v2.
@@ -2689,7 +2685,11 @@ impl RemoteAgentActiveS1CasV2 {
         owner_slot_revision: u64,
         active: RemoteAgentActiveS1FieldsV2,
     ) -> Result<Self, RemoteAgentDataPlanePlanError> {
-        Self::try_new(access_generation_high_water, owner_slot_revision, Some(active))
+        Self::try_new(
+            access_generation_high_water,
+            owner_slot_revision,
+            Some(active),
+        )
     }
 
     fn try_new(
@@ -2710,11 +2710,8 @@ impl RemoteAgentActiveS1CasV2 {
                 return Err(RemoteAgentDataPlanePlanError::InvalidBootstrapCas);
             }
         }
-        let canonical_wire = encode_active_s1_cas_v2(
-            access_generation_high_water,
-            owner_slot_revision,
-            active,
-        );
+        let canonical_wire =
+            encode_active_s1_cas_v2(access_generation_high_water, owner_slot_revision, active);
         let cas_digest = digest_wire(ACTIVE_S1_CAS_V2_DIGEST_DOMAIN, &canonical_wire)?;
         Ok(Self {
             access_generation_high_water,
@@ -2819,8 +2816,11 @@ fn encode_retained_s0_cas_v2(
         wire[offset..offset + 32].copy_from_slice(digest.as_bytes());
         offset += 32;
     }
-    wire[offset..offset + 8]
-        .copy_from_slice(&fields.expected_descriptor_evidence_record_sequence.to_be_bytes());
+    wire[offset..offset + 8].copy_from_slice(
+        &fields
+            .expected_descriptor_evidence_record_sequence
+            .to_be_bytes(),
+    );
     offset += 8;
     for digest in [
         fields.expected_descriptor_receipt_digest,
@@ -2829,8 +2829,7 @@ fn encode_retained_s0_cas_v2(
         wire[offset..offset + 32].copy_from_slice(digest.as_bytes());
         offset += 32;
     }
-    wire[offset..offset + 16]
-        .copy_from_slice(fields.expected_fabric_session_epoch.as_bytes());
+    wire[offset..offset + 16].copy_from_slice(fields.expected_fabric_session_epoch.as_bytes());
     offset += 16;
     wire[offset..offset + 8]
         .copy_from_slice(&fields.expected_fabric_generation.value().to_be_bytes());
@@ -2855,16 +2854,14 @@ fn encode_active_s1_cas_v2(
         wire[56..88].copy_from_slice(active.active_request_digest.as_bytes());
         wire[88..120].copy_from_slice(active.active_snapshot_digest.as_bytes());
         wire[120..128].copy_from_slice(&active.active_snapshot_sequence.to_be_bytes());
-        wire[128..136]
-            .copy_from_slice(&active.active_access_generation.value().to_be_bytes());
+        wire[128..136].copy_from_slice(&active.active_access_generation.value().to_be_bytes());
         wire[136..152].copy_from_slice(&active.active_proxy_session_epoch);
     }
     wire
 }
 
 /// Computes the successor-only S1 topology fingerprint without reinterpreting PXAE v1.
-pub fn remote_agent_proxy_topology_compatibility_digest_v2(
-) -> Result<Digest32, DigestBuildError> {
+pub fn remote_agent_proxy_topology_compatibility_digest_v2() -> Result<Digest32, DigestBuildError> {
     let mut builder = Digest32Builder::try_new(PROXY_TOPOLOGY_COMPATIBILITY_V2_DIGEST_DOMAIN)?;
     builder.field_digest(&remote_agent_data_plane_compatibility_digest_v1()?)?;
     builder.field_bytes(PROJECTION_MAGIC)?;
@@ -2874,9 +2871,7 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2(
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_PROFILE_VERSION)?;
     builder.field_u16(ASYMMETRIC_LISTENER_CONNECTOR_PROFILE_KIND)?;
     builder.field_u16(ASYMMETRIC_AGENT_ACL_PROFILE_VERSION)?;
-    builder.field_bytes(
-        &(MAX_REMOTE_AGENT_DATA_PLANE_PROFILE_BYTES as u32).to_be_bytes(),
-    )?;
+    builder.field_bytes(&(MAX_REMOTE_AGENT_DATA_PLANE_PROFILE_BYTES as u32).to_be_bytes())?;
     builder.field_bytes(TARGET_EXECUTION_MAGIC)?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_VERSION)?;
     builder.field_bytes(
@@ -2885,9 +2880,8 @@ pub fn remote_agent_proxy_topology_compatibility_digest_v2(
     builder.field_bytes(APPLY_REQUEST_MAGIC)?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_VERSION)?;
     builder.field_u16(APPLY_REQUEST_HEADER_BYTES as u16)?;
-    builder.field_bytes(
-        &(MAX_REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_BYTES as u32).to_be_bytes(),
-    )?;
+    builder
+        .field_bytes(&(MAX_REMOTE_AGENT_DATA_PLANE_APPLY_REQUEST_V2_BYTES as u32).to_be_bytes())?;
     builder.field_bytes(TERMINAL_RECEIPT_MAGIC)?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_TERMINAL_RECEIPT_V2_VERSION)?;
     builder.field_u16(REMOTE_AGENT_DATA_PLANE_TERMINAL_SIGNING_V2_VERSION)?;
@@ -3005,8 +2999,13 @@ impl RemoteAgentDataPlaneTargetExecutionV2 {
                 != Some(profile.base_loopback_listen_endpoint())
             || matches!(
                 (mode, expected_s1_cas.active()),
-                (RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive, Some(_))
-                    | (RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate, None)
+                (
+                    RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive,
+                    Some(_)
+                ) | (
+                    RemoteAgentDataPlaneTargetModeV2::LocalAgentOnlyDeactivate,
+                    None
+                )
             )
         {
             return Err(RemoteAgentDataPlanePlanError::InvalidShape);
@@ -3044,9 +3043,10 @@ impl RemoteAgentDataPlaneTargetExecutionV2 {
         if frame.len() > MAX_REMOTE_AGENT_DATA_PLANE_TARGET_EXECUTION_V2_BYTES {
             return Err(RemoteAgentDataPlanePlanError::FrameTooLarge);
         }
-        if frame.len() < TARGET_EXECUTION_V2_PREFIX_BYTES
-            + REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES
-            + REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES
+        if frame.len()
+            < TARGET_EXECUTION_V2_PREFIX_BYTES
+                + REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES
+                + REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES
         {
             return Err(RemoteAgentDataPlanePlanError::Truncated);
         }
@@ -3086,9 +3086,8 @@ impl RemoteAgentDataPlaneTargetExecutionV2 {
         let retained_s0_cas = RemoteAgentRetainedS0CasV2::decode(
             cursor.take(REMOTE_AGENT_RETAINED_S0_CAS_V2_BYTES)?,
         )?;
-        let expected_s1_cas = RemoteAgentActiveS1CasV2::decode(
-            cursor.take(REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES)?,
-        )?;
+        let expected_s1_cas =
+            RemoteAgentActiveS1CasV2::decode(cursor.take(REMOTE_AGENT_ACTIVE_S1_CAS_V2_BYTES)?)?;
         let profile = RemoteAgentDataPlaneProfileV1::decode(cursor.take(profile_length)?)?;
         cursor.finish()?;
         let decoded = Self::try_new(
