@@ -6,14 +6,15 @@
 //! executor.  It retains the byte-exact outer PXRA, the sole embedded PXAR-v10,
 //! the exact active predecessor PXAS, the live-verified bootstrap PXDE required
 //! by `RemoteAccessActive`, and an authenticated PXAU only in a terminal phase.
-//! Recovery returns inert structural state only.  A later owner may recover
-//! transition authority only after independently authenticating the retained
-//! outer PXRA and inner PXAR-v10 again, exactly matching the proof-envelope and
-//! three replay identities, and revalidating every mode/phase-specific live
-//! PXDE or PXAU marker.  Local-only recovery authorizes removal of a distinct
-//! remote overlay only.  That overlay owner is not implemented yet, and the
-//! current same-session Fabric shutdown path must not be used to simulate hot
-//! removal because it would also disturb the retained local bindings.
+//! Recovery returns inert structural state only.  No API can promote a decoded
+//! PXRS back into transition authority: every restart, including a terminal
+//! restart, is `ReconcileRequired` until a future store owner supplies a
+//! non-cloneable marker binding the exact snapshot digest, store and Runtime
+//! epoch, slot revision, and current-latest observation.  Local-only in-process
+//! authority permits removal of a distinct remote overlay only.  That overlay
+//! owner is not implemented yet, and the current same-session Fabric shutdown
+//! path must not be used to simulate hot removal because it would also disturb
+//! the retained local bindings.
 
 use core::fmt;
 
@@ -40,9 +41,7 @@ use paraegox_runtime_contracts::{
 use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::{
-    admission::{
-        AuthenticatedRemoteAgentDataPlaneApplyV1, VerifiedRemoteAgentDataPlaneApplyIngressV1,
-    },
+    admission::VerifiedRemoteAgentDataPlaneApplyIngressV1,
     managed_agent_stack_state::{
         MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES, ManagedAgentStackDurablePhase,
         ManagedAgentStackSnapshot, ManagedAgentStackStateError,
@@ -190,7 +189,7 @@ pub(crate) struct RemoteAgentAccessSnapshotV1 {
     snapshot_digest: Digest32,
 }
 
-/// Non-cloneable authority to advance one already authenticated PXRS value.
+/// Non-cloneable in-process authority to advance one freshly prepared PXRS value.
 pub(crate) struct RemoteAgentAuthorizedAccessSnapshotV1 {
     snapshot: RemoteAgentAccessSnapshotV1,
 }
@@ -282,6 +281,8 @@ impl RemoteAgentAuthorizedAccessSnapshotV1 {
                             != identity.fabric_owner_target_fingerprint
                         || previous.fabric_transition_projection_digest
                             != identity.fabric_transition_projection_digest
+                        || previous.runtime_host_epoch
+                            != outer.expected_runtime_host_epoch()
                         || previous.target != outer.target()
                         || prior_inner.operation_id() == inner.operation_id()
                     {
@@ -472,8 +473,8 @@ impl RemoteAgentAuthorizedAccessSnapshotV1 {
 }
 
 impl RemoteAgentAccessSnapshotV1 {
-    /// Strict recovery decode. This restores structural state only and cannot
-    /// manufacture either live PXDE verification or authenticated PXAU markers.
+    /// Strict recovery decode. This permanently restores structural state only;
+    /// the returned value has no path back to transition authority.
     pub(crate) fn decode(
         frame: &[u8],
         identity: RemoteAgentAccessSnapshotIdentityPinsV1,
@@ -648,72 +649,6 @@ impl RemoteAgentAccessSnapshotV1 {
             return Err(RemoteAgentAccessStateError::NonCanonical);
         }
         Ok(snapshot)
-    }
-
-    /// Reauthorizes one inert recovery value only from independently verified
-    /// outer/inner authentication and every exact mode/phase-specific marker.
-    pub(crate) fn try_reauthorize(
-        &self,
-        authenticated_request: ControllerAuthenticatedRemoteAgentAccessRequestV1<'_>,
-        authenticated_inner: AuthenticatedRemoteAgentDataPlaneApplyV1,
-        verified_descriptor: Option<RemoteAgentVerifiedDescriptorEvidenceV1<'_>>,
-        authenticated_terminal: Option<RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1<'_>>,
-    ) -> Result<RemoteAgentAuthorizedAccessSnapshotV1, RemoteAgentAccessStateError> {
-        let outer = authenticated_request.request();
-        if authenticated_request.kind() != RemoteAgentAccessKindV1::ApplyRemoteAccess
-            || outer.canonical_wire() != self.request.canonical_wire()
-            || outer.carrier() != self.request.carrier()
-            || outer.target() != self.target
-            || outer.expected_runtime_store_instance_id() != self.store_instance_id
-            || outer.expected_runtime_host_epoch() != self.runtime_host_epoch
-        {
-            return Err(RemoteAgentAccessStateError::AuthenticationMismatch);
-        }
-        let inner = inner_request(&self.request)?;
-        if authenticated_inner.request_digest() != self.admission.request_digest
-            || authenticated_inner.request_digest() != inner.request_digest()
-            || authenticated_inner.proof_envelope_digest() != self.admission.proof_envelope_digest
-            || authenticated_inner.tenure_nonce_identity() != self.admission.tenure_nonce_identity
-            || authenticated_inner.request_nonce_identity() != self.admission.request_nonce_identity
-            || authenticated_inner.temporal_lineage_identity()
-                != self.admission.temporal_lineage_identity
-        {
-            return Err(RemoteAgentAccessStateError::AuthenticationMismatch);
-        }
-        match (
-            self.mode,
-            self.phase,
-            self.descriptor_evidence.as_ref(),
-            verified_descriptor,
-        ) {
-            (
-                RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-                RemoteAgentAccessDurablePhaseV1::PreparedNoEffects,
-                Some(retained),
-                Some(verified),
-            ) if retained.canonical_wire() == verified.evidence().canonical_wire() => {
-                validate_descriptor_authority_scope(&self.request, inner, retained)?;
-            }
-            (RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive, phase, Some(_), None)
-                if phase != RemoteAgentAccessDurablePhaseV1::PreparedNoEffects => {}
-            (RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate, _, None, None) => {}
-            _ => return Err(RemoteAgentAccessStateError::InvalidDescriptorShape),
-        }
-        match (self.terminal.as_ref(), authenticated_terminal) {
-            (None, None) if !self.phase.is_terminal() => {}
-            (Some(retained), Some(authenticated))
-                if self.phase.is_terminal()
-                    && retained.canonical_wire() == authenticated.receipt().canonical_wire() =>
-            {
-                retained
-                    .validate_against_request(inner)
-                    .map_err(RemoteAgentAccessStateError::TerminalContract)?;
-            }
-            _ => return Err(RemoteAgentAccessStateError::InvalidTerminalShape),
-        }
-        Ok(RemoteAgentAuthorizedAccessSnapshotV1 {
-            snapshot: self.clone(),
-        })
     }
 
     fn try_build(mut snapshot: Self) -> Result<Self, RemoteAgentAccessStateError> {
@@ -915,24 +850,6 @@ impl RemoteAgentAccessSnapshotV1 {
     #[must_use]
     pub(crate) const fn generations(&self) -> RemoteAgentAccessGenerationStateV1 {
         self.generations
-    }
-
-    /// Exact retained outer request; authentication must still be rerun.
-    #[must_use]
-    pub(crate) const fn request(&self) -> &RemoteAgentAccessRequestV1 {
-        &self.request
-    }
-
-    /// Exact retained PXDE; live verification must still be rerun when required.
-    #[must_use]
-    pub(crate) const fn descriptor_evidence(&self) -> Option<&RemoteAgentDescriptorEvidenceV1> {
-        self.descriptor_evidence.as_ref()
-    }
-
-    /// Exact retained PXAU; Runtime authentication must still be rerun.
-    #[must_use]
-    pub(crate) const fn terminal(&self) -> Option<&RemoteAgentDataPlaneTerminalReceiptV1> {
-        self.terminal.as_ref()
     }
 
     #[must_use]
@@ -1740,6 +1657,7 @@ mod tests {
         stack_agent_generation_high_water: u64,
         descriptor_scope: DescriptorScope,
         operation_id: ApplyOperationId,
+        admitted_operation_id: Option<ApplyOperationId>,
         identity: RemoteAgentAccessSnapshotIdentityPinsV1,
     }
 
@@ -1757,6 +1675,7 @@ mod tests {
                 stack_agent_generation_high_water: AGENT_GENERATION,
                 descriptor_scope: DescriptorScope::Exact,
                 operation_id: ApplyOperationId::from_bytes([0xa1; 16]),
+                admitted_operation_id: None,
                 identity: identity(),
             }
         }
@@ -2237,6 +2156,10 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("bootstrap CAS rejected: {error}"));
         let inner = rebuilt_inner_request(options.mode, cas, options.operation_id);
+        let admitted_inner = options.admitted_operation_id.map_or_else(
+            || inner.clone(),
+            |operation_id| rebuilt_inner_request(options.mode, cas, operation_id),
+        );
         let outer = outer_request(&inner, stack_terminal.receipt_digest());
         let authenticated_outer = outer
             .verify_controller_request(outer.carrier(), |_, _, _, _, signature| {
@@ -2248,8 +2171,8 @@ mod tests {
             inner.temporal().target_clock_generation(),
             MonotonicInstant::from_ticks(1),
         );
-        let verified_ingress = admission_policy(&inner)
-            .verify_remote_agent_data_plane_apply_request(&inner, admission_reading)
+        let verified_ingress = admission_policy(&admitted_inner)
+            .verify_remote_agent_data_plane_apply_request(&admitted_inner, admission_reading)
             .unwrap_or_else(|error| panic!("inner admission rejected: {error:?}"));
         let verified_descriptor = verify_remote_agent_descriptor_evidence_v1(
             &evidence,
@@ -2346,7 +2269,7 @@ mod tests {
     }
 
     fn clock_at(snapshot: &RemoteAgentAccessSnapshotV1, ticks: u64) -> ClockReading {
-        let inner = inner_request(snapshot.request())
+        let inner = inner_request(&snapshot.request)
             .unwrap_or_else(|error| panic!("clock fixture request rejected: {error}"));
         ClockReading::new(
             inner.temporal().target_clock_domain(),
@@ -2451,6 +2374,14 @@ mod tests {
         snapshot: &RemoteAgentAccessSnapshotV1,
         outcome: RemoteAgentDataPlaneTerminalOutcomeV1,
     ) -> RemoteAgentDataPlaneTerminalReceiptV1 {
+        terminal_receipt_with_local_generations(snapshot, outcome, None)
+    }
+
+    fn terminal_receipt_with_local_generations(
+        snapshot: &RemoteAgentAccessSnapshotV1,
+        outcome: RemoteAgentDataPlaneTerminalOutcomeV1,
+        local_generations: Option<(ManagedServiceGeneration, ManagedServiceGeneration)>,
+    ) -> RemoteAgentDataPlaneTerminalReceiptV1 {
         let inner = inner_request(&snapshot.request)
             .unwrap_or_else(|error| panic!("terminal fixture request rejected: {error}"));
         let zero = zero_digest();
@@ -2488,26 +2419,31 @@ mod tests {
                 false,
                 Digest32::from_bytes([0xf1; 32]),
             ),
-            RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady => (
-                RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
-                RemoteAgentDataPlaneTerminalHeadV1::CommittedIncoming,
-                snapshot
-                    .predecessor
-                    .active
-                    .as_ref()
-                    .map(|active| active.fabric_generation),
-                snapshot
-                    .predecessor
-                    .active
-                    .as_ref()
-                    .map(|active| active.agent_generation),
-                None,
-                2,
-                true,
-                RemoteAgentDataPlaneRemoteObservationV1::RemoteAbsent,
-                false,
-                zero,
-            ),
+            RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady => {
+                let (fabric, agent) = local_generations.map_or_else(
+                    || {
+                        let active = snapshot
+                            .predecessor
+                            .active
+                            .as_ref()
+                            .unwrap_or_else(|| panic!("LocalOnly predecessor must remain active"));
+                        (active.fabric_generation, active.agent_generation)
+                    },
+                    |generations| generations,
+                );
+                (
+                    RemoteAgentDataPlaneTerminalLifecycleEffectV1::MayHaveStarted,
+                    RemoteAgentDataPlaneTerminalHeadV1::CommittedIncoming,
+                    Some(fabric),
+                    Some(agent),
+                    None,
+                    2,
+                    true,
+                    RemoteAgentDataPlaneRemoteObservationV1::RemoteAbsent,
+                    false,
+                    zero,
+                )
+            }
             RemoteAgentDataPlaneTerminalOutcomeV1::NoEffectRejected => (
                 RemoteAgentDataPlaneTerminalLifecycleEffectV1::ProvenNotStarted,
                 RemoteAgentDataPlaneTerminalHeadV1::PreservedNone,
@@ -2609,101 +2545,6 @@ mod tests {
             RemoteAgentDataPlaneTerminalOutcomeV1::NoEffectRejected,
         )
         .unwrap_or_else(|error| panic!("NoEffect terminal fixture rejected: {error}"))
-    }
-
-    fn recovered(
-        authorized: &RemoteAgentAuthorizedAccessSnapshotV1,
-    ) -> RemoteAgentAccessSnapshotV1 {
-        RemoteAgentAccessSnapshotV1::decode(authorized.snapshot().canonical_wire(), identity())
-            .unwrap_or_else(|error| panic!("authorized recovery fixture rejected: {error}"))
-    }
-
-    fn authenticated_outer(
-        snapshot: &RemoteAgentAccessSnapshotV1,
-    ) -> ControllerAuthenticatedRemoteAgentAccessRequestV1<'_> {
-        snapshot
-            .request()
-            .verify_controller_request(snapshot.request().carrier(), |_, _, _, _, signature| {
-                signature == OUTER_SIGNATURE
-            })
-            .unwrap_or_else(|error| panic!("retained outer authentication rejected: {error}"))
-    }
-
-    fn authenticated_inner(
-        snapshot: &RemoteAgentAccessSnapshotV1,
-    ) -> AuthenticatedRemoteAgentDataPlaneApplyV1 {
-        let inner = inner_request(snapshot.request())
-            .unwrap_or_else(|error| panic!("retained inner request rejected: {error}"));
-        admission_policy(inner)
-            .authenticate_remote_agent_data_plane_apply_request(inner)
-            .unwrap_or_else(|error| panic!("retained inner authentication rejected: {error:?}"))
-    }
-
-    fn live_descriptor(
-        snapshot: &RemoteAgentAccessSnapshotV1,
-    ) -> RemoteAgentVerifiedDescriptorEvidenceV1<'_> {
-        let inner = inner_request(snapshot.request())
-            .unwrap_or_else(|error| panic!("retained descriptor request rejected: {error}"));
-        let cas = inner
-            .target_execution()
-            .bootstrap_cas()
-            .unwrap_or_else(|| panic!("Active recovery fixture must retain bootstrap CAS"));
-        let evidence = snapshot
-            .descriptor_evidence()
-            .unwrap_or_else(|| panic!("Active recovery fixture must retain PXDE"));
-        verify_remote_agent_descriptor_evidence_v1(
-            evidence,
-            RemoteAgentDescriptorLiveFactsV1 {
-                carrier: snapshot.request().carrier(),
-                target: snapshot.request().target(),
-                store_instance_id: snapshot.request().expected_runtime_store_instance_id(),
-                runtime_host_epoch: snapshot.request().expected_runtime_host_epoch(),
-                active_pxst_digest: cas.expected_active_pxst_digest(),
-                descriptor: DESCRIPTOR,
-                fabric_generation: cas.expected_fabric_generation(),
-                agent_generation: cas.expected_agent_generation(),
-            },
-            |_, _, _, _, signature| signature == DESCRIPTOR_REQUEST_SIGNATURE,
-            |_, _, _, _, signature| signature == DESCRIPTOR_RECEIPT_SIGNATURE,
-        )
-        .unwrap_or_else(|error| panic!("retained descriptor live verification rejected: {error}"))
-    }
-
-    fn authenticated_terminal(
-        snapshot: &RemoteAgentAccessSnapshotV1,
-    ) -> RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV1<'_> {
-        let inner = inner_request(snapshot.request())
-            .unwrap_or_else(|error| panic!("retained terminal request rejected: {error}"));
-        snapshot
-            .terminal()
-            .unwrap_or_else(|| panic!("terminal recovery fixture must retain PXAU"))
-            .verify_runtime_terminal(
-                inner,
-                terminal_auth_claim(snapshot),
-                |_, _, _, _, _, signature| signature == [0xf4; 64],
-            )
-            .unwrap_or_else(|error| panic!("retained PXAU authentication rejected: {error}"))
-    }
-
-    fn reauthorize(
-        snapshot: &RemoteAgentAccessSnapshotV1,
-    ) -> RemoteAgentAuthorizedAccessSnapshotV1 {
-        let verified_descriptor = (snapshot.mode()
-            == RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive
-            && snapshot.phase() == RemoteAgentAccessDurablePhaseV1::PreparedNoEffects)
-            .then(|| live_descriptor(snapshot));
-        let authenticated_terminal = snapshot
-            .phase()
-            .is_terminal()
-            .then(|| authenticated_terminal(snapshot));
-        snapshot
-            .try_reauthorize(
-                authenticated_outer(snapshot),
-                authenticated_inner(snapshot),
-                verified_descriptor,
-                authenticated_terminal,
-            )
-            .unwrap_or_else(|error| panic!("exact recovery reauthorization rejected: {error}"))
     }
 
     #[derive(Clone, Debug)]
@@ -2845,6 +2686,17 @@ mod tests {
     }
 
     #[test]
+    fn fresh_preparation_rejects_a_different_authenticated_inner_request() {
+        let mut options =
+            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        options.admitted_operation_id = Some(ApplyOperationId::from_bytes([0xa2; 16]));
+        assert!(matches!(
+            prepared_result(options),
+            Err(RemoteAgentAccessStateError::AuthenticationMismatch)
+        ));
+    }
+
+    #[test]
     fn prepared_pins_store_and_inherits_both_fabric_high_waters() {
         let mut options =
             PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
@@ -2954,6 +2806,82 @@ mod tests {
     }
 
     #[test]
+    fn authorized_methods_reject_cross_mode_and_skipped_successors() {
+        let active = prepared_authorized(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let generations = active.snapshot().generations();
+        let reading = clock_at(active.snapshot(), 2);
+        assert!(matches!(
+            active.try_begin_effect_successor(
+                RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent,
+                generations,
+                reading,
+            ),
+            Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
+        ));
+
+        let local =
+            prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        let generations = local.snapshot().generations();
+        let reading = clock_at(local.snapshot(), 2);
+        assert!(matches!(
+            local.try_begin_effect_successor(
+                RemoteAgentAccessDurablePhaseV1::AgentStopIntent,
+                generations,
+                reading,
+            ),
+            Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
+        ));
+
+        let active = prepared_authorized(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let generations = active.snapshot().generations();
+        let agent_stop = effect_successor(
+            active,
+            RemoteAgentAccessDurablePhaseV1::AgentStopIntent,
+            generations,
+        );
+        let generations = agent_stop.snapshot().generations();
+        assert!(matches!(
+            agent_stop.try_effect_successor(
+                RemoteAgentAccessDurablePhaseV1::ReadyObservation,
+                generations,
+            ),
+            Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
+        ));
+
+        let local =
+            prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        let generations = local.snapshot().generations();
+        let remote_stop = effect_successor(
+            local,
+            RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent,
+            generations,
+        );
+        assert!(matches!(
+            remote_stop.try_effect_successor(
+                RemoteAgentAccessDurablePhaseV1::FabricStopIntent,
+                generations,
+            ),
+            Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
+        ));
+
+        let active = prepared_authorized(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let generations = active.snapshot().generations();
+        let agent_stop = effect_successor(
+            active,
+            RemoteAgentAccessDurablePhaseV1::AgentStopIntent,
+            generations,
+        );
+        assert!(matches!(
+            terminal_successor(
+                agent_stop,
+                RemoteAgentAccessDurablePhaseV1::NoEffectTerminal,
+                RemoteAgentDataPlaneTerminalOutcomeV1::NoEffectRejected,
+            ),
+            Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
+        ));
+    }
+
+    #[test]
     fn complete_effect_chains_roundtrip_to_authenticated_ready_terminals() {
         for (mode, phase, outcome) in [
             (
@@ -3025,11 +2953,12 @@ mod tests {
             .active
             .as_ref()
             .unwrap_or_else(|| panic!("LocalOnly predecessor must remain active"));
-        let inner = inner_request(terminal.snapshot().request())
+        let inner = inner_request(&terminal.snapshot().request)
             .unwrap_or_else(|error| panic!("LocalOnly terminal request rejected: {error}"));
         let state = terminal
             .snapshot()
-            .terminal()
+            .terminal
+            .as_ref()
             .unwrap_or_else(|| panic!("LocalOnly terminal must retain PXAU"))
             .validate_against_request(inner)
             .unwrap_or_else(|error| panic!("LocalOnly PXAU validation rejected: {error}"))
@@ -3050,6 +2979,103 @@ mod tests {
             ),
             Err(RemoteAgentAccessStateError::InvalidPhaseSuccessor)
         ));
+    }
+
+    #[test]
+    fn local_only_authority_rejects_every_candidate_and_high_water_change() {
+        let initial = prepared(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate)
+            .generations();
+        let access = next_generation(initial.access_generation_high_water);
+        let fabric = next_generation(initial.fabric_generation_high_water);
+        let agent = next_generation(initial.agent_generation_high_water);
+        let mutations = [
+            RemoteAgentAccessGenerationStateV1 {
+                access_generation_high_water: access.value(),
+                access_generation_candidate: Some(access),
+                ..initial
+            },
+            RemoteAgentAccessGenerationStateV1 {
+                fabric_generation_high_water: fabric.value(),
+                fabric_generation_candidate: Some(fabric),
+                ..initial
+            },
+            RemoteAgentAccessGenerationStateV1 {
+                agent_generation_high_water: agent.value(),
+                agent_generation_candidate: Some(agent),
+                ..initial
+            },
+            RemoteAgentAccessGenerationStateV1 {
+                access_generation_high_water: access.value(),
+                ..initial
+            },
+            RemoteAgentAccessGenerationStateV1 {
+                fabric_generation_high_water: fabric.value(),
+                ..initial
+            },
+            RemoteAgentAccessGenerationStateV1 {
+                agent_generation_high_water: agent.value(),
+                ..initial
+            },
+        ];
+        for generations in mutations {
+            let prepared =
+                prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+            let reading = clock_at(prepared.snapshot(), 2);
+            assert!(matches!(
+                prepared.try_begin_effect_successor(
+                    RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent,
+                    generations,
+                    reading,
+                ),
+                Err(RemoteAgentAccessStateError::InvalidGenerationSuccessor)
+            ));
+        }
+    }
+
+    #[test]
+    fn local_only_terminal_rejects_a_different_valid_base_generation() {
+        for change_fabric in [true, false] {
+            let ready =
+                ready_observation(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+            let snapshot = ready.snapshot();
+            let generations = snapshot.generations();
+            let active = snapshot
+                .predecessor
+                .active
+                .as_ref()
+                .unwrap_or_else(|| panic!("LocalOnly predecessor must remain active"));
+            let receipt = terminal_receipt_with_local_generations(
+                snapshot,
+                RemoteAgentDataPlaneTerminalOutcomeV1::LocalOnlyReady,
+                Some(if change_fabric {
+                    (
+                        next_generation(active.fabric_generation.value()),
+                        active.agent_generation,
+                    )
+                } else {
+                    (
+                        active.fabric_generation,
+                        next_generation(active.agent_generation.value()),
+                    )
+                }),
+            );
+            let authenticated = receipt
+                .verify_runtime_terminal(
+                    inner_request(&snapshot.request)
+                        .unwrap_or_else(|error| panic!("LocalOnly request rejected: {error}")),
+                    terminal_auth_claim(snapshot),
+                    |_, _, _, _, _, signature| signature == [0xf4; 64],
+                )
+                .unwrap_or_else(|error| panic!("wrong-generation PXAU auth rejected: {error}"));
+            assert!(matches!(
+                ready.try_terminal_successor(
+                    RemoteAgentAccessDurablePhaseV1::LocalOnlyReady,
+                    generations,
+                    authenticated,
+                ),
+                Err(RemoteAgentAccessStateError::InvalidTerminalShape)
+            ));
+        }
     }
 
     #[test]
@@ -3342,115 +3368,19 @@ mod tests {
     }
 
     #[test]
-    fn recovery_reauthorization_requires_phase_exact_pxde_and_pxau_markers() {
-        let prepared = prepared_authorized(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
-        let raw_prepared = recovered(&prepared);
-        assert!(matches!(
-            raw_prepared.try_reauthorize(
-                authenticated_outer(&raw_prepared),
-                authenticated_inner(&raw_prepared),
-                None,
-                None,
-            ),
-            Err(RemoteAgentAccessStateError::InvalidDescriptorShape)
-        ));
-        let recovered_prepared = reauthorize(&raw_prepared);
-        let generations = recovered_prepared.snapshot().generations();
-        let reading = clock_at(recovered_prepared.snapshot(), 2);
-        let agent_stop = recovered_prepared
+    fn preparation_and_first_effect_accept_now_equal_to_admitted() {
+        let prepared =
+            prepared_authorized(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        let generations = prepared.snapshot().generations();
+        let admitted_at = prepared.snapshot().admission.admitted_at_nanos;
+        let reading = clock_at(prepared.snapshot(), admitted_at);
+        prepared
             .try_begin_effect_successor(
-                RemoteAgentAccessDurablePhaseV1::AgentStopIntent,
+                RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent,
                 generations,
                 reading,
             )
-            .unwrap_or_else(|error| panic!("reauthorized first effect rejected: {error}"));
-
-        let raw_agent_stop = recovered(&agent_stop);
-        assert!(matches!(
-            raw_agent_stop.try_reauthorize(
-                authenticated_outer(&raw_agent_stop),
-                authenticated_inner(&raw_agent_stop),
-                Some(live_descriptor(&raw_agent_stop)),
-                None,
-            ),
-            Err(RemoteAgentAccessStateError::InvalidDescriptorShape)
-        ));
-        let recovered_agent_stop = reauthorize(&raw_agent_stop);
-        let generations = recovered_agent_stop.snapshot().generations();
-        recovered_agent_stop
-            .try_effect_successor(
-                RemoteAgentAccessDurablePhaseV1::FabricStopIntent,
-                generations,
-            )
-            .unwrap_or_else(|error| panic!("reauthorized cleanup successor rejected: {error}"));
-
-        let terminal = no_effect_terminal(PreparedOptions::valid(
-            RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive,
-        ));
-        let raw_terminal = recovered(&terminal);
-        assert!(matches!(
-            raw_terminal.try_reauthorize(
-                authenticated_outer(&raw_terminal),
-                authenticated_inner(&raw_terminal),
-                None,
-                None,
-            ),
-            Err(RemoteAgentAccessStateError::InvalidTerminalShape)
-        ));
-        let exact_terminal = reauthorize(&raw_terminal);
-        assert_eq!(
-            exact_terminal.snapshot().phase(),
-            RemoteAgentAccessDurablePhaseV1::NoEffectTerminal
-        );
-
-        let mut other_options =
-            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
-        other_options.operation_id = ApplyOperationId::from_bytes([0xa2; 16]);
-        let other_terminal = no_effect_terminal(other_options);
-        let other_raw = recovered(&other_terminal);
-        assert!(matches!(
-            raw_terminal.try_reauthorize(
-                authenticated_outer(&raw_terminal),
-                authenticated_inner(&raw_terminal),
-                None,
-                Some(authenticated_terminal(&other_raw)),
-            ),
-            Err(RemoteAgentAccessStateError::InvalidTerminalShape)
-        ));
-    }
-
-    #[test]
-    fn recovery_reauthorization_requires_exact_outer_and_inner_authentication() {
-        let primary = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
-        let mut alternate_options =
-            PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
-        alternate_options.operation_id = ApplyOperationId::from_bytes([0xa2; 16]);
-        let alternate = prepared_result(alternate_options)
-            .unwrap_or_else(|error| panic!("alternate Prepared rejected: {error}"));
-        let alternate = recovered(&alternate);
-
-        assert!(matches!(
-            primary.try_reauthorize(
-                authenticated_outer(&alternate),
-                authenticated_inner(&primary),
-                Some(live_descriptor(&primary)),
-                None,
-            ),
-            Err(RemoteAgentAccessStateError::AuthenticationMismatch)
-        ));
-        assert!(matches!(
-            primary.try_reauthorize(
-                authenticated_outer(&primary),
-                authenticated_inner(&alternate),
-                Some(live_descriptor(&primary)),
-                None,
-            ),
-            Err(RemoteAgentAccessStateError::AuthenticationMismatch)
-        ));
-        assert_eq!(
-            reauthorize(&primary).snapshot().phase(),
-            RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
-        );
+            .unwrap_or_else(|error| panic!("effect at the admission instant rejected: {error}"));
     }
 
     #[test]
@@ -3540,6 +3470,40 @@ mod tests {
     }
 
     #[test]
+    fn replacement_rejects_each_previous_identity_pin_and_runtime_epoch() {
+        fn assert_rejected(mutate: impl FnOnce(&mut RemoteAgentAccessSnapshotV1)) {
+            let default =
+                PreparedOptions::valid(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+            let mut previous = no_effect_terminal(default);
+            mutate(&mut previous.snapshot);
+            let mut fresh = default;
+            fresh.operation_id = ApplyOperationId::from_bytes([0xa2; 16]);
+            assert!(matches!(
+                prepared_result_after(fresh, Some(previous), None),
+                Err(RemoteAgentAccessStateError::InvalidOperationReplacement)
+            ));
+        }
+
+        assert_rejected(|previous| previous.store_instance_id = [0x45; 32]);
+        assert_rejected(|previous| {
+            previous.target = RuntimeHostId::from_bytes([0xee; 16]);
+        });
+        assert_rejected(|previous| {
+            previous.owner_target_fingerprint = Digest32::from_bytes([0x58; 32]);
+        });
+        assert_rejected(|previous| {
+            previous.transition_projection_digest = Digest32::from_bytes([0x69; 32]);
+        });
+        assert_rejected(|previous| {
+            previous.fabric_owner_target_fingerprint = Digest32::from_bytes([0x59; 32]);
+        });
+        assert_rejected(|previous| {
+            previous.fabric_transition_projection_digest = Digest32::from_bytes([0x6a; 32]);
+        });
+        assert_rejected(|previous| previous.runtime_host_epoch = RUNTIME_EPOCH + 1);
+    }
+
+    #[test]
     fn outer_wire_bounds_flags_lengths_magic_and_checksum_fail_closed() {
         let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
         let wire = snapshot.canonical_wire();
@@ -3624,6 +3588,89 @@ mod tests {
             RemoteAgentAccessSnapshotV1::decode(&nested_magic, identity()),
             Err(RemoteAgentAccessStateError::InvalidNestedRequest)
         ));
+    }
+
+    #[test]
+    fn checksum_resealed_active_agent_stop_decodes_only_raw_inert_with_no_authority() {
+        let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let mut wire = snapshot.canonical_wire().to_vec();
+        wire[28] = RemoteAgentAccessDurablePhaseV1::AgentStopIntent as u8;
+        reseal(&mut wire);
+
+        let decoded: RemoteAgentAccessSnapshotV1 =
+            RemoteAgentAccessSnapshotV1::decode(&wire, identity())
+                .unwrap_or_else(|error| panic!("raw Active intent decode rejected: {error}"));
+        assert_eq!(
+            decoded.phase(),
+            RemoteAgentAccessDurablePhaseV1::AgentStopIntent
+        );
+        assert_eq!(decoded.canonical_wire(), wire);
+    }
+
+    #[test]
+    fn checksum_resealed_local_remote_stop_decodes_only_raw_inert_with_no_authority() {
+        let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::LocalAgentOnlyDeactivate);
+        let mut wire = snapshot.canonical_wire().to_vec();
+        wire[28] = RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent as u8;
+        reseal(&mut wire);
+
+        let decoded: RemoteAgentAccessSnapshotV1 =
+            RemoteAgentAccessSnapshotV1::decode(&wire, identity())
+                .unwrap_or_else(|error| panic!("raw Local intent decode rejected: {error}"));
+        assert_eq!(
+            decoded.phase(),
+            RemoteAgentAccessDurablePhaseV1::RemoteAccessStopIntent
+        );
+        assert_eq!(decoded.canonical_wire(), wire);
+    }
+
+    #[test]
+    fn checksum_resealed_admission_shift_decodes_only_raw_inert_with_no_authority() {
+        let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let mut wire = snapshot.canonical_wire().to_vec();
+        let admitted = u64::from_be_bytes(
+            wire[316..324]
+                .try_into()
+                .unwrap_or_else(|_| panic!("admitted-at field must be eight bytes")),
+        );
+        let deadline = u64::from_be_bytes(
+            wire[324..332]
+                .try_into()
+                .unwrap_or_else(|_| panic!("deadline field must be eight bytes")),
+        );
+        let shifted_admitted = admitted + 7;
+        let shifted_deadline = deadline + 7;
+        wire[316..324].copy_from_slice(&shifted_admitted.to_be_bytes());
+        wire[324..332].copy_from_slice(&shifted_deadline.to_be_bytes());
+        reseal(&mut wire);
+
+        let decoded: RemoteAgentAccessSnapshotV1 =
+            RemoteAgentAccessSnapshotV1::decode(&wire, identity())
+                .unwrap_or_else(|error| panic!("raw admission-shift decode rejected: {error}"));
+        assert_eq!(decoded.admission.admitted_at_nanos, shifted_admitted);
+        assert_eq!(decoded.admission.deadline_nanos, shifted_deadline);
+        assert_eq!(shifted_deadline - shifted_admitted, deadline - admitted);
+    }
+
+    #[test]
+    fn checksum_resealed_high_waters_decode_only_raw_inert_with_no_authority() {
+        let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
+        let initial = snapshot.generations();
+        let mut wire = snapshot.canonical_wire().to_vec();
+        let access = initial.access_generation_high_water + 1;
+        let fabric = initial.fabric_generation_high_water + 1;
+        let agent = initial.agent_generation_high_water + 1;
+        wire[260..268].copy_from_slice(&access.to_be_bytes());
+        wire[268..276].copy_from_slice(&fabric.to_be_bytes());
+        wire[276..284].copy_from_slice(&agent.to_be_bytes());
+        reseal(&mut wire);
+
+        let decoded: RemoteAgentAccessSnapshotV1 =
+            RemoteAgentAccessSnapshotV1::decode(&wire, identity())
+                .unwrap_or_else(|error| panic!("raw high-water decode rejected: {error}"));
+        assert_eq!(decoded.generations().access_generation_high_water, access);
+        assert_eq!(decoded.generations().fabric_generation_high_water, fabric);
+        assert_eq!(decoded.generations().agent_generation_high_water, agent);
     }
 
     #[test]
@@ -3760,7 +3807,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_decode_is_structural_and_never_mints_live_authority() {
+    fn checksum_resealed_outer_signature_decodes_raw_inert_with_no_authority() {
         let snapshot = prepared(RemoteAgentDataPlaneTargetModeV1::RemoteAccessActive);
         let ranges = payload_ranges(snapshot.canonical_wire());
         let mut structurally_resigned = snapshot.canonical_wire().to_vec();
@@ -3777,23 +3824,12 @@ mod tests {
             decoded.phase(),
             RemoteAgentAccessDurablePhaseV1::PreparedNoEffects
         );
-        assert!(
-            decoded
-                .request()
-                .verify_controller_request(decoded.request().carrier(), |_, _, _, _, signature| {
-                    signature == OUTER_SIGNATURE
-                })
-                .is_err()
-        );
-        assert!(matches!(
-            decoded.try_reauthorize(
-                authenticated_outer(&snapshot),
-                authenticated_inner(&snapshot),
-                Some(live_descriptor(&decoded)),
-                None,
-            ),
-            Err(RemoteAgentAccessStateError::AuthenticationMismatch)
-        ));
+        assert!(decoded
+            .request
+            .verify_controller_request(decoded.request.carrier(), |_, _, _, _, signature| {
+                signature == OUTER_SIGNATURE
+            })
+            .is_err());
 
         assert!(!terminal_generation_is_known(
             Some(generation(1)),
