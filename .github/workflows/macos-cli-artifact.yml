@@ -1105,7 +1105,10 @@ jobs:
           environment["DEEPSEEK_API_KEY"] = DEEPSEEK_CANARY
           environment["PARAEGOX_M5A_UNLISTED_CANARY"] = ENVIRONMENT_CANARY
 
-          temporary_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+          # Keep lifecycle-owned Unix socket paths below macOS sun_path limits.
+          # RUNNER_TEMP is substantially longer and previously produced a
+          # configuration-valid but unstartable owner path.
+          temporary_parent = Path("/tmp").resolve(strict=True)
           with tempfile.TemporaryDirectory(
               prefix="pxm5a-",
               dir=temporary_parent,

@@ -64,6 +64,9 @@ _INSPECTION_TOKEN = bytes([0x5B]) * 32
 _INSPECTION_REQUEST_SEED = bytes([0x6C]) * 16
 _INSPECTION_TIMEOUT_NANOS = 2_000_000_000
 _RUST_INSPECTION_FIXTURES = Path(__file__).parents[2] / "crates/paraegox-inspection/tests/fixtures"
+_TUI_ATTACH_HANDOFF_GOLDEN = (
+    Path(__file__).parents[1] / "fixtures/wire/m5a_tui_attach_handoff_v1.hex"
+)
 
 
 def _inspection_fixture(name: str) -> bytes:
@@ -314,7 +317,13 @@ def _fixed_tui_handoff() -> console_client._TuiAttachHandoffV1:
 def test_tui_attach_handoff_v1_is_canonical_bounded_and_token_free() -> None:
     handoff = _fixed_tui_handoff()
     wire = console_client._encode_tui_attach_handoff_v1(handoff)
+    golden = bytes.fromhex(_TUI_ATTACH_HANDOFF_GOLDEN.read_text(encoding="ascii"))
 
+    assert len(golden) == 346
+    assert hashlib.sha256(golden).hexdigest() == (
+        "b2290af8d07d94ccbef67bf05e115181afa330d57aa66b68690322d846548621"
+    )
+    assert wire == golden
     assert wire[:4] == b"PXTH"
     assert wire[4:6] == (1).to_bytes(2, "big")
     assert wire[6:8] == b"TR"

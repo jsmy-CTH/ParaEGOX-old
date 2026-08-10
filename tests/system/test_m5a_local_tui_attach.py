@@ -294,6 +294,29 @@ def _wait_for_no_matching_processes(binary: Path) -> None:
     assert not _matching_processes(binary), "joined down left an exact-binary process alive"
 
 
+def _reserve_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _assign_unique_fabric_listener(config: Path) -> None:
+    before = config.lstat()
+    assert stat.S_ISREG(before.st_mode)
+    assert not config.is_symlink()
+    assert before.st_uid == os.geteuid() and before.st_gid == os.getegid()
+    assert before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == 0o600
+    document = config.read_text(encoding="utf-8")
+    default = 'fabric_listen = "tcp/127.0.0.1:7447"\n'
+    assert document.count(default) == 1
+    replacement = f'fabric_listen = "tcp/127.0.0.1:{_reserve_loopback_port()}"\n'
+    config.write_text(document.replace(default, replacement), encoding="utf-8")
+    after = config.lstat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_uid == before.st_uid and after.st_gid == before.st_gid
+    assert after.st_nlink == 1 and stat.S_IMODE(after.st_mode) == 0o600
+
+
 def _terminate_test_processes(binary: Path) -> None:
     for requested_signal in (signal.SIGTERM, signal.SIGKILL):
         deadline = time.monotonic() + 5.0
@@ -488,7 +511,10 @@ def _install_launcher(
     command = " ".join(
         shlex.quote(value)
         for value in (
-            os.fspath(Path(sys.executable).resolve(strict=True)),
+            # Keep the active virtual-environment interpreter identity. Resolving
+            # this symlink selects uv's base interpreter and loses the installed
+            # pytest/ParaEGOX environment before the private fault runs.
+            os.fspath(Path(sys.executable).absolute()),
             os.fspath(test_file),
             "--m5a-launcher",
             os.fspath(mode_file),
@@ -508,9 +534,12 @@ def _wait_for_file(path: Path, timeout_seconds: float = 10.0) -> bytes:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         try:
-            return path.read_bytes()
+            content = path.read_bytes()
         except FileNotFoundError:
-            time.sleep(0.02)
+            content = b""
+        if content:
+            return content
+        time.sleep(0.02)
     raise TimeoutError(f"timed out waiting for harness marker {path.name}")
 
 
@@ -526,14 +555,23 @@ def _running_owner(
     environment: dict[str, str],
     root: Path,
 ) -> Iterator[tuple[Path, Path, str, set[int]]]:
+    _wait_for_no_matching_processes(binary)
     workspace = root / "workspace"
     config = _invoke_init(binary, workspace, environment)
+    _assign_unique_fabric_listener(config)
     state_root = workspace / "state"
-    up = _invoke_lifecycle(binary, "up", config, environment)
-    assert up["ok"] is True and up["state"] == "running"
-    generation = up["generation"]
-    assert isinstance(generation, str) and _GENERATION_PATTERN.fullmatch(generation)
-    owners = _owner_processes(binary)
+    try:
+        up = _invoke_lifecycle(binary, "up", config, environment)
+        assert up["ok"] is True and up["state"] == "running"
+        generation = up["generation"]
+        assert isinstance(generation, str) and _GENERATION_PATTERN.fullmatch(generation)
+        owners = _owner_processes(binary)
+    except BaseException:
+        if _matching_processes(binary):
+            with suppress(Exception):
+                _invoke_lifecycle(binary, "down", config, environment)
+        _terminate_test_processes(binary)
+        raise
     try:
         yield config, state_root, generation, owners
     finally:
@@ -593,10 +631,12 @@ def test_m5a_exact_grammar_help_and_never_started_are_pre_effect() -> None:
 
 
 def test_m5a_real_pty_echo_watch_detach_and_signals_preserve_owner() -> None:
-    binary = _require_exact_binary()
+    exact_binary = _require_exact_binary()
     console = _require_console_program()
     with tempfile.TemporaryDirectory(prefix="px-m5a-live-") as temporary:
         root = Path(temporary).resolve(strict=True)
+        binary = root / "paraegox"
+        _copy_exact_binary(exact_binary, binary)
         environment = _environment(root, console)
         with _running_owner(binary, environment, root) as (
             config,
@@ -650,9 +690,7 @@ def test_m5a_real_pty_echo_watch_detach_and_signals_preserve_owner() -> None:
                 assert _owner_processes(binary) == owners
 
         _wait_for_no_matching_processes(binary)
-        assert not any(
-            path.is_socket() for path in state_root.rglob("*") if path.exists()
-        )
+        assert not any(path.is_socket() for path in state_root.rglob("*") if path.exists())
 
 
 def test_m5a_private_20_21_23_24_child_and_generation_race_are_single_line() -> None:
@@ -680,6 +718,7 @@ def test_m5a_private_20_21_23_24_child_and_generation_race_are_single_line() -> 
                 _write_mode(layout, mode)
                 invocation = _spawn_tui_pty(layout.binary, config, environment)
                 try:
+                    assert _wait_for_file(layout.marker_file) == b"handoff-read"
                     capture = _wait_for_pty_exit(
                         invocation,
                         expected_returncode=1,
@@ -754,6 +793,7 @@ def test_m5a_wrong_peer_private_22_and_root_execution_fail_closed() -> None:
         environment = _environment(root, real_console)
         workspace = root / "workspace"
         config = _invoke_init(layout.binary, workspace, environment)
+        _assign_unique_fabric_listener(config)
         state_root = workspace / "state"
 
         root_process = subprocess.run(
@@ -785,14 +825,15 @@ def test_m5a_wrong_peer_private_22_and_root_execution_fail_closed() -> None:
         )
         assert not state_root.exists()
 
-        up = _invoke_lifecycle(layout.binary, "up", config, environment)
-        generation = up["generation"]
-        owners = _owner_processes(layout.binary)
         try:
+            up = _invoke_lifecycle(layout.binary, "up", config, environment)
+            generation = up["generation"]
+            owners = _owner_processes(layout.binary)
             _clear_launcher_files(layout)
             _write_mode(layout, "inspection-wrong-peer")
             invocation = _spawn_tui_pty(layout.binary, config, environment)
             try:
+                assert _wait_for_file(layout.marker_file) == b"handoff-read"
                 capture = _wait_for_pty_exit(invocation, expected_returncode=1)
                 _assert_single_pty_diagnostic(capture, "PXLC-TUI-PEER")
                 _assert_capture_redacted(capture, config, state_root)
@@ -996,6 +1037,15 @@ def _launcher_main(arguments: list[str]) -> int:
     if not frame:
         return 125
     mode = mode_file.read_text(encoding="utf-8").strip()
+    if mode in {
+        "partial-handoff",
+        "replace-bootstrap",
+        "inspection-not-found",
+        "handoff-eof-timeout",
+        "child-25",
+        "inspection-wrong-peer",
+    }:
+        marker_file.write_text("handoff-read", encoding="utf-8")
     if mode == "child-25":
         return 25
     if mode == "hang-ignore-signals":
@@ -1036,7 +1086,9 @@ def _launcher_main(arguments: list[str]) -> int:
             command = [
                 os.fspath(sudo),
                 "-n",
-                os.fspath(Path(sys.executable).resolve(strict=True)),
+                # Preserve the active virtual-environment launcher. Resolving it
+                # selects uv's base interpreter and loses the installed package.
+                os.fspath(Path(sys.executable).absolute()),
                 os.fspath(Path(__file__).resolve(strict=True)),
                 "--m5a-root-peer",
                 os.fspath(replacement.socket_path),

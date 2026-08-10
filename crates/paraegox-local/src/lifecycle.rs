@@ -483,6 +483,21 @@ pub(crate) struct LocalTuiAttachLocatorV1 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TuiAttachOwnerIdentityV1 {
+    uid: u32,
+    gid: u32,
+}
+
+impl TuiAttachOwnerIdentityV1 {
+    fn effective() -> Self {
+        Self {
+            uid: Uid::effective().as_raw(),
+            gid: Gid::effective().as_raw(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TuiAttachFrameKindV1 {
     Locator,
     Handoff,
@@ -2552,14 +2567,28 @@ fn encode_tui_attach_frame(
     locator: &LocalTuiAttachLocatorV1,
     frame_kind: TuiAttachFrameKindV1,
 ) -> Result<Vec<u8>, LocalProcessError> {
+    encode_tui_attach_frame_for_owner(
+        locator,
+        frame_kind,
+        TuiAttachOwnerIdentityV1::effective(),
+    )
+}
+
+fn encode_tui_attach_frame_for_owner(
+    locator: &LocalTuiAttachLocatorV1,
+    frame_kind: TuiAttachFrameKindV1,
+    expected_owner: TuiAttachOwnerIdentityV1,
+) -> Result<Vec<u8>, LocalProcessError> {
     let error = frame_kind.error();
     if locator.generation.iter().all(|byte| *byte == 0)
         || locator.config_commitment.iter().all(|byte| *byte == 0)
     {
         return Err(error);
     }
-    let conversation_path = validate_tui_attach_pin(&locator.conversation, b'C', error)?;
-    let inspection_path = validate_tui_attach_pin(&locator.inspection, b'I', error)?;
+    let conversation_path =
+        validate_tui_attach_pin(&locator.conversation, b'C', expected_owner, error)?;
+    let inspection_path =
+        validate_tui_attach_pin(&locator.inspection, b'I', expected_owner, error)?;
     if conversation_path == inspection_path {
         return Err(error);
     }
@@ -2621,6 +2650,7 @@ fn encode_tui_attach_frame(
 fn validate_tui_attach_pin(
     pin: &LocalTuiBootstrapPinV1,
     expected_kind: u8,
+    expected_owner: TuiAttachOwnerIdentityV1,
     error: LocalProcessError,
 ) -> Result<&[u8], LocalProcessError> {
     let path = pin.path.to_str().ok_or(error)?.as_bytes();
@@ -2638,8 +2668,8 @@ fn validate_tui_attach_pin(
         || !content_bounds.contains(&usize::try_from(pin.content_length).map_err(|_| error)?)
         || pin.uid == 0
         || pin.gid == 0
-        || pin.uid != Uid::effective().as_raw()
-        || pin.gid != Gid::effective().as_raw()
+        || pin.uid != expected_owner.uid
+        || pin.gid != expected_owner.gid
         || pin.mode != 0o600
         || pin.link_count != 1
         || pin.content_sha256.iter().all(|byte| *byte == 0)
@@ -2682,6 +2712,22 @@ fn decode_tui_attach_frame(
     frame_kind: TuiAttachFrameKindV1,
     expected_generation: [u8; 16],
     expected_config_commitment: [u8; 32],
+) -> Result<LocalTuiAttachLocatorV1, LocalProcessError> {
+    decode_tui_attach_frame_for_owner(
+        frame,
+        frame_kind,
+        expected_generation,
+        expected_config_commitment,
+        TuiAttachOwnerIdentityV1::effective(),
+    )
+}
+
+fn decode_tui_attach_frame_for_owner(
+    frame: &[u8],
+    frame_kind: TuiAttachFrameKindV1,
+    expected_generation: [u8; 16],
+    expected_config_commitment: [u8; 32],
+    expected_owner: TuiAttachOwnerIdentityV1,
 ) -> Result<LocalTuiAttachLocatorV1, LocalProcessError> {
     let error = frame_kind.error();
     if frame.len() < TUI_ATTACH_FRAME_HEADER_BYTES
@@ -2726,12 +2772,14 @@ fn decode_tui_attach_frame(
         &frame[64..160],
         b'C',
         PathBuf::from(conversation_path),
+        expected_owner,
         error,
     )?;
     let inspection = decode_tui_attach_pin_record(
         &frame[160..256],
         b'I',
         PathBuf::from(inspection_path),
+        expected_owner,
         error,
     )?;
     let declared_digest: [u8; 32] = frame[256..TUI_ATTACH_FRAME_HEADER_BYTES]
@@ -2751,7 +2799,9 @@ fn decode_tui_attach_frame(
         conversation,
         inspection,
     };
-    if encode_tui_attach_frame(&locator, frame_kind)?.as_slice() != frame {
+    if encode_tui_attach_frame_for_owner(&locator, frame_kind, expected_owner)?.as_slice()
+        != frame
+    {
         return Err(error);
     }
     Ok(locator)
@@ -2761,6 +2811,7 @@ fn decode_tui_attach_pin_record(
     record: &[u8],
     expected_kind: u8,
     path: PathBuf,
+    expected_owner: TuiAttachOwnerIdentityV1,
     error: LocalProcessError,
 ) -> Result<LocalTuiBootstrapPinV1, LocalProcessError> {
     if record.len() != TUI_ATTACH_PIN_RECORD_BYTES
@@ -2787,7 +2838,7 @@ fn decode_tui_attach_pin_record(
     if pin.path.as_os_str().as_bytes().len() != declared_path_length {
         return Err(error);
     }
-    validate_tui_attach_pin(&pin, expected_kind, error)?;
+    validate_tui_attach_pin(&pin, expected_kind, expected_owner, error)?;
     Ok(pin)
 }
 
@@ -3576,6 +3627,90 @@ mod tests {
             inode: if kind == b'C' { 0x1112 } else { 0x1314 },
             content_sha256: if kind == b'C' { [0x51; 32] } else { [0x52; 32] },
         }
+    }
+
+    fn decode_lower_hex_fixture(value: &str) -> Vec<u8> {
+        let value = value
+            .strip_suffix('\n')
+            .expect("lowercase hexadecimal fixture must end with one LF");
+        assert!(!value.is_empty());
+        assert_eq!(value.len() % 2, 0);
+        assert!(!value.contains('\n'));
+        assert!(!value.contains('\r'));
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                (hex_nibble(pair[0]).expect("lowercase hexadecimal fixture") << 4)
+                    | hex_nibble(pair[1]).expect("lowercase hexadecimal fixture")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tui_attach_handoff_matches_shared_cross_language_golden() {
+        let expected_owner = TuiAttachOwnerIdentityV1 { uid: 501, gid: 20 };
+        let generation = [0x41; 16];
+        let commitment = [0x42; 32];
+        let locator = LocalTuiAttachLocatorV1 {
+            generation,
+            config_commitment: commitment,
+            conversation: LocalTuiBootstrapPinV1 {
+                kind: b'C',
+                path: PathBuf::from("/private/run/conversation.pxab"),
+                content_length: 144,
+                uid: expected_owner.uid,
+                gid: expected_owner.gid,
+                mode: 0o600,
+                link_count: 1,
+                device: 7,
+                inode: 11,
+                content_sha256: [0x43; 32],
+            },
+            inspection: LocalTuiBootstrapPinV1 {
+                kind: b'I',
+                path: PathBuf::from("/private/run/inspection.pxib"),
+                content_length: 128,
+                uid: expected_owner.uid,
+                gid: expected_owner.gid,
+                mode: 0o600,
+                link_count: 1,
+                device: 7,
+                inode: 12,
+                content_sha256: [0x44; 32],
+            },
+        };
+        let golden = decode_lower_hex_fixture(include_str!(
+            "../../../tests/fixtures/wire/m5a_tui_attach_handoff_v1.hex"
+        ));
+        assert_eq!(golden.len(), 346);
+        assert_eq!(
+            lower_hex(&golden[256..288]),
+            "ea8d1bf518eadab961581f54fe910b1f4c0ef3576bf604453a105692bff4a390"
+        );
+        let whole_frame_sha256: [u8; 32] = Sha256::digest(&golden).into();
+        assert_eq!(
+            lower_hex(&whole_frame_sha256),
+            "b2290af8d07d94ccbef67bf05e115181afa330d57aa66b68690322d846548621"
+        );
+
+        let encoded = encode_tui_attach_frame_for_owner(
+            &locator,
+            TuiAttachFrameKindV1::Handoff,
+            expected_owner,
+        )
+        .expect("canonical shared PXTH golden");
+        assert_eq!(encoded, golden);
+        assert_eq!(
+            decode_tui_attach_frame_for_owner(
+                &golden,
+                TuiAttachFrameKindV1::Handoff,
+                generation,
+                commitment,
+                expected_owner,
+            ),
+            Ok(locator)
+        );
     }
 
     #[test]
