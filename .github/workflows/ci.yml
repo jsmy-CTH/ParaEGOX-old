@@ -48,6 +48,7 @@ jobs:
       CARGO_TERM_COLOR: always
       PARAEGOX_M0_INIT_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
       PARAEGOX_M2_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
+      PARAEGOX_D0A_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -58,7 +59,7 @@ jobs:
           enable-cache: true
       - name: Install repository-pinned Rust toolchain for governance
         run: rustup toolchain install --no-self-update
-      - name: Build exact-revision init and managed-local lifecycle CLI
+      - name: Build exact-revision init, lifecycle, and compiled local deploy CLI
         run: cargo build --locked -p paraegox-local --bin paraegox
       - name: Rebuild locked development environment
         run: uv sync --locked
@@ -66,7 +67,7 @@ jobs:
         run: uv run --frozen ruff check .
       - name: Governance fitness checks
         run: uv run --frozen python scripts/check_governance.py
-      - name: Tests, including exact-binary init and managed-local lifecycle
+      - name: Tests, including exact-binary init, lifecycle, and compiled local deploy
         run: uv run --frozen pytest
       - name: Rust to Python ProcessDomain system test
         run: PARAEGOX_PYTHON="$PWD/.venv/bin/python" cargo test -p paraegox-runtime --locked process_domain::tests::python_reference_worker_round_trips_through_rust_process_domain -- --ignored --exact
