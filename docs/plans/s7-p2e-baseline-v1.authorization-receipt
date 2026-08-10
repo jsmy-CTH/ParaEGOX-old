@@ -1,0 +1,37 @@
+receipt_version = 1
+authorization_status = "accepted"
+decision_maker = "ParaEGOX workspace user"
+session_reference = "current-codex-thread"
+authorization_received_at = "2026-07-31T06:02:05Z"
+authorization_phrase = "接受 S7/P2e 基线 v1"
+authorization_message_sha256 = "c18b3406b76ff94c3f470520c2d62236456ee47291503f4029048792ae67098e"
+code_baseline = "861d4365b8777acabb91a1083f74829e78c90fce"
+manifest_path = "docs/plans/s7-p2e-baseline-v1.manifest"
+manifest_sha256 = "3570f703711a5e91029a4b39b7232e80df78fb9aa35aa25999793ff8c9189fdc"
+decision_plan_path = "docs/plans/s7-p2e-admission-and-delivery-plan.md"
+decision_plan_bytes = 48449
+decision_plan_sha256 = "ffcbf2472d8ce348c40803450ddc67ba85484d9a0f9a667facbbeaa435f4b1a6"
+[[adrs]]
+path = "docs/adr/ADR-0004-deck-workload-and-application-admission-boundary.md"
+proposal_bytes = 19428
+proposal_sha256 = "68871a36be84f2cb7c2db1561d6137db2ba08d77a474ffc518a621056667adfd"
+accepted_bytes = 19428
+accepted_sha256 = "1ca258f61d2fe83db1929050be8e85cf590c5660a6afd8fc79e0db4acfedcc89"
+[[adrs]]
+path = "docs/adr/ADR-0005-typed-domain-graphs-and-runtime-assembly-boundary.md"
+proposal_bytes = 33125
+proposal_sha256 = "2c10d7d8c6312ac574e2db823649c9aa42edb57553abe0b6bf9fb8b88583309b"
+accepted_bytes = 33125
+accepted_sha256 = "a94010beba3ea02c89a338391c8c9294a3c0a368e06a93a4a4d5d0fd3528ac5d"
+[[adrs]]
+path = "docs/adr/ADR-0007-p2e-reference-journal-and-crash-recovery.md"
+proposal_bytes = 90034
+proposal_sha256 = "70087c3bd1d96a66a03b355a1b7200b39a4868b76c153db1905f95022b7f2725"
+accepted_bytes = 90034
+accepted_sha256 = "4f63d8581aedcb14278d0a42061f965dbf71b8a996b258c0f4513254ba2d1a5b"
+[[adrs]]
+path = "docs/adr/ADR-0008-pxte-v4-pxar-v5-subject-ingress-separation.md"
+proposal_bytes = 57207
+proposal_sha256 = "1b3b1bf2b8b5d56f35608ee8eec30fa635efecc108329b55122486c24b5cd31f"
+accepted_bytes = 57207
+accepted_sha256 = "b019b7ba004f8ac517602db35657c07ec51170c8a7ca51e41851faa47bec2349"

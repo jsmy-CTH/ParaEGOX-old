@@ -139,8 +139,8 @@ use crate::config::{
     DeveloperDeploymentConfigV1, DeveloperDeploymentResolvedPartsV1,
     DeveloperDistributedFixtureConfigV1, DeveloperDistributedTargetConfigV1,
     DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperNodeConfigSchemaV1,
-    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1, ProviderProfileV1,
-    ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
+    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1, LocalManagedChatOwnerConfigV1,
+    ProviderProfileV1, ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
 };
 use crate::error::LocalProcessError;
 use crate::inspection::{
@@ -214,6 +214,74 @@ const LOCAL_DETERMINISTIC_ECHO_ADAPTER_DESCRIPTOR_V1: ModelAdapterDescriptorV1 =
 pub(crate) fn run(config: DeveloperFixtureConfigV1) -> Result<(), LocalProcessError> {
     let peer = current_developer_local_peer()?;
     run_with_runner(config, peer, &mut ChildProcessConversationRunner)
+}
+
+/// Single-use inputs for the hidden headless chat owner.
+///
+/// This value deliberately implements neither `Clone` nor `Debug` and exposes
+/// no fields or getters. A provisioned value owns the already validated,
+/// zeroizing provider key so the lifecycle owner cannot resolve the Secret a
+/// second time after it begins making process or durable-state effects.
+pub(crate) struct PreparedHeadlessChatV1 {
+    owner: PreparedHeadlessChatOwnerV1,
+    peer: DeveloperLocalPeerIdentityV1,
+}
+
+enum PreparedHeadlessChatOwnerV1 {
+    Fixture(Box<DeveloperFixtureConfigV1>),
+    Provisioned {
+        config: Box<DeveloperProvisionedConfigV1>,
+        api_key: ResolvedProviderApiKeyV1,
+    },
+}
+
+/// Validates the current peer and takes single-use ownership of any configured
+/// provider Secret before the lifecycle owner may create state, prepare a
+/// layout, load identity, detach a process, or start an owner.
+pub(crate) fn prepare_headless_chat(
+    config: LocalManagedChatOwnerConfigV1,
+) -> Result<PreparedHeadlessChatV1, LocalProcessError> {
+    prepare_headless_chat_with_environment(config, |name| env::var_os(name))
+}
+
+fn prepare_headless_chat_with_environment(
+    config: LocalManagedChatOwnerConfigV1,
+    read_environment: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) -> Result<PreparedHeadlessChatV1, LocalProcessError> {
+    let peer = current_developer_local_peer()?;
+    let owner = match config {
+        LocalManagedChatOwnerConfigV1::Fixture(config) => {
+            PreparedHeadlessChatOwnerV1::Fixture(Box::new(config))
+        }
+        LocalManagedChatOwnerConfigV1::Provisioned(config) => {
+            let api_key_environment = read_environment(config.secret_ref().environment_variable());
+            let api_key =
+                resolve_provisioned_api_key(config.provider_profile(), api_key_environment)?;
+            PreparedHeadlessChatOwnerV1::Provisioned {
+                config: Box::new(config),
+                api_key,
+            }
+        }
+    };
+    Ok(PreparedHeadlessChatV1 { owner, peer })
+}
+
+/// Runs the same admitted chat owner graph without spawning the Textual
+/// console. The supplied control remains the only owner of process lifecycle:
+/// readiness is reported only after both local IPC endpoints are live, and a
+/// stop request merely releases the existing joined-shutdown path below.
+pub(crate) fn run_prepared_headless_chat(
+    prepared: PreparedHeadlessChatV1,
+    control: &mut impl HeadlessLifecycleControlV1,
+) -> Result<(), LocalProcessError> {
+    let PreparedHeadlessChatV1 { owner, peer } = prepared;
+    let mut runner = HeadlessConversationRunner { control };
+    match owner {
+        PreparedHeadlessChatOwnerV1::Fixture(config) => run_with_runner(*config, peer, &mut runner),
+        PreparedHeadlessChatOwnerV1::Provisioned { config, api_key } => {
+            run_provisioned_with_runner_and_key(*config, api_key, peer, &mut runner)
+        }
+    }
 }
 
 /// Runs the public, single-owner DeploymentController composition. The
@@ -2100,11 +2168,25 @@ struct ConversationInspectionInput {
     ipc_bootstrap_path: PathBuf,
 }
 
+/// Narrow lifecycle seam for the hidden managed-chat supervisor. It conveys
+/// no Runtime, Node, Deployment, Fabric, Model, or Agent facts; those remain
+/// owned by the composition above. Implementations must not report readiness
+/// until this module calls `mark_ready`.
+pub(crate) trait HeadlessLifecycleControlV1 {
+    fn mark_ready(&mut self) -> Result<(), LocalProcessError>;
+
+    fn wait_for_shutdown(&mut self) -> Result<(), LocalProcessError>;
+}
+
 trait ConversationRunner {
     fn run(&mut self, input: ConversationRunInput) -> Result<(), LocalProcessError>;
 }
 
 struct ChildProcessConversationRunner;
+
+struct HeadlessConversationRunner<'a, Control> {
+    control: &'a mut Control,
+}
 
 impl ConversationRunner for ChildProcessConversationRunner {
     fn run(&mut self, input: ConversationRunInput) -> Result<(), LocalProcessError> {
@@ -2130,6 +2212,45 @@ impl ConversationRunner for ChildProcessConversationRunner {
             .shutdown_and_join()
             .map_err(|_| LocalProcessError::ConversationIpc);
         child_result.and(inspection_result).and(conversation_result)
+    }
+}
+
+impl<Control> ConversationRunner for HeadlessConversationRunner<'_, Control>
+where
+    Control: HeadlessLifecycleControlV1,
+{
+    fn run(&mut self, input: ConversationRunInput) -> Result<(), LocalProcessError> {
+        let conversation_endpoint = start_conversation_ipc(&input)?;
+        let inspection_endpoint = match input
+            .inspection
+            .as_ref()
+            .map(|inspection| start_inspection_ipc(&input, inspection))
+            .transpose()
+        {
+            Ok(endpoint) => endpoint,
+            Err(primary) => {
+                let cleanup = conversation_endpoint
+                    .shutdown_and_join()
+                    .map_err(|_| LocalProcessError::ConversationIpc);
+                return Err::<(), LocalProcessError>(primary).and(cleanup);
+            }
+        };
+
+        let lifecycle_result = self
+            .control
+            .mark_ready()
+            .and_then(|()| self.control.wait_for_shutdown());
+        let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
+            endpoint
+                .shutdown_and_join()
+                .map_err(|_| LocalProcessError::InspectionIpc)
+        });
+        let conversation_result = conversation_endpoint
+            .shutdown_and_join()
+            .map_err(|_| LocalProcessError::ConversationIpc);
+        lifecycle_result
+            .and(inspection_result)
+            .and(conversation_result)
     }
 }
 
@@ -4000,6 +4121,30 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ImmediateHeadlessControl {
+        ready: bool,
+        shutdown_waited: bool,
+    }
+
+    impl HeadlessLifecycleControlV1 for ImmediateHeadlessControl {
+        fn mark_ready(&mut self) -> Result<(), LocalProcessError> {
+            if self.ready || self.shutdown_waited {
+                return Err(LocalProcessError::LifecycleStartup);
+            }
+            self.ready = true;
+            Ok(())
+        }
+
+        fn wait_for_shutdown(&mut self) -> Result<(), LocalProcessError> {
+            if !self.ready || self.shutdown_waited {
+                return Err(LocalProcessError::LifecycleShutdown);
+            }
+            self.shutdown_waited = true;
+            Ok(())
+        }
+    }
+
     #[test]
     fn public_node_ready_marker_is_exact_and_flushed() {
         let mut output = FlushProbe::default();
@@ -5705,26 +5850,119 @@ mod tests {
             state_root: state_root.clone(),
             socket_directory: None,
         };
-        let peer = current_developer_local_peer().expect("non-root test peer");
 
-        let mut missing_runner = NonInteractiveConversationRunner::provisioned(Vec::new());
-        assert_eq!(
-            run_provisioned_with_environment_value(config.clone(), None, peer, &mut missing_runner),
-            Err(LocalProcessError::ProviderSecret)
+        let missing_reads = AtomicUsize::new(0);
+        let missing = prepare_headless_chat_with_environment(
+            LocalManagedChatOwnerConfigV1::Provisioned(config.clone()),
+            |name| {
+                assert_eq!(name, "OPENAI_API_KEY");
+                missing_reads.fetch_add(1, Ordering::AcqRel);
+                None
+            },
         );
+        assert!(matches!(missing, Err(LocalProcessError::ProviderSecret)));
+        assert_eq!(missing_reads.load(Ordering::Acquire), 1);
         assert!(!state_root.exists());
 
-        let mut invalid_runner = NonInteractiveConversationRunner::provisioned(Vec::new());
-        assert_eq!(
-            run_provisioned_with_environment_value(
-                config,
-                Some(OsString::from("invalid key with spaces")),
-                peer,
-                &mut invalid_runner,
-            ),
-            Err(LocalProcessError::ProviderSecret)
+        let invalid_reads = AtomicUsize::new(0);
+        let invalid = prepare_headless_chat_with_environment(
+            LocalManagedChatOwnerConfigV1::Provisioned(config),
+            |name| {
+                assert_eq!(name, "OPENAI_API_KEY");
+                invalid_reads.fetch_add(1, Ordering::AcqRel);
+                Some(OsString::from("invalid key with spaces"))
+            },
         );
+        assert!(matches!(invalid, Err(LocalProcessError::ProviderSecret)));
+        assert_eq!(invalid_reads.load(Ordering::Acquire), 1);
         assert!(!state_root.exists());
+    }
+
+    #[test]
+    fn prepared_provisioned_headless_owner_consumes_one_resolved_secret() {
+        let state_root = fresh_state_root("prepared-secret-once");
+        let (port, fabric_listen) = ephemeral_fabric_listen();
+        let config = provisioned_config(
+            &state_root,
+            &fabric_listen,
+            "openai-responses-v1",
+            "gpt-test-model",
+            "env:OPENAI_API_KEY",
+        );
+        let mut cleanup = TestCleanup {
+            state_root: state_root.clone(),
+            socket_directory: None,
+        };
+        let environment_reads = AtomicUsize::new(0);
+        let prepared = prepare_headless_chat_with_environment(
+            LocalManagedChatOwnerConfigV1::Provisioned(config.clone()),
+            |name| {
+                assert_eq!(name, "OPENAI_API_KEY");
+                environment_reads.fetch_add(1, Ordering::AcqRel);
+                Some(OsString::from("test-api-key"))
+            },
+        )
+        .expect("headless Secret preparation");
+        assert_eq!(environment_reads.load(Ordering::Acquire), 1);
+        assert!(!state_root.exists());
+
+        let mut control = ImmediateHeadlessControl::default();
+        run_prepared_headless_chat(prepared, &mut control)
+            .expect("prepared provisioned headless owner");
+        assert!(control.ready);
+        assert!(control.shutdown_waited);
+        assert_eq!(environment_reads.load(Ordering::Acquire), 1);
+
+        let manifest = identity::load_or_create_provisioned(&config)
+            .expect("stable provisioned identity manifest");
+        let prepared_layout =
+            layout::prepare_provisioned(&config, &manifest).expect("stable provisioned layout");
+        cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
+        assert!(!prepared_layout.authority_socket_path().exists());
+        assert!(!prepared_layout.runtime_socket_path().exists());
+        drop(prepared_layout);
+        drop(manifest);
+        let rebound = TcpListener::bind(("127.0.0.1", port))
+            .expect("Fabric port must be released after joined shutdown");
+        drop(rebound);
+    }
+
+    #[test]
+    fn prepared_headless_owner_is_move_only_and_cannot_resolve_the_secret_again() {
+        let source = include_str!("composition.rs");
+        let tests_start = source
+            .rfind("\n#[cfg(test)]\nmod tests {")
+            .expect("composition test module");
+        let production = &source[..tests_start];
+        let prepared_start = production
+            .find("pub(crate) struct PreparedHeadlessChatV1")
+            .expect("prepared headless owner");
+        let prepare_start = production
+            .find("pub(crate) fn prepare_headless_chat(")
+            .expect("headless preparation entrypoint");
+        let consume_start = production
+            .find("pub(crate) fn run_prepared_headless_chat(")
+            .expect("prepared headless consumer");
+        let deployment_start = production
+            .find("pub(crate) fn run_deployment(")
+            .expect("next public composition entrypoint");
+
+        let prepared_type = &production[prepared_start..prepare_start];
+        assert!(!prepared_type.contains("#[derive"));
+        assert!(!prepared_type.contains("impl Clone for PreparedHeadlessChatV1"));
+        assert!(!prepared_type.contains("impl Debug for PreparedHeadlessChatV1"));
+        assert!(!prepared_type.contains("impl PreparedHeadlessChatV1"));
+
+        let preparation = &production[prepare_start..consume_start];
+        assert!(preparation.contains("current_developer_local_peer()?"));
+        assert!(preparation.contains("config, |name| env::var_os(name)"));
+        assert!(preparation.contains("resolve_provisioned_api_key("));
+
+        let consumer = &production[consume_start..deployment_start];
+        assert!(consumer.contains("run_with_runner("));
+        assert!(consumer.contains("run_provisioned_with_runner_and_key("));
+        assert!(!consumer.contains("env::var_os"));
+        assert!(!consumer.contains("run_provisioned_with_environment_value("));
     }
 
     #[test]

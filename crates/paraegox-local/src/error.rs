@@ -3,6 +3,20 @@ use crate::config::ConfigError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LocalProcessError {
     Configuration(ConfigError),
+    OfflineJsonOutput,
+    InitUnsafeExecutionIdentity,
+    InitWorkspaceConflict,
+    InitIo,
+    InitPublicationUncertain,
+    InitJsonOutput,
+    LifecycleConfiguration,
+    LifecycleState,
+    LifecycleControl,
+    LifecycleUnavailable,
+    LifecycleStartup,
+    LifecycleShutdown,
+    LifecycleReconcileRequired,
+    LifecycleJsonOutput,
     UnsafeExecutionIdentity,
     SignalHandling,
     IdentityManifest,
@@ -46,6 +60,20 @@ impl LocalProcessError {
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::Configuration(error) => error.code(),
+            Self::OfflineJsonOutput => "PXLC-OFFLINE-JSON-OUTPUT",
+            Self::InitUnsafeExecutionIdentity => "PXLC-INIT-EXECUTION-IDENTITY",
+            Self::InitWorkspaceConflict => "PXLC-INIT-WORKSPACE-CONFLICT",
+            Self::InitIo => "PXLC-INIT-IO",
+            Self::InitPublicationUncertain => "PXLC-INIT-PUBLICATION-UNCERTAIN",
+            Self::InitJsonOutput => "PXLC-INIT-JSON-OUTPUT",
+            Self::LifecycleConfiguration => "PXLC-LIFECYCLE-CONFIGURATION",
+            Self::LifecycleState => "PXLC-LIFECYCLE-STATE",
+            Self::LifecycleControl => "PXLC-LIFECYCLE-CONTROL",
+            Self::LifecycleUnavailable => "PXLC-LIFECYCLE-UNAVAILABLE",
+            Self::LifecycleStartup => "PXLC-LIFECYCLE-STARTUP",
+            Self::LifecycleShutdown => "PXLC-LIFECYCLE-SHUTDOWN",
+            Self::LifecycleReconcileRequired => "PXLC-LIFECYCLE-RECONCILE-REQUIRED",
+            Self::LifecycleJsonOutput => "PXLC-LIFECYCLE-JSON-OUTPUT",
             Self::UnsafeExecutionIdentity => "PXLC-EXECUTION-IDENTITY",
             Self::SignalHandling => "PXLC-SIGNAL-HANDLING",
             Self::IdentityManifest => "PXLC-IDENTITY-MANIFEST",
@@ -89,6 +117,32 @@ impl LocalProcessError {
     pub(crate) const fn message(self) -> &'static str {
         match self {
             Self::Configuration(error) => error.message(),
+            Self::OfflineJsonOutput => "offline machine-readable output failed",
+            Self::InitUnsafeExecutionIdentity => {
+                "init requires a non-root Unix user and group"
+            }
+            Self::InitWorkspaceConflict => {
+                "init workspace or configuration conflicts with the strict private layout"
+            }
+            Self::InitIo => "init workspace I/O failed",
+            Self::InitPublicationUncertain => {
+                "init configuration publication is uncertain and requires inspection"
+            }
+            Self::InitJsonOutput => "init machine-readable output failed",
+            Self::LifecycleConfiguration => {
+                "managed-local lifecycle configuration authority changed"
+            }
+            Self::LifecycleState => "managed-local lifecycle state failed strict validation",
+            Self::LifecycleControl => "managed-local lifecycle control exchange failed closed",
+            Self::LifecycleUnavailable => "managed-local lifecycle owner is unavailable",
+            Self::LifecycleStartup => "managed-local owner composition failed to become ready",
+            Self::LifecycleShutdown => {
+                "managed-local owner composition did not complete joined shutdown"
+            }
+            Self::LifecycleReconcileRequired => {
+                "managed-local lifecycle authority is uncertain and requires explicit recovery"
+            }
+            Self::LifecycleJsonOutput => "managed-local lifecycle JSON output failed",
             Self::UnsafeExecutionIdentity => {
                 "DeveloperLocal commands require a non-root user and group"
             }
@@ -173,7 +227,10 @@ impl LocalProcessError {
 
     pub(crate) const fn exit_code(self) -> u8 {
         match self {
-            Self::Configuration(_) => 2,
+            Self::Configuration(_)
+            | Self::InitUnsafeExecutionIdentity
+            | Self::InitWorkspaceConflict
+            | Self::LifecycleConfiguration => 2,
             _ => 1,
         }
     }
@@ -199,6 +256,32 @@ mod tests {
         assert_eq!(integration.exit_code(), 1);
         assert_eq!(integration.code(), "PXLC-DEPLOYMENT-ACTIVATION");
         assert!(!integration.message().contains("ready"));
+
+        let output = LocalProcessError::OfflineJsonOutput;
+        assert_eq!(output.exit_code(), 1);
+        assert_eq!(output.code(), "PXLC-OFFLINE-JSON-OUTPUT");
+        assert_eq!(output.message(), "offline machine-readable output failed");
+
+        let lifecycle_config = LocalProcessError::LifecycleConfiguration;
+        assert_eq!(lifecycle_config.exit_code(), 2);
+        assert_eq!(lifecycle_config.code(), "PXLC-LIFECYCLE-CONFIGURATION");
+
+        let lifecycle_output = LocalProcessError::LifecycleJsonOutput;
+        assert_eq!(lifecycle_output.exit_code(), 1);
+        assert_eq!(lifecycle_output.code(), "PXLC-LIFECYCLE-JSON-OUTPUT");
+
+        let init_conflict = LocalProcessError::InitWorkspaceConflict;
+        assert_eq!(init_conflict.exit_code(), 2);
+        assert_eq!(init_conflict.code(), "PXLC-INIT-WORKSPACE-CONFLICT");
+
+        for failure in [
+            LocalProcessError::InitIo,
+            LocalProcessError::InitPublicationUncertain,
+            LocalProcessError::InitJsonOutput,
+        ] {
+            assert_eq!(failure.exit_code(), 1);
+            assert!(failure.code().starts_with("PXLC-INIT-"));
+        }
     }
 
     #[test]

@@ -43,9 +43,20 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 const CHAT_COMMAND: &str = "chat";
+const INIT_COMMAND: &str = "init";
 const NODE_COMMAND: &str = "node";
 const DEPLOYMENT_COMMAND: &str = "deployment";
+const VERSION_COMMAND: &str = "version";
+const CONFIG_COMMAND: &str = "config";
+const CONFIG_CHECK_COMMAND: &str = "check";
+const DOCTOR_COMMAND: &str = "doctor";
+const UP_COMMAND: &str = "up";
+const STATUS_COMMAND: &str = "status";
+const DOWN_COMMAND: &str = "down";
 const CONFIG_OPTION: &str = "--config";
+const OFFLINE_OPTION: &str = "--offline";
+const JSON_OPTION: &str = "--json";
+const DIRECTORY_OPTION: &str = "--directory";
 const DETERMINISTIC_ECHO_PROVIDER: &str = "deterministic-echo-v1";
 const OPENAI_RESPONSES_PROVIDER: &str = "openai-responses-v1";
 const DEEPSEEK_CHAT_COMPLETIONS_PROVIDER: &str = "deepseek-chat-completions-v1";
@@ -63,6 +74,8 @@ const DEVELOPER_DEPLOYMENT_SIGNING_SEED_BYTES: u64 = 32;
 const NODE_CONFIG_COMMITMENT_V1_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v1";
 const NODE_CONFIG_COMMITMENT_V2_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v2";
 const NODE_CONFIG_COMMITMENT_V3_DOMAIN: &[u8] = b"paraegox.local.developer-node-config.sha256.v3";
+const LOCAL_MANAGED_CHAT_CONFIG_COMMITMENT_DOMAIN: &[u8] =
+    b"paraegox.local.managed-chat-config.sha256.v1";
 const NODE_MANAGED_AGENT_PROVIDER_REF_DOMAIN: &[u8] =
     b"paraegox.local.developer-node-managed-agent-provider-ref.sha256.v1";
 const DETERMINISTIC_PROVIDER_CONFIG_DOMAIN: &[u8] =
@@ -121,6 +134,9 @@ const FABRIC_CONNECT_PRIVATE_KEY_FILE_A_OPTION: &str = "--fabric-connect-private
 const FABRIC_CONNECT_PRIVATE_KEY_FILE_B_OPTION: &str = "--fabric-connect-private-key-file-b";
 const LOOPBACK_TCP_PREFIX: &str = "tcp/127.0.0.1:";
 const MAX_STATE_ROOT_BYTES: usize = 4_096;
+const INIT_CONFIG_FILE_NAME: &str = "paraegox.toml";
+const MAX_INIT_DIRECTORY_BYTES: usize =
+    MAX_STATE_ROOT_BYTES - INIT_CONFIG_FILE_NAME.len() - 1;
 const MAX_TLS_FILE_PATH_BYTES: usize = 4_096;
 const MAX_EXPERIMENTAL_PEER_COMMON_NAME_BYTES: usize = 253;
 
@@ -140,6 +156,177 @@ pub(crate) enum Command {
     DeveloperFixtureV1(DeveloperFixtureConfigV1),
     DeveloperDistributedFixtureV1(DeveloperDistributedFixtureConfigV1),
     DeveloperProvisionedV1(DeveloperProvisionedConfigV1),
+}
+
+/// Exact machine-readable commands that perform no owner startup or network I/O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OfflineCommandV1 {
+    Version,
+    ConfigCheck(OfflineConfigSummaryV1),
+    Doctor(OfflineConfigSummaryV1),
+}
+
+/// Exact public lifecycle actions for one managed local chat composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalLifecycleActionV1 {
+    Up,
+    Status,
+    Down,
+}
+
+/// Strict public input for the offline DeveloperLocal workspace initializer.
+///
+/// The directory is retained only for the initializer call. It is never
+/// projected into machine-readable output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InitCommandV1 {
+    directory: PathBuf,
+}
+
+impl InitCommandV1 {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
+impl LocalLifecycleActionV1 {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => UP_COMMAND,
+            Self::Status => STATUS_COMMAND,
+            Self::Down => DOWN_COMMAND,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            UP_COMMAND => Some(Self::Up),
+            STATUS_COMMAND => Some(Self::Status),
+            DOWN_COMMAND => Some(Self::Down),
+            _ => None,
+        }
+    }
+}
+
+/// Stable intent used to keep exact lifecycle errors on the one-object JSON
+/// channel even when the selected config cannot be decoded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LocalLifecycleJsonIntentV1 {
+    action: LocalLifecycleActionV1,
+}
+
+impl LocalLifecycleJsonIntentV1 {
+    pub(crate) const fn action(self) -> LocalLifecycleActionV1 {
+        self.action
+    }
+}
+
+/// Parsed public lifecycle command. The config stays whole so only the local
+/// lifecycle supervisor can move it into the existing composition owner.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct LocalLifecycleCommandV1 {
+    action: LocalLifecycleActionV1,
+    config: LocalManagedChatConfigV1,
+}
+
+impl LocalLifecycleCommandV1 {
+    pub(crate) const fn action(&self) -> LocalLifecycleActionV1 {
+        self.action
+    }
+
+    pub(crate) fn into_config(self) -> LocalManagedChatConfigV1 {
+        self.config
+    }
+}
+
+/// Stable operation identity used to select the one-object JSON error surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OfflineJsonIntentV1 {
+    operation: OfflineOperationV1,
+    target: Option<OfflineConfigTargetV1>,
+}
+
+impl OfflineJsonIntentV1 {
+    pub(crate) const fn command(self) -> &'static str {
+        self.operation.command()
+    }
+
+    pub(crate) const fn target(self) -> Option<OfflineConfigTargetV1> {
+        self.target
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfflineOperationV1 {
+    Version,
+    ConfigCheck,
+    Doctor,
+}
+
+impl OfflineOperationV1 {
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Version => "version",
+            Self::ConfigCheck => "config.check",
+            Self::Doctor => "doctor.offline",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OfflineConfigTargetV1 {
+    Chat,
+    Node,
+    Deployment,
+}
+
+impl OfflineConfigTargetV1 {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => CHAT_COMMAND,
+            Self::Node => NODE_COMMAND,
+            Self::Deployment => DEPLOYMENT_COMMAND,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            CHAT_COMMAND => Some(Self::Chat),
+            NODE_COMMAND => Some(Self::Node),
+            DEPLOYMENT_COMMAND => Some(Self::Deployment),
+            _ => None,
+        }
+    }
+}
+
+/// Public-safe result of strict configuration parsing.
+///
+/// It deliberately retains no path, endpoint, model identifier, SecretRef value,
+/// credential identifier, or key material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OfflineConfigSummaryV1 {
+    target: OfflineConfigTargetV1,
+    schema_version: u16,
+    profile: &'static str,
+    secret_input_reference_present: bool,
+}
+
+impl OfflineConfigSummaryV1 {
+    pub(crate) const fn target(self) -> OfflineConfigTargetV1 {
+        self.target
+    }
+
+    pub(crate) const fn schema_version(self) -> u16 {
+        self.schema_version
+    }
+
+    pub(crate) const fn profile(self) -> &'static str {
+        self.profile
+    }
+
+    pub(crate) const fn secret_input_reference_present(self) -> bool {
+        self.secret_input_reference_present
+    }
 }
 
 #[derive(Deserialize)]
@@ -1247,6 +1434,53 @@ pub(crate) struct DeveloperFixtureConfigV1 {
     profile: DeveloperLocalProfileV1,
 }
 
+/// The already-admitted chat owner configuration retained by the lifecycle
+/// supervisor. This is not a second config schema and cannot represent Node
+/// or Deployment-only modes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalManagedChatOwnerConfigV1 {
+    Fixture(DeveloperFixtureConfigV1),
+    Provisioned(DeveloperProvisionedConfigV1),
+}
+
+impl LocalManagedChatOwnerConfigV1 {
+    pub(crate) fn state_root(&self) -> &Path {
+        match self {
+            Self::Fixture(config) => config.state_root(),
+            Self::Provisioned(config) => config.state_root(),
+        }
+    }
+}
+
+/// Exact chat config plus the public source identity used by the hidden local
+/// supervisor. The commitment is derived from the strict config bytes; it is
+/// never a substitute for reopening and revalidating the config before owner
+/// startup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalManagedChatConfigV1 {
+    source_path: PathBuf,
+    config_commitment: [u8; 32],
+    owner: LocalManagedChatOwnerConfigV1,
+}
+
+impl LocalManagedChatConfigV1 {
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub(crate) fn state_root(&self) -> &Path {
+        self.owner.state_root()
+    }
+
+    pub(crate) const fn config_commitment(&self) -> [u8; 32] {
+        self.config_commitment
+    }
+
+    pub(crate) fn into_owner_config(self) -> LocalManagedChatOwnerConfigV1 {
+        self.owner
+    }
+}
+
 impl DeveloperFixtureConfigV1 {
     pub(crate) fn state_root(&self) -> &std::path::Path {
         &self.state_root
@@ -1565,6 +1799,8 @@ pub(crate) enum ConfigError {
     UnknownOption,
     MissingOptionValue,
     DuplicateOption,
+    InvalidInitGrammar,
+    InvalidInitDirectory,
     MissingStateRoot,
     MissingFabricListenA,
     MissingFabricListenB,
@@ -1644,6 +1880,8 @@ impl ConfigError {
             Self::UnknownOption => "PXLC-OPTION-UNKNOWN",
             Self::MissingOptionValue => "PXLC-OPTION-VALUE-MISSING",
             Self::DuplicateOption => "PXLC-OPTION-DUPLICATE",
+            Self::InvalidInitGrammar => "PXLC-INIT-GRAMMAR",
+            Self::InvalidInitDirectory => "PXLC-INIT-DIRECTORY-INVALID",
             Self::MissingStateRoot => "PXLC-STATE-ROOT-MISSING",
             Self::MissingFabricListenA => "PXLC-FABRIC-LISTEN-A-MISSING",
             Self::MissingFabricListenB => "PXLC-FABRIC-LISTEN-B-MISSING",
@@ -1733,6 +1971,12 @@ impl ConfigError {
             Self::UnknownOption => "the mode contains an unknown or positional argument",
             Self::MissingOptionValue => "an option is missing its value",
             Self::DuplicateOption => "an option was supplied more than once",
+            Self::InvalidInitGrammar => {
+                "init requires exactly --directory <absolute-directory> --json"
+            }
+            Self::InvalidInitDirectory => {
+                "init directory must be a bounded non-root lexically canonical absolute path"
+            }
             Self::MissingStateRoot => "the selected DeveloperLocal mode requires --state-root",
             Self::MissingFabricListenA => "internal distributed fixture requires --fabric-listen-a",
             Self::MissingFabricListenB => "internal distributed fixture requires --fabric-listen-b",
@@ -1852,6 +2096,228 @@ impl ConfigError {
     }
 }
 
+/// Recognizes only the three complete machine-readable grammars.
+///
+/// The config path itself may be non-UTF-8 here so that the strict parser can
+/// return its stable argument error through the requested JSON surface.
+pub(crate) fn offline_json_intent(arguments: &[OsString]) -> Option<OfflineJsonIntentV1> {
+    let argument = |index: usize| arguments.get(index).and_then(|value| value.to_str());
+    match argument(0)? {
+        VERSION_COMMAND if arguments.len() == 2 && argument(1) == Some(JSON_OPTION) => {
+            Some(OfflineJsonIntentV1 {
+                operation: OfflineOperationV1::Version,
+                target: None,
+            })
+        }
+        CONFIG_COMMAND
+            if arguments.len() == 6
+                && argument(1) == Some(CONFIG_CHECK_COMMAND)
+                && argument(3) == Some(CONFIG_OPTION)
+                && argument(5) == Some(JSON_OPTION) =>
+        {
+            Some(OfflineJsonIntentV1 {
+                operation: OfflineOperationV1::ConfigCheck,
+                target: OfflineConfigTargetV1::parse(argument(2)?),
+            })
+        }
+        DOCTOR_COMMAND
+            if arguments.len() == 6
+                && argument(2) == Some(CONFIG_OPTION)
+                && argument(4) == Some(OFFLINE_OPTION)
+                && argument(5) == Some(JSON_OPTION) =>
+        {
+            Some(OfflineJsonIntentV1 {
+                operation: OfflineOperationV1::Doctor,
+                target: OfflineConfigTargetV1::parse(argument(1)?),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Recognizes a public lifecycle command before validating its exact grammar.
+///
+/// Unlike the offline slice, every `up`, `status`, or `down` invocation owns
+/// the lifecycle JSON error channel. This lets malformed recognized grammar
+/// fail with the same path-free schema and exit 2 instead of falling through
+/// to the legacy human error surface.
+pub(crate) fn lifecycle_json_intent(arguments: &[OsString]) -> Option<LocalLifecycleJsonIntentV1> {
+    let argument = |index: usize| arguments.get(index).and_then(|value| value.to_str());
+    Some(LocalLifecycleJsonIntentV1 {
+        action: LocalLifecycleActionV1::parse(argument(0)?)?,
+    })
+}
+
+/// Recognizes every invocation of the public `init` command before grammar
+/// validation so all failures stay on its path-free JSON channel.
+pub(crate) fn init_json_intent(arguments: &[OsString]) -> bool {
+    arguments
+        .first()
+        .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(INIT_COMMAND))
+}
+
+/// Parses the one exact public initializer grammar without opening the
+/// filesystem, resolving a Secret, accessing the network, or starting an
+/// owner.
+pub(crate) fn parse_init(arguments: &[OsString]) -> Result<InitCommandV1, ConfigError> {
+    if !init_json_intent(arguments)
+        || arguments.len() != 4
+        || arguments.get(1).and_then(|value| value.to_str()) != Some(DIRECTORY_OPTION)
+        || arguments.get(3).and_then(|value| value.to_str()) != Some(JSON_OPTION)
+    {
+        return Err(ConfigError::InvalidInitGrammar);
+    }
+    ensure_unix_developer_local()?;
+    let directory = arguments
+        .get(2)
+        .cloned()
+        .ok_or(ConfigError::InvalidInitGrammar)?
+        .into_string()
+        .map_err(|_| ConfigError::NonUtf8Argument)?;
+    Ok(InitCommandV1 {
+        directory: parse_init_directory(directory)?,
+    })
+}
+
+/// Parses one public managed-local lifecycle command without starting owners.
+///
+/// The exact chat decoder remains the sole schema authority. Status and down
+/// intentionally reopen the same config so a changed file cannot select an
+/// already-running lifecycle generation by path alone.
+pub(crate) fn parse_lifecycle(
+    arguments: &[OsString],
+) -> Result<Option<LocalLifecycleCommandV1>, ConfigError> {
+    let Some(mode) = arguments.first().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    if !matches!(mode, UP_COMMAND | STATUS_COMMAND | DOWN_COMMAND) {
+        return Ok(None);
+    }
+    if arguments.len() != 4
+        || arguments.get(1).and_then(|value| value.to_str()) != Some(CONFIG_OPTION)
+        || arguments.get(3).and_then(|value| value.to_str()) != Some(JSON_OPTION)
+    {
+        return Err(ConfigError::UnknownOption);
+    }
+    ensure_unix_developer_local()?;
+    let intent = lifecycle_json_intent(arguments).ok_or(ConfigError::UnknownOption)?;
+    let config = parse_managed_chat_config_file(
+        arguments
+            .get(2)
+            .cloned()
+            .ok_or(ConfigError::MissingConfigPath)?,
+    )?;
+    Ok(Some(LocalLifecycleCommandV1 {
+        action: intent.action,
+        config,
+    }))
+}
+
+/// Parses an offline command without starting an owner or resolving a Secret.
+///
+/// `Ok(None)` means the arguments belong to the existing runtime command
+/// grammar. An offline top-level name with malformed arguments fails closed
+/// instead of falling through to a runtime mode.
+pub(crate) fn parse_offline(
+    arguments: &[OsString],
+) -> Result<Option<OfflineCommandV1>, ConfigError> {
+    let Some(mode) = arguments.first().and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    if !matches!(mode, VERSION_COMMAND | CONFIG_COMMAND | DOCTOR_COMMAND) {
+        return Ok(None);
+    }
+    let intent = offline_json_intent(arguments).ok_or(ConfigError::UnknownOption)?;
+    let command = match intent.operation {
+        OfflineOperationV1::Version => OfflineCommandV1::Version,
+        OfflineOperationV1::ConfigCheck | OfflineOperationV1::Doctor => {
+            let target = intent.target.ok_or(ConfigError::UnknownMode)?;
+            let path_index = match intent.operation {
+                OfflineOperationV1::ConfigCheck => 4,
+                OfflineOperationV1::Doctor => 3,
+                OfflineOperationV1::Version => unreachable!("version has no config path"),
+            };
+            let path = arguments[path_index]
+                .clone()
+                .into_string()
+                .map_err(|_| ConfigError::NonUtf8Argument)?;
+            let summary = parse_offline_config(target, path)?;
+            match intent.operation {
+                OfflineOperationV1::ConfigCheck => OfflineCommandV1::ConfigCheck(summary),
+                OfflineOperationV1::Doctor => OfflineCommandV1::Doctor(summary),
+                OfflineOperationV1::Version => unreachable!("version has no config summary"),
+            }
+        }
+    };
+    Ok(Some(command))
+}
+
+fn parse_offline_config(
+    target: OfflineConfigTargetV1,
+    path: String,
+) -> Result<OfflineConfigSummaryV1, ConfigError> {
+    let parsed = match target {
+        OfflineConfigTargetV1::Chat => parse_chat_config_file(path)?,
+        OfflineConfigTargetV1::Node => parse_node_config_file(path)?,
+        OfflineConfigTargetV1::Deployment => parse_deployment_config_file(path)?,
+    };
+    match (target, parsed) {
+        (OfflineConfigTargetV1::Chat, Command::DeveloperFixtureV1(_)) => {
+            Ok(OfflineConfigSummaryV1 {
+                target,
+                schema_version: CHAT_CONFIG_SCHEMA_VERSION,
+                profile: DETERMINISTIC_ECHO_PROVIDER,
+                secret_input_reference_present: false,
+            })
+        }
+        (OfflineConfigTargetV1::Chat, Command::DeveloperProvisionedV1(config)) => {
+            let profile = match config.provider_profile() {
+                ProviderProfileV1::OpenAiResponsesV1 => OPENAI_RESPONSES_PROVIDER,
+                ProviderProfileV1::DeepSeekChatCompletionsV1 => DEEPSEEK_CHAT_COMPLETIONS_PROVIDER,
+                ProviderProfileV1::DeterministicFixtureV1 => {
+                    return Err(ConfigError::InvalidProviderConfiguration);
+                }
+            };
+            Ok(OfflineConfigSummaryV1 {
+                target,
+                schema_version: CHAT_CONFIG_SCHEMA_VERSION,
+                profile,
+                secret_input_reference_present: true,
+            })
+        }
+        (OfflineConfigTargetV1::Node, Command::DeveloperNodeV1(config)) => {
+            let profile = match config.schema() {
+                DeveloperNodeConfigSchemaV1::HostLocalV1 => "host-local-v1",
+                DeveloperNodeConfigSchemaV1::RemoteControlV2 => "remote-control-v2",
+                DeveloperNodeConfigSchemaV1::ManagedAgentBootstrapV3 => {
+                    "managed-agent-bootstrap-v3"
+                }
+            };
+            Ok(OfflineConfigSummaryV1 {
+                target,
+                schema_version: config.schema().wire_value(),
+                profile,
+                secret_input_reference_present: true,
+            })
+        }
+        (OfflineConfigTargetV1::Deployment, Command::DeveloperDeploymentV1(config)) => {
+            let profile = match config.schema() {
+                DeveloperDeploymentConfigSchemaV1::EnrollmentV1 => "enrollment-v1",
+                DeveloperDeploymentConfigSchemaV1::ManagedAgentBootstrapV2 => {
+                    "managed-agent-bootstrap-v2"
+                }
+            };
+            Ok(OfflineConfigSummaryV1 {
+                target,
+                schema_version: config.schema().wire_value(),
+                profile,
+                secret_input_reference_present: true,
+            })
+        }
+        _ => Err(ConfigError::UnknownMode),
+    }
+}
+
 pub(crate) fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, ConfigError> {
     let arguments = arguments
         .into_iter()
@@ -1905,6 +2371,51 @@ fn parse_chat_config_file(path: String) -> Result<Command, ConfigError> {
     parse_chat_config_document(document)
 }
 
+fn parse_managed_chat_config_file(
+    source_path: OsString,
+) -> Result<LocalManagedChatConfigV1, ConfigError> {
+    let source_path = source_path
+        .into_string()
+        .map_err(|_| ConfigError::NonUtf8Argument)?;
+    let text = read_config_file(source_path.clone())?;
+    let document = toml::from_str::<DeveloperLocalConfigDocumentV1>(&text)
+        .map_err(|_| ConfigError::InvalidConfigDocument)?;
+    let owner = match parse_chat_config_document(document)? {
+        Command::DeveloperFixtureV1(config) => LocalManagedChatOwnerConfigV1::Fixture(config),
+        Command::DeveloperProvisionedV1(config) => {
+            LocalManagedChatOwnerConfigV1::Provisioned(config)
+        }
+        Command::Help
+        | Command::DeveloperNodeV1(_)
+        | Command::DeveloperDeploymentV1(_)
+        | Command::DeveloperDistributedFixtureV1(_) => {
+            return Err(ConfigError::UnknownMode);
+        }
+    };
+    let mut digest = Sha256::new();
+    digest.update(LOCAL_MANAGED_CHAT_CONFIG_COMMITMENT_DOMAIN);
+    digest.update(
+        u64::try_from(text.len())
+            .map_err(|_| ConfigError::ConfigFileTooLarge)?
+            .to_be_bytes(),
+    );
+    digest.update(text.as_bytes());
+    Ok(LocalManagedChatConfigV1 {
+        source_path: PathBuf::from(source_path),
+        config_commitment: digest.finalize().into(),
+        owner,
+    })
+}
+
+/// Hidden supervisor entrypoint reopens the exact same public config through
+/// this narrow adapter. It is not a second public grammar.
+pub(crate) fn parse_managed_chat_supervisor_config(
+    source_path: OsString,
+) -> Result<LocalManagedChatConfigV1, ConfigError> {
+    ensure_unix_developer_local()?;
+    parse_managed_chat_config_file(source_path)
+}
+
 fn parse_node(mut arguments: impl Iterator<Item = String>) -> Result<Command, ConfigError> {
     ensure_unix_developer_local()?;
     if arguments.next().as_deref() != Some(CONFIG_OPTION) {
@@ -1914,6 +2425,10 @@ fn parse_node(mut arguments: impl Iterator<Item = String>) -> Result<Command, Co
     if arguments.next().is_some() {
         return Err(ConfigError::UnknownOption);
     }
+    parse_node_config_file(path)
+}
+
+fn parse_node_config_file(path: String) -> Result<Command, ConfigError> {
     let text = read_config_file(path)?;
     let document = toml::from_str::<DeveloperNodeConfigDocumentV1>(&text)
         .map_err(|_| ConfigError::InvalidConfigDocument)?;
@@ -1929,6 +2444,10 @@ fn parse_deployment(mut arguments: impl Iterator<Item = String>) -> Result<Comma
     if arguments.next().is_some() {
         return Err(ConfigError::UnknownOption);
     }
+    parse_deployment_config_file(path)
+}
+
+fn parse_deployment_config_file(path: String) -> Result<Command, ConfigError> {
     let text = read_config_file(path)?;
     parse_developer_deployment_config_toml_v1(&text)
         .map(|config| Command::DeveloperDeploymentV1(Box::new(config)))
@@ -2828,6 +3347,29 @@ fn parse_state_root(value: String) -> Result<PathBuf, ConfigError> {
     Ok(PathBuf::from(value))
 }
 
+fn parse_init_directory(value: String) -> Result<PathBuf, ConfigError> {
+    let bytes = value.as_bytes();
+    let path = PathBuf::from(&value);
+    if bytes.len() <= 1
+        || bytes.len() > MAX_INIT_DIRECTORY_BYTES
+        || bytes.first() != Some(&b'/')
+        || bytes.last() == Some(&b'/')
+        || bytes.contains(&0)
+        || bytes.windows(2).any(|window| window == b"//")
+        || bytes[1..]
+            .split(|byte| *byte == b'/')
+            .any(|component| component == b"." || component == b"..")
+        || !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(ConfigError::InvalidInitDirectory);
+    }
+    Ok(path)
+}
+
 fn parse_tls_file_path(value: String) -> Result<PathBuf, ConfigError> {
     let path = PathBuf::from(&value);
     let mut normalized = PathBuf::new();
@@ -3581,6 +4123,63 @@ limits_profile = "developer-agent-bootstrap-v1"
             Some("deepseek-v4-flash"),
             Some(DEEPSEEK_SECRET_REF),
         ))
+    }
+
+    fn offline_config_check_arguments(target: &str, config_path: OsString) -> Vec<OsString> {
+        vec![
+            OsString::from(CONFIG_COMMAND),
+            OsString::from(CONFIG_CHECK_COMMAND),
+            OsString::from(target),
+            OsString::from(CONFIG_OPTION),
+            config_path,
+            OsString::from(JSON_OPTION),
+        ]
+    }
+
+    fn offline_doctor_arguments(target: &str, config_path: OsString) -> Vec<OsString> {
+        vec![
+            OsString::from(DOCTOR_COMMAND),
+            OsString::from(target),
+            OsString::from(CONFIG_OPTION),
+            config_path,
+            OsString::from(OFFLINE_OPTION),
+            OsString::from(JSON_OPTION),
+        ]
+    }
+
+    fn lifecycle_arguments(action: &str, config_path: OsString) -> Vec<OsString> {
+        vec![
+            OsString::from(action),
+            OsString::from(CONFIG_OPTION),
+            config_path,
+            OsString::from(JSON_OPTION),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn unresolved_deployment_document(root: &Path) -> String {
+        let root = root.to_str().expect("UTF-8 unresolved Deployment root");
+        format!(
+            r#"schema_version = 1
+state_root = "{root}/state"
+enrollment_artifact_file = "{root}/input/enrollment-v1.pxea"
+enrollment_artifact_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+controller_signing_seed_file = "{root}/secrets/controller.seed"
+authority_signing_seed_file = "{root}/secrets/authority.seed"
+authority_state_directory = "{root}/authority"
+authority_socket_path = "{root}/authority-socket/authority.sock"
+
+[runtime_connector]
+root_ca_certificate_file = "{root}/runtime/root-ca.pem"
+client_certificate_file = "{root}/runtime/controller.pem"
+client_private_key_file = "{root}/runtime/controller-key.pem"
+
+[node_connector]
+root_ca_certificate_file = "{root}/node/root-ca.pem"
+client_certificate_file = "{root}/node/controller.pem"
+client_private_key_file = "{root}/node/controller-key.pem"
+"#,
+        )
     }
 
     fn valid_distributed_arguments() -> Vec<OsString> {
@@ -4578,6 +5177,274 @@ limits_profile = "developer-agent-bootstrap-v1"
             Duration::from_secs(30)
         );
         assert_eq!(config.profile().command_capacity(), 4);
+    }
+
+    #[test]
+    fn offline_json_intent_recognizes_only_the_three_exact_grammars() {
+        let version = [OsString::from(VERSION_COMMAND), OsString::from(JSON_OPTION)];
+        let intent = offline_json_intent(&version).expect("exact version grammar");
+        assert_eq!(intent.command(), "version");
+        assert_eq!(intent.target(), None);
+
+        for (target, expected) in [
+            (CHAT_COMMAND, OfflineConfigTargetV1::Chat),
+            (NODE_COMMAND, OfflineConfigTargetV1::Node),
+            (DEPLOYMENT_COMMAND, OfflineConfigTargetV1::Deployment),
+        ] {
+            let check = offline_config_check_arguments(
+                target,
+                OsString::from("/private/tmp/paraegox-offline.toml"),
+            );
+            let intent = offline_json_intent(&check).expect("exact config-check grammar");
+            assert_eq!(intent.command(), "config.check");
+            assert_eq!(intent.target(), Some(expected));
+
+            let doctor = offline_doctor_arguments(
+                target,
+                OsString::from("/private/tmp/paraegox-offline.toml"),
+            );
+            let intent = offline_json_intent(&doctor).expect("exact doctor grammar");
+            assert_eq!(intent.command(), "doctor.offline");
+            assert_eq!(intent.target(), Some(expected));
+        }
+
+        assert!(
+            offline_json_intent(&[
+                OsString::from(VERSION_COMMAND),
+                OsString::from("--verbose"),
+                OsString::from(JSON_OPTION),
+            ])
+            .is_none()
+        );
+        let wrong_order = [
+            OsString::from(DOCTOR_COMMAND),
+            OsString::from(OFFLINE_OPTION),
+            OsString::from(CHAT_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            OsString::from("/private/tmp/paraegox-offline.toml"),
+            OsString::from(JSON_OPTION),
+        ];
+        assert!(offline_json_intent(&wrong_order).is_none());
+        assert_eq!(parse_offline(&wrong_order), Err(ConfigError::UnknownOption));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_owns_one_exact_bounded_absolute_grammar() {
+        let exact = [
+            OsString::from(INIT_COMMAND),
+            OsString::from(DIRECTORY_OPTION),
+            OsString::from("/private/tmp/paraegox-init"),
+            OsString::from(JSON_OPTION),
+        ];
+        assert!(init_json_intent(&exact));
+        assert_eq!(
+            parse_init(&exact).expect("exact init grammar").directory(),
+            Path::new("/private/tmp/paraegox-init")
+        );
+
+        for invalid in [
+            vec![OsString::from(INIT_COMMAND)],
+            vec![
+                OsString::from(INIT_COMMAND),
+                OsString::from(JSON_OPTION),
+                OsString::from(DIRECTORY_OPTION),
+                OsString::from("/private/tmp/paraegox-init"),
+            ],
+            vec![
+                OsString::from(INIT_COMMAND),
+                OsString::from(DIRECTORY_OPTION),
+                OsString::from("/private/tmp/paraegox-init"),
+                OsString::from(JSON_OPTION),
+                OsString::from("--force"),
+            ],
+        ] {
+            assert_eq!(parse_init(&invalid), Err(ConfigError::InvalidInitGrammar));
+        }
+
+        for invalid in [
+            "relative",
+            "/",
+            "/private/tmp/paraegox-init/",
+            "/private//tmp/paraegox-init",
+            "/private/tmp/./paraegox-init",
+            "/private/tmp/../paraegox-init",
+        ] {
+            let arguments = [
+                OsString::from(INIT_COMMAND),
+                OsString::from(DIRECTORY_OPTION),
+                OsString::from(invalid),
+                OsString::from(JSON_OPTION),
+            ];
+            assert_eq!(
+                parse_init(&arguments),
+                Err(ConfigError::InvalidInitDirectory),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+
+        let too_long = format!("/{}", "a".repeat(MAX_INIT_DIRECTORY_BYTES));
+        let arguments = [
+            OsString::from(INIT_COMMAND),
+            OsString::from(DIRECTORY_OPTION),
+            OsString::from(too_long),
+            OsString::from(JSON_OPTION),
+        ];
+        assert_eq!(parse_init(&arguments), Err(ConfigError::InvalidInitDirectory));
+    }
+
+    #[test]
+    fn managed_local_lifecycle_uses_one_exact_chat_config_for_all_actions() {
+        let chat = valid_arguments();
+        let config_path = chat[2].clone();
+        let mut commitment = None;
+        for (action, expected) in [
+            (UP_COMMAND, LocalLifecycleActionV1::Up),
+            (STATUS_COMMAND, LocalLifecycleActionV1::Status),
+            (DOWN_COMMAND, LocalLifecycleActionV1::Down),
+        ] {
+            let arguments = lifecycle_arguments(action, config_path.clone());
+            let intent = lifecycle_json_intent(&arguments).expect("exact lifecycle intent");
+            assert_eq!(intent.action(), expected);
+            let command = parse_lifecycle(&arguments)
+                .expect("valid lifecycle grammar")
+                .expect("lifecycle command");
+            assert_eq!(command.action(), expected);
+            let config = command.into_config();
+            assert_eq!(config.source_path(), Path::new(&config_path));
+            assert_eq!(config.state_root(), Path::new("/tmp/paraegox-local-test"));
+            assert_ne!(config.config_commitment(), [0; 32]);
+            assert_eq!(
+                commitment.get_or_insert(config.config_commitment()),
+                &config.config_commitment()
+            );
+            assert!(matches!(
+                config.into_owner_config(),
+                LocalManagedChatOwnerConfigV1::Fixture(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_local_lifecycle_rejects_incomplete_or_reordered_grammar() {
+        let chat = valid_arguments();
+        let config_path = chat[2].clone();
+        for arguments in [
+            vec![
+                OsString::from(UP_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+            ],
+            vec![
+                OsString::from(STATUS_COMMAND),
+                OsString::from(JSON_OPTION),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+            ],
+            vec![
+                OsString::from(DOWN_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                config_path,
+                OsString::from(JSON_OPTION),
+                OsString::from("--force"),
+            ],
+        ] {
+            let intent = lifecycle_json_intent(&arguments)
+                .expect("recognized lifecycle command owns the JSON error channel");
+            assert_eq!(
+                intent.action().as_str(),
+                arguments[0].to_str().unwrap_or("")
+            );
+            assert_eq!(parse_lifecycle(&arguments), Err(ConfigError::UnknownOption));
+        }
+    }
+
+    #[test]
+    fn offline_parser_never_enters_deployment_secret_input_resolution() {
+        let source = include_str!("config.rs");
+        let start = source
+            .find("fn parse_offline_config(")
+            .expect("offline config parser");
+        let remaining = &source[start..];
+        let end = remaining
+            .find("pub(crate) fn parse(")
+            .expect("ordinary parser after offline parser");
+        let offline_parser = &remaining[..end];
+
+        assert!(offline_parser.contains("parse_deployment_config_file(path)?"));
+        assert!(!offline_parser.contains("resolve_current_user_inputs"));
+        assert!(!offline_parser.contains("validate_current_user_files"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_config_and_doctor_parse_safe_summaries_without_opening_secret_inputs() {
+        let chat_runtime = valid_openai_arguments();
+        let chat_check = offline_config_check_arguments(CHAT_COMMAND, chat_runtime[2].clone());
+        let Some(OfflineCommandV1::ConfigCheck(chat)) =
+            parse_offline(&chat_check).expect("valid offline chat check")
+        else {
+            panic!("expected chat config check")
+        };
+        assert_eq!(chat.target(), OfflineConfigTargetV1::Chat);
+        assert_eq!(chat.schema_version(), CHAT_CONFIG_SCHEMA_VERSION);
+        assert_eq!(chat.profile(), OPENAI_RESPONSES_PROVIDER);
+        assert!(chat.secret_input_reference_present());
+
+        let temporary_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+        let node_unresolved_root = temporary_root.join(format!(
+            "paraegox-node-offline-unresolved-{}-{}",
+            std::process::id(),
+            TEST_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        assert!(!node_unresolved_root.exists());
+        let node_runtime = node_config_arguments(developer_node_document_v3_for_test(
+            node_unresolved_root
+                .to_str()
+                .expect("UTF-8 unresolved Node root"),
+        ));
+        let node_doctor = offline_doctor_arguments(NODE_COMMAND, node_runtime[2].clone());
+        let Some(OfflineCommandV1::Doctor(node)) =
+            parse_offline(&node_doctor).expect("valid offline node doctor")
+        else {
+            panic!("expected node doctor")
+        };
+        assert_eq!(node.target(), OfflineConfigTargetV1::Node);
+        assert_eq!(node.schema_version(), NODE_CONFIG_SCHEMA_V3);
+        assert_eq!(node.profile(), "managed-agent-bootstrap-v3");
+        assert!(node.secret_input_reference_present());
+        assert!(
+            !node_unresolved_root.exists(),
+            "offline Node doctor must not create or open credential paths"
+        );
+
+        let deployment_unresolved_root = temporary_root.join(format!(
+            "paraegox-deployment-offline-unresolved-{}-{}",
+            std::process::id(),
+            TEST_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        assert!(!deployment_unresolved_root.exists());
+        let deployment_runtime = deployment_config_arguments(unresolved_deployment_document(
+            &deployment_unresolved_root,
+        ));
+        let deployment_check =
+            offline_config_check_arguments(DEPLOYMENT_COMMAND, deployment_runtime[2].clone());
+        let Some(OfflineCommandV1::ConfigCheck(deployment)) =
+            parse_offline(&deployment_check).expect("valid offline Deployment check")
+        else {
+            panic!("expected Deployment config check")
+        };
+        assert_eq!(deployment.target(), OfflineConfigTargetV1::Deployment);
+        assert_eq!(
+            deployment.schema_version(),
+            DEVELOPER_DEPLOYMENT_CONFIG_SCHEMA_V1
+        );
+        assert_eq!(deployment.profile(), "enrollment-v1");
+        assert!(deployment.secret_input_reference_present());
+        assert!(
+            !deployment_unresolved_root.exists(),
+            "offline Deployment config check must not open artifact, seed, or credential paths"
+        );
     }
 
     #[test]
@@ -5781,6 +6648,8 @@ limits_profile = "developer-agent-bootstrap-v1"
             ConfigError::UnknownOption,
             ConfigError::MissingOptionValue,
             ConfigError::DuplicateOption,
+            ConfigError::InvalidInitGrammar,
+            ConfigError::InvalidInitDirectory,
             ConfigError::MissingStateRoot,
             ConfigError::MissingFabricListenA,
             ConfigError::MissingFabricListenB,

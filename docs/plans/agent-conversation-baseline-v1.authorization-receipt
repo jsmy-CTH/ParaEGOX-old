@@ -1,0 +1,11 @@
+receipt_version = 1
+authorization_status = "accepted"
+decision_maker = "ParaEGOX workspace user"
+session_reference = "current-codex-thread"
+authorization_received_at = "2026-08-03T09:01:39Z"
+authorization_phrase = "那你全部做吧"
+authorization_message_sha256 = "2863c1ace6790ea2bd45fe2b9e950b8061e44dfacc8f207f53451c3b5997910d"
+authorization_scope = "immediately preceding M0-M6 implementation plan; ADR-0009 narrows the first local conversation slice"
+adr_path = "docs/adr/ADR-0009-agent-conversation-and-client-boundary.md"
+adr_bytes = 11730
+adr_sha256 = "622f3104317123920e50268ba635bec5f8f09f2987ae180ce118d769122ed5dd"

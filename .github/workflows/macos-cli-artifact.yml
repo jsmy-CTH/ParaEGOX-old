@@ -79,10 +79,240 @@ jobs:
           "$binary" --help | tee "$help_output"
 
           grep -Fqx 'Usage: paraegox chat --config <absolute-paraegox.toml>' "$help_output"
+          grep -Fqx '       paraegox init --directory <absolute-directory> --json' "$help_output"
+          grep -Fqx '       paraegox up --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox status --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox down --config <absolute-paraegox.toml> --json' "$help_output"
           grep -Fqx '       paraegox node --config <absolute-paraegox-node.toml>' "$help_output"
           grep -Fqx '       paraegox deployment --config <absolute-paraegox-deployment.toml>' "$help_output"
+          grep -Fqx '       paraegox version --json' "$help_output"
+          grep -Fqx '       paraegox config check <chat|node|deployment> --config <absolute-config.toml> --json' "$help_output"
+          grep -Fqx '       paraegox doctor <chat|node|deployment> --config <absolute-config.toml> --offline --json' "$help_output"
           grep -Fqx '       paraegox --help' "$help_output"
-          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 4
+          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 11
+
+          version_json="$RUNNER_TEMP/paraegox-version.json"
+          init_first_json="$RUNNER_TEMP/paraegox-init-first.json"
+          init_repeat_json="$RUNNER_TEMP/paraegox-init-repeat.json"
+          init_config_json="$RUNNER_TEMP/paraegox-init-config-check.json"
+          config_json="$RUNNER_TEMP/paraegox-config-check.json"
+          doctor_json="$RUNNER_TEMP/paraegox-doctor.json"
+          invalid_json="$RUNNER_TEMP/paraegox-invalid-config.json"
+          version_stderr="$RUNNER_TEMP/paraegox-version.stderr"
+          init_stderr="$RUNNER_TEMP/paraegox-init.stderr"
+          config_stderr="$RUNNER_TEMP/paraegox-config-check.stderr"
+          doctor_stderr="$RUNNER_TEMP/paraegox-doctor.stderr"
+          invalid_stderr="$RUNNER_TEMP/paraegox-invalid-config.stderr"
+          offline_config="$RUNNER_TEMP/paraegox-offline-check.toml"
+          offline_state_root="$RUNNER_TEMP/paraegox-offline-state"
+          physical_runner_temp="$(cd "$RUNNER_TEMP" && pwd -P)"
+          init_directory="$physical_runner_temp/paraegox-init-smoke"
+          OFFLINE_CONFIG="$offline_config" \
+            OFFLINE_STATE_ROOT="$offline_state_root" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+
+          Path(os.environ["OFFLINE_CONFIG"]).write_text(
+              "schema_version = 1\n"
+              f"state_root = {json.dumps(os.environ['OFFLINE_STATE_ROOT'])}\n"
+              'fabric_listen = "tcp/127.0.0.1:7447"\n\n'
+              "[model]\n"
+              'provider = "deepseek-chat-completions-v1"\n'
+              'model = "deepseek-v4-flash"\n'
+              'secret_ref = "env:DEEPSEEK_API_KEY"\n',
+              encoding="utf-8",
+          )
+          PY
+          test ! -e "$offline_state_root"
+          test ! -e "$init_directory"
+          "$binary" version --json > "$version_json" 2> "$version_stderr"
+          OPENAI_API_KEY='init poison Secret value' \
+            DEEPSEEK_API_KEY='init poison Secret value' \
+            "$binary" init \
+              --directory "$init_directory" \
+              --json > "$init_first_json" 2> "$init_stderr"
+          test ! -s "$init_stderr"
+          test "$(stat -f '%Lp' "$init_directory")" = '700'
+          test "$(stat -f '%Lp' "$init_directory/paraegox.toml")" = '600'
+          test "$(stat -f '%u:%g' "$init_directory")" = "$(id -u):$(id -g)"
+          test "$(stat -f '%u:%g' "$init_directory/paraegox.toml")" = "$(id -u):$(id -g)"
+          test "$(stat -f '%l' "$init_directory/paraegox.toml")" = '1'
+          test ! -L "$init_directory"
+          test ! -L "$init_directory/paraegox.toml"
+          test ! -e "$init_directory/state"
+          test "$(find "$init_directory" -print | wc -l | tr -d ' ')" -eq 2
+          init_config_identity="$(stat -f '%d:%i:%m:%c' "$init_directory/paraegox.toml")"
+          init_config_sha256="$(shasum -a 256 "$init_directory/paraegox.toml" | cut -d ' ' -f 1)"
+          OPENAI_API_KEY='init poison Secret value' \
+            DEEPSEEK_API_KEY='init poison Secret value' \
+            "$binary" init \
+              --directory "$init_directory" \
+              --json > "$init_repeat_json" 2> "$init_stderr"
+          test ! -s "$init_stderr"
+          test "$(stat -f '%d:%i:%m:%c' "$init_directory/paraegox.toml")" = \
+            "$init_config_identity"
+          test "$(shasum -a 256 "$init_directory/paraegox.toml" | cut -d ' ' -f 1)" = \
+            "$init_config_sha256"
+          "$binary" config check chat \
+            --config "$init_directory/paraegox.toml" \
+            --json > "$init_config_json" 2> "$init_stderr"
+          test ! -e "$init_directory/state"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$binary" config check chat \
+            --config "$offline_config" \
+            --json > "$config_json" 2> "$config_stderr"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$binary" doctor chat \
+            --config "$offline_config" \
+            --offline --json > "$doctor_json" 2> "$doctor_stderr"
+          set +e
+          "$binary" config check chat \
+            --config "$RUNNER_TEMP/does-not-exist.toml" \
+            --json > "$invalid_json" 2> "$invalid_stderr"
+          invalid_status=$?
+          set -e
+          test "$invalid_status" -eq 2
+          test ! -s "$version_stderr"
+          test ! -s "$init_stderr"
+          test ! -s "$config_stderr"
+          test ! -s "$doctor_stderr"
+          test ! -s "$invalid_stderr"
+          test ! -e "$offline_state_root"
+          VERSION_JSON="$version_json" \
+            INIT_FIRST_JSON="$init_first_json" \
+            INIT_REPEAT_JSON="$init_repeat_json" \
+            INIT_CONFIG_JSON="$init_config_json" \
+            INIT_DIRECTORY="$init_directory" \
+            CONFIG_JSON="$config_json" \
+            DOCTOR_JSON="$doctor_json" \
+            INVALID_JSON="$invalid_json" \
+            OFFLINE_CONFIG="$offline_config" \
+            OFFLINE_STATE_ROOT="$offline_state_root" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+
+          def load_one(name: str) -> dict:
+              raw = Path(os.environ[name]).read_bytes()
+              if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+                  raise SystemExit(f"{name} is not one newline-terminated JSON object")
+              value = json.loads(raw)
+              if not isinstance(value, dict):
+                  raise SystemExit(f"{name} is not a JSON object")
+              return value
+
+
+          version = load_one("VERSION_JSON")
+          init_first = load_one("INIT_FIRST_JSON")
+          init_repeat = load_one("INIT_REPEAT_JSON")
+          init_config = load_one("INIT_CONFIG_JSON")
+          config = load_one("CONFIG_JSON")
+          doctor = load_one("DOCTOR_JSON")
+          invalid = load_one("INVALID_JSON")
+          if (version["schema_version"], version["command"], version["ok"]) != (
+              1,
+              "version",
+              True,
+          ):
+              raise SystemExit(f"unexpected version envelope: {version!r}")
+          expected_init_fields = {
+              "schema_version",
+              "command",
+              "ok",
+              "changed",
+              "profile",
+              "config_relative_path",
+              "state_relative_path",
+              "diagnostics",
+          }
+          for result, changed in ((init_first, True), (init_repeat, False)):
+              if set(result) != expected_init_fields:
+                  raise SystemExit(f"unexpected init fields: {result!r}")
+              if (
+                  result["schema_version"],
+                  result["command"],
+                  result["ok"],
+                  result["changed"],
+                  result["profile"],
+                  result["config_relative_path"],
+                  result["state_relative_path"],
+                  result["diagnostics"],
+              ) != (
+                  1,
+                  "init",
+                  True,
+                  changed,
+                  "deterministic-echo-v1",
+                  "paraegox.toml",
+                  "state",
+                  [],
+              ):
+                  raise SystemExit(f"unexpected init envelope: {result!r}")
+              serialized = str(result)
+              if os.environ["INIT_DIRECTORY"] in serialized:
+                  raise SystemExit("init output leaked its absolute directory")
+              if "init poison Secret value" in serialized:
+                  raise SystemExit("init output leaked a Secret canary")
+          if (
+              init_config["command"],
+              init_config["kind"],
+              init_config["ok"],
+              init_config["profile"],
+          ) != ("config.check", "chat", True, "deterministic-echo-v1"):
+              raise SystemExit(f"generated config failed strict check: {init_config!r}")
+          if os.environ["INIT_DIRECTORY"] in str(init_config):
+              raise SystemExit("generated config check leaked the init directory")
+          if (config["command"], config["kind"], config["ok"]) != (
+              "config.check",
+              "chat",
+              True,
+          ):
+              raise SystemExit(f"unexpected config-check envelope: {config!r}")
+          if (doctor["command"], doctor["kind"], doctor["ok"]) != (
+              "doctor.offline",
+              "chat",
+              True,
+          ):
+              raise SystemExit(f"unexpected doctor envelope: {doctor!r}")
+          if config["secret_input_reference_present"] is not True:
+              raise SystemExit("config check did not report the configured SecretRef")
+          if doctor["secret_input_reference_present"] is not True:
+              raise SystemExit("doctor did not report the configured SecretRef")
+          if (invalid["command"], invalid["kind"], invalid["ok"]) != (
+              "config.check",
+              "chat",
+              False,
+          ):
+              raise SystemExit(f"unexpected invalid-config envelope: {invalid!r}")
+          if invalid["diagnostics"][0]["code"] != "PXLC-CONFIG-FILE-READ":
+              raise SystemExit(f"unexpected invalid-config diagnostic: {invalid!r}")
+          if "does-not-exist" in str(invalid):
+              raise SystemExit("invalid-config output leaked the config path")
+          for result in (config, doctor):
+              if result["schema_version"] != 1:
+                  raise SystemExit(f"unexpected offline schema version: {result!r}")
+              serialized = str(result)
+              if any(
+                  path in serialized
+                  for path in (
+                      os.environ["OFFLINE_CONFIG"],
+                      os.environ["OFFLINE_STATE_ROOT"],
+                  )
+              ):
+                  raise SystemExit("offline output leaked an absolute config or state path")
+              if "DEEPSEEK_API_KEY" in serialized or "offline poison Secret value" in serialized:
+                  raise SystemExit("offline output leaked the SecretRef value")
+              skipped = {item["id"] for item in result["checks_skipped"]}
+              if not {"owner_startup", "network_connectivity", "runtime_readiness"} <= skipped:
+                  raise SystemExit(f"offline boundary is incomplete: {result!r}")
+          PY
 
           if "$binary" controller >/dev/null 2>&1; then
             printf 'bare controller unexpectedly selected a public command\n' >&2
@@ -193,6 +423,27 @@ jobs:
 
           relocated_bundle="$RUNNER_TEMP/ParaEGOX bundle"
           cp -R artifact "$relocated_bundle"
+          relocated_stderr="$RUNNER_TEMP/paraegox-relocated-offline.stderr"
+          test ! -e "$RUNNER_TEMP/paraegox-offline-state"
+          "$relocated_bundle/paraegox" version --json \
+            2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-version.json"
+          test ! -s "$relocated_stderr"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$relocated_bundle/paraegox" config check chat \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-config-check.json"
+          test ! -s "$relocated_stderr"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$relocated_bundle/paraegox" doctor chat \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --offline --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-doctor.json"
+          test ! -s "$relocated_stderr"
+          test ! -e "$RUNNER_TEMP/paraegox-offline-state"
           smoke_python_prefix="$(.venv/bin/python3 -c 'import sys; print(sys.base_prefix)')"
           smoke_python="$smoke_python_prefix/bin/python3"
           test -x "$smoke_python"

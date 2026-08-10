@@ -17,8 +17,8 @@ dist/
 # Rust
 /target/
 
-# Local architecture workbench (intentionally not versioned)
-/docs/
+# Local documentation workbench (intentionally not versioned)
+/docs/workbench/
 
 # JavaScript
 node_modules/
