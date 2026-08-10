@@ -1538,6 +1538,18 @@ mod tests {
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
     const SUCCESSOR_STORE_ID: [u8; 32] = [0xd1; 32];
+    const LARGE_CUTOVER_RECOVERY_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    fn run_large_cutover_recovery_test(thread_name: &str, test: impl FnOnce() + Send + 'static) {
+        let worker = std::thread::Builder::new()
+            .name(thread_name.into())
+            .stack_size(LARGE_CUTOVER_RECOVERY_TEST_STACK_BYTES)
+            .spawn(test)
+            .expect("spawn large-stack cutover recovery test thread");
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -1704,8 +1716,7 @@ mod tests {
         drop(open_legacy(&legacy));
     }
 
-    #[test]
-    fn durable_marker_without_successor_snapshot_has_one_recovery_path() {
+    fn durable_marker_without_successor_snapshot_has_one_recovery_path_inner() {
         let legacy_directory = TestDirectory::new("legacy-crash");
         let successor_directory = TestDirectory::new("successor-crash");
         let legacy_store = install_legacy(&legacy_directory);
@@ -1780,6 +1791,13 @@ mod tests {
         )
         .expect("durable successor reopens from the same marker");
         assert_eq!(reopened.state().sequence(), 1);
+    }
+
+    #[test]
+    fn durable_marker_without_successor_snapshot_has_one_recovery_path() {
+        run_large_cutover_recovery_test("px-fabric-cutover-recovery", || {
+            durable_marker_without_successor_snapshot_has_one_recovery_path_inner();
+        });
     }
 
     #[test]
