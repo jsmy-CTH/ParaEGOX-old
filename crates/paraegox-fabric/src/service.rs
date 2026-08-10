@@ -512,13 +512,7 @@ impl FabricServiceConfig {
     /// and the two concrete Agent routes. Preparing and opening this config
     /// requires the role-specific [`PreparedRemoteAgentProxyListenerV2`]
     /// lifecycle; [`FabricService::start`] rejects this profile.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
-        )
-    )] // GOV-WAIVER-0014
+    #[cfg_attr(not(test), expect(dead_code, reason = "T2-B1 internal candidate"))] // GOV-WAIVER-0014
     pub(crate) fn try_remote_agent_proxy_listener_v2(
         remote_tls_listen_endpoint: RemoteTlsEndpoint,
         credentials: ResolvedRemoteMtlsListenerCredentialFilesV1,
@@ -1269,26 +1263,14 @@ impl ExperimentalRemoteMtlsLinkSnapshotV1 {
 /// listener for the later role-specific PXAP binding slice.
 ///
 /// This plan is intentionally neither `Clone` nor `Copy`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
-    )
-)] // GOV-WAIVER-0014
+#[cfg_attr(not(test), expect(dead_code, reason = "T2-B1 internal candidate"))] // GOV-WAIVER-0014
 pub(crate) struct PreparedRemoteAgentProxyListenerV2 {
     zenoh_config: zenoh::Config,
     session_epoch: DistributedFabricSessionEpochV1,
     routes: RemoteAgentDataPlaneRoutesV1,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
-    )
-)] // GOV-WAIVER-0014
+#[cfg_attr(not(test), expect(dead_code, reason = "T2-B1 internal candidate"))] // GOV-WAIVER-0014
 impl PreparedRemoteAgentProxyListenerV2 {
     /// Builds an effect-free start plan for exactly the S1 proxy-listener role.
     ///
@@ -1364,26 +1346,14 @@ impl PreparedRemoteAgentProxyListenerV2 {
 /// The raw Zenoh Session, exact routes, and general [`FabricService`] mutation
 /// surface remain private. This initial slice exposes only epoch correlation
 /// and consuming shutdown; exact PXAP lane installation is added separately.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
-    )
-)] // GOV-WAIVER-0014
+#[cfg_attr(not(test), expect(dead_code, reason = "T2-B1 internal candidate"))] // GOV-WAIVER-0014
 pub(crate) struct RemoteAgentProxyListenerV2 {
     session: zenoh::Session,
     session_epoch: DistributedFabricSessionEpochV1,
     routes: RemoteAgentDataPlaneRoutesV1,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
-    )
-)] // GOV-WAIVER-0014
+#[cfg_attr(not(test), expect(dead_code, reason = "T2-B1 internal candidate"))] // GOV-WAIVER-0014
 impl RemoteAgentProxyListenerV2 {
     /// Returns the exact epoch reserved by the consumed prepared plan.
     #[must_use]
