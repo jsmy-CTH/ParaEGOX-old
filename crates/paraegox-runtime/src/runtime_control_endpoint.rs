@@ -9664,8 +9664,7 @@ mod tests {
         current
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn live_lower_rejects_a0_a1_field_drift_and_an_unrelated_live_pin() {
+    async fn live_lower_rejects_a0_a1_field_drift_and_an_unrelated_live_pin_inner() {
         fn flip_submit_epoch(observation: &mut RemoteAgentCurrentOwnerObservationV2) {
             observation.submit_binding_epoch = observation.submit_binding_epoch.saturating_add(1);
         }
@@ -9715,6 +9714,14 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("live-lower rejection cleanup failed: {error}"));
+    }
+
+    #[test]
+    fn live_lower_rejects_a0_a1_field_drift_and_an_unrelated_live_pin() {
+        run_large_runtime_control_async_test(
+            "px-live-lower-reject",
+            live_lower_rejects_a0_a1_field_drift_and_an_unrelated_live_pin_inner,
+        );
     }
 
     async fn live_lower_genesis_is_exact_post_readback_and_second_initialize_is_unavailable_inner()
@@ -11010,8 +11017,8 @@ mod tests {
         assert!(!compile_boundary.contains("RuntimeRestrictedApplyCarrierPinV1::"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pxar7_restart_rotates_live_channel_and_replays_historical_pxst_in_current_pxah() {
+    async fn pxar7_restart_rotates_live_channel_and_replays_historical_pxst_in_current_pxah_inner()
+    {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, started) =
             managed_started_service(socket_directory.socket_path.clone());
@@ -11174,8 +11181,15 @@ mod tests {
         drop(guard_b);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pxrs2_old_epoch_restart_returns_reconcile_and_preserves_exact_final() {
+    #[test]
+    fn pxar7_restart_rotates_live_channel_and_replays_historical_pxst_in_current_pxah() {
+        run_large_runtime_control_async_test(
+            "px-pxar7-restart",
+            pxar7_restart_rotates_live_channel_and_replays_historical_pxst_in_current_pxah_inner,
+        );
+    }
+
+    async fn pxrs2_old_epoch_restart_returns_reconcile_and_preserves_exact_final_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut control, _stack_request) =
             managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
@@ -11862,6 +11876,14 @@ mod tests {
     }
 
     #[test]
+    fn pxrs2_old_epoch_restart_returns_reconcile_and_preserves_exact_final() {
+        run_large_runtime_control_async_test(
+            "px-pxrs2-old-epoch",
+            pxrs2_old_epoch_restart_returns_reconcile_and_preserves_exact_final_inner,
+        );
+    }
+
+    #[test]
     fn runtime_control_outer_auth_precedes_legacy_describe_and_query_without_mutation() {
         let socket_directory = TestSocketDirectory::create();
         let channel = ReferenceChannelBindingV1::try_new(
@@ -12063,8 +12085,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pxag_apply_and_describe_use_one_authenticated_owner_chain_and_fail_closed() {
+    async fn pxag_apply_and_describe_use_one_authenticated_owner_chain_and_fail_closed_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut control, stack_request) =
             managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
@@ -12373,8 +12394,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("Agent-control cleanup failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frozen_pxag_describe_replays_exact_pxde_without_self_drift() {
+    #[test]
+    fn pxag_apply_and_describe_use_one_authenticated_owner_chain_and_fail_closed() {
+        run_large_runtime_control_async_test(
+            "px-pxag-apply-describe",
+            pxag_apply_and_describe_use_one_authenticated_owner_chain_and_fail_closed_inner,
+        );
+    }
+
+    async fn frozen_pxag_describe_replays_exact_pxde_without_self_drift_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut control, stack_request) =
             managed_control_with_active_stack(socket_directory.socket_path.clone()).await;
@@ -12519,8 +12547,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("frozen Describe cleanup failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frozen_pxag_describe_without_latest_pxde_rejects_without_creation() {
+    #[test]
+    fn frozen_pxag_describe_replays_exact_pxde_without_self_drift() {
+        run_large_runtime_control_async_test(
+            "px-frozen-pxag-describe",
+            frozen_pxag_describe_replays_exact_pxde_without_self_drift_inner,
+        );
+    }
+
+    async fn frozen_pxag_describe_without_latest_pxde_rejects_without_creation_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, started) =
             managed_started_service(socket_directory.socket_path.clone());
@@ -12585,6 +12620,14 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("missing-PXDE cleanup failed: {error}"));
+    }
+
+    #[test]
+    fn frozen_pxag_describe_without_latest_pxde_rejects_without_creation() {
+        run_large_runtime_control_async_test(
+            "px-frozen-pxag-missing",
+            frozen_pxag_describe_without_latest_pxde_rejects_without_creation_inner,
+        );
     }
 
     #[test]
@@ -14951,8 +14994,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn managed_pxar9_routes_only_to_model_agent_owner_and_returns_exact_pxmt() {
+    async fn managed_pxar9_routes_only_to_model_agent_owner_and_returns_exact_pxmt_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (_state_directory, mut started) = managed_started_service_with_dependencies(
             socket_directory.socket_path.clone(),
@@ -15075,8 +15117,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("PXAR9 successor shutdown failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn managed_pxar7_active_conversation_empty_and_restart_replay_are_one_vertical() {
+    #[test]
+    fn managed_pxar9_routes_only_to_model_agent_owner_and_returns_exact_pxmt() {
+        run_large_runtime_control_async_test(
+            "px-managed-pxar9",
+            managed_pxar9_routes_only_to_model_agent_owner_and_returns_exact_pxmt_inner,
+        );
+    }
+
+    async fn managed_pxar7_active_conversation_empty_and_restart_replay_are_one_vertical_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut started) =
             managed_started_service(socket_directory.socket_path.clone());
@@ -15310,6 +15359,14 @@ mod tests {
             .shutdown()
             .await
             .unwrap_or_else(|error| panic!("restart predecessor shutdown failed: {error}"));
+    }
+
+    #[test]
+    fn managed_pxar7_active_conversation_empty_and_restart_replay_are_one_vertical() {
+        run_large_runtime_control_async_test(
+            "px-managed-pxar7",
+            managed_pxar7_active_conversation_empty_and_restart_replay_are_one_vertical_inner,
+        );
     }
 
     #[test]
@@ -16115,8 +16172,7 @@ mod tests {
         });
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restricted_pxrc_verifies_before_mutation_and_returns_exact_pinned_pxds2() {
+    async fn restricted_pxrc_verifies_before_mutation_and_returns_exact_pinned_pxds2_inner() {
         const ROUTE: &str = "paraegox/runtime/endpoint-stack/restricted/apply";
 
         let socket_directory = TestSocketDirectory::create();
@@ -16355,6 +16411,14 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("restricted successor shutdown failed: {error}"));
+    }
+
+    #[test]
+    fn restricted_pxrc_verifies_before_mutation_and_returns_exact_pinned_pxds2() {
+        run_large_runtime_control_async_test(
+            "px-restricted-pxrc",
+            restricted_pxrc_verifies_before_mutation_and_returns_exact_pinned_pxds2_inner,
+        );
     }
 
     #[tokio::test]
