@@ -569,8 +569,16 @@ def _process_command_line(process_id: int) -> tuple[bytes, ...]:
     return tuple(argument for argument in raw.split(b"\0") if argument)
 
 
-def _assert_single_owner_graph(binary: Path) -> tuple[set[int], int]:
-    processes = _matching_processes(binary)
+def _assert_single_owner_graph(
+    binary: Path,
+    *,
+    ignored_process_ids: frozenset[int] = frozenset(),
+) -> tuple[set[int], int]:
+    all_processes = _matching_processes(binary)
+    assert ignored_process_ids <= all_processes, (
+        "an explicitly ignored harness client is no longer live"
+    )
+    processes = all_processes - ignored_process_ids
     assert len(processes) >= 2, "Inspection success lacks the supervisor and real Node child"
     supervisors = {
         process_id
@@ -591,6 +599,21 @@ def _wait_for_no_matching_processes(binary: Path) -> None:
             return
         time.sleep(0.05)
     assert not _matching_processes(binary), "joined down left a ParaEGOX process alive"
+
+
+def _wait_for_exact_matching_processes(
+    binary: Path,
+    expected_process_ids: frozenset[int],
+) -> None:
+    assert expected_process_ids, "exact process waiting is only for a known blocked client"
+    deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _matching_processes(binary) == expected_process_ids:
+            return
+        time.sleep(0.05)
+    assert _matching_processes(binary) == expected_process_ids, (
+        "joined down did not leave exactly the intentionally blocked harness client"
+    )
 
 
 def _terminate_private_processes(binary: Path) -> None:
@@ -1780,15 +1803,20 @@ def test_generation_fencing_single_query_races_output_and_secret_are_bounded() -
         )
         replacement_observed = _wait_for_audit_marker(replacement_fd, b"O")
         assert replacement_observed == b"LO"
+        replacement_client = frozenset({replacement_process.pid})
+        assert replacement_process.poll() is None
         old_down = _invoke_lifecycle(binary, "down", config_path, environment)
         assert old_down["ok"] is True and old_down["state"] == "stopped"
-        _wait_for_no_matching_processes(binary)
+        _wait_for_exact_matching_processes(binary, replacement_client)
         replacement_up = _invoke_lifecycle(binary, "up", config_path, environment)
         assert replacement_up["ok"] is True and replacement_up["state"] == "running"
         replacement_generation = replacement_up["generation"]
         assert isinstance(replacement_generation, str)
         assert replacement_generation != generation
-        replacement_processes, _ = _assert_single_owner_graph(binary)
+        replacement_processes, _ = _assert_single_owner_graph(
+            binary,
+            ignored_process_ids=replacement_client,
+        )
         os.write(replacement_release, b"1")
         os.close(replacement_release)
         replacement_failure = _finish_inspection(
@@ -1805,6 +1833,9 @@ def test_generation_fencing_single_query_races_output_and_secret_are_bounded() -
         assert _diagnostic_code(replacement_failure) == "PXLC-INSPECTION-BOOTSTRAP"
         assert replacement_markers == b"LO", (
             "old locator accepted a successor-generation PXIB or attempted Latest"
+        )
+        assert _matching_processes(binary) == replacement_processes, (
+            "completed old-generation client remained in the successor owner graph"
         )
         successor_snapshot = _invoke_inspection(
             binary,
@@ -1825,9 +1856,11 @@ def test_generation_fencing_single_query_races_output_and_secret_are_bounded() -
         )
         race_observed = _wait_for_audit_marker(race_fd, b"Q")
         assert race_observed == b"LQ"
+        race_client = frozenset({race_process.pid})
+        assert race_process.poll() is None
         raced_down = _invoke_lifecycle(binary, "down", config_path, environment)
         assert raced_down["ok"] is True and raced_down["state"] == "stopped"
-        _wait_for_no_matching_processes(binary)
+        _wait_for_exact_matching_processes(binary, race_client)
         os.write(race_release, b"1")
         os.close(race_release)
         race_failure = _finish_inspection(
@@ -1840,6 +1873,7 @@ def test_generation_fencing_single_query_races_output_and_secret_are_bounded() -
         os.close(race_fd)
         assert _diagnostic_code(race_failure) == "PXLC-INSPECTION-IO"
         assert race_markers == b"LQ", "down-raced Latest retried or returned cache"
+        _wait_for_no_matching_processes(binary)
         after_race = _invoke_inspection(
             binary,
             config_path,
