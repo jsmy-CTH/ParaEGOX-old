@@ -4278,10 +4278,7 @@ mod tests {
 
         for declaration in [
             concat!("pub(crate) ", "fn try_remote_agent_proxy_listener_v2("),
-            concat!(
-                "pub(crate) ",
-                "struct PreparedRemoteAgentProxyListenerV2 {"
-            ),
+            concat!("pub(crate) ", "struct PreparedRemoteAgentProxyListenerV2 {"),
             concat!("pub(crate) ", "struct RemoteAgentProxyListenerV2 {"),
         ] {
             assert!(
@@ -4438,13 +4435,8 @@ mod tests {
                 ]);
                 protect_private_key(&root_key);
 
-                let listener = issue_listener(
-                    directory,
-                    listener_ip,
-                    common_name,
-                    &root_ca,
-                    &root_key,
-                );
+                let listener =
+                    issue_listener(directory, listener_ip, common_name, &root_ca, &root_key);
                 Self { root_ca, listener }
             }
         }
@@ -4663,10 +4655,10 @@ mod tests {
             let s0_socket =
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_port(Ipv4Addr::LOCALHOST));
             let s1_socket = SocketAddrV4::new(remote_ip, available_port(remote_ip));
-            let s0_endpoint = SessionEndpoint::try_new(format!("tcp/{s0_socket}"))
-                .expect("S0 loopback endpoint");
-            let s1_endpoint = RemoteTlsEndpoint::try_new(format!("tls/{s1_socket}"))
-                .expect("S1 TLS endpoint");
+            let s0_endpoint =
+                SessionEndpoint::try_new(format!("tcp/{s0_socket}")).expect("S0 loopback endpoint");
+            let s1_endpoint =
+                RemoteTlsEndpoint::try_new(format!("tls/{s1_socket}")).expect("S1 TLS endpoint");
 
             let directory = TestDirectory::new();
             let pki = ListenerPki::generate(
