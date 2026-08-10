@@ -208,8 +208,8 @@ mod platform {
         ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1,
         ReferenceBootstrapStateV1, ReferenceQueryIdV1, ReferenceQueryRequestDraftV1,
         ReferenceQueryRequestV1, ReferenceQueryResponseV1, ReferenceQuerySelectorV1,
-        ValidatedReferenceLifecycleBudgetsV1,
-        ed25519_control_key_fingerprint, reference_admission_policy_fingerprint_v1,
+        ValidatedReferenceLifecycleBudgetsV1, ed25519_control_key_fingerprint,
+        reference_admission_policy_fingerprint_v1,
         reference_bootstrap_channel_policy_fingerprint_v1,
     };
     use paraegox_runtime_contracts::wire::{
@@ -4721,11 +4721,7 @@ mod platform {
         authority_domain_fingerprint: ControllerTenureAuthorityDomainFingerprint,
     ) -> Result<TurnoverTenureSelection<'a>, DeploymentdProcessError> {
         if let Some(exact) = exact_operation {
-            validate_durable_tenure_request(
-                exact,
-                requested_writer,
-                authority_domain_fingerprint,
-            )?;
+            validate_durable_tenure_request(exact, requested_writer, authority_domain_fingerprint)?;
             return Ok(TurnoverTenureSelection::Recover(exact.canonical_request));
         }
         if unresolved.is_some() {
@@ -4733,13 +4729,9 @@ mod platform {
             // Prepared/Uncertain request. The caller must resume that exact ID.
             return Err(process_error(ProcessErrorKind::Tenure));
         }
-        let latest = global_latest_committed
-            .ok_or_else(|| process_error(ProcessErrorKind::Tenure))?;
-        validate_durable_tenure_request(
-            latest,
-            requested_writer,
-            authority_domain_fingerprint,
-        )?;
+        let latest =
+            global_latest_committed.ok_or_else(|| process_error(ProcessErrorKind::Tenure))?;
+        validate_durable_tenure_request(latest, requested_writer, authority_domain_fingerprint)?;
         Ok(TurnoverTenureSelection::Fresh(requested_operation))
     }
 
@@ -9990,15 +9982,15 @@ mod platform {
                     operation_id: parse_nonzero_hex(&arguments[9])?,
                 }))
             }
-            "acquire-tenure-v1" if arguments.len() == 18 => Ok(
-                ProcessCommand::AcquireTenure(parse_acquire_tenure_arguments(&arguments)?),
-            ),
-            "turnover-tenure-v1" if arguments.len() == 19 => Ok(
-                ProcessCommand::TurnoverTenure(TurnoverTenureArguments {
+            "acquire-tenure-v1" if arguments.len() == 18 => Ok(ProcessCommand::AcquireTenure(
+                parse_acquire_tenure_arguments(&arguments)?,
+            )),
+            "turnover-tenure-v1" if arguments.len() == 19 => {
+                Ok(ProcessCommand::TurnoverTenure(TurnoverTenureArguments {
                     acquire: parse_acquire_tenure_arguments(&arguments)?,
                     operation_id: parse_nonzero_hex(&arguments[18])?,
-                }),
-            ),
+                }))
+            }
             command @ ("bootstrap-runtime-v1"
             | "apply-reference-v1"
             | "reconcile-reference-once-v1")
@@ -10492,8 +10484,7 @@ mod platform {
             ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES, TenureRequestProfile,
             TurnoverTenureSelection, acquire_developer_tenure_once, build_empty_commit_receipt,
             build_reference_candidate, build_reference_empty_candidate,
-            commit_reference_empty_in_store,
-            developer_agent_bootstrap_service_plan,
+            commit_reference_empty_in_store, developer_agent_bootstrap_service_plan,
             distributed_owner_terminal_runtime_observation_is_admissible,
             fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
             parse_nonzero_hex, read_pinned_file, recover_tenure_request,
@@ -11378,7 +11369,9 @@ mod platform {
                     writer_a,
                     domain_a,
                 ),
-                Ok(TurnoverTenureSelection::Recover(unresolved.canonical_request)),
+                Ok(TurnoverTenureSelection::Recover(
+                    unresolved.canonical_request
+                )),
                 "an exact caller ID resumes its byte-identical unresolved request"
             );
             assert_eq!(
@@ -11390,7 +11383,9 @@ mod platform {
                     writer_a,
                     domain_a,
                 ),
-                Ok(TurnoverTenureSelection::Recover(committed.canonical_request)),
+                Ok(TurnoverTenureSelection::Recover(
+                    committed.canonical_request
+                )),
                 "an exact committed caller ID replays without allocating a successor"
             );
             assert_eq!(
@@ -11419,11 +11414,9 @@ mod platform {
                 ProcessErrorKind::Tenure
             );
             assert_eq!(
-                select_turnover_tenure_request(
-                    None, None, None, operation, writer_a, domain_a,
-                )
-                .expect_err("turnover requires an existing committed tenure")
-                .kind,
+                select_turnover_tenure_request(None, None, None, operation, writer_a, domain_a,)
+                    .expect_err("turnover requires an existing committed tenure")
+                    .kind,
                 ProcessErrorKind::Tenure
             );
             for latest in [
