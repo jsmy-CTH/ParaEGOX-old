@@ -12408,12 +12408,14 @@ mod tests {
             assert!(rejected.contains("authorized_transition"));
             assert!(rejected.contains("observed"));
 
-            assert!(!source.contains(
-                "impl From<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"
-            ));
-            assert!(!source.contains(
-                "impl TryFrom<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"
-            ));
+            assert!(!source.contains(concat!(
+                "impl From<RemoteAgentAccessSnapshotV2> for ",
+                "RemoteAgentAuthorizedTransitionV2"
+            )));
+            assert!(!source.contains(concat!(
+                "impl TryFrom<RemoteAgentAccessSnapshotV2> for ",
+                "RemoteAgentAuthorizedTransitionV2"
+            )));
         }
 
         fn reseal_replay_journal_v2(wire: &mut [u8]) {
