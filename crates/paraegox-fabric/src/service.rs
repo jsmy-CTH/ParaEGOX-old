@@ -512,31 +512,14 @@ impl FabricServiceConfig {
     /// and the two concrete Agent routes. Preparing and opening this config
     /// requires the role-specific [`PreparedRemoteAgentProxyListenerV2`]
     /// lifecycle; [`FabricService::start`] rejects this profile.
-    ///
-    /// A connector credential cannot be substituted for the listener role:
-    ///
-    /// ```compile_fail
-    /// use paraegox_fabric::{
-    ///     FabricServiceConfig, RemoteTlsEndpoint,
-    ///     ResolvedRemoteMtlsConnectorCredentialFilesV1,
-    /// };
-    /// use paraegox_kernel::identity::PrincipalRef;
-    ///
-    /// fn wrong_credential_role(
-    ///     endpoint: RemoteTlsEndpoint,
-    ///     connector: ResolvedRemoteMtlsConnectorCredentialFilesV1,
-    ///     expected_mac: PrincipalRef,
-    /// ) {
-    ///     let _ = FabricServiceConfig::try_remote_agent_proxy_listener_v2(
-    ///         endpoint,
-    ///         connector,
-    ///         expected_mac,
-    ///         "paraegox/agent/submit",
-    ///         "paraegox/agent/control",
-    ///     );
-    /// }
-    /// ```
-    pub fn try_remote_agent_proxy_listener_v2(
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
+        )
+    )] // GOV-WAIVER-0014
+    pub(crate) fn try_remote_agent_proxy_listener_v2(
         remote_tls_listen_endpoint: RemoteTlsEndpoint,
         credentials: ResolvedRemoteMtlsListenerCredentialFilesV1,
         expected_mac_agent_client_principal: PrincipalRef,
@@ -1285,33 +1268,33 @@ impl ExperimentalRemoteMtlsLinkSnapshotV1 {
 /// [`Self::start`]. The exact two routes remain private and move into the live
 /// listener for the later role-specific PXAP binding slice.
 ///
-/// This plan is intentionally neither `Clone` nor `Copy`:
-///
-/// ```compile_fail
-/// use paraegox_fabric::PreparedRemoteAgentProxyListenerV2;
-///
-/// fn require_clone<T: Clone>() {}
-/// require_clone::<PreparedRemoteAgentProxyListenerV2>();
-/// ```
-///
-/// ```compile_fail
-/// use paraegox_fabric::PreparedRemoteAgentProxyListenerV2;
-///
-/// fn require_copy<T: Copy>() {}
-/// require_copy::<PreparedRemoteAgentProxyListenerV2>();
-/// ```
-pub struct PreparedRemoteAgentProxyListenerV2 {
+/// This plan is intentionally neither `Clone` nor `Copy`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
+    )
+)] // GOV-WAIVER-0014
+pub(crate) struct PreparedRemoteAgentProxyListenerV2 {
     zenoh_config: zenoh::Config,
     session_epoch: DistributedFabricSessionEpochV1,
     routes: RemoteAgentDataPlaneRoutesV1,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
+    )
+)] // GOV-WAIVER-0014
 impl PreparedRemoteAgentProxyListenerV2 {
     /// Builds an effect-free start plan for exactly the S1 proxy-listener role.
     ///
     /// Any other [`FabricServiceConfig`] profile fails before entropy is read.
     /// Entropy is sampled exactly once and is never caller supplied.
-    pub fn try_prepare(config: FabricServiceConfig) -> Result<Self, FabricError> {
+    pub(crate) fn try_prepare(config: FabricServiceConfig) -> Result<Self, FabricError> {
         Self::try_prepare_with(config, |destination| {
             getrandom::fill(destination).map_err(|_| ())
         })
@@ -1336,7 +1319,7 @@ impl PreparedRemoteAgentProxyListenerV2 {
 
     /// Returns the reserved nonzero epoch without exposing transport authority.
     #[must_use]
-    pub const fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {
+    pub(crate) const fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {
         self.session_epoch
     }
 
@@ -1345,7 +1328,7 @@ impl PreparedRemoteAgentProxyListenerV2 {
     /// A failure returns no live listener token and the consumed plan cannot be
     /// reused for an implicit retry. The caller remains responsible for mapping
     /// a failure after its durable open intent to outcome-uncertain state.
-    pub async fn start(self) -> Result<RemoteAgentProxyListenerV2, FabricError> {
+    pub(crate) async fn start(self) -> Result<RemoteAgentProxyListenerV2, FabricError> {
         self.start_with(
             |zenoh_config| async move { zenoh::open(zenoh_config).await.map_err(|_| ()) },
         )
@@ -1381,24 +1364,30 @@ impl PreparedRemoteAgentProxyListenerV2 {
 /// The raw Zenoh Session, exact routes, and general [`FabricService`] mutation
 /// surface remain private. This initial slice exposes only epoch correlation
 /// and consuming shutdown; exact PXAP lane installation is added separately.
-///
-/// ```compile_fail
-/// use paraegox_fabric::RemoteAgentProxyListenerV2;
-///
-/// fn cannot_borrow_raw_session(listener: &RemoteAgentProxyListenerV2) {
-///     let _ = &listener.session;
-/// }
-/// ```
-pub struct RemoteAgentProxyListenerV2 {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
+    )
+)] // GOV-WAIVER-0014
+pub(crate) struct RemoteAgentProxyListenerV2 {
     session: zenoh::Session,
     session_epoch: DistributedFabricSessionEpochV1,
     routes: RemoteAgentDataPlaneRoutesV1,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "crate-private B1 candidate must be consumed or removed in the next owner batch"
+    )
+)] // GOV-WAIVER-0014
 impl RemoteAgentProxyListenerV2 {
     /// Returns the exact epoch reserved by the consumed prepared plan.
     #[must_use]
-    pub const fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {
+    pub(crate) const fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {
         self.session_epoch
     }
 
@@ -1409,7 +1398,7 @@ impl RemoteAgentProxyListenerV2 {
     /// [`FabricError::SessionCloseFailed`] is outcome-uncertain: the consuming
     /// call returns no reusable live token and cannot prove that close had no
     /// effect.
-    pub async fn shutdown(self) -> Result<(), FabricError> {
+    pub(crate) async fn shutdown(self) -> Result<(), FabricError> {
         let Self {
             session,
             session_epoch: _,
@@ -4280,5 +4269,473 @@ mod tests {
                 .unwrap(),
             "\"/run/paraegox/tls/connect-private-key.pem\""
         );
+    }
+
+    #[test]
+    fn proxy_listener_candidate_remains_crate_private_and_move_only() {
+        let service_source = include_str!("service.rs");
+        let lib_source = include_str!("lib.rs");
+
+        for declaration in [
+            concat!("pub(crate) ", "fn try_remote_agent_proxy_listener_v2("),
+            concat!(
+                "pub(crate) ",
+                "struct PreparedRemoteAgentProxyListenerV2 {"
+            ),
+            concat!("pub(crate) ", "struct RemoteAgentProxyListenerV2 {"),
+        ] {
+            assert!(
+                service_source.contains(declaration),
+                "missing crate-private declaration: {declaration}"
+            );
+        }
+        for public_escape in [
+            concat!("pub ", "fn try_remote_agent_proxy_listener_v2("),
+            concat!("pub ", "struct PreparedRemoteAgentProxyListenerV2 {"),
+            concat!("pub ", "struct RemoteAgentProxyListenerV2 {"),
+            concat!("impl Clone ", "for PreparedRemoteAgentProxyListenerV2"),
+            concat!("impl Copy ", "for PreparedRemoteAgentProxyListenerV2"),
+            concat!("impl Clone ", "for RemoteAgentProxyListenerV2"),
+            concat!("impl Copy ", "for RemoteAgentProxyListenerV2"),
+        ] {
+            assert!(
+                !service_source.contains(public_escape),
+                "crate-private lifecycle escaped through: {public_escape}"
+            );
+        }
+        for root_escape in [
+            "PreparedRemoteAgentProxyListenerV2",
+            "RemoteAgentProxyListenerV2",
+        ] {
+            assert!(
+                !lib_source.contains(root_escape),
+                "crate root must not re-export {root_escape}"
+            );
+        }
+
+        let live_impl = service_source
+            .split(concat!("impl ", "RemoteAgentProxyListenerV2 {"))
+            .nth(1)
+            .expect("live owner impl")
+            .split("/// Owns exactly one private Zenoh session")
+            .next()
+            .expect("bounded live owner impl");
+        let visible_methods: Vec<_> = live_impl
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub"))
+            .collect();
+        assert_eq!(
+            visible_methods,
+            [
+                "pub(crate) const fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {",
+                "pub(crate) async fn shutdown(self) -> Result<(), FabricError> {",
+            ],
+            "the live owner must not expose its raw Session or routes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod proxy_listener_real_network {
+        use std::{
+            fs,
+            net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket},
+            os::unix::fs::PermissionsExt,
+            path::{Path, PathBuf},
+            process::Command,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::{Duration, SystemTime, UNIX_EPOCH},
+        };
+
+        use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
+        use paraegox_runtime_contracts::assignment::{BindingId, SchemaRef};
+        use tokio::task::JoinHandle;
+
+        use super::super::{
+            FabricService, FabricServiceConfig, HandlerResponse, PortBinding,
+            PreparedRemoteAgentProxyListenerV2, RemoteTlsEndpoint, RequestReceiver,
+            RequestResponseBindingSpec, ResolvedRemoteMtlsIdentityFiles,
+            ResolvedRemoteMtlsListenerCredentialFilesV1, SessionEndpoint,
+        };
+        use crate::{
+            contract::{RequestId, ResponseStatus},
+            ingress::IngressLimits,
+            runtime_apply::restricted_runtime_apply_peer_certificate_common_name_v1,
+        };
+
+        const SUBMIT_ROUTE: &str = "paraegox/agent/submit";
+        const CONTROL_ROUTE: &str = "paraegox/agent/control";
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+        struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new() -> Self {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("wall clock after Unix epoch")
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!(
+                    "paraegox-internal-s1-mtls-{}-{nonce}",
+                    std::process::id()
+                ));
+                fs::create_dir(&path).expect("create private test directory");
+                let mut permissions = fs::metadata(&path)
+                    .expect("read test directory metadata")
+                    .permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(&path, permissions).expect("restrict test directory");
+                Self(path)
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct IdentityMaterial {
+            certificate: PathBuf,
+            private_key: PathBuf,
+        }
+
+        struct ListenerPki {
+            root_ca: PathBuf,
+            listener: IdentityMaterial,
+        }
+
+        impl ListenerPki {
+            fn generate(directory: &Path, listener_ip: Ipv4Addr, common_name: &str) -> Self {
+                let root_ca = directory.join("root-ca.pem");
+                let root_key = directory.join("root-ca.key");
+                run_openssl(&[
+                    "req".to_owned(),
+                    "-x509".to_owned(),
+                    "-newkey".to_owned(),
+                    "rsa:2048".to_owned(),
+                    "-nodes".to_owned(),
+                    "-sha256".to_owned(),
+                    "-days".to_owned(),
+                    "2".to_owned(),
+                    "-subj".to_owned(),
+                    "/CN=paraegox-internal-s1-test-ca".to_owned(),
+                    "-addext".to_owned(),
+                    "basicConstraints=critical,CA:TRUE".to_owned(),
+                    "-addext".to_owned(),
+                    "keyUsage=critical,keyCertSign,cRLSign".to_owned(),
+                    "-keyout".to_owned(),
+                    path_text(&root_key),
+                    "-out".to_owned(),
+                    path_text(&root_ca),
+                ]);
+                protect_private_key(&root_key);
+
+                let listener = issue_listener(
+                    directory,
+                    listener_ip,
+                    common_name,
+                    &root_ca,
+                    &root_key,
+                );
+                Self { root_ca, listener }
+            }
+        }
+
+        fn issue_listener(
+            directory: &Path,
+            listener_ip: Ipv4Addr,
+            common_name: &str,
+            root_ca: &Path,
+            root_key: &Path,
+        ) -> IdentityMaterial {
+            let certificate = directory.join("listener.pem");
+            let private_key = directory.join("listener.key");
+            let request = directory.join("listener.csr");
+            let extension_file = directory.join("listener.ext");
+            fs::write(
+                &extension_file,
+                format!(
+                    "basicConstraints=critical,CA:FALSE\n\
+                     keyUsage=critical,digitalSignature,keyEncipherment\n\
+                     extendedKeyUsage=serverAuth\n\
+                     subjectAltName=IP:{listener_ip}\n"
+                ),
+            )
+            .expect("write listener extension file");
+            run_openssl(&[
+                "req".to_owned(),
+                "-new".to_owned(),
+                "-newkey".to_owned(),
+                "rsa:2048".to_owned(),
+                "-nodes".to_owned(),
+                "-sha256".to_owned(),
+                "-subj".to_owned(),
+                format!("/CN={common_name}"),
+                "-keyout".to_owned(),
+                path_text(&private_key),
+                "-out".to_owned(),
+                path_text(&request),
+            ]);
+            run_openssl(&[
+                "x509".to_owned(),
+                "-req".to_owned(),
+                "-in".to_owned(),
+                path_text(&request),
+                "-CA".to_owned(),
+                path_text(root_ca),
+                "-CAkey".to_owned(),
+                path_text(root_key),
+                "-set_serial".to_owned(),
+                "1001".to_owned(),
+                "-days".to_owned(),
+                "2".to_owned(),
+                "-sha256".to_owned(),
+                "-extfile".to_owned(),
+                path_text(&extension_file),
+                "-out".to_owned(),
+                path_text(&certificate),
+            ]);
+            protect_private_key(&private_key);
+            IdentityMaterial {
+                certificate,
+                private_key,
+            }
+        }
+
+        fn run_openssl(arguments: &[String]) {
+            let output = Command::new("openssl")
+                .args(arguments)
+                .output()
+                .expect("openssl must be installed for the Linux mTLS test");
+            assert!(
+                output.status.success(),
+                "openssl {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn protect_private_key(path: &Path) {
+            let mut permissions = fs::metadata(path)
+                .expect("read generated key metadata")
+                .permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(path, permissions).expect("restrict generated private key");
+        }
+
+        fn path_text(path: &Path) -> String {
+            path.to_str().expect("test path must be UTF-8").to_owned()
+        }
+
+        fn actual_non_loopback_ipv4() -> Ipv4Addr {
+            let probe = UdpSocket::bind("0.0.0.0:0").expect("bind IPv4 route probe");
+            probe
+                .connect("192.0.2.1:9")
+                .expect("select the host's non-loopback IPv4 route");
+            let SocketAddr::V4(address) = probe.local_addr().expect("read route probe address")
+            else {
+                panic!("IPv4 route probe returned an IPv6 address");
+            };
+            let address = *address.ip();
+            assert!(!address.is_unspecified());
+            assert!(!address.is_loopback());
+            assert!(!address.is_multicast());
+            assert_ne!(address, Ipv4Addr::BROADCAST);
+            address
+        }
+
+        fn available_port(address: Ipv4Addr) -> u16 {
+            let listener = TcpListener::bind(SocketAddrV4::new(address, 0))
+                .expect("reserve an available TCP port");
+            let port = listener
+                .local_addr()
+                .expect("read reserved TCP port")
+                .port();
+            drop(listener);
+            port
+        }
+
+        fn identity(material: &IdentityMaterial) -> ResolvedRemoteMtlsIdentityFiles {
+            ResolvedRemoteMtlsIdentityFiles::try_new(
+                material.certificate.clone(),
+                material.private_key.clone(),
+            )
+            .expect("resolved generated identity files")
+        }
+
+        fn schema(marker: u8) -> SchemaRef {
+            SchemaRef::try_new([marker; 16], 1, Digest32::from_bytes([marker; 32]))
+                .expect("test schema")
+        }
+
+        fn binding_spec(marker: u8) -> RequestResponseBindingSpec {
+            RequestResponseBindingSpec::try_new(
+                BindingId::from_bytes([marker; 16]),
+                None,
+                SUBMIT_ROUTE,
+                schema(marker.wrapping_add(0x40)),
+                schema(marker.wrapping_add(0x60)),
+                IngressLimits::try_new(4, 16_384, 4_096, 4_096, Duration::from_secs(2))
+                    .expect("test ingress limits"),
+            )
+            .expect("test binding spec")
+        }
+
+        async fn install_counting_binding(
+            service: &mut FabricService,
+        ) -> (PortBinding, Arc<AtomicUsize>, JoinHandle<()>) {
+            let installed = service
+                .install_request_response_binding(binding_spec(0x41))
+                .await
+                .expect("install S0 test binding");
+            let (binding, mut requests): (PortBinding, RequestReceiver) = installed.into_parts();
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let handler_callbacks = Arc::clone(&callbacks);
+            let handler = tokio::spawn(async move {
+                while let Some(request) = requests.recv().await {
+                    handler_callbacks.fetch_add(1, Ordering::SeqCst);
+                    let body = request.body().to_vec();
+                    request
+                        .respond(HandlerResponse::Ok(body))
+                        .expect("test response receiver remains live");
+                }
+            });
+            (binding, callbacks, handler)
+        }
+
+        async fn expect_echo(
+            service: &FabricService,
+            binding: &PortBinding,
+            request_marker: u8,
+            body: &[u8],
+        ) {
+            let response = service
+                .request(
+                    binding,
+                    RequestId::try_from_bytes([request_marker; 16]).expect("request id"),
+                    body.to_vec(),
+                    REQUEST_TIMEOUT,
+                )
+                .await
+                .expect("admitted exact route must respond");
+            assert_eq!(response.status(), ResponseStatus::Ok);
+            assert_eq!(response.body(), body);
+        }
+
+        fn assert_port_is_owned(address: SocketAddrV4, owner: &str) {
+            let error =
+                TcpListener::bind(address).expect_err("live session must retain its listener port");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::AddrInUse,
+                "{owner} listener {address} failed for an unexpected reason"
+            );
+        }
+
+        async fn assert_port_rebinds(address: SocketAddrV4) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match TcpListener::bind(address) {
+                    Ok(listener) => {
+                        drop(listener);
+                        return;
+                    }
+                    Err(_) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => panic!("listener {address} was not released: {error}"),
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn prepared_proxy_listener_owns_independent_tls_s1_without_mutating_s0() {
+            let ubuntu_listener_principal = PrincipalRef::from_bytes([0x71; 16]);
+            let mac_client_principal = PrincipalRef::from_bytes([0x72; 16]);
+            let remote_ip = actual_non_loopback_ipv4();
+            let s0_socket =
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_port(Ipv4Addr::LOCALHOST));
+            let s1_socket = SocketAddrV4::new(remote_ip, available_port(remote_ip));
+            let s0_endpoint = SessionEndpoint::try_new(format!("tcp/{s0_socket}"))
+                .expect("S0 loopback endpoint");
+            let s1_endpoint = RemoteTlsEndpoint::try_new(format!("tls/{s1_socket}"))
+                .expect("S1 TLS endpoint");
+
+            let directory = TestDirectory::new();
+            let pki = ListenerPki::generate(
+                directory.path(),
+                remote_ip,
+                &restricted_runtime_apply_peer_certificate_common_name_v1(
+                    ubuntu_listener_principal,
+                ),
+            );
+
+            let mut s0 = FabricService::start(
+                FabricServiceConfig::try_peer(vec![s0_endpoint], Vec::new())
+                    .expect("independent S0 loopback config"),
+            )
+            .await
+            .expect("open independent S0 loopback owner");
+            let s0_epoch = s0.session_epoch();
+            let (s0_submit, s0_callbacks, s0_handler) = install_counting_binding(&mut s0).await;
+            expect_echo(&s0, &s0_submit, 0x61, b"s0-before-s1").await;
+            assert_eq!(s0_callbacks.load(Ordering::SeqCst), 1);
+            assert_port_is_owned(s0_socket, "S0");
+
+            let proxy_config = FabricServiceConfig::try_remote_agent_proxy_listener_v2(
+                s1_endpoint,
+                ResolvedRemoteMtlsListenerCredentialFilesV1::try_new(
+                    pki.root_ca.clone(),
+                    identity(&pki.listener),
+                )
+                .expect("S1 listener credentials"),
+                mac_client_principal,
+                SUBMIT_ROUTE,
+                CONTROL_ROUTE,
+            )
+            .expect("TLS-only S1 proxy-listener config");
+            let prepared = PreparedRemoteAgentProxyListenerV2::try_prepare(proxy_config)
+                .expect("prepare S1 without transport effects");
+            let reserved_s1_epoch = prepared.session_epoch();
+            let unbound_s1 =
+                TcpListener::bind(s1_socket).expect("prepare must not bind the S1 TLS endpoint");
+            drop(unbound_s1);
+            assert_eq!(s0.session_epoch(), s0_epoch);
+            assert_port_is_owned(s0_socket, "S0 after S1 prepare");
+
+            let s1 = prepared
+                .start()
+                .await
+                .expect("production prepared start must bind the S1 TLS listener");
+            assert_eq!(s1.session_epoch(), reserved_s1_epoch);
+            assert_port_is_owned(s1_socket, "S1 TLS listener");
+            assert_port_is_owned(s0_socket, "S0 while S1 is live");
+            assert_eq!(s0.session_epoch(), s0_epoch);
+            expect_echo(&s0, &s0_submit, 0x62, b"s0-while-s1-live").await;
+            assert_eq!(s0_callbacks.load(Ordering::SeqCst), 2);
+
+            s1.shutdown()
+                .await
+                .expect("consuming S1 shutdown must close its TLS listener");
+            assert_port_rebinds(s1_socket).await;
+            assert_port_is_owned(s0_socket, "S0 after S1 shutdown");
+            assert_eq!(s0.session_epoch(), s0_epoch);
+            expect_echo(&s0, &s0_submit, 0x63, b"s0-after-s1").await;
+            assert_eq!(s0_callbacks.load(Ordering::SeqCst), 3);
+
+            s0.shutdown().await.expect("shutdown independent S0 owner");
+            tokio::time::timeout(Duration::from_secs(2), s0_handler)
+                .await
+                .expect("S0 handler must stop")
+                .expect("S0 handler must join");
+            assert_port_rebinds(s0_socket).await;
+        }
     }
 }

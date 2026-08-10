@@ -15,10 +15,10 @@ use std::{
 
 use paraegox_fabric::{
     FabricService, FabricServiceConfig, HandlerResponse, IngressLimits, PortBinding,
-    PreparedRemoteAgentProxyListenerV2, RemoteTlsEndpoint, RequestId, RequestReceiver,
-    RequestResponseBindingSpec, ResolvedRemoteMtlsConnectorCredentialFilesV1,
-    ResolvedRemoteMtlsIdentityFiles, ResolvedRemoteMtlsListenerCredentialFilesV1, ResponseStatus,
-    SessionEndpoint, restricted_runtime_apply_peer_certificate_common_name_v1,
+    RemoteTlsEndpoint, RequestId, RequestReceiver, RequestResponseBindingSpec,
+    ResolvedRemoteMtlsConnectorCredentialFilesV1, ResolvedRemoteMtlsIdentityFiles,
+    ResolvedRemoteMtlsListenerCredentialFilesV1, ResponseStatus, SessionEndpoint,
+    restricted_runtime_apply_peer_certificate_common_name_v1,
 };
 use paraegox_kernel::{digest::Digest32, identity::PrincipalRef};
 use paraegox_runtime_contracts::assignment::{BindingId, SchemaRef};
@@ -404,15 +404,6 @@ async fn assert_port_rebinds(address: SocketAddrV4) {
     }
 }
 
-fn assert_port_is_owned(address: SocketAddrV4, owner: &str) {
-    let error = TcpListener::bind(address).expect_err("live session must retain its listener port");
-    assert_eq!(
-        error.kind(),
-        std::io::ErrorKind::AddrInUse,
-        "{owner} listener {address} failed for an unexpected reason"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_agent_listener_and_connector_enforce_two_route_mtls_acl() {
     let ubuntu_listener_principal = PrincipalRef::from_bytes([0x61; 16]);
@@ -541,88 +532,4 @@ async fn remote_agent_listener_and_connector_enforce_two_route_mtls_acl() {
     }
     assert_port_rebinds(loopback_socket).await;
     assert_port_rebinds(remote_socket).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prepared_proxy_listener_owns_independent_tls_s1_without_mutating_s0() {
-    let ubuntu_listener_principal = PrincipalRef::from_bytes([0x71; 16]);
-    let mac_client_principal = PrincipalRef::from_bytes([0x72; 16]);
-    let wrong_client_principal = PrincipalRef::from_bytes([0x73; 16]);
-    let remote_ip = actual_non_loopback_ipv4();
-    let s0_socket = SocketAddrV4::new(Ipv4Addr::LOCALHOST, available_port(Ipv4Addr::LOCALHOST));
-    let s1_socket = SocketAddrV4::new(remote_ip, available_port(remote_ip));
-    let s0_endpoint =
-        SessionEndpoint::try_new(format!("tcp/{s0_socket}")).expect("S0 loopback endpoint");
-    let s1_endpoint =
-        RemoteTlsEndpoint::try_new(format!("tls/{s1_socket}")).expect("S1 TLS endpoint");
-
-    let directory = TestDirectory::new();
-    let pki = TestPki::generate(
-        directory.path(),
-        remote_ip,
-        &restricted_runtime_apply_peer_certificate_common_name_v1(ubuntu_listener_principal),
-        &restricted_runtime_apply_peer_certificate_common_name_v1(mac_client_principal),
-        &restricted_runtime_apply_peer_certificate_common_name_v1(wrong_client_principal),
-    );
-
-    let mut s0 = FabricService::start(
-        FabricServiceConfig::try_peer(vec![s0_endpoint], Vec::new())
-            .expect("independent S0 loopback config"),
-    )
-    .await
-    .expect("open independent S0 loopback owner");
-    let s0_epoch = s0.session_epoch();
-    let (s0_submit, s0_callbacks, s0_handler) =
-        install_counting_binding(&mut s0, 0x41, SUBMIT_ROUTE).await;
-    expect_echo(&s0, &s0_submit, 0x61, b"s0-before-s1").await;
-    assert_eq!(s0_callbacks.load(Ordering::SeqCst), 1);
-    assert_port_is_owned(s0_socket, "S0");
-
-    let proxy_config = FabricServiceConfig::try_remote_agent_proxy_listener_v2(
-        s1_endpoint,
-        ResolvedRemoteMtlsListenerCredentialFilesV1::try_new(
-            pki.root_ca.clone(),
-            identity(&pki.listener),
-        )
-        .expect("S1 listener credentials"),
-        mac_client_principal,
-        SUBMIT_ROUTE,
-        CONTROL_ROUTE,
-    )
-    .expect("TLS-only S1 proxy-listener config");
-    let prepared = PreparedRemoteAgentProxyListenerV2::try_prepare(proxy_config)
-        .expect("prepare S1 without transport effects");
-    let reserved_s1_epoch = prepared.session_epoch();
-    let unbound_s1 =
-        TcpListener::bind(s1_socket).expect("prepare must not bind the S1 TLS endpoint");
-    drop(unbound_s1);
-    assert_eq!(s0.session_epoch(), s0_epoch);
-    assert_port_is_owned(s0_socket, "S0 after S1 prepare");
-
-    let s1 = prepared
-        .start()
-        .await
-        .expect("production prepared start must bind the S1 TLS listener");
-    assert_eq!(s1.session_epoch(), reserved_s1_epoch);
-    assert_port_is_owned(s1_socket, "S1 TLS listener");
-    assert_port_is_owned(s0_socket, "S0 while S1 is live");
-    assert_eq!(s0.session_epoch(), s0_epoch);
-    expect_echo(&s0, &s0_submit, 0x62, b"s0-while-s1-live").await;
-    assert_eq!(s0_callbacks.load(Ordering::SeqCst), 2);
-
-    s1.shutdown()
-        .await
-        .expect("consuming S1 shutdown must close its TLS listener");
-    assert_port_rebinds(s1_socket).await;
-    assert_port_is_owned(s0_socket, "S0 after S1 shutdown");
-    assert_eq!(s0.session_epoch(), s0_epoch);
-    expect_echo(&s0, &s0_submit, 0x63, b"s0-after-s1").await;
-    assert_eq!(s0_callbacks.load(Ordering::SeqCst), 3);
-
-    s0.shutdown().await.expect("shutdown independent S0 owner");
-    tokio::time::timeout(Duration::from_secs(2), s0_handler)
-        .await
-        .expect("S0 handler must stop")
-        .expect("S0 handler must join");
-    assert_port_rebinds(s0_socket).await;
 }
