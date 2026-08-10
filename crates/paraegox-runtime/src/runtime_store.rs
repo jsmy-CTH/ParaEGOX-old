@@ -1379,6 +1379,16 @@ pub(crate) struct RemoteAgentReplayJournalAbsentLeaseV2 {
     current_runtime_host_epoch: u64,
 }
 
+impl Drop for RemoteAgentReplayJournalAbsentLeaseV2 {
+    fn drop(&mut self) {
+        let _authority_lifetime_guard = (
+            &self.lock_identity,
+            &self.static_identity,
+            &self.current_runtime_host_epoch,
+        );
+    }
+}
+
 /// Inert same-epoch Stable startup evidence. Fresh authority requires a later
 /// borrowed exact reopen of both this PXRJ final and its PXRS source.
 pub(crate) struct RemoteAgentReplayJournalStableLeaseV2 {
@@ -1490,6 +1500,19 @@ impl RemoteAgentReplayJournalPendingAuthorityV2 {
     #[must_use]
     pub(crate) const fn request_nonce_identity(&self) -> Digest32 {
         self.request_nonce_identity
+    }
+}
+
+impl Drop for RemoteAgentReplayJournalPendingAuthorityV2 {
+    fn drop(&mut self) {
+        let _authority_lifetime_guard = (
+            &self.source_pxrs_sequence,
+            &self.source_pxrs_digest,
+            &self.pending_candidate_snapshot_digest,
+            &self.operation_id,
+            &self.tenure_nonce_identity,
+            &self.request_nonce_identity,
+        );
     }
 }
 
@@ -9748,8 +9771,9 @@ pub(crate) mod tests {
         RemoteAgentAccessCommitFailpointV2, RemoteAgentAccessGenesisInitializeCommitErrorV2,
         RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2,
         RemoteAgentDescriptorEvidenceCommitFailpoint, RemoteAgentReplayJournalAbsentLeaseV2,
-        RemoteAgentReplayJournalCommitFailpointV2, RemoteAgentReplayJournalStartupSlotV2,
-        RuntimeCommitFailpoint, RuntimeFileStage, RuntimeFilesystemPolicy,
+        RemoteAgentReplayJournalCommitFailpointV2, RemoteAgentReplayJournalPendingAuthorityV2,
+        RemoteAgentReplayJournalStartupSlotV2, RuntimeCommitFailpoint, RuntimeFileStage,
+        RuntimeFilesystemPolicy,
         RuntimeInitializerBeginError, RuntimeInitializerGuard, RuntimeInitializerPreflight,
         RuntimeInitializerPublishError, RuntimeJournalMigrationKind, RuntimeMigrationFailpoints,
         RuntimeMigrationRequest, RuntimeMigrationTokens, RuntimePublishFailure, RuntimeStore,
@@ -10774,6 +10798,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_agent_replay_authorities_have_explicit_drop_guards() {
+        assert!(std::mem::needs_drop::<RemoteAgentReplayJournalAbsentLeaseV2>());
+        assert!(std::mem::needs_drop::<
+            RemoteAgentReplayJournalPendingAuthorityV2
+        >());
+
+        let source = include_str!("runtime_store.rs");
+        for authority in [
+            "RemoteAgentReplayJournalAbsentLeaseV2",
+            "RemoteAgentReplayJournalPendingAuthorityV2",
+        ] {
+            assert!(
+                source.contains(&format!("impl Drop for {authority}")),
+                "move-only replay authority lost its explicit Drop guard: {authority}"
+            );
+        }
+    }
+
+    #[test]
     fn production_pxrs2_genesis_store_boundary_accepts_only_the_opaque_candidate() {
         let seam: fn(
             &mut ManagedFabricStore,
@@ -11464,7 +11507,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn remote_agent_access_v2_postpublish_failpoints_are_uncertain_and_reopen_new_final() {
+    fn remote_agent_access_v2_postpublish_failpoints_leave_pxrs_only_pair_for_reconcile() {
         for (case, failpoint) in [
             (
                 0x61,
@@ -11491,6 +11534,7 @@ pub(crate) mod tests {
                 REMOTE_AGENT_ACCESS_FIXTURE_EPOCH,
             );
             let expected_wire = snapshot.canonical_wire().to_vec();
+            let expected_digest = snapshot.snapshot_digest();
             assert!(matches!(
                 store.initialize_remote_agent_access_v2_at_failpoint(absent, snapshot, failpoint,),
                 Err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain(_))
@@ -11503,15 +11547,47 @@ pub(crate) mod tests {
                 transition_projection_digest,
             )
             .expect("uncertain PXRS2 store must resolve by final reopen");
-            let recovered = remote_agent_access_same_epoch_lease_v2(
+            assert!(matches!(
                 reopened
-                    .adjudicate_remote_agent_access_startup_v2(
+                    .adjudicate_remote_agent_replay_journal_startup_v2(
                         static_identity,
                         REMOTE_AGENT_ACCESS_FIXTURE_EPOCH,
                     )
-                    .expect("published PXRS2 final must structurally recover"),
+                    .expect("PXRS-only pair must jointly classify for reconciliation"),
+                RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(marker)
+                    if marker.classification()
+                        == RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired
+            ));
+            let marker = match reopened
+                .adjudicate_remote_agent_access_startup_v2(
+                    static_identity,
+                    REMOTE_AGENT_ACCESS_FIXTURE_EPOCH,
+                )
+                .expect("PXRS-only access final must remain inert after uncertain publication")
+            {
+                RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(marker) => marker,
+                RemoteAgentAccessStartupSlotV2::Absent(_)
+                | RemoteAgentAccessStartupSlotV2::SameEpoch(_) => {
+                    panic!("PXRS-only final must not mint same-epoch authority")
+                }
+            };
+            assert_eq!(marker.snapshot_sequence(), 1);
+            assert_eq!(marker.snapshot_digest(), expected_digest);
+            assert_eq!(
+                fs::read(
+                    directory
+                        .path()
+                        .join(REMOTE_AGENT_ACCESS_ACTIVE_FILE_NAME)
+                )
+                .expect("uncertain PXRS2 final must remain readable"),
+                expected_wire
             );
-            assert_eq!(recovered.canonical_wire(), expected_wire);
+            assert!(
+                !directory
+                    .path()
+                    .join(REMOTE_AGENT_REPLAY_JOURNAL_ACTIVE_FILE_NAME)
+                    .exists()
+            );
         }
     }
 
@@ -11545,13 +11621,38 @@ pub(crate) mod tests {
             static_identity.transition_projection_digest,
         )
         .expect("replaced PXRS2 store must reopen");
-        let recovered = remote_agent_access_same_epoch_lease_v2(
+        assert!(matches!(
             reopened
-                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
-                .expect("replaced PXRS2 final must recover at the same epoch"),
+                .adjudicate_remote_agent_replay_journal_startup_v2(
+                    static_identity,
+                    runtime_host_epoch,
+                )
+                .expect("raw PXRS2 replacement pair must jointly classify"),
+            RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(marker)
+                if marker.classification()
+                    == RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired
+        ));
+        let marker = match reopened
+            .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
+            .expect("raw PXRS2 replacement must remain inert without matching Stable PXRJ")
+        {
+            RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(marker) => marker,
+            RemoteAgentAccessStartupSlotV2::Absent(_)
+            | RemoteAgentAccessStartupSlotV2::SameEpoch(_) => {
+                panic!("mismatched PXRS/PXRJ pair must not mint same-epoch authority")
+            }
+        };
+        assert_eq!(marker.snapshot_sequence(), 2);
+        assert_eq!(marker.snapshot_digest(), expected_digest);
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join(REMOTE_AGENT_ACCESS_ACTIVE_FILE_NAME)
+            )
+            .expect("raw replacement PXRS2 final must remain readable"),
+            expected_wire
         );
-        assert_eq!(recovered.canonical_wire(), expected_wire);
-        assert_eq!(recovered.snapshot().snapshot_digest(), expected_digest);
     }
 
     #[test]
@@ -11619,7 +11720,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn remote_agent_access_v2_replacement_postpublish_failure_reopens_new_final_without_candidate()
+    fn remote_agent_access_v2_replacement_postpublish_failure_reopens_pair_for_reconcile_without_candidate()
     {
         let (directory, mut store, initial, pending, static_identity, runtime_host_epoch) =
             remote_agent_access_prepared_store_fixture_v2();
@@ -11632,6 +11733,7 @@ pub(crate) mod tests {
             .initialize_remote_agent_access_v2(absent, initial)
             .expect("prepared PXRS2 initial commit must pass");
         let expected_wire = pending.canonical_wire().to_vec();
+        let expected_digest = pending.snapshot().snapshot_digest();
         let failure = match store.replace_remote_agent_access_v2_at_failpoint(
             current,
             pending,
@@ -11654,13 +11756,38 @@ pub(crate) mod tests {
             static_identity.transition_projection_digest,
         )
         .expect("uncertain replacement must resolve by final reopen");
-        let recovered = remote_agent_access_same_epoch_lease_v2(
+        assert!(matches!(
             reopened
-                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
-                .expect("uncertain replacement must recover the published final"),
+                .adjudicate_remote_agent_replay_journal_startup_v2(
+                    static_identity,
+                    runtime_host_epoch,
+                )
+                .expect("uncertain raw replacement pair must jointly classify"),
+            RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(marker)
+                if marker.classification()
+                    == RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired
+        ));
+        let marker = match reopened
+            .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)
+            .expect("uncertain raw replacement must remain inert without matching Stable PXRJ")
+        {
+            RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(marker) => marker,
+            RemoteAgentAccessStartupSlotV2::Absent(_)
+            | RemoteAgentAccessStartupSlotV2::SameEpoch(_) => {
+                panic!("uncertain mismatched pair must not mint same-epoch authority")
+            }
+        };
+        assert_eq!(marker.snapshot_sequence(), 2);
+        assert_eq!(marker.snapshot_digest(), expected_digest);
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join(REMOTE_AGENT_ACCESS_ACTIVE_FILE_NAME)
+            )
+            .expect("uncertain replacement PXRS2 final must remain readable"),
+            expected_wire
         );
-        assert_eq!(recovered.canonical_wire(), expected_wire);
-        assert_eq!(recovered.snapshot().sequence(), 2);
     }
 
     #[test]

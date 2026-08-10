@@ -2044,9 +2044,14 @@ pub(crate) struct RemoteAgentJournalAuthorizedFreshV2<'request, 'running> {
 }
 
 /// Rejected pure preflight returns every move-only authority input intact so an
-/// owning orchestrator can fail closed without silently dropping the Pin.
+/// owning orchestrator can fail closed without silently dropping the Pin. The
+/// large authority pair is boxed so the rejection ABI remains bounded.
 pub(crate) struct RemoteAgentReplayFreshPreflightErrorV2<'request, 'running> {
     cause: RemoteAgentAccessStateErrorV2,
+    rejected: Box<RemoteAgentReplayFreshPreflightRejectedV2<'request, 'running>>,
+}
+
+struct RemoteAgentReplayFreshPreflightRejectedV2<'request, 'running> {
     current_final: RemoteAgentCurrentFinalAccessSnapshotV2,
     verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
 }
@@ -2860,8 +2865,10 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
             }
             Err(cause) => Err(RemoteAgentReplayFreshPreflightErrorV2 {
                 cause,
-                current_final: self,
-                verified_ingress,
+                rejected: Box::new(RemoteAgentReplayFreshPreflightRejectedV2 {
+                    current_final: self,
+                    verified_ingress,
+                }),
             }),
         }
     }
@@ -3222,7 +3229,12 @@ impl<'request, 'running> RemoteAgentReplayFreshPreflightErrorV2<'request, 'runni
         RemoteAgentCurrentFinalAccessSnapshotV2,
         VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
     ) {
-        (self.cause, self.current_final, self.verified_ingress)
+        let Self { cause, rejected } = self;
+        let RemoteAgentReplayFreshPreflightRejectedV2 {
+            current_final,
+            verified_ingress,
+        } = *rejected;
+        (cause, current_final, verified_ingress)
     }
 }
 
@@ -3236,16 +3248,14 @@ impl RemoteAgentDurableReplayCheckedV2 {
     fn from_pending_journal_exact_readback(
         authority: RemoteAgentReplayJournalPendingAuthorityV2,
     ) -> Self {
-        let checked = Self {
+        Self {
             current_snapshot_sequence: authority.source_pxrs_sequence(),
             current_snapshot_digest: authority.source_pxrs_digest(),
             operation_id: authority.operation_id(),
             tenure_nonce_identity: authority.tenure_nonce_identity(),
             request_nonce_identity: authority.request_nonce_identity(),
             pending_candidate_snapshot_digest: authority.pending_candidate_snapshot_digest(),
-        };
-        drop(authority);
-        checked
+        }
     }
 
     fn validate_preflight(
@@ -4018,6 +4028,24 @@ impl fmt::Display for RemoteAgentReplayJournalStateErrorV2 {
 impl std::error::Error for RemoteAgentReplayJournalStateErrorV2 {}
 
 impl RemoteAgentAuthorizedTransitionV2 {
+    /// Test-only continuation marker for the modeled reconciliation edge.
+    /// Production deliberately cannot mint CurrentFinal authority while a
+    /// QuarantineIntent snapshot still requires external reconciliation.
+    #[cfg(test)]
+    fn from_reconcile_required_exact_readback_for_test(
+        snapshot: RemoteAgentAccessSnapshotV2,
+    ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
+        if snapshot.phase != RemoteAgentAccessDurablePhaseV2::QuarantineIntent
+            || !matches!(
+                snapshot.resolved_current_s1_for_current_final_marker_v2(),
+                Err(RemoteAgentAccessStateErrorV2::ReconcileRequired)
+            )
+        {
+            return Err(RemoteAgentAccessStateErrorV2::InvalidCurrentFinalMarker);
+        }
+        Ok(Self { snapshot })
+    }
+
     #[must_use]
     pub(crate) const fn snapshot(&self) -> &RemoteAgentAccessSnapshotV2 {
         &self.snapshot
@@ -8746,7 +8774,16 @@ mod tests {
         fn authorize_pending_v2(
             pending: RemoteAgentPendingAccessSnapshotV2,
         ) -> RemoteAgentAuthorizedTransitionV2 {
-            current_final_v2(readback_pending_v2(pending), |_| {})
+            let snapshot = readback_pending_v2(pending);
+            if snapshot.phase == RemoteAgentAccessDurablePhaseV2::QuarantineIntent {
+                return RemoteAgentAuthorizedTransitionV2::from_reconcile_required_exact_readback_for_test(
+                    snapshot,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("QuarantineIntent reconciliation fixture rejected: {error}")
+                });
+            }
+            current_final_v2(snapshot, |_| {})
                 .and_then(RemoteAgentCurrentFinalAccessSnapshotV2::try_authorize_existing)
                 .unwrap_or_else(|error| panic!("Pending PXRS2 readback rejected: {error}"))
         }
@@ -10023,22 +10060,22 @@ mod tests {
                         .map(|(implementation, _)| implementation)
                 })
                 .unwrap_or_else(|| panic!("fresh transition implementation missing"));
-            let normalized_fresh_transition = fresh_transition
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
+            let compact_fresh_transition = fresh_transition
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
             let build = fresh_transition
                 .find("let snapshot = RemoteAgentAccessSnapshotV2::try_build")
                 .unwrap_or_else(|| panic!("fresh Pending build missing"));
             for exact_check in [
-                "live_carrier_binding_digest != self.current_carrier_binding_digest",
-                "inner.target_execution().profile().mac_agent_client_principal() != self.current_intended_client",
-                "request.expected_s1_cas() != self.current_s1_cas",
-                "inner.target_execution().expected_s1_cas() != self.current_s1_cas",
-                "resolved_current_s1_cas != self.current_s1_cas",
+                "live_carrier_binding_digest!=self.current_carrier_binding_digest",
+                "inner.target_execution().profile().mac_agent_client_principal()!=self.current_intended_client",
+                "request.expected_s1_cas()!=self.current_s1_cas",
+                "inner.target_execution().expected_s1_cas()!=self.current_s1_cas",
+                "resolved_current_s1_cas!=self.current_s1_cas",
             ] {
                 assert!(
-                    normalized_fresh_transition.contains(exact_check),
+                    compact_fresh_transition.contains(exact_check),
                     "fresh CurrentFinal check missing: {exact_check}",
                 );
             }
@@ -11529,6 +11566,10 @@ mod tests {
                     Digest32::from_bytes(request),
                 ));
             }
+            let duplicate_operation_id = burns
+                .first()
+                .unwrap_or_else(|| panic!("full PXRJ fixture lost its first burn"))
+                .operation_id;
             let full =
                 RemoteAgentReplayJournalSnapshotV2::try_build(RemoteAgentReplayJournalSnapshotV2 {
                     identity,
@@ -11557,7 +11598,7 @@ mod tests {
             let duplicate_request = rebuilt_active_request_with_identities_v2(
                 RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
                     .unwrap_or_else(|error| panic!("absent S1 rejected: {error}")),
-                ApplyOperationId::from_bytes([0x40; 16]),
+                ApplyOperationId::from_bytes(duplicate_operation_id),
                 &[0x82; 16],
                 &[0x83; 16],
                 &[0x84; 16],
@@ -11701,11 +11742,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("journal-authorized fresh wrapper missing"));
             assert!(authorized.contains("verified_ingress:"));
             assert!(authorized.contains("pending: RemoteAgentPendingAccessSnapshotV2"));
-            assert!(
-                source.contains(
-                    "pub(crate) fn pending_snapshot_for_store_precommit(\n        &self,"
+            let preflight = source
+                .split_once(
+                    "impl<'request, 'running> RemoteAgentReplayFreshPreflightV2<'request, 'running> {",
                 )
-            );
+                .and_then(|(_, tail)| {
+                    tail.split_once(
+                        "impl<'request, 'running> RemoteAgentJournalAuthorizedFreshV2<'request, 'running> {",
+                    )
+                    .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("fresh preflight implementation missing"));
+            let pending_snapshot = preflight
+                .split_once("pub(crate) const fn pending_snapshot_for_store_precommit(")
+                .and_then(|(_, tail)| {
+                    tail.split_once("pub(crate) fn pending_canonical_wire_for_store_precommit")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("borrowed precommit snapshot API missing"));
+            assert!(pending_snapshot.contains("&self"));
+            assert!(pending_snapshot.contains(") -> &RemoteAgentAccessSnapshotV2 {"));
+            assert!(pending_snapshot.contains("self.pending.snapshot()"));
             assert!(source.contains(
                 "pub(crate) fn pending_canonical_wire_for_store_precommit(&self) -> &[u8]"
             ));

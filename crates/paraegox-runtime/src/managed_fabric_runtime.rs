@@ -4031,10 +4031,10 @@ mod tests {
         assert!(stable_publication < release_pin && release_pin < return_lease);
         assert_eq!(
             store_transaction[..stable_publication]
-                .match_indices("drop(authorized);")
+                .match_indices("\n        drop(authorized);")
                 .count(),
             0,
-            "live ingress Pin was released before Stable journal readback",
+            "live ingress Pin left the successful transaction spine before Stable journal readback",
         );
 
         let test_forwarding_start = source

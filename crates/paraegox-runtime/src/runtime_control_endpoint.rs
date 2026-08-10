@@ -8591,21 +8591,29 @@ mod tests {
         .unwrap_or_else(|error| panic!("managed auth claim rejected: {error}"))
     }
 
-    fn signed_managed_remote_agent_access_apply_v2(
-        stack_request: &ManagedAgentStackApplyRequestV1,
+    struct ManagedRemoteAgentAccessRequestFixtureV2<'fixture> {
+        stack_request: &'fixture ManagedAgentStackApplyRequestV1,
         retained_s0_cas: RemoteAgentRetainedS0CasV2,
         expected_s1_cas: RemoteAgentActiveS1CasV2,
-        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        carrier: &'fixture RestrictedRuntimeApplyCarrierBindingV1,
         intended_client: PrincipalRef,
         runtime_host_epoch: u64,
         clock_generation: ClockGeneration,
+    }
+
+    struct ManagedRemoteAgentAccessFreshAxesV2<'fixture> {
         operation_id: [u8; 16],
-        tenure_nonce: &[u8],
-        request_nonce: &[u8],
-        outer_nonce: &[u8],
+        tenure_nonce: &'fixture [u8],
+        request_nonce: &'fixture [u8],
+        outer_nonce: &'fixture [u8],
         temporal_seed: u8,
+    }
+
+    fn signed_managed_remote_agent_access_apply_v2(
+        fixture: &ManagedRemoteAgentAccessRequestFixtureV2<'_>,
+        axes: ManagedRemoteAgentAccessFreshAxesV2<'_>,
     ) -> RemoteAgentAccessRequestV2 {
-        let predecessor = stack_request.target_execution().clone();
+        let predecessor = fixture.stack_request.target_execution().clone();
         let projection = RemoteAgentDataPlaneProjectionV1::try_from_managed_agent_stack_projection(
             predecessor.projection().clone(),
         )
@@ -8633,7 +8641,7 @@ mod tests {
                 [0xe5; 16],
             )
             .unwrap_or_else(|error| panic!("remote-Agent listener credential rejected: {error}")),
-            mac_agent_client_principal: intended_client,
+            mac_agent_client_principal: fixture.intended_client,
             ubuntu_agent_listener_principal: PrincipalRef::from_bytes([0xe6; 16]),
             operation_timeout_nanos: RESTRICTED_OPERATION_TIMEOUT_NANOS,
         })
@@ -8641,8 +8649,8 @@ mod tests {
         let execution = RemoteAgentDataPlaneTargetExecutionV2::try_remote_access_active(
             projection,
             predecessor,
-            retained_s0_cas,
-            expected_s1_cas,
+            fixture.retained_s0_cas,
+            fixture.expected_s1_cas,
             profile,
         )
         .unwrap_or_else(|error| panic!("remote-Agent target execution rejected: {error}"));
@@ -8652,19 +8660,18 @@ mod tests {
             SourcePlanRevision::new(2),
             SourcePlanDigest::new(digest(0xe8)),
         );
-        let operation_id = ApplyOperationId::from_bytes(operation_id);
         let control = RuntimeApplyControl::new(
-            managed_writer_context(2, 1, tenure_nonce),
+            managed_writer_context(2, 1, axes.tenure_nonce),
             ExpectedActive::None,
-            operation_id,
+            ApplyOperationId::from_bytes(axes.operation_id),
         );
         let inner_draft = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
             execution,
             provenance,
             control,
-            managed_temporal(clock_generation, temporal_seed),
+            managed_temporal(fixture.clock_generation, axes.temporal_seed),
             STORE_INSTANCE_ID,
-            managed_auth(request_nonce),
+            managed_auth(axes.request_nonce),
         )
         .unwrap_or_else(|error| panic!("remote-Agent PXAR11 draft rejected: {error}"));
         let inner_signature = SigningKey::from_bytes(&CONTROLLER_SEED)
@@ -8682,15 +8689,15 @@ mod tests {
             .unwrap_or_else(|error| panic!("remote-Agent PXAR11 rejected: {error}"));
         let outer_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
             RemoteAgentAccessRequestFieldsV2 {
-                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(*operation_id.as_bytes())
+                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(axes.operation_id)
                     .unwrap_or_else(|error| {
                         panic!("remote-Agent PXRA2 request ID rejected: {error}")
                     }),
-                carrier,
+                carrier: fixture.carrier.clone(),
                 target: TARGET,
                 expected_runtime_store_instance_id: STORE_INSTANCE_ID,
-                expected_runtime_host_epoch: runtime_host_epoch,
-                auth_claim: managed_auth(outer_nonce),
+                expected_runtime_host_epoch: fixture.runtime_host_epoch,
+                auth_claim: managed_auth(axes.outer_nonce),
             },
             inner,
         )
@@ -9476,18 +9483,22 @@ mod tests {
         )
     }
 
+    struct ManagedRemoteAgentReplayStableFixtureV2<'fixture> {
+        pxrs_path: &'fixture Path,
+        pxrj_path: &'fixture Path,
+        expected_pxrs: &'fixture [u8],
+        expected_pxrj: &'fixture [u8],
+        expected_pxrs_inode: u64,
+        expected_pxrj_inode: u64,
+    }
+
     fn assert_managed_remote_agent_replay_rejected_v2(
         control: &mut ManagedFabricControlService,
         dependencies: &RuntimeRestrictedApplyEndpointDependenciesV1,
         current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
         request: &RemoteAgentAccessRequestV2,
         clock_generation: ClockGeneration,
-        pxrs_path: &Path,
-        pxrj_path: &Path,
-        expected_pxrs: &[u8],
-        expected_pxrj: &[u8],
-        expected_pxrs_inode: u64,
-        expected_pxrj_inode: u64,
+        stable: &ManagedRemoteAgentReplayStableFixtureV2<'_>,
     ) -> RemoteAgentAccessCurrentFinalLeaseBundleV2 {
         let current_snapshot_digest = current
             .current_final_for_test()
@@ -9535,23 +9546,23 @@ mod tests {
             0,
             "a pure replay rejection must return the still-live ingress Pin",
         );
-        let actual_pxrs = fs::read(pxrs_path)
+        let actual_pxrs = fs::read(stable.pxrs_path)
             .unwrap_or_else(|error| panic!("replay PXRS readback failed: {error}"));
-        let actual_pxrj = fs::read(pxrj_path)
+        let actual_pxrj = fs::read(stable.pxrj_path)
             .unwrap_or_else(|error| panic!("replay PXRJ readback failed: {error}"));
-        assert_eq!(actual_pxrs.as_slice(), expected_pxrs);
-        assert_eq!(actual_pxrj.as_slice(), expected_pxrj);
+        assert_eq!(actual_pxrs.as_slice(), stable.expected_pxrs);
+        assert_eq!(actual_pxrj.as_slice(), stable.expected_pxrj);
         assert_eq!(
-            fs::metadata(pxrs_path)
+            fs::metadata(stable.pxrs_path)
                 .unwrap_or_else(|error| panic!("replay PXRS metadata failed: {error}"))
                 .ino(),
-            expected_pxrs_inode,
+            stable.expected_pxrs_inode,
         );
         assert_eq!(
-            fs::metadata(pxrj_path)
+            fs::metadata(stable.pxrj_path)
                 .unwrap_or_else(|error| panic!("replay PXRJ metadata failed: {error}"))
                 .ino(),
-            expected_pxrj_inode,
+            stable.expected_pxrj_inode,
         );
         drop(verified_ingress);
         assert_eq!(pin_drops.load(Ordering::SeqCst), 1);
@@ -9884,19 +9895,24 @@ mod tests {
         assert_eq!(initial_journal.applied_burn_ordinal(), 0);
         assert_eq!(initial_journal.burn_count(), 0);
 
-        let request = signed_managed_remote_agent_access_apply_v2(
-            &stack_request,
+        let request_fixture = ManagedRemoteAgentAccessRequestFixtureV2 {
+            stack_request: &stack_request,
             retained_s0_cas,
             expected_s1_cas,
-            dependencies.expected_carrier.clone(),
+            carrier: &dependencies.expected_carrier,
             intended_client,
             runtime_host_epoch,
             clock_generation,
-            [0xea; 16],
-            b"remote-agent-fresh-tenure-nonce",
-            b"remote-agent-fresh-request-nonce",
-            b"remote-agent-fresh-outer-nonce",
-            0xeb,
+        };
+        let request = signed_managed_remote_agent_access_apply_v2(
+            &request_fixture,
+            ManagedRemoteAgentAccessFreshAxesV2 {
+                operation_id: [0xea; 16],
+                tenure_nonce: b"remote-agent-fresh-tenure-nonce",
+                request_nonce: b"remote-agent-fresh-request-nonce",
+                outer_nonce: b"remote-agent-fresh-outer-nonce",
+                temporal_seed: 0xeb,
+            },
         );
         let pin_drops = Arc::new(AtomicU64::new(0));
         let verified_ingress = verify_managed_remote_agent_access_ingress_v2(
@@ -9987,19 +10003,24 @@ mod tests {
             .unwrap_or_else(|error| panic!("preburn PXRS metadata failed: {error}"))
             .ino();
 
-        let base_request = signed_managed_remote_agent_access_apply_v2(
-            &stack_request,
+        let request_fixture = ManagedRemoteAgentAccessRequestFixtureV2 {
+            stack_request: &stack_request,
             retained_s0_cas,
             expected_s1_cas,
-            dependencies.expected_carrier.clone(),
+            carrier: &dependencies.expected_carrier,
             intended_client,
             runtime_host_epoch,
             clock_generation,
-            [0xea; 16],
-            b"remote-agent-replay-base-tenure",
-            b"remote-agent-replay-base-request",
-            b"remote-agent-replay-base-outer",
-            0xea,
+        };
+        let base_request = signed_managed_remote_agent_access_apply_v2(
+            &request_fixture,
+            ManagedRemoteAgentAccessFreshAxesV2 {
+                operation_id: [0xea; 16],
+                tenure_nonce: b"remote-agent-replay-base-tenure",
+                request_nonce: b"remote-agent-replay-base-request",
+                outer_nonce: b"remote-agent-replay-base-outer",
+                temporal_seed: 0xea,
+            },
         );
         let base_pin_drops = Arc::new(AtomicU64::new(0));
         let base_ingress = verify_managed_remote_agent_access_ingress_v2(
@@ -10035,20 +10056,24 @@ mod tests {
         assert_eq!(burned.revision(), 3);
         assert_eq!(burned.applied_burn_ordinal(), 0);
         assert_eq!(burned.burn_count(), 1);
+        let stable_fixture = ManagedRemoteAgentReplayStableFixtureV2 {
+            pxrs_path: &pxrs_path,
+            pxrj_path: &pxrj_path,
+            expected_pxrs: &burned_pxrs,
+            expected_pxrj: &burned_pxrj,
+            expected_pxrs_inode: burned_pxrs_inode,
+            expected_pxrj_inode: burned_pxrj_inode,
+        };
 
         let operation_replay = signed_managed_remote_agent_access_apply_v2(
-            &stack_request,
-            retained_s0_cas,
-            expected_s1_cas,
-            dependencies.expected_carrier.clone(),
-            intended_client,
-            runtime_host_epoch,
-            clock_generation,
-            [0xea; 16],
-            b"remote-agent-replay-operation-tenure",
-            b"remote-agent-replay-operation-request",
-            b"remote-agent-replay-operation-outer",
-            0xeb,
+            &request_fixture,
+            ManagedRemoteAgentAccessFreshAxesV2 {
+                operation_id: [0xea; 16],
+                tenure_nonce: b"remote-agent-replay-operation-tenure",
+                request_nonce: b"remote-agent-replay-operation-request",
+                outer_nonce: b"remote-agent-replay-operation-outer",
+                temporal_seed: 0xeb,
+            },
         );
         current = assert_managed_remote_agent_replay_rejected_v2(
             &mut control,
@@ -10056,27 +10081,18 @@ mod tests {
             current,
             &operation_replay,
             clock_generation,
-            &pxrs_path,
-            &pxrj_path,
-            &burned_pxrs,
-            &burned_pxrj,
-            burned_pxrs_inode,
-            burned_pxrj_inode,
+            &stable_fixture,
         );
 
         let tenure_replay = signed_managed_remote_agent_access_apply_v2(
-            &stack_request,
-            retained_s0_cas,
-            expected_s1_cas,
-            dependencies.expected_carrier.clone(),
-            intended_client,
-            runtime_host_epoch,
-            clock_generation,
-            [0xec; 16],
-            b"remote-agent-replay-base-tenure",
-            b"remote-agent-replay-tenure-request",
-            b"remote-agent-replay-tenure-outer",
-            0xec,
+            &request_fixture,
+            ManagedRemoteAgentAccessFreshAxesV2 {
+                operation_id: [0xec; 16],
+                tenure_nonce: b"remote-agent-replay-base-tenure",
+                request_nonce: b"remote-agent-replay-tenure-request",
+                outer_nonce: b"remote-agent-replay-tenure-outer",
+                temporal_seed: 0xec,
+            },
         );
         current = assert_managed_remote_agent_replay_rejected_v2(
             &mut control,
@@ -10084,27 +10100,18 @@ mod tests {
             current,
             &tenure_replay,
             clock_generation,
-            &pxrs_path,
-            &pxrj_path,
-            &burned_pxrs,
-            &burned_pxrj,
-            burned_pxrs_inode,
-            burned_pxrj_inode,
+            &stable_fixture,
         );
 
         let request_replay = signed_managed_remote_agent_access_apply_v2(
-            &stack_request,
-            retained_s0_cas,
-            expected_s1_cas,
-            dependencies.expected_carrier.clone(),
-            intended_client,
-            runtime_host_epoch,
-            clock_generation,
-            [0xed; 16],
-            b"remote-agent-replay-request-tenure",
-            b"remote-agent-replay-base-request",
-            b"remote-agent-replay-request-outer",
-            0xed,
+            &request_fixture,
+            ManagedRemoteAgentAccessFreshAxesV2 {
+                operation_id: [0xed; 16],
+                tenure_nonce: b"remote-agent-replay-request-tenure",
+                request_nonce: b"remote-agent-replay-base-request",
+                outer_nonce: b"remote-agent-replay-request-outer",
+                temporal_seed: 0xed,
+            },
         );
         current = assert_managed_remote_agent_replay_rejected_v2(
             &mut control,
@@ -10112,12 +10119,7 @@ mod tests {
             current,
             &request_replay,
             clock_generation,
-            &pxrs_path,
-            &pxrj_path,
-            &burned_pxrs,
-            &burned_pxrj,
-            burned_pxrs_inode,
-            burned_pxrj_inode,
+            &stable_fixture,
         );
         assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
         drop(current);
@@ -10211,19 +10213,24 @@ mod tests {
             let initial_pxrj_inode = fs::metadata(&pxrj_path)
                 .unwrap_or_else(|error| panic!("{stage:?} initial PXRJ metadata failed: {error}"))
                 .ino();
-            let request = signed_managed_remote_agent_access_apply_v2(
-                &stack_request,
+            let request_fixture = ManagedRemoteAgentAccessRequestFixtureV2 {
+                stack_request: &stack_request,
                 retained_s0_cas,
                 expected_s1_cas,
-                dependencies.expected_carrier.clone(),
+                carrier: &dependencies.expected_carrier,
                 intended_client,
                 runtime_host_epoch,
                 clock_generation,
-                [operation_byte; 16],
-                &[operation_byte, 0x01, 0x02],
-                &[operation_byte, 0x03, 0x04],
-                &[operation_byte, 0x05, 0x06],
-                operation_byte,
+            };
+            let request = signed_managed_remote_agent_access_apply_v2(
+                &request_fixture,
+                ManagedRemoteAgentAccessFreshAxesV2 {
+                    operation_id: [operation_byte; 16],
+                    tenure_nonce: &[operation_byte, 0x01, 0x02],
+                    request_nonce: &[operation_byte, 0x03, 0x04],
+                    outer_nonce: &[operation_byte, 0x05, 0x06],
+                    temporal_seed: operation_byte,
+                },
             );
             let pin_drops = Arc::new(AtomicU64::new(0));
             let verified_ingress = verify_managed_remote_agent_access_ingress_v2(
@@ -11829,19 +11836,17 @@ mod tests {
                 signature_length: ED25519_SIGNATURE_BYTES,
             },
         );
-        assert!(matches!(
-            control
-                .handle_restricted_runtime_control_frame_v1(
-                    broken_invariant.canonical_wire(),
-                    &carrier,
-                )
-                .await,
-            Err(RuntimeControlRequestError::Internal(
-                RuntimeBootstrapEndpointError::ManagedAgentStack(
-                    ManagedAgentStackRuntimeError::InvalidDurableState
-                )
-            ))
-        ));
+        let revoked_owner = control
+            .handle_restricted_runtime_control_frame_v1(
+                broken_invariant.canonical_wire(),
+                &carrier,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&revoked_owner, RuntimeControlRequestError::Unavailable),
+            "revoked live owner was not reported as unavailable: {revoked_owner:?}",
+        );
         assert_eq!(
             control
                 .core
