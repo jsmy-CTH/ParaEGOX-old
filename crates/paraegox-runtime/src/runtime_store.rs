@@ -33,8 +33,10 @@ use crate::managed_model_agent_stack_state::MAX_MANAGED_MODEL_AGENT_STACK_SNAPSH
 use crate::remote_agent_access_state::RemoteAgentPendingAccessSnapshotV2;
 use crate::remote_agent_access_state::{
     MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_V2_BYTES, MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES,
-    RemoteAgentAccessGenesisCandidateV2, RemoteAgentAccessSnapshotV2,
+    RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessGenesisCandidateV2,
+    RemoteAgentAccessObservedProgressV2, RemoteAgentAccessSnapshotV2,
     RemoteAgentAccessStateErrorV2, RemoteAgentAccessStaticIdentityPinsV2,
+    RemoteAgentAuthorizedSuccessorCandidateV2, RemoteAgentAuthorizedTransitionV2,
     RemoteAgentReplayFreshPreflightV2, RemoteAgentReplayJournalGenesisCandidateV2,
     RemoteAgentReplayJournalIdentityPinsV2, RemoteAgentReplayJournalPhaseV2,
     RemoteAgentReplayJournalSnapshotV2, RemoteAgentReplayJournalStateErrorV2,
@@ -1360,6 +1362,66 @@ impl RemoteAgentAccessSameEpochLeaseV2 {
     }
 }
 
+/// Move-only proof that one exact PXRS successor and its Stable PXRJ named
+/// final were jointly read back under this store's held owner lock. State may
+/// inspect only the bound edge facts; only this filesystem owner can mint the
+/// production value.
+pub(crate) struct RemoteAgentAccessTransitionCommitAuthorityV2 {
+    source_snapshot_sequence: u64,
+    source_snapshot_digest: Digest32,
+    source_phase: RemoteAgentAccessDurablePhaseV2,
+    destination_snapshot_sequence: u64,
+    destination_snapshot_digest: Digest32,
+    destination_phase: RemoteAgentAccessDurablePhaseV2,
+}
+
+impl RemoteAgentAccessTransitionCommitAuthorityV2 {
+    #[must_use]
+    pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
+        self.source_snapshot_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn source_snapshot_digest(&self) -> Digest32 {
+        self.source_snapshot_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn source_phase(&self) -> RemoteAgentAccessDurablePhaseV2 {
+        self.source_phase
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_snapshot_sequence(&self) -> u64 {
+        self.destination_snapshot_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_snapshot_digest(&self) -> Digest32 {
+        self.destination_snapshot_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_phase(&self) -> RemoteAgentAccessDurablePhaseV2 {
+        self.destination_phase
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_exact_edge_for_test(
+        source: &RemoteAgentAccessSnapshotV2,
+        destination: &RemoteAgentAccessSnapshotV2,
+    ) -> Self {
+        Self {
+            source_snapshot_sequence: source.sequence(),
+            source_snapshot_digest: source.snapshot_digest(),
+            source_phase: source.phase(),
+            destination_snapshot_sequence: destination.sequence(),
+            destination_snapshot_digest: destination.snapshot_digest(),
+            destination_phase: destination.phase(),
+        }
+    }
+}
+
 /// Exact, decoded PXRJ named-final state retained only inside the filesystem
 /// owner. It is inert: neither decode nor startup can mint replay authority.
 struct RemoteAgentReplayJournalExactLeaseV2 {
@@ -1516,6 +1578,89 @@ impl Drop for RemoteAgentReplayJournalPendingAuthorityV2 {
     }
 }
 
+/// The only post-commit authority exported by the filesystem owner. Keeping
+/// the exact named-final lease and its one-edge transition together prevents a
+/// caller from advancing either half independently.
+pub(crate) struct RemoteAgentAccessJointTransitionV2 {
+    same_epoch: RemoteAgentAccessSameEpochLeaseV2,
+    transition: RemoteAgentAuthorizedTransitionV2,
+}
+
+impl RemoteAgentAccessJointTransitionV2 {
+    /// Purely consumes the transition into one successor candidate while the
+    /// exact source lease remains inseparably paired with it.
+    pub(crate) fn try_prepare_observed_successor(
+        self,
+        observed: RemoteAgentAccessObservedProgressV2,
+    ) -> Result<
+        RemoteAgentAccessJointSuccessorCandidateV2,
+        RemoteAgentAccessJointObservedSuccessorErrorV2,
+    > {
+        let Self {
+            same_epoch,
+            transition,
+        } = self;
+        match transition.try_observed_successor(observed) {
+            Ok(candidate) => Ok(RemoteAgentAccessJointSuccessorCandidateV2 {
+                same_epoch,
+                candidate,
+            }),
+            Err(error) => {
+                let (cause, transition, observed) = error.into_parts();
+                Err(RemoteAgentAccessJointObservedSuccessorErrorV2 {
+                    cause,
+                    joint: Box::new(Self {
+                        same_epoch,
+                        transition,
+                    }),
+                    observed: Box::new(observed),
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn same_epoch_snapshot_for_test(&self) -> &RemoteAgentAccessSnapshotV2 {
+        self.same_epoch.snapshot()
+    }
+}
+
+/// Exact source lease paired with the only state-authorized structural
+/// successor. It can be consumed only by the production successor commit.
+pub(crate) struct RemoteAgentAccessJointSuccessorCandidateV2 {
+    same_epoch: RemoteAgentAccessSameEpochLeaseV2,
+    candidate: RemoteAgentAuthorizedSuccessorCandidateV2,
+}
+
+pub(crate) struct RemoteAgentAccessJointObservedSuccessorErrorV2 {
+    cause: RemoteAgentAccessStateErrorV2,
+    joint: Box<RemoteAgentAccessJointTransitionV2>,
+    observed: Box<RemoteAgentAccessObservedProgressV2>,
+}
+
+impl fmt::Debug for RemoteAgentAccessJointObservedSuccessorErrorV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("RemoteAgentAccessJointObservedSuccessorErrorV2")
+            .field(&self.cause)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteAgentAccessJointObservedSuccessorErrorV2 {
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RemoteAgentAccessStateErrorV2,
+        RemoteAgentAccessJointTransitionV2,
+        RemoteAgentAccessObservedProgressV2,
+    ) {
+        (self.cause, *self.joint, *self.observed)
+    }
+}
+
 pub(crate) enum RemoteAgentAccessFreshCommitErrorV2<'request, 'running> {
     Rejected {
         cause: ManagedFabricStoreError,
@@ -1523,6 +1668,44 @@ pub(crate) enum RemoteAgentAccessFreshCommitErrorV2<'request, 'running> {
         preflight: Box<RemoteAgentReplayFreshPreflightV2<'request, 'running>>,
     },
     OutcomeUncertain(ManagedFabricStoreError),
+}
+
+pub(crate) enum RemoteAgentAccessSuccessorCommitErrorV2 {
+    Rejected {
+        cause: ManagedFabricStoreError,
+        joint: Box<RemoteAgentAccessJointSuccessorCandidateV2>,
+    },
+    OutcomeUncertain(ManagedFabricStoreError),
+}
+
+impl fmt::Debug for RemoteAgentAccessSuccessorCommitErrorV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected { cause, .. } => formatter
+                .debug_tuple("Rejected")
+                .field(cause)
+                .finish_non_exhaustive(),
+            Self::OutcomeUncertain(cause) => formatter
+                .debug_tuple("OutcomeUncertain")
+                .field(cause)
+                .finish(),
+        }
+    }
+}
+
+impl RemoteAgentAccessSuccessorCommitErrorV2 {
+    #[must_use]
+    pub(crate) fn into_rejected_parts(
+        self,
+    ) -> Option<(
+        ManagedFabricStoreError,
+        RemoteAgentAccessJointSuccessorCandidateV2,
+    )> {
+        match self {
+            Self::Rejected { cause, joint } => Some((cause, *joint)),
+            Self::OutcomeUncertain(_) => None,
+        }
+    }
 }
 
 impl fmt::Debug for RemoteAgentAccessFreshCommitErrorV2<'_, '_> {
@@ -1681,6 +1864,15 @@ pub(crate) enum RemoteAgentAccessCommitFailpointV2 {
     AfterDirectorySyncBeforeReadBack,
     #[cfg(test)]
     InstallCompetingFinalBeforeRename,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteAgentAccessJointReadbackFailpointV2 {
+    None,
+    #[cfg(test)]
+    AfterAccessReadBackBeforeStableReadBack,
+    #[cfg(test)]
+    AfterStableReadBackBeforeSeal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3310,13 +3502,14 @@ impl ManagedFabricStore {
     /// Sole production fresh-edge transaction. Before the first PXRJ write it
     /// completely validates and caches the PXRS destination plus both journal
     /// successors. After that boundary only exact publication/readback occurs;
-    /// the live carrier Pin remains inside `authorized` until Stable readback.
+    /// the live carrier Pin remains inside `authorized` until the final exact
+    /// PXRS+Stable seal releases the one-edge transition authority.
     pub(crate) fn commit_remote_agent_access_fresh_v2<'request, 'running>(
         &mut self,
         current: RemoteAgentAccessSameEpochLeaseV2,
         preflight: RemoteAgentReplayFreshPreflightV2<'request, 'running>,
     ) -> Result<
-        RemoteAgentAccessSameEpochLeaseV2,
+        RemoteAgentAccessJointTransitionV2,
         RemoteAgentAccessFreshCommitErrorV2<'request, 'running>,
     > {
         self.commit_remote_agent_access_fresh_v2_with_failpoints(
@@ -3325,6 +3518,7 @@ impl ManagedFabricStore {
             RemoteAgentReplayJournalCommitFailpointV2::None,
             RemoteAgentAccessCommitFailpointV2::None,
             RemoteAgentReplayJournalCommitFailpointV2::None,
+            RemoteAgentAccessJointReadbackFailpointV2::None,
         )
     }
 
@@ -3335,12 +3529,12 @@ impl ManagedFabricStore {
         pending_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2,
         access_failpoint: RemoteAgentAccessCommitFailpointV2,
         stable_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2,
+        joint_readback_failpoint: RemoteAgentAccessJointReadbackFailpointV2,
     ) -> Result<
-        RemoteAgentAccessSameEpochLeaseV2,
+        RemoteAgentAccessJointTransitionV2,
         RemoteAgentAccessFreshCommitErrorV2<'request, 'running>,
     > {
-        if let Err(cause) = self.revalidate_remote_agent_access_same_epoch_v2(&current) {
-            self.stopped = true;
+        if let Err(cause) = self.ensure_operational() {
             drop(current);
             drop(preflight);
             return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause));
@@ -3357,12 +3551,91 @@ impl ManagedFabricStore {
                 preflight: Box::new(preflight),
             });
         }
-        let stable_exact = match self.exact_remote_agent_replay_journal_stable_for_pxrs(
-            &current.snapshot,
+        let destination_wire = preflight
+            .pending_canonical_wire_for_store_precommit()
+            .to_vec();
+        let destination = match Self::validate_remote_agent_access_candidate(
+            &destination_wire,
             current.static_identity,
-            current.current_runtime_host_epoch,
         ) {
-            Ok(exact) => exact,
+            Ok(destination) => destination,
+            Err(cause) => {
+                return Err(RemoteAgentAccessFreshCommitErrorV2::Rejected {
+                    cause,
+                    current: Box::new(current),
+                    preflight: Box::new(preflight),
+                });
+            }
+        };
+        let expected_destination_sequence = match current.snapshot.sequence().checked_add(1) {
+            Some(sequence) => sequence,
+            None => {
+                return Err(RemoteAgentAccessFreshCommitErrorV2::Rejected {
+                    cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
+                    current: Box::new(current),
+                    preflight: Box::new(preflight),
+                });
+            }
+        };
+        if &destination != preflight.pending_snapshot_for_store_precommit()
+            || destination.sequence() != expected_destination_sequence
+            || destination.previous_snapshot_digest()
+                != Some(current.snapshot.snapshot_digest())
+            || destination.writer_runtime_host_epoch() != current.current_runtime_host_epoch
+            || destination.snapshot_digest() != preflight.pending_candidate_snapshot_digest()
+        {
+            return Err(RemoteAgentAccessFreshCommitErrorV2::Rejected {
+                cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
+                current: Box::new(current),
+                preflight: Box::new(preflight),
+            });
+        }
+
+        if self.remote_agent_access_startup_adjudication
+            != Some(RemoteAgentAccessStartupAdjudicationV2 {
+                static_identity: current.static_identity,
+                current_runtime_host_epoch: current.current_runtime_host_epoch,
+            })
+            || current.lock_identity != self.lock_identity
+            || self
+                .remote_agent_access_active
+                .as_ref()
+                .is_none_or(|active| {
+                    active.identity != current.final_identity
+                        || active.encoded.as_ref() != current.encoded.as_ref()
+                })
+            || self.remote_agent_replay_journal_temp_present
+            || self.remote_agent_replay_journal_startup_adjudication
+                != Some(RemoteAgentReplayJournalStartupAdjudicationV2 {
+                    static_identity: current.static_identity,
+                    current_runtime_host_epoch: current.current_runtime_host_epoch,
+                })
+        {
+            self.stopped = true;
+            drop(current);
+            drop(preflight);
+            return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(
+                ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
+            ));
+        }
+        let (planned_stable_identity, planned_stable_encoded) =
+            match self.remote_agent_replay_journal_active.as_ref() {
+                Some(active) => (active.identity, active.encoded.clone()),
+                None => {
+                    self.stopped = true;
+                    drop(current);
+                    drop(preflight);
+                    return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(
+                        ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing,
+                    ));
+                }
+            };
+        let journal_identity = RemoteAgentReplayJournalIdentityPinsV2::from(current.static_identity);
+        let planned_stable = match Self::validate_remote_agent_replay_journal_candidate(
+            planned_stable_encoded.as_ref(),
+            journal_identity,
+        ) {
+            Ok(stable) => stable,
             Err(cause) => {
                 self.stopped = true;
                 drop(current);
@@ -3370,32 +3643,26 @@ impl ManagedFabricStore {
                 return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause));
             }
         };
+        if planned_stable.phase() != RemoteAgentReplayJournalPhaseV2::Stable
+            || planned_stable.writer_runtime_host_epoch()
+                != current.current_runtime_host_epoch
+            || classify_remote_agent_replay_startup_pair_v2(
+                Some(&current.snapshot),
+                Some(&planned_stable),
+                current.current_runtime_host_epoch,
+            ) != RemoteAgentReplayStartupPairClassificationV2::SameEpochStable
+        {
+            self.stopped = true;
+            drop(current);
+            drop(preflight);
+            return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(
+                ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch,
+            ));
+        }
         let prepared = (|| {
-            let pending_candidate = stable_exact
-                .snapshot
+            let pending_candidate = planned_stable
                 .try_prepare_edge(&preflight)
                 .map_err(ManagedFabricStoreError::RemoteAgentReplayJournalState)?;
-            let destination_wire = preflight
-                .pending_canonical_wire_for_store_precommit()
-                .to_vec();
-            let destination = Self::validate_remote_agent_access_candidate(
-                &destination_wire,
-                current.static_identity,
-            )?;
-            if &destination != preflight.pending_snapshot_for_store_precommit()
-                || destination.sequence()
-                    != current
-                        .snapshot
-                        .sequence()
-                        .checked_add(1)
-                        .ok_or(ManagedFabricStoreError::RemoteAgentAccessChainMismatch)?
-                || destination.previous_snapshot_digest()
-                    != Some(current.snapshot.snapshot_digest())
-                || destination.writer_runtime_host_epoch() != current.current_runtime_host_epoch
-                || destination.snapshot_digest() != preflight.pending_candidate_snapshot_digest()
-            {
-                return Err(ManagedFabricStoreError::RemoteAgentAccessChainMismatch);
-            }
             let stable_candidate = pending_candidate
                 .snapshot()
                 .try_apply_edge(&destination)
@@ -3404,7 +3671,7 @@ impl ManagedFabricStore {
             let stable_wire = stable_candidate.canonical_wire().to_vec();
             let expected_pending = Self::validate_remote_agent_replay_journal_candidate(
                 &pending_wire,
-                stable_exact.journal_identity,
+                journal_identity,
             )?;
             if expected_pending != *pending_candidate.snapshot()
                 || expected_pending.phase() != RemoteAgentReplayJournalPhaseV2::PendingEdge
@@ -3424,7 +3691,7 @@ impl ManagedFabricStore {
             }
             let expected_stable = Self::validate_remote_agent_replay_journal_candidate(
                 &stable_wire,
-                stable_exact.journal_identity,
+                journal_identity,
             )?;
             if expected_stable != *stable_candidate.snapshot()
                 || expected_stable.phase() != RemoteAgentReplayJournalPhaseV2::Stable
@@ -3437,24 +3704,43 @@ impl ManagedFabricStore {
                 return Err(ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch);
             }
             Ok((
-                stable_exact,
                 expected_pending,
                 expected_stable,
-                destination,
                 pending_wire,
                 stable_wire,
-                destination_wire,
             ))
         })();
-        let (
-            stable_exact,
-            expected_pending,
-            expected_stable,
-            destination,
-            pending_wire,
-            stable_wire,
-            destination_wire,
-        ) = match prepared {
+        if let Err(cause) = self.revalidate_remote_agent_access_same_epoch_v2(&current) {
+            self.stopped = true;
+            drop(current);
+            drop(preflight);
+            return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause));
+        }
+        let stable_exact = match self.exact_remote_agent_replay_journal_stable_for_pxrs(
+            &current.snapshot,
+            current.static_identity,
+            current.current_runtime_host_epoch,
+        ) {
+            Ok(exact) => exact,
+            Err(cause) => {
+                self.stopped = true;
+                drop(current);
+                drop(preflight);
+                return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause));
+            }
+        };
+        if stable_exact.final_identity != planned_stable_identity
+            || stable_exact.encoded.as_ref() != planned_stable_encoded.as_ref()
+            || stable_exact.snapshot != planned_stable
+        {
+            self.stopped = true;
+            drop(current);
+            drop(preflight);
+            return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(
+                ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
+            ));
+        }
+        let (expected_pending, expected_stable, pending_wire, stable_wire) = match prepared {
             Ok(prepared) => prepared,
             Err(cause) => {
                 return Err(RemoteAgentAccessFreshCommitErrorV2::Rejected {
@@ -3612,9 +3898,222 @@ impl ManagedFabricStore {
                 ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch,
             ));
         }
+        let authority = match self.transition_commit_authority_from_exact_joint_readback_v2(
+            &current,
+            &committed_pxrs,
+            &stable_exact,
+            joint_readback_failpoint,
+        ) {
+            Ok(authority) => authority,
+            Err(cause) => {
+                self.stopped = true;
+                drop(current);
+                drop(authorized);
+                drop(committed_pxrs);
+                return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause));
+            }
+        };
+        let transition = match authorized.try_authorize_committed_prepared_v2(authority) {
+            Ok(transition) => transition,
+            Err(cause) => {
+                self.stopped = true;
+                drop(current);
+                drop(committed_pxrs);
+                return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(
+                    ManagedFabricStoreError::RemoteAgentAccessState(cause),
+                ));
+            }
+        };
         drop(current);
-        drop(authorized);
-        Ok(committed_pxrs)
+        Ok(RemoteAgentAccessJointTransitionV2 {
+            same_epoch: committed_pxrs,
+            transition,
+        })
+    }
+
+    /// Sole production successor transaction for an already authorized
+    /// nonterminal PXRS edge. It preserves the exact Stable PXRJ named final:
+    /// source joint revalidation precedes the PXRS CAS, and the identical PXRJ
+    /// bytes plus inode must jointly classify with the exact destination before
+    /// the next transition authority is released.
+    pub(crate) fn commit_remote_agent_access_successor_v2(
+        &mut self,
+        joint: RemoteAgentAccessJointSuccessorCandidateV2,
+    ) -> Result<RemoteAgentAccessJointTransitionV2, RemoteAgentAccessSuccessorCommitErrorV2> {
+        self.commit_remote_agent_access_successor_v2_with_failpoints(
+            joint,
+            RemoteAgentAccessCommitFailpointV2::None,
+            RemoteAgentAccessJointReadbackFailpointV2::None,
+        )
+    }
+
+    fn commit_remote_agent_access_successor_v2_with_failpoints(
+        &mut self,
+        joint: RemoteAgentAccessJointSuccessorCandidateV2,
+        access_failpoint: RemoteAgentAccessCommitFailpointV2,
+        joint_readback_failpoint: RemoteAgentAccessJointReadbackFailpointV2,
+    ) -> Result<RemoteAgentAccessJointTransitionV2, RemoteAgentAccessSuccessorCommitErrorV2> {
+        if let Err(cause) = self.ensure_operational() {
+            drop(joint);
+            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+        }
+
+        // This block is deliberately pure: these are the only failures that
+        // may return the complete one-shot input for rejection handling.
+        let destination = match Self::validate_remote_agent_access_candidate(
+            joint
+                .candidate
+                .destination_canonical_wire_for_store_precommit(),
+            joint.same_epoch.static_identity,
+        ) {
+            Ok(destination) => destination,
+            Err(cause) => {
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected {
+                    cause,
+                    joint: Box::new(joint),
+                });
+            }
+        };
+        let expected_destination_sequence = match joint.same_epoch.snapshot.sequence().checked_add(1)
+        {
+            Some(sequence) => sequence,
+            None => {
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected {
+                    cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
+                    joint: Box::new(joint),
+                });
+            }
+        };
+        if joint.candidate.source_snapshot_sequence() != joint.same_epoch.snapshot.sequence()
+            || joint.candidate.source_snapshot_digest()
+                != joint.same_epoch.snapshot.snapshot_digest()
+            || joint.candidate.source_phase() != joint.same_epoch.snapshot.phase()
+            || destination
+                != *joint
+                    .candidate
+                    .destination_snapshot_for_store_precommit()
+            || joint.candidate.destination_snapshot_sequence()
+                != expected_destination_sequence
+            || destination.sequence() != expected_destination_sequence
+            || destination.previous_snapshot_digest()
+                != Some(joint.same_epoch.snapshot.snapshot_digest())
+            || destination.writer_runtime_host_epoch()
+                != joint.same_epoch.current_runtime_host_epoch
+            || joint.candidate.destination_snapshot_digest() != destination.snapshot_digest()
+            || joint.candidate.destination_phase() != destination.phase()
+        {
+            return Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected {
+                cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
+                joint: Box::new(joint),
+            });
+        }
+
+        // Store/lease disagreement is not a retryable candidate-shape error.
+        // No filesystem access has occurred, but the owner can no longer prove
+        // that returning transition authority is safe.
+        if self.remote_agent_access_startup_adjudication
+            != Some(RemoteAgentAccessStartupAdjudicationV2 {
+                static_identity: joint.same_epoch.static_identity,
+                current_runtime_host_epoch: joint.same_epoch.current_runtime_host_epoch,
+            })
+            || joint.same_epoch.lock_identity != self.lock_identity
+            || self
+                .remote_agent_access_active
+                .as_ref()
+                .is_none_or(|active| {
+                    active.identity != joint.same_epoch.final_identity
+                        || active.encoded.as_ref() != joint.same_epoch.encoded.as_ref()
+                })
+        {
+            self.stopped = true;
+            drop(joint);
+            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
+            ));
+        }
+
+        let RemoteAgentAccessJointSuccessorCandidateV2 {
+            same_epoch: current,
+            candidate,
+        } = joint;
+        if let Err(cause) = self.revalidate_remote_agent_access_same_epoch_v2(&current) {
+            self.stopped = true;
+            drop(current);
+            drop(candidate);
+            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+        }
+        let stable_before = match self.exact_remote_agent_replay_journal_stable_for_pxrs(
+            &current.snapshot,
+            current.static_identity,
+            current.current_runtime_host_epoch,
+        ) {
+            Ok(stable) => stable,
+            Err(cause) => {
+                self.stopped = true;
+                drop(current);
+                drop(candidate);
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+            }
+        };
+
+        let committed = match self.publish_remote_agent_access_v2(
+            candidate.destination_canonical_wire_for_store_precommit(),
+            current.static_identity,
+            current.current_runtime_host_epoch,
+            Some((current.final_identity, current.encoded.as_ref())),
+            access_failpoint,
+        ) {
+            Ok(committed) => committed,
+            Err(
+                RemoteAgentAccessPublishErrorV2::ProvenNotCommitted(cause)
+                | RemoteAgentAccessPublishErrorV2::OutcomeUncertain(cause),
+            ) => {
+                self.stopped = true;
+                drop(current);
+                drop(candidate);
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+            }
+        };
+        if committed.snapshot != destination {
+            self.stopped = true;
+            drop(current);
+            drop(candidate);
+            drop(committed);
+            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
+            ));
+        }
+        let authority = match self.transition_commit_authority_from_exact_joint_readback_v2(
+            &current,
+            &committed,
+            &stable_before,
+            joint_readback_failpoint,
+        ) {
+            Ok(authority) => authority,
+            Err(cause) => {
+                self.stopped = true;
+                drop(current);
+                drop(candidate);
+                drop(committed);
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+            }
+        };
+        let transition = match candidate.try_authorize_committed_successor_v2(authority) {
+            Ok(transition) => transition,
+            Err(cause) => {
+                self.stopped = true;
+                drop(current);
+                drop(committed);
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                    ManagedFabricStoreError::RemoteAgentAccessState(cause),
+                ));
+            }
+        };
+        drop(current);
+        Ok(RemoteAgentAccessJointTransitionV2 {
+            same_epoch: committed,
+            transition,
+        })
     }
 
     /// Raw structural fixture seam. Production initialization accepts only an
@@ -3984,7 +4483,7 @@ impl ManagedFabricStore {
         access_failpoint: RemoteAgentAccessCommitFailpointV2,
         stable_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2,
     ) -> Result<
-        RemoteAgentAccessSameEpochLeaseV2,
+        RemoteAgentAccessJointTransitionV2,
         RemoteAgentAccessFreshCommitErrorV2<'request, 'running>,
     > {
         self.commit_remote_agent_access_fresh_v2_with_failpoints(
@@ -3993,6 +4492,44 @@ impl ManagedFabricStore {
             pending_journal_failpoint,
             access_failpoint,
             stable_journal_failpoint,
+            RemoteAgentAccessJointReadbackFailpointV2::None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint<
+        'request,
+        'running,
+    >(
+        &mut self,
+        current: RemoteAgentAccessSameEpochLeaseV2,
+        preflight: RemoteAgentReplayFreshPreflightV2<'request, 'running>,
+        failpoint: RemoteAgentAccessJointReadbackFailpointV2,
+    ) -> Result<
+        RemoteAgentAccessJointTransitionV2,
+        RemoteAgentAccessFreshCommitErrorV2<'request, 'running>,
+    > {
+        self.commit_remote_agent_access_fresh_v2_with_failpoints(
+            current,
+            preflight,
+            RemoteAgentReplayJournalCommitFailpointV2::None,
+            RemoteAgentAccessCommitFailpointV2::None,
+            RemoteAgentReplayJournalCommitFailpointV2::None,
+            failpoint,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_remote_agent_access_successor_v2_at_failpoints(
+        &mut self,
+        joint: RemoteAgentAccessJointSuccessorCandidateV2,
+        access_failpoint: RemoteAgentAccessCommitFailpointV2,
+        joint_readback_failpoint: RemoteAgentAccessJointReadbackFailpointV2,
+    ) -> Result<RemoteAgentAccessJointTransitionV2, RemoteAgentAccessSuccessorCommitErrorV2> {
+        self.commit_remote_agent_access_successor_v2_with_failpoints(
+            joint,
+            access_failpoint,
+            joint_readback_failpoint,
         )
     }
 
@@ -4690,6 +5227,112 @@ impl ManagedFabricStore {
                 current_runtime_host_epoch,
             });
         Ok(exact)
+    }
+
+    /// Mints the sole state-consumable edge seal only after exact named-final
+    /// readback of the committed PXRS destination and its jointly Stable PXRJ.
+    /// `expected_stable` also makes successor commits prove that PXRJ retained
+    /// the identical bytes and inode observed before the PXRS CAS.
+    fn transition_commit_authority_from_exact_joint_readback_v2(
+        &mut self,
+        source: &RemoteAgentAccessSameEpochLeaseV2,
+        destination: &RemoteAgentAccessSameEpochLeaseV2,
+        expected_stable: &RemoteAgentReplayJournalExactLeaseV2,
+        failpoint: RemoteAgentAccessJointReadbackFailpointV2,
+    ) -> Result<RemoteAgentAccessTransitionCommitAuthorityV2, ManagedFabricStoreError> {
+        let expected_destination_sequence = source
+            .snapshot
+            .sequence()
+            .checked_add(1)
+            .ok_or(ManagedFabricStoreError::RemoteAgentAccessChainMismatch)?;
+        if source.lock_identity != self.lock_identity
+            || destination.lock_identity != self.lock_identity
+            || expected_stable.lock_identity != self.lock_identity
+            || source.static_identity != destination.static_identity
+            || source.current_runtime_host_epoch != destination.current_runtime_host_epoch
+            || expected_stable.journal_identity
+                != RemoteAgentReplayJournalIdentityPinsV2::from(destination.static_identity)
+            || expected_stable.current_runtime_host_epoch
+                != destination.current_runtime_host_epoch
+            || destination.snapshot.sequence() != expected_destination_sequence
+            || destination.snapshot.previous_snapshot_digest()
+                != Some(source.snapshot.snapshot_digest())
+            || destination.snapshot.writer_runtime_host_epoch()
+                != destination.current_runtime_host_epoch
+        {
+            return Err(ManagedFabricStoreError::RemoteAgentAccessChainMismatch);
+        }
+
+        let reopened_destination = self
+            .reopen_remote_agent_access_exact(Some((
+                destination.final_identity,
+                destination.encoded.as_ref(),
+            )))?
+            .ok_or(ManagedFabricStoreError::RemoteAgentAccessSnapshotMissing)?;
+        let destination_snapshot = Self::validate_remote_agent_access_candidate(
+            reopened_destination.encoded.as_ref(),
+            destination.static_identity,
+        )?;
+        if reopened_destination.identity != destination.final_identity
+            || destination_snapshot != destination.snapshot
+        {
+            return Err(ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch);
+        }
+        #[cfg(test)]
+        if failpoint
+            == RemoteAgentAccessJointReadbackFailpointV2::AfterAccessReadBackBeforeStableReadBack
+        {
+            return Err(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch);
+        }
+
+        let reopened_stable = self
+            .reopen_remote_agent_replay_journal_exact(Some((
+                expected_stable.final_identity,
+                expected_stable.encoded.as_ref(),
+            )))?
+            .ok_or(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing)?;
+        let stable_snapshot = Self::validate_remote_agent_replay_journal_candidate(
+            reopened_stable.encoded.as_ref(),
+            expected_stable.journal_identity,
+        )?;
+        if reopened_stable.identity != expected_stable.final_identity
+            || stable_snapshot != expected_stable.snapshot
+            || stable_snapshot.phase() != RemoteAgentReplayJournalPhaseV2::Stable
+            || classify_remote_agent_replay_startup_pair_v2(
+                Some(&destination_snapshot),
+                Some(&stable_snapshot),
+                destination.current_runtime_host_epoch,
+            ) != RemoteAgentReplayStartupPairClassificationV2::SameEpochStable
+        {
+            return Err(ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch);
+        }
+        #[cfg(test)]
+        if failpoint == RemoteAgentAccessJointReadbackFailpointV2::AfterStableReadBackBeforeSeal {
+            return Err(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch);
+        }
+        let _ = failpoint;
+
+        self.remote_agent_access_active = Some(reopened_destination);
+        self.remote_agent_access_startup_adjudication =
+            Some(RemoteAgentAccessStartupAdjudicationV2 {
+                static_identity: destination.static_identity,
+                current_runtime_host_epoch: destination.current_runtime_host_epoch,
+            });
+        self.remote_agent_replay_journal_active = Some(reopened_stable);
+        self.remote_agent_replay_journal_startup_adjudication =
+            Some(RemoteAgentReplayJournalStartupAdjudicationV2 {
+                static_identity: destination.static_identity,
+                current_runtime_host_epoch: destination.current_runtime_host_epoch,
+            });
+
+        Ok(RemoteAgentAccessTransitionCommitAuthorityV2 {
+            source_snapshot_sequence: source.snapshot.sequence(),
+            source_snapshot_digest: source.snapshot.snapshot_digest(),
+            source_phase: source.snapshot.phase(),
+            destination_snapshot_sequence: destination_snapshot.sequence(),
+            destination_snapshot_digest: destination_snapshot.snapshot_digest(),
+            destination_phase: destination_snapshot.phase(),
+        })
     }
 
     /// Returns the strict latest PXDE slot selected at open or after an exact
@@ -10950,11 +11593,22 @@ pub(crate) mod tests {
                 .count(),
             1,
         );
-        let body = &production[helper_start..];
+        assert_eq!(
+            wrapper
+                .matches("RemoteAgentAccessJointReadbackFailpointV2::None")
+                .count(),
+            1,
+        );
+        let helper_end = production[helper_start..]
+            .find("    /// Sole production successor transaction")
+            .map(|offset| helper_start + offset)
+            .expect("fresh core must end before the production successor transaction");
+        let body = &production[helper_start..helper_end];
         for failpoint in [
             "pending_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2",
             "access_failpoint: RemoteAgentAccessCommitFailpointV2",
             "stable_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2",
+            "joint_readback_failpoint: RemoteAgentAccessJointReadbackFailpointV2",
         ] {
             assert!(body.contains(failpoint), "fresh core lost {failpoint}");
         }
@@ -10978,6 +11632,18 @@ pub(crate) mod tests {
         assert!(pre_journal.contains("RemoteAgentAccessFreshCommitErrorV2::Rejected"));
         assert!(pre_journal.contains("current: Box::new(current)"));
         assert!(pre_journal.contains("preflight: Box::new(preflight)"));
+        let last_rejected = pre_journal
+            .rfind("RemoteAgentAccessFreshCommitErrorV2::Rejected")
+            .expect("fresh pure-shape rejection must exist");
+        let first_fs_currentness = pre_journal
+            .find("self.revalidate_remote_agent_access_same_epoch_v2(&current)")
+            .expect("fresh commit must jointly revalidate before its first write");
+        let exact_stable = pre_journal
+            .find("self.exact_remote_agent_replay_journal_stable_for_pxrs(")
+            .expect("fresh rejection must follow exact Stable currentness");
+        assert!(first_fs_currentness < exact_stable);
+        assert!(exact_stable < last_rejected);
+        assert!(last_rejected < first_journal_publish);
         assert!(!post_journal.contains("RemoteAgentAccessFreshCommitErrorV2::Rejected"));
         assert_eq!(
             body.matches("self.publish_remote_agent_replay_journal_v2(")
@@ -10993,16 +11659,26 @@ pub(crate) mod tests {
         let stable_publish = post_journal
             .rfind("self.publish_remote_agent_replay_journal_v2(")
             .expect("fresh transaction must publish Stable PXRJ");
-        let success_drop = post_journal
-            .rfind("drop(authorized);")
-            .expect("live carrier Pin wrapper must be explicitly dropped on success");
+        let exact_joint_seal = post_journal
+            .rfind("self.transition_commit_authority_from_exact_joint_readback_v2(")
+            .expect("fresh transaction must mint authority only from exact joint readback");
+        let authorize_committed = post_journal
+            .rfind("authorized.try_authorize_committed_prepared_v2(authority)")
+            .expect("fresh success must retain the one-edge transition authority");
+        let joint_success = post_journal
+            .rfind("Ok(RemoteAgentAccessJointTransitionV2 {")
+            .expect("fresh success must keep the named-final and transition inseparable");
         assert!(exact_authority < authorize);
         assert!(authorize < stable_publish);
-        assert!(stable_publish < success_drop);
+        assert!(stable_publish < exact_joint_seal);
+        assert!(exact_joint_seal < authorize_committed);
+        assert!(authorize_committed < joint_success);
+        assert!(!post_journal[authorize_committed..joint_success].contains("drop(authorized);"));
         assert!(post_journal.contains("self.stopped = true;"));
         assert!(post_journal.contains("pending_journal_failpoint,"));
         assert!(post_journal.contains("access_failpoint,"));
         assert!(post_journal.contains("stable_journal_failpoint,"));
+        assert!(post_journal.contains("joint_readback_failpoint,"));
 
         let test_seam_name = concat!(
             "pub(crate) fn commit_remote_agent_access_fresh_v2_",
@@ -11017,6 +11693,129 @@ pub(crate) mod tests {
             .find("pub(crate) fn replace_remote_agent_access_v2(")
             .expect("raw PXRS replacement fixture seam must exist");
         assert!(source[raw_replace.saturating_sub(180)..raw_replace].contains("#[cfg(test)]"));
+    }
+
+    #[test]
+    fn production_pxrs_successor_commit_preserves_stable_pxrj_and_returns_only_joint_authority() {
+        let _commit_anchor = ManagedFabricStore::commit_remote_agent_access_successor_v2;
+        let _prepare_anchor = RemoteAgentAccessJointTransitionV2::try_prepare_observed_successor;
+        let source = include_str!("runtime_store.rs");
+        let start = source
+            .find("pub(crate) fn commit_remote_agent_access_successor_v2(")
+            .expect("production successor commit must exist");
+        let end = source[start..]
+            .find("    /// Raw structural fixture seam")
+            .map(|offset| start + offset)
+            .expect("production successor commit must remain bounded");
+        let production = &source[start..end];
+        assert_eq!(
+            production
+                .matches("pub(crate) fn commit_remote_agent_access_successor_v2(")
+                .count(),
+            1,
+        );
+        assert!(production.contains("joint: RemoteAgentAccessJointSuccessorCandidateV2"));
+        assert!(production.contains("Result<RemoteAgentAccessJointTransitionV2"));
+        assert!(production.contains("RemoteAgentAccessSuccessorCommitErrorV2"));
+        assert!(!production.contains("publish_remote_agent_replay_journal_v2("));
+
+        let core = production
+            .find("fn commit_remote_agent_access_successor_v2_with_failpoints(")
+            .expect("successor failpoint core must exist");
+        let body = &production[core..];
+        let pure_reject = body
+            .rfind("RemoteAgentAccessSuccessorCommitErrorV2::Rejected")
+            .expect("pure successor shape must retain whole rejection authority");
+        let fs_currentness = body
+            .find("self.revalidate_remote_agent_access_same_epoch_v2(&current)")
+            .expect("successor must jointly revalidate its exact source");
+        let stable_before = body
+            .find("self.exact_remote_agent_replay_journal_stable_for_pxrs(")
+            .expect("successor must retain the exact pre-CAS Stable final");
+        let publish = body
+            .find("self.publish_remote_agent_access_v2(")
+            .expect("successor must CAS-publish one PXRS final");
+        let post_joint = body
+            .find("self.transition_commit_authority_from_exact_joint_readback_v2(")
+            .expect("successor must perform post-CAS exact joint readback");
+        let authorize = body
+            .find("candidate.try_authorize_committed_successor_v2(authority)")
+            .expect("successor seal must be consumed by state");
+        let joint_success = body
+            .find("Ok(RemoteAgentAccessJointTransitionV2 {")
+            .expect("successor must return only inseparable joint authority");
+        assert!(pure_reject < fs_currentness);
+        assert!(!body[fs_currentness..].contains("RemoteAgentAccessSuccessorCommitErrorV2::Rejected"));
+        assert!(fs_currentness < stable_before);
+        assert!(stable_before < publish);
+        assert!(publish < post_joint);
+        assert!(post_joint < authorize);
+        assert!(authorize < joint_success);
+        assert!(body[fs_currentness..].contains("self.stopped = true;"));
+        assert!(body[fs_currentness..].contains("OutcomeUncertain"));
+
+        let joint_definition = source
+            .split_once("pub(crate) struct RemoteAgentAccessJointTransitionV2 {")
+            .and_then(|(_, tail)| {
+                tail.split_once("/// Exact source lease paired with the only state-authorized")
+                    .map(|(joint, _)| joint)
+            })
+            .expect("joint authority definitions must remain bounded");
+        assert!(joint_definition.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
+        assert!(joint_definition.contains("transition: RemoteAgentAuthorizedTransitionV2"));
+        assert!(!joint_definition.contains("pub(crate) fn into_parts"));
+        assert!(!joint_definition.contains("pub(crate) fn same_epoch("));
+        assert!(!joint_definition.contains("pub(crate) fn transition("));
+        let candidate_definition = source
+            .split_once("pub(crate) struct RemoteAgentAccessJointSuccessorCandidateV2 {")
+            .and_then(|(_, tail)| tail.split_once('}').map(|(candidate, _)| candidate))
+            .expect("joint successor candidate must remain bounded");
+        assert!(candidate_definition.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
+        assert!(candidate_definition.contains("candidate: RemoteAgentAuthorizedSuccessorCandidateV2"));
+    }
+
+    #[test]
+    fn transition_commit_seal_has_one_production_exact_joint_mint_path() {
+        let source = include_str!("runtime_store.rs");
+        let mint_seam = concat!(
+            "Ok(RemoteAgentAccessTransitionCommit",
+            "AuthorityV2 {"
+        );
+        assert_eq!(
+            source.matches(mint_seam).count(),
+            1,
+            "only exact joint named-final readback may mint the production seal"
+        );
+        let helper_start = source
+            .find("fn transition_commit_authority_from_exact_joint_readback_v2(")
+            .expect("exact joint seal helper must exist");
+        let helper_end = source[helper_start..]
+            .find("    /// Returns the strict latest PXDE slot")
+            .map(|offset| helper_start + offset)
+            .expect("exact joint seal helper must remain bounded");
+        let helper = &source[helper_start..helper_end];
+        let access_readback = helper
+            .find(".reopen_remote_agent_access_exact(Some((")
+            .expect("seal helper must reopen exact PXRS bytes and inode");
+        let stable_readback = helper
+            .find(".reopen_remote_agent_replay_journal_exact(Some((")
+            .expect("seal helper must reopen exact Stable PXRJ bytes and inode");
+        let classification = helper
+            .find("RemoteAgentReplayStartupPairClassificationV2::SameEpochStable")
+            .expect("seal helper must jointly classify the destination and Stable PXRJ");
+        let mint = helper
+            .find(mint_seam)
+            .expect("seal helper must mint after all exact checks");
+        assert!(access_readback < stable_readback);
+        assert!(stable_readback < classification);
+        assert!(classification < mint);
+        assert!(helper[..mint].contains("expected_stable.final_identity"));
+        assert!(helper[..mint].contains("expected_stable.encoded.as_ref()"));
+
+        let fixture = source
+            .find("pub(crate) fn from_exact_edge_for_test(")
+            .expect("state behavior tests need the narrow seal fixture");
+        assert!(source[fixture.saturating_sub(120)..fixture].contains("#[cfg(test)]"));
     }
 
     #[test]

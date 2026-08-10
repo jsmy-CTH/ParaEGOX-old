@@ -2349,8 +2349,8 @@ impl ManagedFabricControlService {
     }
 
     /// Initializes PXRS genesis between two complete live-lower observations.
-    /// Any post-commit observation failure is fail-stop Unavailable: PXRS stays
-    /// committed, the core stays frozen, and no retry authority is claimed.
+    /// Any post-commit observation failure is fatal to this service loop: PXRS
+    /// stays committed, the core stays frozen, and no retry authority exists.
     async fn initialize_remote_agent_access_genesis_v2<'running>(
         &mut self,
         carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
@@ -2370,10 +2370,18 @@ impl ManagedFabricControlService {
                 initialized.precommit_live_lower(),
             )
             .await
-            .map_err(|_| RuntimeControlRequestError::Unavailable)?;
+            .map_err(|_| {
+                RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::InvalidStartedState,
+                )
+            })?;
         initialized
             .try_verify_post_readback_v2(post_readback)
-            .map_err(|_| RuntimeControlRequestError::Unavailable)
+            .map_err(|_| {
+                RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::InvalidStartedState,
+                )
+            })
     }
 
     /// Sole composition root for sequence-one PXRS genesis and CurrentFinal.
@@ -2391,7 +2399,11 @@ impl ManagedFabricControlService {
             .await?;
         self.core
             .bind_remote_agent_access_current_final_genesis_v2(whole)
-            .map_err(|_| RuntimeControlRequestError::Unavailable)
+            .map_err(|_| {
+                RuntimeControlRequestError::Internal(
+                    RuntimeBootstrapEndpointError::InvalidStartedState,
+                )
+            })
     }
 
     async fn handle_request(
@@ -3774,6 +3786,8 @@ const _: () = {
     fn typecheck_remote_agent_access_current_final_genesis_boundary_v2() {
         let _initialize_and_bind_remote_agent_access_current_final_genesis_v2 =
             ManagedFabricControlService::initialize_and_bind_remote_agent_access_current_final_genesis_v2;
+        let _commit_remote_agent_access_observed_successor_v2 =
+            ManagedFabricRuntimeCore::commit_remote_agent_access_observed_successor_v2;
         let _retained_s0_census_digest_v2 = RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;
         let _exact_pxap_v2 = RemoteAgentLiveLowerFactsV2::exact_pxap;
         let _intended_client_v2 = RemoteAgentLiveLowerFactsV2::intended_client;
@@ -3871,8 +3885,10 @@ fn map_remote_agent_access_genesis_initialize_error_v2(
     match error {
         RemoteAgentAccessGenesisInitializeErrorV2::Core(error) => map_managed_fabric_error(error),
         RemoteAgentAccessGenesisInitializeErrorV2::Commit(
-            RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_),
-        ) => RuntimeControlRequestError::Unavailable,
+            RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(cause),
+        ) => RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedFabric(
+            ManagedFabricRuntimeError::Store(cause),
+        )),
         RemoteAgentAccessGenesisInitializeErrorV2::State(_)
         | RemoteAgentAccessGenesisInitializeErrorV2::Commit(
             RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_),
@@ -6675,16 +6691,18 @@ mod tests {
         RuntimeResolvedFabricPeerCredentialV2,
     };
     use crate::managed_fabric_runtime::{
-        RemoteAgentAccessFreshCommitRejectCauseV2, RemoteAgentAccessManagedFreshCommitErrorV2,
+        RemoteAgentAccessFreshCommitRejectCauseV2, RemoteAgentAccessJointTransitionBundleV2,
+        RemoteAgentAccessManagedFreshCommitErrorV2,
+        RemoteAgentAccessManagedSuccessorCommitErrorV2,
     };
     use crate::managed_model_runtime::{
         RuntimeModelBackendResolveError, RuntimeResolvedModelBackendV1,
     };
     use crate::remote_agent_access_state::{
-        RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessSnapshotIdentityPinsV2,
-        RemoteAgentAccessSnapshotV2, RemoteAgentReplayJournalIdentityPinsV2,
-        RemoteAgentReplayJournalPhaseV2, RemoteAgentReplayJournalSnapshotV2,
-        RemoteAgentReplayJournalStateErrorV2,
+        RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessObservedProgressV2,
+        RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
+        RemoteAgentReplayJournalIdentityPinsV2, RemoteAgentReplayJournalPhaseV2,
+        RemoteAgentReplayJournalSnapshotV2, RemoteAgentReplayJournalStateErrorV2,
     };
     use crate::runtime_agent_provider::{
         RuntimeAgentProviderResolveError, RuntimeResolvedAgentProviderV1,
@@ -6706,6 +6724,7 @@ mod tests {
     use crate::runtime_provisioning::RuntimeProvisioningInputV1;
     use crate::runtime_store::{
         ManagedFabricStore, RemoteAgentAccessCommitFailpointV2,
+        RemoteAgentAccessJointReadbackFailpointV2,
         RemoteAgentReplayJournalCommitFailpointV2,
         tests::{TestDirectory, managed_fabric_store_fixture_from_snapshot},
     };
@@ -9483,6 +9502,55 @@ mod tests {
         )
     }
 
+    fn committed_fresh_joint_for_successor_v2(
+        control: &mut ManagedFabricControlService,
+        dependencies: &RuntimeRestrictedApplyEndpointDependenciesV1,
+        intended_client: PrincipalRef,
+        stack_request: &ManagedAgentStackApplyRequestV1,
+        current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        operation_byte: u8,
+    ) -> RemoteAgentAccessJointTransitionBundleV2 {
+        let current_final = current.current_final_for_test();
+        let request_fixture = ManagedRemoteAgentAccessRequestFixtureV2 {
+            stack_request,
+            retained_s0_cas: current_final.current_retained_s0_cas_for_test(),
+            expected_s1_cas: current_final.current_s1_cas_for_test(),
+            carrier: &dependencies.expected_carrier,
+            intended_client,
+            runtime_host_epoch: current_final.current_runtime_host_epoch_for_test(),
+            clock_generation: control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("fresh fixture Runtime clock unavailable: {error}"))
+                .generation(),
+        };
+        let request = signed_managed_remote_agent_access_apply_v2(
+            &request_fixture,
+            ManagedRemoteAgentAccessFreshAxesV2 {
+                operation_id: [operation_byte; 16],
+                tenure_nonce: &[operation_byte, 0x11, 0x12],
+                request_nonce: &[operation_byte, 0x13, 0x14],
+                outer_nonce: &[operation_byte, 0x15, 0x16],
+                temporal_seed: operation_byte,
+            },
+        );
+        let pin_drops = Arc::new(AtomicU64::new(0));
+        let verified_ingress = verify_managed_remote_agent_access_ingress_v2(
+            &request,
+            dependencies,
+            &control.provisioning,
+            request_fixture.clock_generation,
+            Arc::clone(&pin_drops),
+        );
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 0);
+        let joint = control
+            .core
+            .commit_remote_agent_access_fresh_v2(current, verified_ingress)
+            .unwrap_or_else(|error| panic!("fresh successor fixture commit failed: {error:?}"));
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 1);
+        joint
+    }
+
     struct ManagedRemoteAgentReplayStableFixtureV2<'fixture> {
         pxrs_path: &'fixture Path,
         pxrj_path: &'fixture Path,
@@ -9848,7 +9916,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn current_final_fresh_commit_uses_real_signatures_and_finishes_joint_stable() {
+    async fn current_final_fresh_and_observed_successor_keep_joint_and_journal_exact() {
         let socket_directory = TestSocketDirectory::create();
         let (
             state_directory,
@@ -9943,6 +10011,7 @@ mod tests {
             snapshot.previous_snapshot_digest(),
             Some(genesis_snapshot_digest)
         );
+        let prepared_snapshot_digest = snapshot.snapshot_digest();
         assert_eq!(committed.exact_pxap_for_test(), expected_pxap.as_slice());
         let stored_pxrs = fs::read(&pxrs_path)
             .unwrap_or_else(|error| panic!("fresh PXRS readback failed: {error}"));
@@ -9958,7 +10027,46 @@ mod tests {
         assert_eq!(stable.pending_source_snapshot_sequence(), None);
         assert_eq!(stable.pending_source_snapshot_digest(), None);
         assert_eq!(stable.pending_candidate_snapshot_digest(), None);
-        drop(committed);
+        let stable_journal_inode = fs::metadata(&pxrj_path)
+            .unwrap_or_else(|error| panic!("fresh Stable PXRJ metadata failed: {error}"))
+            .ino();
+
+        let successor_clock = control
+            .core
+            .clock_reading()
+            .unwrap_or_else(|error| panic!("successor Runtime clock unavailable: {error}"));
+        let observed = RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test(
+            committed.same_epoch_snapshot_for_test(),
+            [0xac; 16],
+            successor_clock,
+        )
+        .unwrap_or_else(|error| panic!("S1OpenIntent observation fixture rejected: {error}"));
+        let successor = control
+            .core
+            .commit_remote_agent_access_observed_successor_v2(committed, observed)
+            .unwrap_or_else(|error| panic!("joint observed successor commit failed: {error:?}"));
+        let successor_snapshot = successor.same_epoch_snapshot_for_test();
+        assert_eq!(
+            successor_snapshot.phase(),
+            RemoteAgentAccessDurablePhaseV2::S1OpenIntent,
+        );
+        assert_eq!(successor_snapshot.sequence(), 3);
+        assert_eq!(
+            successor_snapshot.previous_snapshot_digest(),
+            Some(prepared_snapshot_digest),
+        );
+        assert_eq!(successor.exact_pxap_for_test(), expected_pxap.as_slice());
+        let successor_pxrs = fs::read(&pxrs_path)
+            .unwrap_or_else(|error| panic!("successor PXRS readback failed: {error}"));
+        assert_eq!(successor_pxrs.as_slice(), successor_snapshot.canonical_wire());
+        let successor_pxrj = fs::read(&pxrj_path)
+            .unwrap_or_else(|error| panic!("successor PXRJ readback failed: {error}"));
+        let successor_pxrj_inode = fs::metadata(&pxrj_path)
+            .unwrap_or_else(|error| panic!("successor PXRJ metadata failed: {error}"))
+            .ino();
+        assert_eq!(successor_pxrj, stored_journal);
+        assert_eq!(successor_pxrj_inode, stable_journal_inode);
+        drop(successor);
 
         shutdown_managed_successor_chain(
             &mut control.distributed,
@@ -9968,6 +10076,180 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("fresh joint commit cleanup failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observed_successor_uncertainty_matrix_keeps_pxrj_exact_and_returns_no_joint() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Stage {
+            BeforeTempSync,
+            BeforeRename,
+            AfterRename,
+            AfterDirectorySync,
+            AfterAccessReadBack,
+            AfterStableReadBack,
+        }
+
+        for (stage, access_failpoint, joint_failpoint, operation_byte, published) in [
+            (
+                Stage::BeforeTempSync,
+                RemoteAgentAccessCommitFailpointV2::BeforeTempSync,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
+                0xf6,
+                false,
+            ),
+            (
+                Stage::BeforeRename,
+                RemoteAgentAccessCommitFailpointV2::BeforeRename,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
+                0xf7,
+                false,
+            ),
+            (
+                Stage::AfterRename,
+                RemoteAgentAccessCommitFailpointV2::AfterRenameBeforeDirectorySync,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
+                0xf8,
+                true,
+            ),
+            (
+                Stage::AfterDirectorySync,
+                RemoteAgentAccessCommitFailpointV2::AfterDirectorySyncBeforeReadBack,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
+                0xf9,
+                true,
+            ),
+            (
+                Stage::AfterAccessReadBack,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::AfterAccessReadBackBeforeStableReadBack,
+                0xfa,
+                true,
+            ),
+            (
+                Stage::AfterStableReadBack,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::AfterStableReadBackBeforeSeal,
+                0xfb,
+                true,
+            ),
+        ] {
+            let socket_directory = TestSocketDirectory::create();
+            let (
+                state_directory,
+                mut control,
+                dependencies,
+                intended_client,
+                stack_request,
+                current,
+            ) = managed_control_with_current_final_v2(socket_directory.socket_path.clone()).await;
+            let current_identity = current.current_final_for_test().current_identity_for_test();
+            let static_identity = RemoteAgentAccessStaticIdentityPinsV2 {
+                target: current_identity.target,
+                store_instance_id: current_identity.store_instance_id,
+                owner_target_fingerprint: current_identity.owner_target_fingerprint,
+                transition_projection_digest: current_identity.transition_projection_digest,
+            };
+            let joint = committed_fresh_joint_for_successor_v2(
+                &mut control,
+                &dependencies,
+                intended_client,
+                &stack_request,
+                current,
+                operation_byte,
+            );
+            let prepared = joint.same_epoch_snapshot_for_test();
+            let prepared_sequence = prepared.sequence();
+            let prepared_digest = prepared.snapshot_digest();
+            let observed = RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test(
+                prepared,
+                [operation_byte; 16],
+                control.core.clock_reading().unwrap_or_else(|error| {
+                    panic!("{stage:?} successor failpoint clock unavailable: {error}")
+                }),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{stage:?} successor failpoint observation rejected: {error}")
+            });
+            let pxrs_path = state_directory
+                .path()
+                .join("remote-agent-access.snapshot-v2");
+            let pxrj_path = state_directory
+                .path()
+                .join("remote-agent-access-replay-journal.snapshot-v2");
+            let prepared_pxrs = fs::read(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} prepared PXRS read failed: {error}"));
+            let prepared_pxrs_inode = fs::metadata(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} prepared PXRS metadata failed: {error}"))
+                .ino();
+            let stable_pxrj = fs::read(&pxrj_path).unwrap_or_else(|error| {
+                panic!("{stage:?} pre-successor PXRJ read failed: {error}")
+            });
+            let stable_pxrj_inode = fs::metadata(&pxrj_path)
+                .unwrap_or_else(|error| {
+                    panic!("{stage:?} pre-successor PXRJ metadata failed: {error}")
+                })
+                .ino();
+
+            let error = match control
+                .core
+                .commit_remote_agent_access_observed_successor_v2_at_failpoints(
+                    joint,
+                    observed,
+                    access_failpoint,
+                    joint_failpoint,
+                ) {
+                Ok(_) => panic!("{stage:?} failpoint returned successor authority"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                RemoteAgentAccessManagedSuccessorCommitErrorV2::OutcomeUncertain(_)
+            ));
+            let disk_pxrj = fs::read(&pxrj_path).unwrap_or_else(|error| {
+                panic!("{stage:?} post-successor PXRJ read failed: {error}")
+            });
+            let disk_pxrj_inode = fs::metadata(&pxrj_path)
+                .unwrap_or_else(|error| {
+                    panic!("{stage:?} post-successor PXRJ metadata failed: {error}")
+                })
+                .ino();
+            assert_eq!(disk_pxrj, stable_pxrj);
+            assert_eq!(disk_pxrj_inode, stable_pxrj_inode);
+            let disk_pxrs = fs::read(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} uncertain PXRS read failed: {error}"));
+            let disk_pxrs_inode = fs::metadata(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} uncertain PXRS metadata failed: {error}"))
+                .ino();
+            let exact = RemoteAgentAccessSnapshotV2::decode(&disk_pxrs, static_identity)
+                .unwrap_or_else(|error| panic!("{stage:?} uncertain PXRS decode failed: {error}"));
+            if published {
+                assert_ne!(disk_pxrs, prepared_pxrs);
+                assert_ne!(disk_pxrs_inode, prepared_pxrs_inode);
+                assert_eq!(
+                    exact.phase(),
+                    RemoteAgentAccessDurablePhaseV2::S1OpenIntent,
+                );
+                assert_eq!(
+                    exact.sequence(),
+                    prepared_sequence
+                        .checked_add(1)
+                        .unwrap_or_else(|| panic!("{stage:?} sequence overflow")),
+                );
+                assert_eq!(exact.previous_snapshot_digest(), Some(prepared_digest));
+            } else {
+                assert_eq!(disk_pxrs, prepared_pxrs);
+                assert_eq!(disk_pxrs_inode, prepared_pxrs_inode);
+                assert_eq!(
+                    exact.phase(),
+                    RemoteAgentAccessDurablePhaseV2::PreparedNoEffects,
+                );
+                assert_eq!(exact.sequence(), prepared_sequence);
+                assert_eq!(exact.snapshot_digest(), prepared_digest);
+            }
+            assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
+            drop(control);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10135,35 +10417,111 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fresh_three_stage_publish_uncertainty_returns_no_authority_and_drops_pin() {
+    async fn fresh_publish_or_joint_readback_uncertainty_returns_no_authority_and_drops_pin() {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum Stage {
             PendingJournal,
             AccessSnapshot,
             StableJournal,
+            JointReadback,
         }
 
-        for (stage, pending_failpoint, access_failpoint, stable_failpoint, operation_byte) in [
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum JournalExpectation {
+            InitialStable,
+            Pending,
+            CommittedStable,
+        }
+
+        for (
+            stage,
+            pending_failpoint,
+            access_failpoint,
+            stable_failpoint,
+            joint_failpoint,
+            operation_byte,
+            pxrs_published,
+            journal_expectation,
+        ) in [
             (
                 Stage::PendingJournal,
                 RemoteAgentReplayJournalCommitFailpointV2::AfterDirectorySyncBeforeReadBack,
                 RemoteAgentAccessCommitFailpointV2::None,
                 RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
                 0xf1,
+                false,
+                JournalExpectation::Pending,
             ),
             (
                 Stage::AccessSnapshot,
                 RemoteAgentReplayJournalCommitFailpointV2::None,
                 RemoteAgentAccessCommitFailpointV2::AfterDirectorySyncBeforeReadBack,
                 RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
                 0xf2,
+                true,
+                JournalExpectation::Pending,
             ),
             (
                 Stage::StableJournal,
                 RemoteAgentReplayJournalCommitFailpointV2::None,
                 RemoteAgentAccessCommitFailpointV2::None,
                 RemoteAgentReplayJournalCommitFailpointV2::AfterDirectorySyncBeforeReadBack,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
                 0xf3,
+                true,
+                JournalExpectation::CommittedStable,
+            ),
+            (
+                Stage::JointReadback,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::AfterStableReadBackBeforeSeal,
+                0xf4,
+                true,
+                JournalExpectation::CommittedStable,
+            ),
+            (
+                Stage::PendingJournal,
+                RemoteAgentReplayJournalCommitFailpointV2::BeforeTempSync,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
+                0xf5,
+                false,
+                JournalExpectation::InitialStable,
+            ),
+            (
+                Stage::AccessSnapshot,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessCommitFailpointV2::BeforeRename,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
+                0xf6,
+                false,
+                JournalExpectation::Pending,
+            ),
+            (
+                Stage::StableJournal,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentReplayJournalCommitFailpointV2::AfterRenameBeforeDirectorySync,
+                RemoteAgentAccessJointReadbackFailpointV2::None,
+                0xf7,
+                true,
+                JournalExpectation::CommittedStable,
+            ),
+            (
+                Stage::JointReadback,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessJointReadbackFailpointV2::AfterAccessReadBackBeforeStableReadBack,
+                0xf8,
+                true,
+                JournalExpectation::CommittedStable,
             ),
         ] {
             let socket_directory = TestSocketDirectory::create();
@@ -10241,15 +10599,25 @@ mod tests {
                 Arc::clone(&pin_drops),
             );
             assert_eq!(pin_drops.load(Ordering::SeqCst), 0);
-            let error = match control
-                .core
-                .commit_remote_agent_access_fresh_v2_at_failpoints(
-                    current,
-                    verified_ingress,
-                    pending_failpoint,
-                    access_failpoint,
-                    stable_failpoint,
-                ) {
+            let result = match stage {
+                Stage::JointReadback => control
+                    .core
+                    .commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint(
+                        current,
+                        verified_ingress,
+                        joint_failpoint,
+                    ),
+                Stage::PendingJournal | Stage::AccessSnapshot | Stage::StableJournal => control
+                    .core
+                    .commit_remote_agent_access_fresh_v2_at_failpoints(
+                        current,
+                        verified_ingress,
+                        pending_failpoint,
+                        access_failpoint,
+                        stable_failpoint,
+                    ),
+            };
+            let error = match result {
                 Ok(_) => panic!("{stage:?} failpoint unexpectedly returned a joint lease"),
                 Err(error) => error,
             };
@@ -10278,47 +10646,49 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{stage:?} disk PXRS decode failed: {error}"));
             let pxrj = RemoteAgentReplayJournalSnapshotV2::decode(&disk_pxrj, journal_identity)
                 .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ decode failed: {error}"));
-            assert_ne!(disk_pxrj, initial_pxrj);
-            match stage {
-                Stage::PendingJournal => {
+            if pxrs_published {
+                assert_ne!(disk_pxrs, initial_pxrs);
+                assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
+                assert_eq!(
+                    pxrs.phase(),
+                    RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+                );
+                assert_eq!(pxrs.sequence(), 2);
+            } else {
+                assert_eq!(disk_pxrs, initial_pxrs);
+                assert_eq!(disk_pxrs_inode, initial_pxrs_inode);
+                assert_eq!(
+                    pxrs.phase(),
+                    RemoteAgentAccessDurablePhaseV2::InitializedAbsent
+                );
+                assert_eq!(pxrs.sequence(), 1);
+            }
+            match journal_expectation {
+                JournalExpectation::InitialStable => {
+                    assert_eq!(disk_pxrj, initial_pxrj);
+                    assert_eq!(disk_pxrj_inode, initial_pxrj_inode);
+                    assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+                    assert_eq!(pxrj.revision(), 1);
+                    assert_eq!(pxrj.applied_burn_ordinal(), 0);
+                    assert_eq!(pxrj.burn_count(), 0);
+                    assert_eq!(pxrj.pending_source_snapshot_sequence(), None);
+                }
+                JournalExpectation::Pending => {
+                    assert_ne!(disk_pxrj, initial_pxrj);
                     assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
-                    assert_eq!(disk_pxrs, initial_pxrs);
-                    assert_eq!(disk_pxrs_inode, initial_pxrs_inode);
-                    assert_eq!(
-                        pxrs.phase(),
-                        RemoteAgentAccessDurablePhaseV2::InitializedAbsent
-                    );
-                    assert_eq!(pxrs.sequence(), 1);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
                     assert_eq!(pxrj.revision(), 2);
                     assert_eq!(pxrj.applied_burn_ordinal(), 0);
+                    assert_eq!(pxrj.burn_count(), 0);
                     assert_eq!(pxrj.pending_source_snapshot_sequence(), Some(1));
                 }
-                Stage::AccessSnapshot => {
+                JournalExpectation::CommittedStable => {
+                    assert_ne!(disk_pxrj, initial_pxrj);
                     assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
-                    assert_ne!(disk_pxrs, initial_pxrs);
-                    assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
-                    assert_eq!(
-                        pxrs.phase(),
-                        RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
-                    );
-                    assert_eq!(pxrs.sequence(), 2);
-                    assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
-                    assert_eq!(pxrj.revision(), 2);
-                    assert_eq!(pxrj.applied_burn_ordinal(), 0);
-                    assert_eq!(pxrj.pending_source_snapshot_sequence(), Some(1));
-                }
-                Stage::StableJournal => {
-                    assert_ne!(disk_pxrs, initial_pxrs);
-                    assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
-                    assert_eq!(
-                        pxrs.phase(),
-                        RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
-                    );
-                    assert_eq!(pxrs.sequence(), 2);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
                     assert_eq!(pxrj.revision(), 3);
                     assert_eq!(pxrj.applied_burn_ordinal(), 1);
+                    assert_eq!(pxrj.burn_count(), 1);
                     assert_eq!(pxrj.pending_source_snapshot_sequence(), None);
                 }
             }
@@ -10378,6 +10748,43 @@ mod tests {
         assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
         drop(error);
         drop(control);
+    }
+
+    #[test]
+    fn remote_agent_store_stopped_uncertainty_is_internal_and_stops_the_service_loop() {
+        let mapped = map_remote_agent_access_genesis_initialize_error_v2(
+            RemoteAgentAccessGenesisInitializeErrorV2::Commit(
+                RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(
+                    ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
+                ),
+            ),
+        );
+        assert!(matches!(
+            mapped,
+            RuntimeControlRequestError::Internal(
+                RuntimeBootstrapEndpointError::ManagedFabric(ManagedFabricRuntimeError::Store(
+                    ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
+                )),
+            )
+        ));
+
+        let source = include_str!("runtime_control_endpoint.rs");
+        let service = section(
+            source,
+            "pub(crate) async fn serve_managed_fabric_until_with_ready<F, R>(",
+            "async fn runtime_shutdown_signal()",
+        );
+        let classify = service
+            .find("RuntimeControlRequestError::Internal(error) => Some(error)")
+            .unwrap_or_else(|| panic!("restricted Runtime-control fatal classification vanished"));
+        let stop = service
+            .find("Err(Some(error)) => {")
+            .unwrap_or_else(|| panic!("restricted Runtime-control fatal branch vanished"));
+        let break_loop = service[stop..]
+            .find("break Err(error);")
+            .map(|offset| stop + offset)
+            .unwrap_or_else(|| panic!("restricted Runtime-control fatal branch no longer stops"));
+        assert!(classify < stop && stop < break_loop);
     }
 
     #[test]
@@ -10453,11 +10860,12 @@ mod tests {
         assert!(pre < initialize && initialize < post && post < compare);
         assert_eq!(
             orchestrator
-                .match_indices("RuntimeControlRequestError::Unavailable")
+                .match_indices("RuntimeControlRequestError::Internal")
                 .count(),
             2,
-            "post-commit drift/failure must be fail-stop Unavailable, never no-effect rejection",
+            "both post-commit observation failures must terminate the service loop",
         );
+        assert!(!orchestrator.contains("RuntimeControlRequestError::Unavailable"));
         assert!(!orchestrator.contains("RuntimeControlRequestError::Rejected"));
 
         let final_orchestrator = section(
@@ -10473,6 +10881,8 @@ mod tests {
             .unwrap_or_else(|| panic!("CurrentFinal binder composition disappeared"));
         assert!(post_bundle < current_final);
         assert!(final_orchestrator.contains("RemoteAgentAccessCurrentFinalLeaseBundleV2"));
+        assert!(final_orchestrator.contains("RuntimeControlRequestError::Internal"));
+        assert!(!final_orchestrator.contains("RuntimeControlRequestError::Unavailable"));
         assert!(
             !final_orchestrator
                 .contains("Result<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2")
@@ -10485,6 +10895,7 @@ mod tests {
         );
         for function_item in [
             "ManagedFabricControlService::initialize_and_bind_remote_agent_access_current_final_genesis_v2;",
+            "ManagedFabricRuntimeCore::commit_remote_agent_access_observed_successor_v2;",
             "RemoteAgentLiveLowerFactsV2::retained_s0_census_digest;",
             "RemoteAgentLiveLowerFactsV2::exact_pxap;",
             "RemoteAgentLiveLowerFactsV2::intended_client;",

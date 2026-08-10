@@ -58,6 +58,7 @@ use crate::managed_service_assembly::{
 };
 use crate::remote_agent_access_state::{
     RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessGenesisCandidateV2,
+    RemoteAgentAccessObservedProgressV2,
     RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
     RemoteAgentAccessStateErrorV2, RemoteAgentAccessStaticIdentityPinsV2,
     RemoteAgentCurrentFinalAccessSnapshotV2,
@@ -73,13 +74,16 @@ use crate::runtime_control_endpoint::{
 use crate::runtime_store::{
     ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessAbsentLeaseV2,
     RemoteAgentAccessFreshCommitErrorV2, RemoteAgentAccessGenesisInitializeCommitErrorV2,
+    RemoteAgentAccessJointSuccessorCandidateV2, RemoteAgentAccessJointTransitionV2,
     RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2,
+    RemoteAgentAccessSuccessorCommitErrorV2,
     RemoteAgentReplayJournalAbsentLeaseV2, RemoteAgentReplayJournalStartupSlotV2, RuntimeStore,
 };
 #[cfg(test)]
 use crate::runtime_store::{
     RemoteAgentAccessCommitErrorV2, RemoteAgentAccessCommitFailpointV2,
-    RemoteAgentAccessInitializeCommitErrorV2, RemoteAgentReplayJournalCommitFailpointV2,
+    RemoteAgentAccessInitializeCommitErrorV2, RemoteAgentAccessJointReadbackFailpointV2,
+    RemoteAgentReplayJournalCommitFailpointV2,
 };
 use crate::task_registry::CancellationSource;
 
@@ -812,34 +816,82 @@ impl RemoteAgentAccessCurrentFinalLeaseBundleV2 {
     }
 }
 
-/// Opaque success from the sole fresh PXRJ/PXRS transaction. It retains the
-/// exact new named-final lease and the already fixed PXAP bytes, but exposes no
-/// Pending snapshot, ingress Pin, replay token, or effect authority.
-pub(crate) struct RemoteAgentAccessFreshCommittedLeaseBundleV2 {
-    same_epoch: RemoteAgentAccessSameEpochLeaseV2,
+/// Opaque current joint authority shared by the fresh and successor commit
+/// seams. The filesystem lease and one-edge transition remain inseparable;
+/// callers receive neither half, a Pending snapshot, nor effect authority.
+pub(crate) struct RemoteAgentAccessJointTransitionBundleV2 {
+    joint_transition: RemoteAgentAccessJointTransitionV2,
     exact_pxap: Box<[u8]>,
 }
 
-impl fmt::Debug for RemoteAgentAccessFreshCommittedLeaseBundleV2 {
+impl fmt::Debug for RemoteAgentAccessJointTransitionBundleV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _retained_joint_authority = (&self.same_epoch, &self.exact_pxap);
+        let _retained_joint_authority = (&self.joint_transition, &self.exact_pxap);
         formatter
-            .debug_struct("RemoteAgentAccessFreshCommittedLeaseBundleV2")
+            .debug_struct("RemoteAgentAccessJointTransitionBundleV2")
             .finish_non_exhaustive()
     }
 }
 
-impl RemoteAgentAccessFreshCommittedLeaseBundleV2 {
+impl RemoteAgentAccessJointTransitionBundleV2 {
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn same_epoch_snapshot_for_test(&self) -> &RemoteAgentAccessSnapshotV2 {
-        self.same_epoch.snapshot()
+        self.joint_transition.same_epoch_snapshot_for_test()
     }
 
     #[cfg(test)]
     #[must_use]
     pub(crate) fn exact_pxap_for_test(&self) -> &[u8] {
         &self.exact_pxap
+    }
+}
+
+/// Pure state rejection recovers the complete current joint authority and the
+/// opaque observation. A store rejection instead retains only the authorized
+/// joint candidate plus fixed PXAP for a future bounded retry/drop decision.
+pub(crate) enum RemoteAgentAccessManagedSuccessorCommitErrorV2 {
+    ObservedRejected {
+        cause: RemoteAgentAccessStateErrorV2,
+        current: Box<RemoteAgentAccessJointTransitionBundleV2>,
+        observed: Box<RemoteAgentAccessObservedProgressV2>,
+    },
+    StoreRejected(Box<RemoteAgentAccessManagedSuccessorRetryV2>),
+    OutcomeUncertain(ManagedFabricStoreError),
+}
+
+pub(crate) struct RemoteAgentAccessManagedSuccessorRetryV2 {
+    cause: ManagedFabricStoreError,
+    joint: RemoteAgentAccessJointSuccessorCandidateV2,
+    exact_pxap: Box<[u8]>,
+}
+
+impl fmt::Debug for RemoteAgentAccessManagedSuccessorCommitErrorV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ObservedRejected {
+                cause,
+                current,
+                observed,
+            } => {
+                let _recovered_pure_authority = (current, observed);
+                formatter
+                    .debug_tuple("ObservedRejected")
+                    .field(cause)
+                    .finish_non_exhaustive()
+            }
+            Self::StoreRejected(retry) => {
+                let _retained_retry_authority = (&retry.joint, &retry.exact_pxap);
+                formatter
+                    .debug_tuple("StoreRejected")
+                    .field(&retry.cause)
+                    .finish_non_exhaustive()
+            }
+            Self::OutcomeUncertain(cause) => formatter
+                .debug_tuple("OutcomeUncertain")
+                .field(cause)
+                .finish(),
+        }
     }
 }
 
@@ -1677,13 +1729,13 @@ impl ManagedFabricRuntimeCore {
     /// Sole managed composition seam for one fresh replay-journal transaction.
     /// Pure preflight and J-before-publication rejection reconstruct the exact
     /// input authorities; any J-after boundary destroys them and fail-stops.
-    /// Success retains only the new joint named-final lease and fixed PXAP.
+    /// Success retains the inseparable named-final/one-edge joint plus PXAP.
     pub(crate) fn commit_remote_agent_access_fresh_v2<'request, 'running>(
         &mut self,
         current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
         verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
     ) -> Result<
-        RemoteAgentAccessFreshCommittedLeaseBundleV2,
+        RemoteAgentAccessJointTransitionBundleV2,
         RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
     > {
         self.commit_remote_agent_access_fresh_v2_with(
@@ -1701,7 +1753,7 @@ impl ManagedFabricRuntimeCore {
         verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
         commit: Commit,
     ) -> Result<
-        RemoteAgentAccessFreshCommittedLeaseBundleV2,
+        RemoteAgentAccessJointTransitionBundleV2,
         RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
     >
     where
@@ -1710,7 +1762,7 @@ impl ManagedFabricRuntimeCore {
             RemoteAgentAccessSameEpochLeaseV2,
             crate::remote_agent_access_state::RemoteAgentReplayFreshPreflightV2<'request, 'running>,
         ) -> Result<
-            RemoteAgentAccessSameEpochLeaseV2,
+            RemoteAgentAccessJointTransitionV2,
             RemoteAgentAccessFreshCommitErrorV2<'request, 'running>,
         >,
     {
@@ -1735,8 +1787,8 @@ impl ManagedFabricRuntimeCore {
             }
         };
         match commit(&mut self.store, same_epoch, preflight) {
-            Ok(same_epoch) => Ok(RemoteAgentAccessFreshCommittedLeaseBundleV2 {
-                same_epoch,
+            Ok(joint_transition) => Ok(RemoteAgentAccessJointTransitionBundleV2 {
+                joint_transition,
                 exact_pxap,
             }),
             Err(RemoteAgentAccessFreshCommitErrorV2::Rejected {
@@ -1758,6 +1810,80 @@ impl ManagedFabricRuntimeCore {
             Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause)) => {
                 drop(exact_pxap);
                 Err(RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(cause))
+            }
+        }
+    }
+
+    /// Sole future S1-owner continuation seam. The opaque observation consumes
+    /// the private one-edge authority only through the joint store wrapper;
+    /// this layer never exposes a lease, transition, or successor candidate.
+    pub(crate) fn commit_remote_agent_access_observed_successor_v2(
+        &mut self,
+        current: RemoteAgentAccessJointTransitionBundleV2,
+        observed: RemoteAgentAccessObservedProgressV2,
+    ) -> Result<
+        RemoteAgentAccessJointTransitionBundleV2,
+        RemoteAgentAccessManagedSuccessorCommitErrorV2,
+    > {
+        self.commit_remote_agent_access_observed_successor_v2_with(
+            current,
+            observed,
+            |store, joint| store.commit_remote_agent_access_successor_v2(joint),
+        )
+    }
+
+    fn commit_remote_agent_access_observed_successor_v2_with<Commit>(
+        &mut self,
+        current: RemoteAgentAccessJointTransitionBundleV2,
+        observed: RemoteAgentAccessObservedProgressV2,
+        commit: Commit,
+    ) -> Result<
+        RemoteAgentAccessJointTransitionBundleV2,
+        RemoteAgentAccessManagedSuccessorCommitErrorV2,
+    >
+    where
+        Commit: FnOnce(
+            &mut ManagedFabricStore,
+            RemoteAgentAccessJointSuccessorCandidateV2,
+        ) -> Result<RemoteAgentAccessJointTransitionV2, RemoteAgentAccessSuccessorCommitErrorV2>,
+    {
+        let RemoteAgentAccessJointTransitionBundleV2 {
+            joint_transition,
+            exact_pxap,
+        } = current;
+        let joint = match joint_transition.try_prepare_observed_successor(observed) {
+            Ok(joint) => joint,
+            Err(error) => {
+                let (cause, joint_transition, observed) = error.into_parts();
+                return Err(
+                    RemoteAgentAccessManagedSuccessorCommitErrorV2::ObservedRejected {
+                        cause,
+                        current: Box::new(RemoteAgentAccessJointTransitionBundleV2 {
+                            joint_transition,
+                            exact_pxap,
+                        }),
+                        observed: Box::new(observed),
+                    },
+                );
+            }
+        };
+        match commit(&mut self.store, joint) {
+            Ok(joint_transition) => Ok(RemoteAgentAccessJointTransitionBundleV2 {
+                joint_transition,
+                exact_pxap,
+            }),
+            Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected { cause, joint }) => {
+                Err(RemoteAgentAccessManagedSuccessorCommitErrorV2::StoreRejected(
+                    Box::new(RemoteAgentAccessManagedSuccessorRetryV2 {
+                        cause,
+                        joint: *joint,
+                        exact_pxap,
+                    }),
+                ))
+            }
+            Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause)) => {
+                drop(exact_pxap);
+                Err(RemoteAgentAccessManagedSuccessorCommitErrorV2::OutcomeUncertain(cause))
             }
         }
     }
@@ -1850,7 +1976,7 @@ impl ManagedFabricRuntimeCore {
         access_failpoint: RemoteAgentAccessCommitFailpointV2,
         stable_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2,
     ) -> Result<
-        RemoteAgentAccessFreshCommittedLeaseBundleV2,
+        RemoteAgentAccessJointTransitionBundleV2,
         RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
     > {
         self.commit_remote_agent_access_fresh_v2_with(
@@ -1863,6 +1989,54 @@ impl ManagedFabricRuntimeCore {
                     pending_journal_failpoint,
                     access_failpoint,
                     stable_journal_failpoint,
+                )
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint<
+        'request,
+        'running,
+    >(
+        &mut self,
+        current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+        failpoint: RemoteAgentAccessJointReadbackFailpointV2,
+    ) -> Result<
+        RemoteAgentAccessJointTransitionBundleV2,
+        RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
+    > {
+        self.commit_remote_agent_access_fresh_v2_with(
+            current,
+            verified_ingress,
+            move |store, same_epoch, preflight| {
+                store.commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint(
+                    same_epoch, preflight, failpoint,
+                )
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_remote_agent_access_observed_successor_v2_at_failpoints(
+        &mut self,
+        current: RemoteAgentAccessJointTransitionBundleV2,
+        observed: RemoteAgentAccessObservedProgressV2,
+        access_failpoint: RemoteAgentAccessCommitFailpointV2,
+        joint_readback_failpoint: RemoteAgentAccessJointReadbackFailpointV2,
+    ) -> Result<
+        RemoteAgentAccessJointTransitionBundleV2,
+        RemoteAgentAccessManagedSuccessorCommitErrorV2,
+    > {
+        self.commit_remote_agent_access_observed_successor_v2_with(
+            current,
+            observed,
+            move |store, joint| {
+                store.commit_remote_agent_access_successor_v2_at_failpoints(
+                    joint,
+                    access_failpoint,
+                    joint_readback_failpoint,
                 )
             },
         )
@@ -3897,7 +4071,7 @@ mod tests {
             .expect("missing CurrentFinal lease bundle");
         let wrapper_tail = &source[wrapper_start..];
         let wrapper_end = wrapper_tail
-            .find("\n/// Opaque success from the sole fresh PXRJ/PXRS transaction.")
+            .find("\n/// Opaque current joint authority shared by the fresh and successor commit")
             .expect("missing CurrentFinal lease bundle boundary");
         let wrapper = &wrapper_tail[..wrapper_end];
         assert!(wrapper.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
@@ -3943,7 +4117,7 @@ mod tests {
             .expect("missing managed fresh transaction owner");
         let tail = &source[start..];
         let end = tail
-            .find("\n    /// After the first PXAR-v7 marker")
+            .find("\n    /// Sole future S1-owner continuation seam.")
             .expect("missing managed fresh seam boundary");
         let seam = &tail[..end];
 
@@ -3960,7 +4134,7 @@ mod tests {
             .find("match commit(&mut self.store, same_epoch, preflight)")
             .expect("sole synchronous PXRJ/PXRS store transaction disappeared");
         let success = seam
-            .find("Ok(RemoteAgentAccessFreshCommittedLeaseBundleV2 {")
+            .find("Ok(RemoteAgentAccessJointTransitionBundleV2 {")
             .expect("opaque fresh success bundle disappeared");
         let store_reject = seam
             .find("RemoteAgentAccessFreshCommitErrorV2::Rejected {")
@@ -3996,18 +4170,23 @@ mod tests {
         assert!(!seam[uncertain..].contains("verified_ingress:"));
 
         let success_start = source
-            .find("pub(crate) struct RemoteAgentAccessFreshCommittedLeaseBundleV2 {")
+            .find("pub(crate) struct RemoteAgentAccessJointTransitionBundleV2 {")
             .expect("missing opaque fresh success wrapper");
         let success_tail = &source[success_start..];
         let success_end = success_tail
-            .find("\n#[derive(Debug)]\npub(crate) enum RemoteAgentAccessFreshCommitRejectCauseV2")
+            .find("\n/// Pure state rejection recovers the complete current joint authority")
             .expect("missing fresh success wrapper boundary");
         let success_wrapper = &success_tail[..success_end];
-        assert!(success_wrapper.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
+        assert!(
+            success_wrapper.contains("joint_transition: RemoteAgentAccessJointTransitionV2")
+        );
         assert!(success_wrapper.contains("exact_pxap: Box<[u8]>"));
         assert!(!success_wrapper.contains("Pending"));
         assert!(!success_wrapper.contains("verified_ingress"));
         assert!(!success_wrapper.contains("current_final"));
+        assert!(!success_wrapper.contains("same_epoch:"));
+        assert!(!success_wrapper.contains("RemoteAgentAuthorizedTransitionV2"));
+        assert!(!success_wrapper.contains("RemoteAgentAccessJointSuccessorCandidateV2"));
         assert!(!success_wrapper.contains("#[derive(Clone"));
 
         let store_source = include_str!("runtime_store.rs");
@@ -4016,25 +4195,25 @@ mod tests {
             .expect("missing sole store fresh transaction");
         let store_tail = &store_source[store_start..];
         let store_end = store_tail
-            .find("    /// Raw structural fixture seam.")
+            .find("    /// Sole production successor transaction")
             .expect("missing store fresh transaction boundary");
         let store_transaction = &store_tail[..store_end];
         let stable_publication = store_transaction
             .find("let stable_exact = match self.publish_remote_agent_replay_journal_v2(")
             .expect("fresh transaction lost final Stable PXRJ publication");
-        let release_pin = store_transaction
-            .rfind("drop(authorized);")
-            .expect("fresh transaction lost explicit post-Stable Pin release");
-        let return_lease = store_transaction
-            .rfind("Ok(committed_pxrs)")
-            .expect("fresh transaction lost joint lease return");
-        assert!(stable_publication < release_pin && release_pin < return_lease);
-        assert_eq!(
-            store_transaction[..stable_publication]
-                .match_indices("\n        drop(authorized);")
-                .count(),
-            0,
-            "live ingress Pin left the successful transaction spine before Stable journal readback",
+        let joint_readback = store_transaction
+            .rfind("self.transition_commit_authority_from_exact_joint_readback_v2(")
+            .expect("fresh transaction lost post-Stable joint exact readback");
+        let release_transition = store_transaction
+            .rfind("authorized.try_authorize_committed_prepared_v2(authority)")
+            .expect("fresh transaction lost consuming Prepared authority release");
+        let return_joint = store_transaction
+            .rfind("Ok(RemoteAgentAccessJointTransitionV2 {")
+            .expect("fresh transaction lost inseparable joint return");
+        assert!(
+            stable_publication < joint_readback
+                && joint_readback < release_transition
+                && release_transition < return_joint
         );
 
         let test_forwarding_start = source
@@ -4049,6 +4228,12 @@ mod tests {
         assert!(
             test_forwarding.contains("store.commit_remote_agent_access_fresh_v2_at_failpoints(")
         );
+        assert!(test_forwarding.contains(
+            "store.commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint("
+        ));
+        assert!(test_forwarding.contains(
+            "store.commit_remote_agent_access_successor_v2_at_failpoints("
+        ));
         assert!(test_forwarding.contains(
             ".seed_remote_agent_replay_unapplied_stable_for_test(&same_epoch, &preflight)"
         ));
@@ -4068,6 +4253,96 @@ mod tests {
         assert!(!dispatch.contains("commit_remote_agent_access_fresh_v2"));
         assert!(!dispatch.contains("seed_remote_agent_replay_unapplied_stable_for_test"));
         assert!(!dispatch.contains("commit_remote_agent_access_fresh_v2_at_failpoints"));
+        assert!(!dispatch.contains("commit_remote_agent_access_observed_successor_v2"));
+        assert!(!dispatch.contains(
+            "commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint"
+        ));
+        assert!(!dispatch.contains(
+            "commit_remote_agent_access_observed_successor_v2_at_failpoints"
+        ));
+    }
+
+    #[test]
+    fn observed_successor_seam_keeps_joint_authority_opaque_and_recovers_only_pure_state() {
+        let _compile_anchor =
+            ManagedFabricRuntimeCore::commit_remote_agent_access_observed_successor_v2;
+        let source = include_str!("managed_fabric_runtime.rs");
+        let start = source
+            .find("    pub(crate) fn commit_remote_agent_access_observed_successor_v2(")
+            .expect("missing managed observed-successor seam");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n    /// After the first PXAR-v7 marker")
+            .expect("missing managed observed-successor seam boundary");
+        let seam = &tail[..end];
+
+        let consume = seam
+            .find("let RemoteAgentAccessJointTransitionBundleV2 {")
+            .expect("successor seam no longer consumes the complete wrapper");
+        let prepare = seam
+            .find("joint_transition.try_prepare_observed_successor(observed)")
+            .expect("successor seam bypasses the joint pure prepare");
+        let recover = seam
+            .find("let (cause, joint_transition, observed) = error.into_parts()")
+            .expect("pure state rejection no longer recovers both one-shot inputs");
+        let rebuild = seam
+            .find("RemoteAgentAccessManagedSuccessorCommitErrorV2::ObservedRejected")
+            .expect("pure state rejection no longer returns the whole wrapper");
+        let store = seam
+            .find("match commit(&mut self.store, joint)")
+            .expect("successor seam bypasses the sole joint store commit");
+        let success = seam
+            .find("Ok(RemoteAgentAccessJointTransitionBundleV2 {")
+            .expect("successor success no longer returns the same opaque wrapper");
+        let store_reject = seam
+            .find("RemoteAgentAccessSuccessorCommitErrorV2::Rejected { cause, joint }")
+            .expect("pure store rejection no longer retains the joint candidate");
+        let retry = seam
+            .find("RemoteAgentAccessManagedSuccessorRetryV2 {")
+            .expect("pure store rejection lost fixed PXAP retry ownership");
+        let uncertain = seam
+            .find("RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause)")
+            .expect("successor uncertainty handling disappeared");
+        let drop_pxap = seam[uncertain..]
+            .find("drop(exact_pxap);")
+            .map(|offset| uncertain + offset)
+            .expect("successor uncertainty retained fixed PXAP authority");
+        assert!(
+            consume < prepare
+                && prepare < recover
+                && recover < rebuild
+                && rebuild < store
+                && store < success
+                && success < store_reject
+                && store_reject < retry
+                && retry < uncertain
+                && uncertain < drop_pxap
+        );
+        assert!(!seam.contains("RemoteAgentAuthorizedTransitionV2"));
+        assert!(!seam.contains("RemoteAgentAccessJointSuccessorCandidateV2"));
+        assert!(!seam.contains("same_epoch"));
+        assert!(!seam[uncertain..].contains("joint_transition"));
+        assert!(!seam[uncertain..].contains("observed:"));
+
+        let error_start = source
+            .find("pub(crate) enum RemoteAgentAccessManagedSuccessorCommitErrorV2 {")
+            .expect("missing managed successor error");
+        let error_tail = &source[error_start..];
+        let error_end = error_tail
+            .find("\n#[derive(Debug)]\npub(crate) enum RemoteAgentAccessFreshCommitRejectCauseV2")
+            .expect("missing managed successor error boundary");
+        let error = &error_tail[..error_end];
+        assert!(error.contains("current: Box<RemoteAgentAccessJointTransitionBundleV2>"));
+        assert!(error.contains("observed: Box<RemoteAgentAccessObservedProgressV2>"));
+        assert!(error.contains("joint: RemoteAgentAccessJointSuccessorCandidateV2"));
+        assert!(error.contains("exact_pxap: Box<[u8]>"));
+        assert!(!error.contains("same_epoch"));
+
+        let endpoint = include_str!("runtime_control_endpoint.rs");
+        assert!(!endpoint.contains("RemoteAgentAccessObservedProgressV2 {"));
+        assert!(endpoint.contains(
+            "RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test("
+        ));
     }
 
     #[test]
@@ -4275,7 +4550,9 @@ mod tests {
         assert!(
             endpoint_map.contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)")
         );
-        assert!(endpoint_map.contains("RuntimeControlRequestError::Unavailable"));
+        assert!(endpoint_map.contains("RuntimeControlRequestError::Internal"));
+        assert!(endpoint_map.contains("ManagedFabricRuntimeError::Store(cause)"));
+        assert!(!endpoint_map.contains("RuntimeControlRequestError::Unavailable"));
         assert!(endpoint_map.contains("RuntimeBootstrapEndpointError::InvalidStartedState"));
         assert!(!endpoint_map.contains("into_retry"));
         assert!(!endpoint_map.contains("RemoteAgentAccessCommitErrorV2"));

@@ -66,7 +66,10 @@ use crate::{
         RemoteAgentDescriptorEvidenceV1, RemoteAgentVerifiedDescriptorEvidenceV1,
     },
     runtime_control_endpoint::RemoteAgentLiveLowerProjectionV2,
-    runtime_store::RemoteAgentReplayJournalPendingAuthorityV2,
+    runtime_store::{
+        RemoteAgentAccessTransitionCommitAuthorityV2,
+        RemoteAgentReplayJournalPendingAuthorityV2,
+    },
 };
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PXRS";
@@ -1875,6 +1878,38 @@ pub(crate) struct RemoteAgentAccessObservedProgressV2 {
     fresh_clock: Option<ClockReading>,
 }
 
+#[cfg(test)]
+impl RemoteAgentAccessObservedProgressV2 {
+    pub(crate) fn try_s1_open_intent_for_test(
+        prepared: &RemoteAgentAccessSnapshotV2,
+        candidate_proxy_session_epoch: [u8; 16],
+        fresh_clock: ClockReading,
+    ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
+        if prepared.phase != RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+            || prepared.mode != Some(RemoteAgentDataPlaneTargetModeV2::RemoteAccessActive)
+        {
+            return Err(RemoteAgentAccessStateErrorV2::InvalidPhaseSuccessor);
+        }
+        if bytes_are_zero_v2(&candidate_proxy_session_epoch) {
+            return Err(RemoteAgentAccessStateErrorV2::InvalidGenerationSuccessor);
+        }
+        let mut facts = prepared
+            .progress
+            .ok_or(RemoteAgentAccessStateErrorV2::InvalidProgress)?;
+        facts.lifecycle_effect = RemoteAgentDataPlaneTerminalLifecycleEffectV2::MayHaveStarted;
+        facts.public_phase = RemoteAgentDataPlaneTerminalPhaseV2::S1OpenIntent;
+        facts.selection_observed_at_nanos = fresh_clock.now().value();
+        let observed = Self {
+            next_phase: RemoteAgentAccessDurablePhaseV2::S1OpenIntent,
+            facts,
+            candidate_proxy_session_epoch: Some(candidate_proxy_session_epoch),
+            fresh_clock: Some(fresh_clock),
+        };
+        validate_progress_successor_v2(prepared, &observed)?;
+        Ok(observed)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RemoteAgentAccessActiveHeadV2 {
     runtime_host_epoch: u64,
@@ -2041,6 +2076,28 @@ pub(crate) struct RemoteAgentJournalAuthorizedFreshV2<'request, 'running> {
     current_final: RemoteAgentCurrentFinalAccessSnapshotV2,
     verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
     pending: RemoteAgentPendingAccessSnapshotV2,
+}
+
+/// Move-only result of consuming one transition authority to build one exact
+/// nonterminal successor. Only the Runtime store may borrow its inert wire and
+/// release the next one-edge authority after exact joint PXRS/PXRJ readback.
+pub(crate) struct RemoteAgentAuthorizedSuccessorCandidateV2 {
+    source_snapshot_sequence: u64,
+    source_snapshot_digest: Digest32,
+    source_phase: RemoteAgentAccessDurablePhaseV2,
+    pending: RemoteAgentPendingAccessSnapshotV2,
+}
+
+/// A pure observed-successor rejection returns both one-shot inputs intact.
+/// The payload is boxed so the error ABI does not copy a full PXRS snapshot.
+pub(crate) struct RemoteAgentAccessObservedSuccessorErrorV2 {
+    cause: RemoteAgentAccessStateErrorV2,
+    rejected: Box<RemoteAgentAccessObservedSuccessorRejectedV2>,
+}
+
+struct RemoteAgentAccessObservedSuccessorRejectedV2 {
+    authorized_transition: RemoteAgentAuthorizedTransitionV2,
+    observed: RemoteAgentAccessObservedProgressV2,
 }
 
 /// Rejected pure preflight returns every move-only authority input intact so an
@@ -3006,9 +3063,7 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
         self,
     ) -> Result<RemoteAgentAuthorizedTransitionV2, RemoteAgentAccessStateErrorV2> {
         self.validate_marker()?;
-        if self.snapshot.phase == RemoteAgentAccessDurablePhaseV2::InitializedAbsent
-            || self.snapshot.phase.is_terminal()
-        {
+        if !snapshot_may_mint_transition_authority_v2(&self.snapshot) {
             return Err(RemoteAgentAccessStateErrorV2::InvalidPhaseSuccessor);
         }
         Ok(RemoteAgentAuthorizedTransitionV2 {
@@ -3211,12 +3266,146 @@ impl<'request, 'running> RemoteAgentJournalAuthorizedFreshV2<'request, 'running>
     pub(crate) fn canonical_wire_for_store(&self) -> &[u8] {
         self.pending.canonical_wire()
     }
+
+    /// Releases Prepared one-edge authority only after the store proves exact
+    /// PXRS publication plus the final Stable PXRJ pairing. The six copied
+    /// fields prevent a valid bearer seal for edge A from authorizing edge B.
+    pub(crate) fn try_authorize_committed_prepared_v2(
+        self,
+        authority: RemoteAgentAccessTransitionCommitAuthorityV2,
+    ) -> Result<RemoteAgentAuthorizedTransitionV2, RemoteAgentAccessStateErrorV2> {
+        if self.pending.snapshot.phase != RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+            || !transition_commit_authority_matches_v2(
+                &authority,
+                &self.current_final.snapshot,
+                &self.pending.snapshot,
+            )
+            || !snapshot_may_mint_transition_authority_v2(&self.pending.snapshot)
+        {
+            return Err(RemoteAgentAccessStateErrorV2::InvalidTransitionCommitAuthority);
+        }
+        let Self {
+            current_final: _current_final,
+            verified_ingress: _verified_ingress,
+            pending,
+        } = self;
+        Ok(RemoteAgentAuthorizedTransitionV2 {
+            snapshot: pending.snapshot,
+        })
+    }
 }
 
-impl<'request, 'running> Drop for RemoteAgentJournalAuthorizedFreshV2<'request, 'running> {
-    fn drop(&mut self) {
-        let _current_final_guard = &self.current_final;
-        let _verified_ingress_guard = &self.verified_ingress;
+impl RemoteAgentAuthorizedSuccessorCandidateV2 {
+    #[must_use]
+    pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
+        self.source_snapshot_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn source_snapshot_digest(&self) -> Digest32 {
+        self.source_snapshot_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn source_phase(&self) -> RemoteAgentAccessDurablePhaseV2 {
+        self.source_phase
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_snapshot_for_store_precommit(
+        &self,
+    ) -> &RemoteAgentAccessSnapshotV2 {
+        self.pending.snapshot()
+    }
+
+    #[must_use]
+    pub(crate) fn destination_canonical_wire_for_store_precommit(&self) -> &[u8] {
+        self.pending.canonical_wire()
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_snapshot_sequence(&self) -> u64 {
+        self.pending.snapshot.sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_snapshot_digest(&self) -> Digest32 {
+        self.pending.snapshot.snapshot_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_phase(&self) -> RemoteAgentAccessDurablePhaseV2 {
+        self.pending.snapshot.phase
+    }
+
+    /// Structural state-machine fixtures predate the production joint store
+    /// owner. This conversion remains test-only and cannot mint authority.
+    #[cfg(test)]
+    fn into_pending_for_test(self) -> RemoteAgentPendingAccessSnapshotV2 {
+        self.pending
+    }
+
+    /// Consumes an exact joint-readback seal and releases only the next
+    /// ordinary nonterminal transition. Reconciliation and terminal states
+    /// deliberately have no conversion through this API.
+    pub(crate) fn try_authorize_committed_successor_v2(
+        self,
+        authority: RemoteAgentAccessTransitionCommitAuthorityV2,
+    ) -> Result<RemoteAgentAuthorizedTransitionV2, RemoteAgentAccessStateErrorV2> {
+        let source_matches = authority.source_snapshot_sequence()
+                == self.source_snapshot_sequence
+            && authority.source_snapshot_digest() == self.source_snapshot_digest
+            && authority.source_phase() == self.source_phase;
+        if !source_matches
+            || authority.destination_snapshot_sequence() != self.pending.snapshot.sequence
+            || authority.destination_snapshot_digest() != self.pending.snapshot.snapshot_digest
+            || authority.destination_phase() != self.pending.snapshot.phase
+            || !snapshot_may_mint_transition_authority_v2(&self.pending.snapshot)
+        {
+            return Err(RemoteAgentAccessStateErrorV2::InvalidTransitionCommitAuthority);
+        }
+        Ok(RemoteAgentAuthorizedTransitionV2 {
+            snapshot: self.pending.snapshot,
+        })
+    }
+}
+
+impl RemoteAgentAccessObservedSuccessorErrorV2 {
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RemoteAgentAccessStateErrorV2,
+        RemoteAgentAuthorizedTransitionV2,
+        RemoteAgentAccessObservedProgressV2,
+    ) {
+        let Self { cause, rejected } = self;
+        let RemoteAgentAccessObservedSuccessorRejectedV2 {
+            authorized_transition,
+            observed,
+        } = *rejected;
+        (cause, authorized_transition, observed)
+    }
+}
+
+impl fmt::Debug for RemoteAgentAccessObservedSuccessorErrorV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("RemoteAgentAccessObservedSuccessorErrorV2")
+            .field(&self.cause)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for RemoteAgentAccessObservedSuccessorErrorV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cause.fmt(formatter)
+    }
+}
+
+impl std::error::Error for RemoteAgentAccessObservedSuccessorErrorV2 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 
@@ -4056,6 +4245,40 @@ impl RemoteAgentAuthorizedTransitionV2 {
     pub(crate) fn try_observed_successor(
         self,
         observed: RemoteAgentAccessObservedProgressV2,
+    ) -> Result<RemoteAgentAuthorizedSuccessorCandidateV2, RemoteAgentAccessObservedSuccessorErrorV2>
+    {
+        let built = if observed.next_phase == RemoteAgentAccessDurablePhaseV2::QuarantineIntent {
+            Err(RemoteAgentAccessStateErrorV2::InvalidPhaseSuccessor)
+        } else {
+            self.try_build_observed_successor(&observed)
+                .and_then(|pending| {
+                    if snapshot_may_mint_transition_authority_v2(&pending.snapshot) {
+                        Ok(pending)
+                    } else {
+                        Err(RemoteAgentAccessStateErrorV2::InvalidPhaseSuccessor)
+                    }
+                })
+        };
+        match built {
+            Ok(pending) => Ok(RemoteAgentAuthorizedSuccessorCandidateV2 {
+                source_snapshot_sequence: self.snapshot.sequence,
+                source_snapshot_digest: self.snapshot.snapshot_digest,
+                source_phase: self.snapshot.phase,
+                pending,
+            }),
+            Err(cause) => Err(RemoteAgentAccessObservedSuccessorErrorV2 {
+                cause,
+                rejected: Box::new(RemoteAgentAccessObservedSuccessorRejectedV2 {
+                    authorized_transition: self,
+                    observed,
+                }),
+            }),
+        }
+    }
+
+    fn try_build_observed_successor(
+        &self,
+        observed: &RemoteAgentAccessObservedProgressV2,
     ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
         let current = &self.snapshot;
         if observed.next_phase.is_terminal()
@@ -4069,7 +4292,7 @@ impl RemoteAgentAuthorizedTransitionV2 {
         {
             return Err(RemoteAgentAccessStateErrorV2::InvalidPhaseSuccessor);
         }
-        validate_progress_successor_v2(current, &observed)?;
+        validate_progress_successor_v2(current, observed)?;
         let mut owner_slot_revision = current.owner_slot_revision;
         let mut access_generation_high_water = current.access_generation_high_water;
         let mut candidate_access_generation = current.candidate_access_generation;
@@ -4527,6 +4750,28 @@ fn validate_clock_window_v2(
         return Err(RemoteAgentAccessStateErrorV2::DeadlineExpired);
     }
     Ok(())
+}
+
+fn transition_commit_authority_matches_v2(
+    authority: &RemoteAgentAccessTransitionCommitAuthorityV2,
+    source: &RemoteAgentAccessSnapshotV2,
+    destination: &RemoteAgentAccessSnapshotV2,
+) -> bool {
+    authority.source_snapshot_sequence() == source.sequence
+        && authority.source_snapshot_digest() == source.snapshot_digest
+        && authority.source_phase() == source.phase
+        && authority.destination_snapshot_sequence() == destination.sequence
+        && authority.destination_snapshot_digest() == destination.snapshot_digest
+        && authority.destination_phase() == destination.phase
+}
+
+fn snapshot_may_mint_transition_authority_v2(snapshot: &RemoteAgentAccessSnapshotV2) -> bool {
+    snapshot.phase != RemoteAgentAccessDurablePhaseV2::InitializedAbsent
+        && !snapshot.phase.is_terminal()
+        && snapshot.phase != RemoteAgentAccessDurablePhaseV2::QuarantineIntent
+        && snapshot
+            .resolved_current_s1_for_current_final_marker_v2()
+            .is_ok()
 }
 
 fn valid_phase_successor_v2(
@@ -5385,6 +5630,7 @@ pub(crate) enum RemoteAgentAccessStateErrorV2 {
     InvalidOperationReplacement,
     ReplayDetected,
     InvalidReplayAuthority,
+    InvalidTransitionCommitAuthority,
     InvalidFreshRequest,
     InvalidFreshClockMarker,
     InvalidCurrentFinalMarker,
@@ -8845,6 +9091,18 @@ mod tests {
             }
         }
 
+        fn observed_successor_error_cause_v2(
+            result: Result<
+                RemoteAgentAuthorizedSuccessorCandidateV2,
+                RemoteAgentAccessObservedSuccessorErrorV2,
+            >,
+        ) -> RemoteAgentAccessStateErrorV2 {
+            match result {
+                Ok(_) => panic!("observed successor unexpectedly succeeded"),
+                Err(error) => error.into_parts().0,
+            }
+        }
+
         fn advance_observed_v2(
             authorized: RemoteAgentAuthorizedTransitionV2,
             next_phase: RemoteAgentAccessDurablePhaseV2,
@@ -8871,14 +9129,27 @@ mod tests {
                 )
             });
             mutate(&mut facts);
-            authorized
-                .try_observed_successor(RemoteAgentAccessObservedProgressV2 {
-                    next_phase,
-                    facts,
-                    candidate_proxy_session_epoch,
-                    fresh_clock,
-                })
-                .unwrap_or_else(|error| panic!("PXRS2 {next_phase:?} successor rejected: {error}"))
+            let observed = RemoteAgentAccessObservedProgressV2 {
+                next_phase,
+                facts,
+                candidate_proxy_session_epoch,
+                fresh_clock,
+            };
+            if next_phase == RemoteAgentAccessDurablePhaseV2::QuarantineIntent {
+                authorized
+                    .try_build_observed_successor(&observed)
+                    .unwrap_or_else(|error| {
+                        panic!("PXRS2 {next_phase:?} successor rejected: {error}")
+                    })
+            } else {
+                authorized
+                    .try_observed_successor(observed)
+                    .map(RemoteAgentAuthorizedSuccessorCandidateV2::into_pending_for_test)
+                    .map_err(|error| error.into_parts().0)
+                    .unwrap_or_else(|error| {
+                        panic!("PXRS2 {next_phase:?} successor rejected: {error}")
+                    })
+            }
         }
 
         fn advance_and_remint_v2(
@@ -10321,7 +10592,7 @@ mod tests {
             let opened = prepared
                 .try_observed_successor(observation)
                 .unwrap_or_else(|error| panic!("Active first intent rejected: {error}"));
-            let snapshot = opened.snapshot();
+            let snapshot = opened.destination_snapshot_for_store_precommit();
             assert_eq!(
                 snapshot.phase(),
                 RemoteAgentAccessDurablePhaseV2::S1OpenIntent
@@ -10343,8 +10614,10 @@ mod tests {
                     Some(clock_for_request_v2(&request, 13)),
                 );
                 assert!(matches!(
-                    prepared.try_observed_successor(observation),
-                    Err(RemoteAgentAccessStateErrorV2::InvalidGenerationSuccessor)
+                    observed_successor_error_cause_v2(
+                        prepared.try_observed_successor(observation)
+                    ),
+                    RemoteAgentAccessStateErrorV2::InvalidGenerationSuccessor
                 ));
             }
 
@@ -10352,8 +10625,10 @@ mod tests {
             let observation =
                 active_open_observation_v2(prepared.snapshot(), Some(proxy_epoch), None);
             assert!(matches!(
-                prepared.try_observed_successor(observation),
-                Err(RemoteAgentAccessStateErrorV2::InvalidFreshClockMarker)
+                observed_successor_error_cause_v2(
+                    prepared.try_observed_successor(observation)
+                ),
+                RemoteAgentAccessStateErrorV2::InvalidFreshClockMarker
             ));
 
             let (request, prepared) = prepared_active_v2(13);
@@ -10368,9 +10643,255 @@ mod tests {
                 Some(clock_for_request_v2(&request, deadline)),
             );
             assert!(matches!(
-                prepared.try_observed_successor(observation),
-                Err(RemoteAgentAccessStateErrorV2::DeadlineExpired)
+                observed_successor_error_cause_v2(
+                    prepared.try_observed_successor(observation)
+                ),
+                RemoteAgentAccessStateErrorV2::DeadlineExpired
             ));
+        }
+
+        #[test]
+        fn pxrs2_exact_joint_readback_releases_fresh_and_successor_authority_once() {
+            let source = initial_snapshot_v2();
+            let request = active_request_v2();
+            let provisioning = terminal_provisioning_v2(&request);
+            let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
+            let ingress = verified_ingress_v2(
+                &request,
+                clock_for_request_v2(&request, 13),
+                &dependencies,
+                &provisioning,
+            )
+            .unwrap_or_else(|error| panic!("fresh ingress rejected: {error}"));
+            let preflight = current_final_v2(source.clone(), |_| {})
+                .unwrap_or_else(|error| panic!("fresh CurrentFinal rejected: {error}"))
+                .try_preflight_fresh(ingress)
+                .unwrap_or_else(|error| panic!("fresh preflight rejected: {error}"));
+            let RemoteAgentReplayFreshPreflightV2 {
+                current_final,
+                verified_ingress,
+                pending,
+                burn: _,
+                pending_candidate_snapshot_digest: _,
+            } = preflight;
+            let prepared_destination = pending.snapshot().clone();
+            let authorized_fresh = RemoteAgentJournalAuthorizedFreshV2 {
+                current_final,
+                verified_ingress,
+                pending,
+            };
+            let prepared_seal = RemoteAgentAccessTransitionCommitAuthorityV2::from_exact_edge_for_test(
+                &source,
+                &prepared_destination,
+            );
+            let prepared = authorized_fresh
+                .try_authorize_committed_prepared_v2(prepared_seal)
+                .unwrap_or_else(|error| panic!("exact Prepared readback rejected: {error}"));
+            assert_eq!(
+                prepared.snapshot().phase(),
+                RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+            );
+
+            let prepared_source = prepared.snapshot().clone();
+            let deadline = prepared_source
+                .admission
+                .unwrap_or_else(|| panic!("Prepared PXRS2 must retain admission"))
+                .absolute_deadline_nanos;
+            let observed = active_open_observation_v2(
+                &prepared_source,
+                Some(ACTIVE_PROXY_SESSION_EPOCH_V2),
+                Some(clock_for_request_v2(&request, deadline - 1)),
+            );
+            let candidate = prepared
+                .try_observed_successor(observed)
+                .unwrap_or_else(|error| panic!("S1OpenIntent candidate rejected: {error}"));
+            assert_eq!(candidate.source_snapshot_sequence(), prepared_source.sequence());
+            assert_eq!(candidate.source_snapshot_digest(), prepared_source.snapshot_digest());
+            assert_eq!(candidate.source_phase(), prepared_source.phase());
+            assert_eq!(
+                candidate.destination_phase(),
+                RemoteAgentAccessDurablePhaseV2::S1OpenIntent
+            );
+            assert_eq!(
+                candidate.destination_snapshot_sequence(),
+                prepared_source.sequence() + 1
+            );
+            assert_eq!(
+                candidate.destination_canonical_wire_for_store_precommit(),
+                candidate
+                    .destination_snapshot_for_store_precommit()
+                    .canonical_wire()
+            );
+            let destination = candidate
+                .destination_snapshot_for_store_precommit()
+                .clone();
+            let successor_seal =
+                RemoteAgentAccessTransitionCommitAuthorityV2::from_exact_edge_for_test(
+                    &prepared_source,
+                    &destination,
+                );
+            let opened = candidate
+                .try_authorize_committed_successor_v2(successor_seal)
+                .unwrap_or_else(|error| panic!("exact S1OpenIntent readback rejected: {error}"));
+            assert_eq!(
+                opened.snapshot().phase(),
+                RemoteAgentAccessDurablePhaseV2::S1OpenIntent
+            );
+        }
+
+        #[test]
+        fn pxrs2_test_only_s1_open_observation_is_strict_and_state_validated() {
+            let (request, prepared) = prepared_active_v2(13);
+            let deadline = prepared
+                .snapshot()
+                .admission
+                .unwrap_or_else(|| panic!("Prepared PXRS2 must retain admission"))
+                .absolute_deadline_nanos;
+            let observed = RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test(
+                prepared.snapshot(),
+                ACTIVE_PROXY_SESSION_EPOCH_V2,
+                clock_for_request_v2(&request, deadline - 1),
+            )
+            .unwrap_or_else(|error| panic!("test S1OpenIntent observation rejected: {error}"));
+            let candidate = prepared
+                .try_observed_successor(observed)
+                .unwrap_or_else(|error| panic!("test S1OpenIntent successor rejected: {error}"));
+            assert_eq!(
+                candidate.destination_phase(),
+                RemoteAgentAccessDurablePhaseV2::S1OpenIntent
+            );
+
+            let (request, prepared) = prepared_active_v2(13);
+            assert!(matches!(
+                RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test(
+                    prepared.snapshot(),
+                    [0; 16],
+                    clock_for_request_v2(&request, deadline - 1),
+                ),
+                Err(RemoteAgentAccessStateErrorV2::InvalidGenerationSuccessor)
+            ));
+        }
+
+        #[test]
+        fn pxrs2_observed_rejection_restores_inputs_and_edge_a_rejects_edge_b_seal() {
+            let (request, prepared) = prepared_active_v2(13);
+            let deadline = prepared
+                .snapshot()
+                .admission
+                .unwrap_or_else(|| panic!("Prepared PXRS2 must retain admission"))
+                .absolute_deadline_nanos;
+            let invalid = active_open_observation_v2(
+                prepared.snapshot(),
+                None,
+                Some(clock_for_request_v2(&request, deadline - 1)),
+            );
+            let error = prepared
+                .try_observed_successor(invalid)
+                .err()
+                .unwrap_or_else(|| panic!("missing proxy epoch unexpectedly succeeded"));
+            let (cause, recovered, mut recovered_observed) = error.into_parts();
+            assert!(matches!(
+                cause,
+                RemoteAgentAccessStateErrorV2::InvalidGenerationSuccessor
+            ));
+            recovered_observed.candidate_proxy_session_epoch = Some([0xa1; 16]);
+            let source_a = recovered.snapshot().clone();
+            let candidate_a = recovered
+                .try_observed_successor(recovered_observed)
+                .unwrap_or_else(|error| panic!("recovered transition rejected: {error}"));
+
+            let (_, prepared_b) = prepared_active_v2(14);
+            let source_b = prepared_b.snapshot().clone();
+            let request_b = source_b
+                .operation_request
+                .as_ref()
+                .unwrap_or_else(|| panic!("Prepared B must retain PXRA v2"));
+            let deadline_b = source_b
+                .admission
+                .unwrap_or_else(|| panic!("Prepared B must retain admission"))
+                .absolute_deadline_nanos;
+            let candidate_b = prepared_b
+                .try_observed_successor(active_open_observation_v2(
+                    &source_b,
+                    Some([0xb1; 16]),
+                    Some(clock_for_request_v2(request_b, deadline_b - 1)),
+                ))
+                .unwrap_or_else(|error| panic!("edge B candidate rejected: {error}"));
+            let destination_b = candidate_b
+                .destination_snapshot_for_store_precommit()
+                .clone();
+            let seal_b = RemoteAgentAccessTransitionCommitAuthorityV2::from_exact_edge_for_test(
+                &source_b,
+                &destination_b,
+            );
+            assert!(matches!(
+                candidate_a.try_authorize_committed_successor_v2(seal_b),
+                Err(RemoteAgentAccessStateErrorV2::InvalidTransitionCommitAuthority)
+            ));
+            assert_ne!(source_a.snapshot_digest(), source_b.snapshot_digest());
+        }
+
+        #[test]
+        fn pxrs2_terminal_and_reconcile_phases_never_create_ordinary_successor_candidates() {
+            let (_, prepared) = prepared_active_v2(100);
+            let started = advance_and_remint_v2(
+                prepared,
+                RemoteAgentAccessDurablePhaseV2::S1OpenIntent,
+                Some(101),
+                Some(ACTIVE_PROXY_SESSION_EPOCH_V2),
+                |_| {},
+            );
+            let started_digest = started.snapshot().snapshot_digest();
+            let mut quarantine_facts = started
+                .snapshot()
+                .progress
+                .unwrap_or_else(|| panic!("S1OpenIntent must retain progress"));
+            quarantine_facts.public_phase = RemoteAgentDataPlaneTerminalPhaseV2::QuarantineIntent;
+            let quarantine_error = started
+                .try_observed_successor(RemoteAgentAccessObservedProgressV2 {
+                    next_phase: RemoteAgentAccessDurablePhaseV2::QuarantineIntent,
+                    facts: quarantine_facts,
+                    candidate_proxy_session_epoch: None,
+                    fresh_clock: None,
+                })
+                .err()
+                .unwrap_or_else(|| panic!("QuarantineIntent created ordinary candidate"));
+            let (cause, recovered, recovered_observed) = quarantine_error.into_parts();
+            assert!(matches!(
+                cause,
+                RemoteAgentAccessStateErrorV2::InvalidPhaseSuccessor
+            ));
+            assert_eq!(recovered.snapshot().snapshot_digest(), started_digest);
+            assert_eq!(
+                recovered_observed.next_phase,
+                RemoteAgentAccessDurablePhaseV2::QuarantineIntent
+            );
+
+            let ready = active_ready_observed_v2();
+            let ready_digest = ready.snapshot().snapshot_digest();
+            let terminal_facts = ready
+                .snapshot()
+                .progress
+                .unwrap_or_else(|| panic!("ReadyObserved must retain progress"));
+            let terminal_error = ready
+                .try_observed_successor(RemoteAgentAccessObservedProgressV2 {
+                    next_phase: RemoteAgentAccessDurablePhaseV2::ActiveReady,
+                    facts: terminal_facts,
+                    candidate_proxy_session_epoch: None,
+                    fresh_clock: None,
+                })
+                .err()
+                .unwrap_or_else(|| panic!("terminal phase created ordinary candidate"));
+            let (cause, recovered, recovered_observed) = terminal_error.into_parts();
+            assert!(matches!(
+                cause,
+                RemoteAgentAccessStateErrorV2::InvalidPhaseSuccessor
+            ));
+            assert_eq!(recovered.snapshot().snapshot_digest(), ready_digest);
+            assert_eq!(
+                recovered_observed.next_phase,
+                RemoteAgentAccessDurablePhaseV2::ActiveReady
+            );
         }
 
         #[test]
@@ -11170,8 +11691,10 @@ mod tests {
             let (_, prepared) = prepared_local_v2();
             let mismatched = local_fence_observation_v2(prepared.snapshot(), 1_001, 1_002);
             assert!(matches!(
-                prepared.try_observed_successor(mismatched),
-                Err(RemoteAgentAccessStateErrorV2::InvalidFreshClockMarker)
+                observed_successor_error_cause_v2(
+                    prepared.try_observed_successor(mismatched)
+                ),
+                RemoteAgentAccessStateErrorV2::InvalidFreshClockMarker
             ));
 
             let (_, prepared) = prepared_local_v2();
@@ -11182,8 +11705,10 @@ mod tests {
                 .absolute_deadline_nanos;
             let at_deadline = local_fence_observation_v2(prepared.snapshot(), deadline, deadline);
             assert!(matches!(
-                prepared.try_observed_successor(at_deadline),
-                Err(RemoteAgentAccessStateErrorV2::DeadlineExpired)
+                observed_successor_error_cause_v2(
+                    prepared.try_observed_successor(at_deadline)
+                ),
+                RemoteAgentAccessStateErrorV2::DeadlineExpired
             ));
 
             let (_, prepared) = prepared_local_v2();
@@ -11195,8 +11720,10 @@ mod tests {
             let after_deadline =
                 local_fence_observation_v2(prepared.snapshot(), deadline + 1, deadline + 1);
             assert!(matches!(
-                prepared.try_observed_successor(after_deadline),
-                Err(RemoteAgentAccessStateErrorV2::DeadlineExpired)
+                observed_successor_error_cause_v2(
+                    prepared.try_observed_successor(after_deadline)
+                ),
+                RemoteAgentAccessStateErrorV2::DeadlineExpired
             ));
 
             let (_, prepared) = prepared_local_v2();
@@ -11204,10 +11731,15 @@ mod tests {
             let pending = prepared
                 .try_observed_successor(exact)
                 .unwrap_or_else(|error| panic!("exact predeadline Local fence rejected: {error}"));
-            assert_eq!(pending.snapshot().first_effect_observed_at_nanos, 1_001);
             assert_eq!(
                 pending
-                    .snapshot()
+                    .destination_snapshot_for_store_precommit()
+                    .first_effect_observed_at_nanos,
+                1_001
+            );
+            assert_eq!(
+                pending
+                    .destination_snapshot_for_store_precommit()
                     .progress
                     .unwrap_or_else(|| panic!("SubmitFenceIntent must retain progress"))
                     .selection_observed_at_nanos,
@@ -11783,6 +12315,105 @@ mod tests {
                 "replay_journal_v2"
             )));
             assert!(!source.contains(concat!("pub(crate) fn into_pending_", "for_store")));
+        }
+
+        #[test]
+        fn pxrs2_joint_commit_authority_and_successor_candidate_api_are_sealed() {
+            let source = include_str!("remote_agent_access_state.rs");
+            let observed_fixture_impl = source
+                .find("impl RemoteAgentAccessObservedProgressV2 {")
+                .unwrap_or_else(|| panic!("test-only observed fixture implementation missing"));
+            assert!(
+                source[observed_fixture_impl.saturating_sub(32)..observed_fixture_impl]
+                    .contains("#[cfg(test)]")
+            );
+            let observed_fixture_tail = &source[observed_fixture_impl..];
+            let observed_fixture_end = observed_fixture_tail
+                .find("\n}\n\n#[derive(Clone, Debug, Eq, PartialEq)]")
+                .unwrap_or_else(|| panic!("test-only observed fixture boundary missing"));
+            let observed_fixture = &observed_fixture_tail[..observed_fixture_end];
+            assert!(observed_fixture.contains("pub(crate) fn try_s1_open_intent_for_test("));
+            assert!(observed_fixture.contains("PreparedNoEffects"));
+            assert!(observed_fixture.contains("RemoteAccessActive"));
+            assert!(observed_fixture.contains("bytes_are_zero_v2"));
+            assert!(observed_fixture.contains("validate_progress_successor_v2(prepared, &observed)?"));
+
+            let candidate = source
+                .split_once("pub(crate) struct RemoteAgentAuthorizedSuccessorCandidateV2 {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("/// A pure observed-successor rejection")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("opaque successor candidate declaration missing"));
+            assert!(candidate.contains("pending: RemoteAgentPendingAccessSnapshotV2"));
+            assert!(!candidate.contains("pub(crate) pending:"));
+            assert!(!candidate.contains("#[derive(Clone"));
+            assert!(!candidate.contains("#[derive(Copy"));
+
+            let fresh_release = source
+                .split_once("pub(crate) fn try_authorize_committed_prepared_v2(")
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl RemoteAgentAuthorizedSuccessorCandidateV2")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("fresh exact-commit release missing"));
+            assert!(fresh_release.contains("RemoteAgentAccessTransitionCommitAuthorityV2"));
+            assert!(fresh_release.contains("transition_commit_authority_matches_v2("));
+            assert!(fresh_release.contains("PreparedNoEffects"));
+            assert!(fresh_release.contains("snapshot_may_mint_transition_authority_v2"));
+
+            let candidate_impl = source
+                .split_once("impl RemoteAgentAuthorizedSuccessorCandidateV2 {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl RemoteAgentAccessObservedSuccessorErrorV2")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("opaque successor candidate implementation missing"));
+            for getter in [
+                "source_snapshot_sequence",
+                "source_snapshot_digest",
+                "source_phase",
+                "destination_snapshot_for_store_precommit",
+                "destination_canonical_wire_for_store_precommit",
+                "destination_snapshot_sequence",
+                "destination_snapshot_digest",
+                "destination_phase",
+            ] {
+                assert!(candidate_impl.contains(getter), "candidate getter missing: {getter}");
+            }
+            assert!(candidate_impl.contains("try_authorize_committed_successor_v2"));
+            assert!(candidate_impl.contains("InvalidTransitionCommitAuthority"));
+            assert!(candidate_impl.contains("snapshot_may_mint_transition_authority_v2"));
+            assert!(candidate_impl.contains("#[cfg(test)]\n    fn into_pending_for_test("));
+            assert!(!candidate_impl.contains("pub(crate) fn into_pending"));
+
+            let observed = source
+                .split_once("pub(crate) fn try_observed_successor(")
+                .and_then(|(_, tail)| {
+                    tail.split_once("pub(crate) fn try_terminal_successor(")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("observed successor implementation missing"));
+            assert!(observed.contains("RemoteAgentAuthorizedSuccessorCandidateV2"));
+            assert!(observed.contains("RemoteAgentAccessObservedSuccessorErrorV2"));
+            assert!(observed.contains("authorized_transition: self"));
+            assert!(observed.contains("observed,"));
+            assert!(observed.contains("QuarantineIntent"));
+            assert!(observed.contains("snapshot_may_mint_transition_authority_v2"));
+            let rejected = source
+                .split_once("impl RemoteAgentAccessObservedSuccessorErrorV2 {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl fmt::Debug for RemoteAgentAccessObservedSuccessorErrorV2")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("recoverable observed rejection implementation missing"));
+            assert!(rejected.contains("RemoteAgentAuthorizedTransitionV2"));
+            assert!(rejected.contains("RemoteAgentAccessObservedProgressV2"));
+            assert!(rejected.contains("authorized_transition"));
+            assert!(rejected.contains("observed"));
+
+            assert!(!source.contains("impl From<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"));
+            assert!(!source.contains("impl TryFrom<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"));
         }
 
         fn reseal_replay_journal_v2(wire: &mut [u8]) {
