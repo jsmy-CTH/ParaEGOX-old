@@ -10489,7 +10489,8 @@ mod tests {
         );
     }
 
-    async fn fresh_publish_or_joint_readback_uncertainty_returns_no_authority_and_drops_pin_inner() {
+    async fn fresh_publish_or_joint_readback_uncertainty_returns_no_authority_and_drops_pin_inner()
+    {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum Stage {
             PendingJournal,
