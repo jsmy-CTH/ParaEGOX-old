@@ -4104,10 +4104,7 @@ mod tests {
     const FULL_COMPOSITION_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-    fn run_full_composition_test(
-        thread_name: &'static str,
-        test: impl FnOnce() + Send + 'static,
-    ) {
+    fn run_full_composition_test(thread_name: &'static str, test: impl FnOnce() + Send + 'static) {
         let worker = std::thread::Builder::new()
             .name(thread_name.to_owned())
             .stack_size(FULL_COMPOSITION_TEST_STACK_BYTES)
@@ -5931,8 +5928,8 @@ mod tests {
 
             let manifest = identity::load_or_create_provisioned(&config)
                 .expect("stable provisioned identity manifest");
-            let prepared_layout = layout::prepare_provisioned(&config, &manifest)
-                .expect("stable provisioned layout");
+            let prepared_layout =
+                layout::prepare_provisioned(&config, &manifest).expect("stable provisioned layout");
             cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
             assert!(!prepared_layout.authority_socket_path().exists());
             assert!(!prepared_layout.runtime_socket_path().exists());
@@ -6060,8 +6057,8 @@ mod tests {
             {
                 let manifest = identity::load_or_create_provisioned(&config)
                     .expect("stable OpenAI identity manifest");
-                let prepared_layout = layout::prepare_provisioned(&config, &manifest)
-                    .expect("stable OpenAI layout");
+                let prepared_layout =
+                    layout::prepare_provisioned(&config, &manifest).expect("stable OpenAI layout");
                 let provider =
                     loopback_composition_provider(&config, &manifest, Arc::clone(&builds));
                 let mut runner = NonInteractiveConversationRunner::provisioned(inputs);
