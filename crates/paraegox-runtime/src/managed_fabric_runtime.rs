@@ -42,7 +42,9 @@ use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 use tokio::sync::RwLock;
 use tokio::time::{Instant, timeout_at};
 
-use crate::admission::VerifiedManagedFabricApplyIngressV1;
+use crate::admission::{
+    VerifiedManagedFabricApplyIngressV1, VerifiedRemoteAgentAccessApplyIngressV2,
+};
 use crate::managed_fabric_state::{
     ManagedFabricDurableActive, ManagedFabricDurablePending, ManagedFabricDurablePhase,
     ManagedFabricPendingKind, ManagedFabricReplayRecord, ManagedFabricRevisionHighWater,
@@ -69,11 +71,15 @@ use crate::runtime_control_endpoint::{
     RemoteAgentLiveLowerProjectionV2,
 };
 #[cfg(test)]
-use crate::runtime_store::RemoteAgentAccessInitializeCommitErrorV2;
+use crate::runtime_store::{
+    RemoteAgentAccessCommitErrorV2, RemoteAgentAccessCommitFailpointV2,
+    RemoteAgentAccessInitializeCommitErrorV2, RemoteAgentReplayJournalCommitFailpointV2,
+};
 use crate::runtime_store::{
     ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessAbsentLeaseV2,
-    RemoteAgentAccessCommitErrorV2, RemoteAgentAccessGenesisInitializeCommitErrorV2,
-    RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2, RuntimeStore,
+    RemoteAgentAccessFreshCommitErrorV2, RemoteAgentAccessGenesisInitializeCommitErrorV2,
+    RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2,
+    RemoteAgentReplayJournalAbsentLeaseV2, RemoteAgentReplayJournalStartupSlotV2, RuntimeStore,
 };
 use crate::task_registry::CancellationSource;
 
@@ -513,12 +519,19 @@ pub(crate) struct ManagedFabricRuntimeCore {
     assembly: Option<ManagedServiceAssembly>,
     fabric_control: Option<ManagedFabricControlHandle>,
     remote_agent_descriptor_evidence: Option<RemoteAgentDescriptorEvidenceV1>,
-    remote_agent_access_startup_v2: Option<RemoteAgentAccessStartupSlotV2>,
+    remote_agent_access_startup_v2: Option<RemoteAgentAccessGenesisStartupLeasesV2>,
     remote_agent_access_s0_mutation_frozen_v2: bool,
     #[cfg(test)]
     fail_next_remote_agent_descriptor_post_commit_reverify: bool,
     cleanup_exact_zero: bool,
     recovery_completed: bool,
+}
+
+/// Sole first-initialization authority retained after joint PXRS/PXRJ startup
+/// adjudication. Neither lease is independently installable or reusable.
+struct RemoteAgentAccessGenesisStartupLeasesV2 {
+    access_absent: RemoteAgentAccessAbsentLeaseV2,
+    replay_journal_absent: RemoteAgentReplayJournalAbsentLeaseV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -796,6 +809,90 @@ impl RemoteAgentAccessCurrentFinalLeaseBundleV2 {
     #[must_use]
     pub(crate) fn exact_pxap_for_test(&self) -> &[u8] {
         &self.exact_pxap
+    }
+}
+
+/// Opaque success from the sole fresh PXRJ/PXRS transaction. It retains the
+/// exact new named-final lease and the already fixed PXAP bytes, but exposes no
+/// Pending snapshot, ingress Pin, replay token, or effect authority.
+pub(crate) struct RemoteAgentAccessFreshCommittedLeaseBundleV2 {
+    same_epoch: RemoteAgentAccessSameEpochLeaseV2,
+    exact_pxap: Box<[u8]>,
+}
+
+impl fmt::Debug for RemoteAgentAccessFreshCommittedLeaseBundleV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _retained_joint_authority = (&self.same_epoch, &self.exact_pxap);
+        formatter
+            .debug_struct("RemoteAgentAccessFreshCommittedLeaseBundleV2")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteAgentAccessFreshCommittedLeaseBundleV2 {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn same_epoch_snapshot_for_test(&self) -> &RemoteAgentAccessSnapshotV2 {
+        self.same_epoch.snapshot()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn exact_pxap_for_test(&self) -> &[u8] {
+        &self.exact_pxap
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RemoteAgentAccessFreshCommitRejectCauseV2 {
+    State(RemoteAgentAccessStateErrorV2),
+    Store(ManagedFabricStoreError),
+}
+
+/// A pure preflight or pre-journal store rejection returns the original
+/// CurrentFinal wrapper and verified ingress intact. Once any PXRJ mutation
+/// begins, OutcomeUncertain carries no lease, CurrentFinal, PXAP, or Pin.
+pub(crate) enum RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running> {
+    Rejected {
+        cause: RemoteAgentAccessFreshCommitRejectCauseV2,
+        current: Box<RemoteAgentAccessCurrentFinalLeaseBundleV2>,
+        verified_ingress: Box<VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>>,
+    },
+    OutcomeUncertain(ManagedFabricStoreError),
+}
+
+impl fmt::Debug for RemoteAgentAccessManagedFreshCommitErrorV2<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected { cause, .. } => formatter
+                .debug_tuple("Rejected")
+                .field(cause)
+                .finish_non_exhaustive(),
+            Self::OutcomeUncertain(cause) => formatter
+                .debug_tuple("OutcomeUncertain")
+                .field(cause)
+                .finish(),
+        }
+    }
+}
+
+impl<'request, 'running> RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running> {
+    #[must_use]
+    pub(crate) fn into_rejected_parts(
+        self,
+    ) -> Option<(
+        RemoteAgentAccessFreshCommitRejectCauseV2,
+        RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    )> {
+        match self {
+            Self::Rejected {
+                cause,
+                current,
+                verified_ingress,
+            } => Some((cause, *current, *verified_ingress)),
+            Self::OutcomeUncertain(_) => None,
+        }
     }
 }
 
@@ -1111,19 +1208,22 @@ impl ManagedFabricRuntimeCore {
         }
     }
 
-    /// Retains the one pre-effect PXRS v2 absent lease produced by this core's
-    /// already-open store. Any existing final is rejected by the caller before
-    /// core construction and therefore can never enter this owner.
+    /// Retains the inseparable PXRS/PXRJ absent leases produced by the
+    /// already-open store's joint-first startup adjudication. Any existing,
+    /// pending, old-epoch, mismatched, or residue-bearing pair is rejected by
+    /// the caller before core construction and therefore cannot enter genesis.
     pub(crate) fn install_remote_agent_access_startup_v2(
         &mut self,
-        startup: RemoteAgentAccessStartupSlotV2,
+        access_absent: RemoteAgentAccessAbsentLeaseV2,
+        replay_journal_absent: RemoteAgentReplayJournalAbsentLeaseV2,
     ) -> Result<(), ManagedFabricRuntimeError> {
-        if self.remote_agent_access_startup_v2.is_some()
-            || !matches!(&startup, RemoteAgentAccessStartupSlotV2::Absent(_))
-        {
+        if self.remote_agent_access_startup_v2.is_some() {
             return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired);
         }
-        self.remote_agent_access_startup_v2 = Some(startup);
+        self.remote_agent_access_startup_v2 = Some(RemoteAgentAccessGenesisStartupLeasesV2 {
+            access_absent,
+            replay_journal_absent,
+        });
         Ok(())
     }
 
@@ -1185,10 +1285,15 @@ impl ManagedFabricRuntimeCore {
                 candidate: Box::new(candidate),
             });
         }
-        let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
+        let (startup, candidate) = self.take_remote_agent_access_absent_leases_v2(candidate)?;
+        let RemoteAgentAccessGenesisStartupLeasesV2 {
+            access_absent,
+            replay_journal_absent,
+        } = startup;
         let result = self
             .store
-            .initialize_remote_agent_access_v2(absent, candidate);
+            .initialize_remote_agent_access_v2(access_absent, candidate);
+        drop(replay_journal_absent);
         self.finish_remote_agent_access_initialization_v2(result)
     }
 
@@ -1206,16 +1311,22 @@ impl ManagedFabricRuntimeCore {
             snapshot,
             snapshot.canonical_wire(),
         ) {
-            return Err(RemoteAgentAccessCommitErrorV2::Rejected {
+            drop(candidate);
+            return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(
                 cause,
-                candidate: Box::new(candidate),
-            });
+            ));
         }
-        let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
-        let result = self
-            .store
-            .initialize_remote_agent_access_genesis_v2(absent, candidate);
-        self.finish_remote_agent_access_initialization_v2(result)
+        let startup = self.take_remote_agent_access_genesis_absent_leases_v2()?;
+        let RemoteAgentAccessGenesisStartupLeasesV2 {
+            access_absent,
+            replay_journal_absent,
+        } = startup;
+        let result = self.store.initialize_remote_agent_access_genesis_v2(
+            access_absent,
+            replay_journal_absent,
+            candidate,
+        );
+        self.finish_remote_agent_access_genesis_initialization_v2(result)
     }
 
     /// Strictly proves the candidate is this core's canonical sequence-one
@@ -1254,22 +1365,68 @@ impl ManagedFabricRuntimeCore {
             .map_err(|_| ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch)
     }
 
-    fn take_remote_agent_access_absent_lease_v2<Candidate>(
+    fn take_remote_agent_access_genesis_absent_leases_v2(
+        &mut self,
+    ) -> Result<
+        RemoteAgentAccessGenesisStartupLeasesV2,
+        RemoteAgentAccessGenesisInitializeCommitErrorV2,
+    > {
+        self.remote_agent_access_startup_v2.take().ok_or(
+            RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(
+                ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
+            ),
+        )
+    }
+
+    fn finish_remote_agent_access_genesis_initialization_v2(
+        &mut self,
+        result: Result<
+            RemoteAgentAccessSameEpochLeaseV2,
+            RemoteAgentAccessGenesisInitializeCommitErrorV2,
+        >,
+    ) -> Result<
+        RemoteAgentAccessInitializedAbsentReadbackV2,
+        RemoteAgentAccessGenesisInitializeCommitErrorV2,
+    > {
+        match result {
+            Ok(same_epoch) => {
+                self.latch_remote_agent_access_s0_mutation_freeze_v2();
+                let initial_absent_s1_cas = self
+                    .verify_remote_agent_access_initialized_absent_candidate_v2(
+                        same_epoch.snapshot(),
+                        same_epoch.canonical_wire(),
+                    )
+                    .map_err(
+                        RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain,
+                    )?;
+                Ok(RemoteAgentAccessInitializedAbsentReadbackV2 {
+                    same_epoch,
+                    target: self.projection.target(),
+                    store_instance_id: self.store_instance_id(),
+                    runtime_host_epoch: self.runtime_host_epoch,
+                    initial_absent_s1_cas,
+                })
+            }
+            Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)) => {
+                self.latch_remote_agent_access_s0_mutation_freeze_v2();
+                Err(error)
+            }
+            Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)) => {
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn take_remote_agent_access_absent_leases_v2<Candidate>(
         &mut self,
         candidate: Candidate,
     ) -> Result<
-        (RemoteAgentAccessAbsentLeaseV2, Candidate),
+        (RemoteAgentAccessGenesisStartupLeasesV2, Candidate),
         RemoteAgentAccessCommitErrorV2<Candidate>,
     > {
         match self.remote_agent_access_startup_v2.take() {
-            Some(RemoteAgentAccessStartupSlotV2::Absent(absent)) => Ok((absent, candidate)),
-            Some(startup) => {
-                self.remote_agent_access_startup_v2 = Some(startup);
-                Err(RemoteAgentAccessCommitErrorV2::Rejected {
-                    cause: ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
-                    candidate: Box::new(candidate),
-                })
-            }
+            Some(startup) => Ok((startup, candidate)),
             None => Err(RemoteAgentAccessCommitErrorV2::Rejected {
                 cause: ManagedFabricStoreError::RemoteAgentAccessLeaseMismatch,
                 candidate: Box::new(candidate),
@@ -1277,6 +1434,7 @@ impl ManagedFabricRuntimeCore {
         }
     }
 
+    #[cfg(test)]
     fn finish_remote_agent_access_initialization_v2<Candidate>(
         &mut self,
         result: Result<
@@ -1330,10 +1488,19 @@ impl ManagedFabricRuntimeCore {
                 candidate: Box::new(candidate),
             });
         }
-        let (absent, candidate) = self.take_remote_agent_access_absent_lease_v2(candidate)?;
+        let (startup, candidate) = self.take_remote_agent_access_absent_leases_v2(candidate)?;
+        let RemoteAgentAccessGenesisStartupLeasesV2 {
+            access_absent,
+            replay_journal_absent,
+        } = startup;
         let result = self
             .store
-            .initialize_remote_agent_access_v2_at_failpoint(absent, candidate, failpoint);
+            .initialize_remote_agent_access_v2_at_failpoint(
+                access_absent,
+                candidate,
+                failpoint,
+            );
+        drop(replay_journal_absent);
         self.finish_remote_agent_access_initialization_v2(result)
     }
 
@@ -1513,10 +1680,104 @@ impl ManagedFabricRuntimeCore {
         })
     }
 
+    /// Sole managed composition seam for one fresh replay-journal transaction.
+    /// Pure preflight and J-before-publication rejection reconstruct the exact
+    /// input authorities; any J-after boundary destroys them and fail-stops.
+    /// Success retains only the new joint named-final lease and fixed PXAP.
+    pub(crate) fn commit_remote_agent_access_fresh_v2<'request, 'running>(
+        &mut self,
+        current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    ) -> Result<
+        RemoteAgentAccessFreshCommittedLeaseBundleV2,
+        RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
+    > {
+        self.commit_remote_agent_access_fresh_v2_with(
+            current,
+            verified_ingress,
+            |store, same_epoch, preflight| {
+                store.commit_remote_agent_access_fresh_v2(same_epoch, preflight)
+            },
+        )
+    }
+
+    fn commit_remote_agent_access_fresh_v2_with<'request, 'running, Commit>(
+        &mut self,
+        current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+        commit: Commit,
+    ) -> Result<
+        RemoteAgentAccessFreshCommittedLeaseBundleV2,
+        RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
+    >
+    where
+        Commit: FnOnce(
+            &mut ManagedFabricStore,
+            RemoteAgentAccessSameEpochLeaseV2,
+            crate::remote_agent_access_state::RemoteAgentReplayFreshPreflightV2<
+                'request,
+                'running,
+            >,
+        ) -> Result<
+            RemoteAgentAccessSameEpochLeaseV2,
+            RemoteAgentAccessFreshCommitErrorV2<'request, 'running>,
+        >,
+    {
+        let RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+            same_epoch,
+            current_final,
+            exact_pxap,
+        } = current;
+        let preflight = match current_final.try_preflight_fresh(verified_ingress) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                let (cause, current_final, verified_ingress) = error.into_parts();
+                return Err(RemoteAgentAccessManagedFreshCommitErrorV2::Rejected {
+                    cause: RemoteAgentAccessFreshCommitRejectCauseV2::State(cause),
+                    current: Box::new(RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+                        same_epoch,
+                        current_final,
+                        exact_pxap,
+                    }),
+                    verified_ingress: Box::new(verified_ingress),
+                });
+            }
+        };
+        match commit(&mut self.store, same_epoch, preflight) {
+            Ok(same_epoch) => Ok(RemoteAgentAccessFreshCommittedLeaseBundleV2 {
+                same_epoch,
+                exact_pxap,
+            }),
+            Err(RemoteAgentAccessFreshCommitErrorV2::Rejected {
+                cause,
+                current,
+                preflight,
+            }) => {
+                let (current_final, verified_ingress) = (*preflight).into_rejected_parts();
+                Err(RemoteAgentAccessManagedFreshCommitErrorV2::Rejected {
+                    cause: RemoteAgentAccessFreshCommitRejectCauseV2::Store(cause),
+                    current: Box::new(RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+                        same_epoch: *current,
+                        current_final,
+                        exact_pxap,
+                    }),
+                    verified_ingress: Box::new(verified_ingress),
+                })
+            }
+            Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause)) => {
+                drop(exact_pxap);
+                Err(RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(
+                    cause,
+                ))
+            }
+        }
+    }
+
     /// After the first PXAR-v7 marker has been durably published and exactly
-    /// read back, classifies and installs PXRS v2 exactly once. Only a proven
-    /// absent final grants the caller permission to resolve a provider or
-    /// start an Agent. Existing finals remain frozen structural authority.
+    /// read back, jointly classifies PXRS/PXRJ before the legacy PXRS lease
+    /// seam. Only exact dual absence reaches provider resolution or Agent
+    /// start; every stable, pending, old, mismatched, or residue-bearing pair
+    /// freezes S0 and requires reconciliation.
     pub(crate) fn adjudicate_remote_agent_access_after_first_stack_marker_v2(
         &mut self,
     ) -> Result<(), ManagedFabricRuntimeError> {
@@ -1532,24 +1793,50 @@ impl ManagedFabricRuntimeCore {
             owner_target_fingerprint: self.owner_target_fingerprint(),
             transition_projection_digest: transition_projection_digest(&self.projection)?,
         };
-        let startup = self
+        let replay_journal_absent = match self
             .store
-            .adjudicate_remote_agent_access_startup_v2(static_identity, self.runtime_host_epoch)?;
-        match startup {
-            startup @ RemoteAgentAccessStartupSlotV2::Absent(_) => {
-                self.remote_agent_access_startup_v2 = Some(startup);
-                Ok(())
-            }
-            startup @ RemoteAgentAccessStartupSlotV2::SameEpoch(_) => {
-                self.remote_agent_access_startup_v2 = Some(startup);
+            .adjudicate_remote_agent_replay_journal_startup_v2(
+                static_identity,
+                self.runtime_host_epoch,
+            ) {
+            Ok(RemoteAgentReplayJournalStartupSlotV2::Absent(absent)) => absent,
+            Ok(
+                RemoteAgentReplayJournalStartupSlotV2::Stable(_)
+                | RemoteAgentReplayJournalStartupSlotV2::Pending(_)
+                | RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(_),
+            ) => {
                 self.latch_remote_agent_access_s0_mutation_freeze_v2();
-                Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+                return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired);
             }
-            startup @ RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
-                self.remote_agent_access_startup_v2 = Some(startup);
-                Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired)
+            Err(cause) => {
+                self.latch_remote_agent_access_s0_mutation_freeze_v2();
+                return Err(ManagedFabricRuntimeError::Store(cause));
             }
-        }
+        };
+        let access_absent = match self
+            .store
+            .adjudicate_remote_agent_access_startup_v2(
+                static_identity,
+                self.runtime_host_epoch,
+            ) {
+            Ok(RemoteAgentAccessStartupSlotV2::Absent(absent)) => absent,
+            Ok(
+                RemoteAgentAccessStartupSlotV2::SameEpoch(_)
+                | RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_),
+            ) => {
+                self.latch_remote_agent_access_s0_mutation_freeze_v2();
+                return Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired);
+            }
+            Err(cause) => {
+                self.latch_remote_agent_access_s0_mutation_freeze_v2();
+                return Err(ManagedFabricRuntimeError::Store(cause));
+            }
+        };
+        self.remote_agent_access_startup_v2 = Some(RemoteAgentAccessGenesisStartupLeasesV2 {
+            access_absent,
+            replay_journal_absent,
+        });
+        Ok(())
     }
 
     /// Enforces that any retained Agent-stack authority or existing PXRS v2
@@ -1560,12 +1847,92 @@ impl ManagedFabricRuntimeCore {
     ) -> Result<(), ManagedFabricRuntimeError> {
         let required = self.store.remote_agent_access_startup_required_v2();
         match (&self.remote_agent_access_startup_v2, required) {
-            (Some(RemoteAgentAccessStartupSlotV2::Absent(_)), true) | (None, false) => Ok(()),
-            (Some(RemoteAgentAccessStartupSlotV2::SameEpoch(_)), _)
-            | (Some(RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)), _)
-            | (Some(_), false)
-            | (None, true) => Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired),
+            (Some(_), true) | (None, false) => Ok(()),
+            (Some(_), false) | (None, true) => {
+                Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired)
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_remote_agent_access_fresh_v2_at_failpoints<'request, 'running>(
+        &mut self,
+        current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+        pending_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2,
+        access_failpoint: RemoteAgentAccessCommitFailpointV2,
+        stable_journal_failpoint: RemoteAgentReplayJournalCommitFailpointV2,
+    ) -> Result<
+        RemoteAgentAccessFreshCommittedLeaseBundleV2,
+        RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
+    > {
+        self.commit_remote_agent_access_fresh_v2_with(
+            current,
+            verified_ingress,
+            move |store, same_epoch, preflight| {
+                store.commit_remote_agent_access_fresh_v2_at_failpoints(
+                    same_epoch,
+                    preflight,
+                    pending_journal_failpoint,
+                    access_failpoint,
+                    stable_journal_failpoint,
+                )
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_remote_agent_replay_unapplied_stable_for_test<'request, 'running>(
+        &mut self,
+        current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    ) -> Result<
+        (
+            RemoteAgentAccessCurrentFinalLeaseBundleV2,
+            VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+        ),
+        RemoteAgentAccessManagedFreshCommitErrorV2<'request, 'running>,
+    > {
+        let RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+            same_epoch,
+            current_final,
+            exact_pxap,
+        } = current;
+        let preflight = match current_final.try_preflight_fresh(verified_ingress) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                let (cause, current_final, verified_ingress) = error.into_parts();
+                return Err(RemoteAgentAccessManagedFreshCommitErrorV2::Rejected {
+                    cause: RemoteAgentAccessFreshCommitRejectCauseV2::State(cause),
+                    current: Box::new(RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+                        same_epoch,
+                        current_final,
+                        exact_pxap,
+                    }),
+                    verified_ingress: Box::new(verified_ingress),
+                });
+            }
+        };
+        if let Err(cause) = self
+            .store
+            .seed_remote_agent_replay_unapplied_stable_for_test(&same_epoch, &preflight)
+        {
+            drop(same_epoch);
+            drop(preflight);
+            drop(exact_pxap);
+            return Err(RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(
+                cause,
+            ));
+        }
+        let (current_final, verified_ingress) = preflight.into_rejected_parts();
+        Ok((
+            RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+                same_epoch,
+                current_final,
+                exact_pxap,
+            },
+            verified_ingress,
+        ))
     }
 
     /// Returns the strictly decoded latest PXDE slot. It is historical bytes,
@@ -3352,37 +3719,60 @@ mod tests {
     const TARGET_FINGERPRINT_BYTE: u8 = 0x55;
 
     #[test]
-    fn post_marker_pxrs2_compile_boundary_allows_only_absent() {
+    fn post_marker_joint_replay_startup_allows_only_dual_absence() {
         let source = include_str!("managed_fabric_runtime.rs");
         let start = source
             .find("    pub(crate) fn adjudicate_remote_agent_access_after_first_stack_marker_v2(")
-            .expect("missing post-marker PXRS v2 gate");
+            .expect("missing post-marker PXRS/PXRJ gate");
         let tail = &source[start..];
         let end = tail
             .find("    /// Enforces that any retained Agent-stack authority")
-            .expect("missing post-marker PXRS v2 gate boundary");
+            .expect("missing post-marker PXRS/PXRJ gate boundary");
         let gate = &tail[..end];
 
-        assert!(gate.contains("startup @ RemoteAgentAccessStartupSlotV2::Absent(_)"));
-        assert!(gate.contains("startup @ RemoteAgentAccessStartupSlotV2::SameEpoch(_)"));
+        let joint = gate
+            .find(".adjudicate_remote_agent_replay_journal_startup_v2(")
+            .expect("joint PXRJ/PXRS adjudication disappeared");
+        let joint_absent = gate
+            .find("Ok(RemoteAgentReplayJournalStartupSlotV2::Absent(absent))")
+            .expect("joint absent lease disappeared");
+        let stable = gate
+            .find("RemoteAgentReplayJournalStartupSlotV2::Stable(_)")
+            .expect("same-epoch Stable fail-stop disappeared");
+        let pending = gate
+            .find("RemoteAgentReplayJournalStartupSlotV2::Pending(_)")
+            .expect("Pending fail-stop disappeared");
+        let reconcile = gate
+            .find("RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(_)")
+            .expect("old/mismatched/residue fail-stop disappeared");
+        let access = gate
+            .find(".adjudicate_remote_agent_access_startup_v2(")
+            .expect("legacy PXRS absent lease seam disappeared");
+        let access_absent = gate
+            .find("Ok(RemoteAgentAccessStartupSlotV2::Absent(absent))")
+            .expect("PXRS absent lease disappeared");
+        let installed = gate
+            .find("RemoteAgentAccessGenesisStartupLeasesV2 {")
+            .expect("dual absent lease installation disappeared");
         assert!(
-            gate.contains("startup @ RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)")
+            joint < joint_absent
+                && joint_absent < stable
+                && stable < pending
+                && pending < reconcile
+                && reconcile < access
+                && access < access_absent
+                && access_absent < installed
         );
+        assert!(gate.contains("RemoteAgentAccessStartupSlotV2::SameEpoch(_)"));
+        assert!(gate.contains("RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)"));
         assert_eq!(gate.match_indices("Ok(())").count(), 1);
+        assert_eq!(gate.match_indices("RemoteAgentAccessReconcileRequired").count(), 3);
         assert_eq!(
-            gate.match_indices("self.remote_agent_access_startup_v2 = Some(startup)")
+            gate.match_indices("self.latch_remote_agent_access_s0_mutation_freeze_v2();")
                 .count(),
-            3
+            4
         );
-        assert!(gate.contains("RemoteAgentAccessSameEpochFrozen"));
         assert!(gate.contains("RemoteAgentAccessReconcileRequired"));
-        assert!(
-            gate.find("self.latch_remote_agent_access_s0_mutation_freeze_v2();")
-                .expect("same-epoch branch must latch the core")
-                < gate
-                    .find("Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)")
-                    .expect("same-epoch typed error disappeared")
-        );
         assert!(!gate.contains("start_agent"));
         assert!(!gate.contains("prepare_agent_provider"));
     }
@@ -3518,7 +3908,7 @@ mod tests {
             .expect("missing CurrentFinal lease bundle");
         let wrapper_tail = &source[wrapper_start..];
         let wrapper_end = wrapper_tail
-            .find("\n#[derive(Debug)]\npub(crate) enum RemoteAgentAccessCurrentFinalGenesisBindFailureV2")
+            .find("\n/// Opaque success from the sole fresh PXRJ/PXRS transaction.")
             .expect("missing CurrentFinal lease bundle boundary");
         let wrapper = &wrapper_tail[..wrapper_end];
         assert!(wrapper.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
@@ -3541,6 +3931,154 @@ mod tests {
         assert!(error.contains(
             "whole: Box<RemoteAgentAccessPostReadbackVerifiedGenesisBundleV2<'running>>"
         ));
+    }
+
+    #[test]
+    fn fresh_managed_seam_recovers_only_pre_journal_and_exposes_no_pending_authority() {
+        let _compile_anchor = ManagedFabricRuntimeCore::commit_remote_agent_access_fresh_v2;
+        let source = include_str!("managed_fabric_runtime.rs");
+        let production_start = source
+            .find("    pub(crate) fn commit_remote_agent_access_fresh_v2<'request, 'running>(")
+            .expect("missing managed fresh replay-journal seam");
+        let production_tail = &source[production_start..];
+        let production_end = production_tail
+            .find("    fn commit_remote_agent_access_fresh_v2_with<'request, 'running, Commit>(")
+            .expect("missing managed fresh transaction owner");
+        let production = &production_tail[..production_end];
+        assert!(production.contains("self.commit_remote_agent_access_fresh_v2_with("));
+        assert!(production.contains(
+            "store.commit_remote_agent_access_fresh_v2(same_epoch, preflight)"
+        ));
+        let start = source
+            .find("    fn commit_remote_agent_access_fresh_v2_with<'request, 'running, Commit>(")
+            .expect("missing managed fresh transaction owner");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n    /// After the first PXAR-v7 marker")
+            .expect("missing managed fresh seam boundary");
+        let seam = &tail[..end];
+
+        let destructure = seam
+            .find("let RemoteAgentAccessCurrentFinalLeaseBundleV2 {")
+            .expect("fresh seam does not consume the whole CurrentFinal wrapper");
+        let preflight = seam
+            .find("current_final.try_preflight_fresh(verified_ingress)")
+            .expect("fresh pure preflight disappeared");
+        let pure_rebuild = seam
+            .find("RemoteAgentAccessFreshCommitRejectCauseV2::State(cause)")
+            .expect("pure rejection no longer rebuilds its wrapper");
+        let store = seam
+            .find("match commit(&mut self.store, same_epoch, preflight)")
+            .expect("sole synchronous PXRJ/PXRS store transaction disappeared");
+        let success = seam
+            .find("Ok(RemoteAgentAccessFreshCommittedLeaseBundleV2 {")
+            .expect("opaque fresh success bundle disappeared");
+        let store_reject = seam
+            .find("RemoteAgentAccessFreshCommitErrorV2::Rejected {")
+            .expect("J-before store rejection handling disappeared");
+        let recover_preflight = seam
+            .find("(*preflight).into_rejected_parts()")
+            .expect("J-before preflight recovery disappeared");
+        let uncertain = seam
+            .find("RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause)")
+            .expect("J-after uncertainty handling disappeared");
+        let drop_pxap = seam
+            .find("drop(exact_pxap);")
+            .expect("J-after uncertainty retained fixed PXAP authority");
+        assert!(
+            destructure < preflight
+                && preflight < pure_rebuild
+                && pure_rebuild < store
+                && store < success
+                && success < store_reject
+                && store_reject < recover_preflight
+                && recover_preflight < uncertain
+                && uncertain < drop_pxap
+        );
+        assert_eq!(
+            seam.match_indices("RemoteAgentAccessCurrentFinalLeaseBundleV2 {")
+                .count(),
+            3,
+            "input destructure plus the two pre-J rejection rebuilds must be the only uses",
+        );
+        assert!(!seam.contains("RemoteAgentPendingAccessSnapshotV2"));
+        assert!(!seam.contains("RemoteAgentAuthorizedTransitionV2"));
+        assert!(!seam[uncertain..].contains("current:"));
+        assert!(!seam[uncertain..].contains("verified_ingress:"));
+
+        let success_start = source
+            .find("pub(crate) struct RemoteAgentAccessFreshCommittedLeaseBundleV2 {")
+            .expect("missing opaque fresh success wrapper");
+        let success_tail = &source[success_start..];
+        let success_end = success_tail
+            .find("\n#[derive(Debug)]\npub(crate) enum RemoteAgentAccessFreshCommitRejectCauseV2")
+            .expect("missing fresh success wrapper boundary");
+        let success_wrapper = &success_tail[..success_end];
+        assert!(success_wrapper.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
+        assert!(success_wrapper.contains("exact_pxap: Box<[u8]>"));
+        assert!(!success_wrapper.contains("Pending"));
+        assert!(!success_wrapper.contains("verified_ingress"));
+        assert!(!success_wrapper.contains("current_final"));
+        assert!(!success_wrapper.contains("#[derive(Clone"));
+
+        let store_source = include_str!("runtime_store.rs");
+        let store_start = store_source
+            .find("    pub(crate) fn commit_remote_agent_access_fresh_v2<'request, 'running>(")
+            .expect("missing sole store fresh transaction");
+        let store_tail = &store_source[store_start..];
+        let store_end = store_tail
+            .find("    /// Raw structural fixture seam.")
+            .expect("missing store fresh transaction boundary");
+        let store_transaction = &store_tail[..store_end];
+        let stable_publication = store_transaction
+            .find("let stable_exact = match self.publish_remote_agent_replay_journal_v2(")
+            .expect("fresh transaction lost final Stable PXRJ publication");
+        let release_pin = store_transaction
+            .rfind("drop(authorized);")
+            .expect("fresh transaction lost explicit post-Stable Pin release");
+        let return_lease = store_transaction
+            .rfind("Ok(committed_pxrs)")
+            .expect("fresh transaction lost joint lease return");
+        assert!(stable_publication < release_pin && release_pin < return_lease);
+        assert_eq!(
+            store_transaction[..stable_publication]
+                .match_indices("drop(authorized);")
+                .count(),
+            0,
+            "live ingress Pin was released before Stable journal readback",
+        );
+
+        let test_forwarding_start = source
+            .find("    pub(crate) fn commit_remote_agent_access_fresh_v2_at_failpoints<")
+            .expect("missing managed three-stage failpoint forwarding");
+        let test_forwarding_tail = &source[test_forwarding_start..];
+        let test_forwarding_end = test_forwarding_tail
+            .find("    /// Returns the strictly decoded latest PXDE slot.")
+            .expect("missing managed fresh test-forwarding boundary");
+        let test_forwarding = &test_forwarding_tail[..test_forwarding_end];
+        assert!(source[..test_forwarding_start].ends_with("    #[cfg(test)]\n"));
+        assert!(test_forwarding.contains(
+            "store.commit_remote_agent_access_fresh_v2_at_failpoints("
+        ));
+        assert!(test_forwarding.contains(
+            ".seed_remote_agent_replay_unapplied_stable_for_test(&same_epoch, &preflight)"
+        ));
+        assert!(test_forwarding.contains("preflight.into_rejected_parts()"));
+        assert!(test_forwarding.contains("RemoteAgentAccessCurrentFinalLeaseBundleV2 {"));
+
+        let endpoint = include_str!("runtime_control_endpoint.rs");
+        let dispatch = endpoint
+            .split_once("    async fn handle_request(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "    pub(crate) async fn handle_restricted_distributed_agent_stack_apply_v1(",
+                )
+            })
+            .map(|(dispatch, _)| dispatch)
+            .expect("missing endpoint request dispatch boundary");
+        assert!(!dispatch.contains("commit_remote_agent_access_fresh_v2"));
+        assert!(!dispatch.contains("seed_remote_agent_replay_unapplied_stable_for_test"));
+        assert!(!dispatch.contains("commit_remote_agent_access_fresh_v2_at_failpoints"));
     }
 
     #[test]
@@ -3582,17 +4120,24 @@ mod tests {
             .find("verify_remote_agent_access_initialized_absent_candidate_v2(")
             .expect("missing PXRS2 prevalidation");
         let lease_take = commit
-            .find("take_remote_agent_access_absent_lease_v2(candidate)")
-            .expect("missing PXRS2 Absent lease take");
+            .find("take_remote_agent_access_genesis_absent_leases_v2()")
+            .expect("missing joint PXRS/PXRJ Absent lease take");
         let store_write = commit
-            .find(".initialize_remote_agent_access_genesis_v2(absent, candidate)")
-            .expect("missing PXRS2 store initialization");
+            .find(".initialize_remote_agent_access_genesis_v2(")
+            .expect("missing joint PXRS/PXRJ store initialization");
         let finish = commit
-            .find("finish_remote_agent_access_initialization_v2(result)")
+            .find("finish_remote_agent_access_genesis_initialization_v2(result)")
             .expect("missing PXRS2 post-readback binder");
         assert!(prevalidation < lease_take && lease_take < store_write && store_write < finish);
+        assert!(commit.contains("access_absent,"));
+        assert!(commit.contains("replay_journal_absent,"));
         assert!(!commit[..lease_take].contains("self.store"));
         assert!(!commit[..lease_take].contains("latch_remote_agent_access_s0_mutation"));
+        assert!(commit.contains("drop(candidate);"));
+        assert!(commit.contains(
+            "RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected("
+        ));
+        assert!(!commit.contains("into_retry"));
 
         let raw_start = source
             .find("    /// Raw structural fixture seam")
@@ -3630,9 +4175,19 @@ mod tests {
         assert!(state_source[..raw_ctor].ends_with("    #[cfg(test)]\n"));
 
         let store_source = include_str!("runtime_store.rs");
-        assert!(store_source.contains(
-            "pub(crate) type RemoteAgentAccessGenesisInitializeCommitErrorV2 =\n    RemoteAgentAccessCommitErrorV2<RemoteAgentAccessGenesisCandidateV2>;"
-        ));
+        let production_error_start = store_source
+            .find("pub(crate) enum RemoteAgentAccessGenesisInitializeCommitErrorV2 {")
+            .expect("missing production-only genesis commit error");
+        let production_error_tail = &store_source[production_error_start..];
+        let production_error_end = production_error_tail
+            .find("\n\n#[cfg(test)]\npub(crate) enum RemoteAgentAccessCommitErrorV2")
+            .expect("missing cfg(test) generic commit-error boundary");
+        let production_error = &production_error_tail[..production_error_end];
+        assert!(production_error.contains("Rejected(ManagedFabricStoreError)"));
+        assert!(production_error.contains("OutcomeUncertain(ManagedFabricStoreError)"));
+        assert!(!production_error.contains("Candidate"));
+        assert!(!production_error.contains("candidate"));
+        assert!(!production_error.contains("into_retry"));
         let sealed_store = store_source
             .find("    pub(crate) fn initialize_remote_agent_access_genesis_v2(")
             .expect("missing opaque-candidate store initializer");
@@ -3646,6 +4201,10 @@ mod tests {
                 .contains("candidate: RemoteAgentAccessGenesisCandidateV2")
         );
         assert!(
+            store_source[sealed_store..raw_store]
+                .contains("replay_journal_absent: RemoteAgentReplayJournalAbsentLeaseV2")
+        );
+        assert!(
             !store_source[sealed_store..raw_store]
                 .contains("snapshot: RemoteAgentAccessSnapshotV2")
         );
@@ -3655,7 +4214,7 @@ mod tests {
             .expect("missing PXRS2 initial-only validator");
         let validator_tail = &source[validator_start..];
         let validator_end = validator_tail
-            .find("\n    fn take_remote_agent_access_absent_lease_v2<Candidate>(")
+            .find("\n    fn take_remote_agent_access_genesis_absent_leases_v2(")
             .expect("missing PXRS2 validator boundary");
         let validator = &validator_tail[..validator_end];
         for required in [
@@ -3682,6 +4241,53 @@ mod tests {
         assert!(!validator.contains("remote_agent_access_startup_v2.take()"));
         assert!(!validator.contains("latch_remote_agent_access_s0_mutation"));
 
+        let production_finish_start = source
+            .find("    fn finish_remote_agent_access_genesis_initialization_v2(")
+            .expect("missing production genesis finish");
+        let production_finish_tail = &source[production_finish_start..];
+        let production_finish_end = production_finish_tail
+            .find(
+                "    #[cfg(test)]\n    fn take_remote_agent_access_absent_leases_v2<Candidate>(",
+            )
+            .expect("missing production genesis finish boundary");
+        let production_finish = &production_finish_tail[..production_finish_end];
+        assert!(production_finish.contains(
+            "RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)"
+        ));
+        assert!(production_finish.contains(
+            "RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)"
+        ));
+        let uncertain = production_finish
+            .find("Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain")
+            .expect("production genesis uncertainty branch disappeared");
+        let rejected = production_finish
+            .find("Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected")
+            .expect("production genesis rejection branch disappeared");
+        assert!(production_finish[uncertain..rejected]
+            .contains("latch_remote_agent_access_s0_mutation_freeze_v2()"));
+        assert!(!production_finish[rejected..]
+            .contains("latch_remote_agent_access_s0_mutation_freeze_v2()"));
+
+        let endpoint_source = include_str!("runtime_control_endpoint.rs");
+        let endpoint_map_start = endpoint_source
+            .find("fn map_remote_agent_access_genesis_initialize_error_v2(")
+            .expect("missing endpoint genesis error map");
+        let endpoint_map_tail = &endpoint_source[endpoint_map_start..];
+        let endpoint_map_end = endpoint_map_tail
+            .find("\nfn map_managed_agent_stack_error(")
+            .expect("missing endpoint genesis error-map boundary");
+        let endpoint_map = &endpoint_map_tail[..endpoint_map_end];
+        assert!(endpoint_map.contains(
+            "RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)"
+        ));
+        assert!(endpoint_map.contains(
+            "RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)"
+        ));
+        assert!(endpoint_map.contains("RuntimeControlRequestError::Unavailable"));
+        assert!(endpoint_map.contains("RuntimeBootstrapEndpointError::InvalidStartedState"));
+        assert!(!endpoint_map.contains("into_retry"));
+        assert!(!endpoint_map.contains("RemoteAgentAccessCommitErrorV2"));
+
         let failpoint_start = source
             .find("    fn initialize_remote_agent_access_and_latch_at_failpoint_v2(")
             .expect("missing PXRS2 failpoint initializer");
@@ -3695,8 +4301,8 @@ mod tests {
                 .find("verify_remote_agent_access_initialized_absent_candidate_v2(")
                 .expect("failpoint path bypasses initial-only prevalidation")
                 < failpoint
-                    .find("take_remote_agent_access_absent_lease_v2(candidate)")
-                    .expect("failpoint path lost the Absent lease take")
+                    .find("take_remote_agent_access_absent_leases_v2(candidate)")
+                    .expect("failpoint path lost the joint Absent lease take")
         );
     }
 
@@ -4119,13 +4725,14 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(
-            core.remote_agent_access_startup_v2.as_ref(),
-            Some(crate::runtime_store::RemoteAgentAccessStartupSlotV2::Absent(_))
-        ));
+        assert!(core.remote_agent_access_startup_v2.is_some());
         assert!(!core.remote_agent_access_s0_mutation_frozen_v2());
         let final_path = directory.path().join("remote-agent-access.snapshot-v2");
+        let replay_journal_path = directory
+            .path()
+            .join("remote-agent-access-replay-journal.snapshot-v2");
         assert!(!final_path.exists());
+        assert!(!replay_journal_path.exists());
 
         let valid =
             remote_agent_access_initial_snapshot_v2(&core.projection, fixture_runtime_host_epoch);
@@ -4137,6 +4744,7 @@ mod tests {
             RemoteAgentAccessDurablePhaseV2::InitializedAbsent
         );
         assert!(final_path.exists());
+        assert!(replay_journal_path.exists());
         assert!(core.remote_agent_access_s0_mutation_frozen_v2());
     }
 
@@ -4191,7 +4799,7 @@ mod tests {
     }
 
     #[test]
-    fn same_epoch_pxrs2_adjudication_latches_core_before_typed_error() {
+    fn same_epoch_stable_pxrs_pxrj_pair_latches_core_and_requires_reconciliation() {
         let projection = projection();
         let projection_digest = transition_projection_digest(&projection)
             .expect("PXRS2 transition projection digest must build");
@@ -4203,6 +4811,20 @@ mod tests {
                 b"same-epoch-agent-stack-initial",
             )
             .unwrap_or_else(|error| panic!("Agent-stack cutover fixture failed: {error}"));
+        let replay_absent = match store
+            .adjudicate_remote_agent_replay_journal_startup_v2(
+                remote_agent_access_static_identity_v2(&projection),
+                1,
+            )
+            .expect("missing PXRS/PXRJ pair must adjudicate absent")
+        {
+            crate::runtime_store::RemoteAgentReplayJournalStartupSlotV2::Absent(absent) => absent,
+            crate::runtime_store::RemoteAgentReplayJournalStartupSlotV2::Stable(_)
+            | crate::runtime_store::RemoteAgentReplayJournalStartupSlotV2::Pending(_)
+            | crate::runtime_store::RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(_) => {
+                panic!("fresh PXRS/PXRJ fixture was not absent")
+            }
+        };
         let absent = match store
             .adjudicate_remote_agent_access_startup_v2(
                 remote_agent_access_static_identity_v2(&projection),
@@ -4216,6 +4838,7 @@ mod tests {
                 panic!("fresh PXRS2 fixture was not absent")
             }
         };
+        drop(replay_absent);
         store
             .initialize_remote_agent_access_v2(
                 absent,
@@ -4239,7 +4862,7 @@ mod tests {
 
         assert!(matches!(
             core.adjudicate_remote_agent_access_after_first_stack_marker_v2(),
-            Err(ManagedFabricRuntimeError::RemoteAgentAccessSameEpochFrozen)
+            Err(ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired)
         ));
         assert!(core.remote_agent_access_s0_mutation_frozen_v2());
         assert!(matches!(

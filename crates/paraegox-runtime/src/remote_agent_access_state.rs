@@ -66,6 +66,7 @@ use crate::{
         RemoteAgentDescriptorEvidenceV1, RemoteAgentVerifiedDescriptorEvidenceV1,
     },
     runtime_control_endpoint::RemoteAgentLiveLowerProjectionV2,
+    runtime_store::RemoteAgentReplayJournalPendingAuthorityV2,
 };
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PXRS";
@@ -1606,6 +1607,24 @@ pub(crate) const MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_V2_BYTES: usize = SNAPSHOT_V2_
 
 const _: [(); 19_446] = [(); MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_V2_BYTES];
 
+const REPLAY_JOURNAL_MAGIC_V2: &[u8; 4] = b"PXRJ";
+const REPLAY_JOURNAL_VERSION_V2: u16 = 2;
+const REPLAY_JOURNAL_HEADER_BYTES_V2: usize = 224;
+const REPLAY_JOURNAL_BURN_BYTES_V2: usize = 80;
+const REPLAY_JOURNAL_DIGEST_BYTES_V2: usize = 32;
+const REPLAY_JOURNAL_HEADER_RESERVED_BYTES_V2: usize = 3;
+const REPLAY_JOURNAL_ORDINAL_RESERVED_BYTES_V2: usize = 6;
+const REPLAY_JOURNAL_DIGEST_DOMAIN_V2: &[u8] =
+    b"paraegox.runtime.remote-agent-replay-authority-journal.sha256.v2";
+
+pub(crate) const MAX_REMOTE_AGENT_REPLAY_JOURNAL_BURNS_V2: usize = 256;
+pub(crate) const MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES: usize =
+    REPLAY_JOURNAL_HEADER_BYTES_V2
+        + (MAX_REMOTE_AGENT_REPLAY_JOURNAL_BURNS_V2 * REPLAY_JOURNAL_BURN_BYTES_V2)
+        + REPLAY_JOURNAL_DIGEST_BYTES_V2;
+
+const _: [(); 20_736] = [(); MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES];
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub(crate) enum RemoteAgentAccessDurablePhaseV2 {
@@ -1933,15 +1952,128 @@ struct RemoteAgentFreshAccessRequestV2<'request> {
     admission: RemoteAgentAccessAdmissionFactsV2,
 }
 
+/// Permanent Runtime-store identity for the replay authority journal. It binds
+/// the complete independently available PXRS static identity; only the live
+/// lower-capability projection remains outside inert startup state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteAgentReplayJournalIdentityPinsV2 {
+    pub(crate) target: RuntimeHostId,
+    pub(crate) store_instance_id: [u8; 32],
+    pub(crate) owner_target_fingerprint: Digest32,
+    pub(crate) transition_projection_digest: Digest32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum RemoteAgentReplayJournalPhaseV2 {
+    Stable = 1,
+    PendingEdge = 2,
+}
+
+impl RemoteAgentReplayJournalPhaseV2 {
+    fn decode(value: u8) -> Result<Self, RemoteAgentReplayJournalStateErrorV2> {
+        match value {
+            1 => Ok(Self::Stable),
+            2 => Ok(Self::PendingEdge),
+            _ => Err(RemoteAgentReplayJournalStateErrorV2::UnknownPhase),
+        }
+    }
+}
+
+/// One permanent three-axis replay burn. The fields remain private so arbitrary
+/// callers cannot fabricate a production reservation from loose identifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteAgentReplayBurnV2 {
+    operation_id: [u8; 16],
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+}
+
+/// Inert canonical PXRJ-v2 state. Decode never grants transition or effect
+/// authority; store exact-readback seams retain that responsibility.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteAgentReplayJournalSnapshotV2 {
+    identity: RemoteAgentReplayJournalIdentityPinsV2,
+    writer_runtime_host_epoch: u64,
+    phase: RemoteAgentReplayJournalPhaseV2,
+    revision: u64,
+    applied_burn_ordinal: u16,
+    pending_source_snapshot_sequence: u64,
+    pending_source_snapshot_digest: Digest32,
+    pending_candidate_snapshot_digest: Digest32,
+    burns: Box<[RemoteAgentReplayBurnV2]>,
+    canonical_wire: Box<[u8]>,
+    snapshot_digest: Digest32,
+}
+
+/// Opaque sequence-one empty-Stable PXRJ candidate. Production construction is
+/// possible only beside the already sealed PXRS genesis candidate.
+pub(crate) struct RemoteAgentReplayJournalGenesisCandidateV2 {
+    snapshot: RemoteAgentReplayJournalSnapshotV2,
+}
+
+/// Opaque Stable-to-PendingEdge candidate. It is durable replay state only and
+/// carries no permission to construct or publish a PXRS successor.
+pub(crate) struct RemoteAgentReplayJournalPendingCandidateV2 {
+    snapshot: RemoteAgentReplayJournalSnapshotV2,
+}
+
+/// Opaque PendingEdge-to-Stable candidate built only after an exact Prepared
+/// PXRS destination structurally matches the pending reservation.
+pub(crate) struct RemoteAgentReplayJournalStableCandidateV2 {
+    snapshot: RemoteAgentReplayJournalSnapshotV2,
+}
+
+/// Move-only, pure fresh preflight. It owns CurrentFinal, the verified ingress
+/// (and therefore its live carrier Pin), and the fully built inert PXRS
+/// candidate. No candidate accessor is exposed before durable PXRJ readback.
+pub(crate) struct RemoteAgentReplayFreshPreflightV2<'request, 'running> {
+    current_final: RemoteAgentCurrentFinalAccessSnapshotV2,
+    verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    pending: RemoteAgentPendingAccessSnapshotV2,
+    burn: RemoteAgentReplayBurnV2,
+    pending_candidate_snapshot_digest: Digest32,
+}
+
+/// Exact PXRJ-authorized fresh edge. Only the Runtime store's paired
+/// PXRS-then-PXRJ commit seam may inspect and consume its private Pending value.
+pub(crate) struct RemoteAgentJournalAuthorizedFreshV2<'request, 'running> {
+    current_final: RemoteAgentCurrentFinalAccessSnapshotV2,
+    verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    pending: RemoteAgentPendingAccessSnapshotV2,
+}
+
+/// Rejected pure preflight returns every move-only authority input intact so an
+/// owning orchestrator can fail closed without silently dropping the Pin.
+pub(crate) struct RemoteAgentReplayFreshPreflightErrorV2<'request, 'running> {
+    cause: RemoteAgentAccessStateErrorV2,
+    current_final: RemoteAgentCurrentFinalAccessSnapshotV2,
+    verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteAgentReplayStartupPairClassificationV2 {
+    Absent,
+    SameEpochStable,
+    SameEpochPendingAtSource,
+    SameEpochPendingDestinationObserved,
+    OldEpochStable,
+    OldEpochPendingAtSource,
+    OldEpochPendingDestinationObserved,
+    ReconcileRequired,
+}
+
 /// Opaque, non-cloneable proof that D2's durable all-history replay registry
-/// admitted this exact request against this exact current-final snapshot. D1
-/// intentionally provides no production constructor: a bounded PXRS record
-/// cannot honestly prove permanent A -> B -> A replay exclusion by itself.
+/// admitted this exact request against this exact current-final snapshot. Its
+/// sole production constructor consumes the store's exact PendingEdge readback
+/// authority; a bounded PXRS record cannot mint it.
 pub(crate) struct RemoteAgentDurableReplayCheckedV2 {
+    current_snapshot_sequence: u64,
     current_snapshot_digest: Digest32,
     operation_id: [u8; 16],
     tenure_nonce_identity: Digest32,
     request_nonce_identity: Digest32,
+    pending_candidate_snapshot_digest: Digest32,
 }
 
 /// One fully-built successor awaiting D2 durable commit plus exact readback.
@@ -2705,14 +2837,46 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
         Ok(())
     }
 
-    /// Consumes current-final authority and creates a fresh Prepared snapshot.
-    /// CAS mismatches return before a successor value exists; consequently D2
-    /// has no state write and PXAU v2 has no producer input on that path.
-    pub(crate) fn try_authorize_fresh(
+    /// Purely validates and completely builds one fresh Prepared successor while
+    /// retaining CurrentFinal and the live ingress Pin. The inert successor
+    /// remains private until an exact PXRJ PendingEdge readback later supplies
+    /// the matching one-shot replay authority.
+    pub(crate) fn try_preflight_fresh<'request, 'running>(
         self,
-        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'_, '_>,
-        durable_replay_checked: RemoteAgentDurableReplayCheckedV2,
-    ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
+        verified_ingress: VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    ) -> Result<
+        RemoteAgentReplayFreshPreflightV2<'request, 'running>,
+        RemoteAgentReplayFreshPreflightErrorV2<'request, 'running>,
+    > {
+        match self.try_build_fresh_preflight(&verified_ingress) {
+            Ok((pending, burn, pending_candidate_snapshot_digest)) => {
+                Ok(RemoteAgentReplayFreshPreflightV2 {
+                    current_final: self,
+                    verified_ingress,
+                    pending,
+                    burn,
+                    pending_candidate_snapshot_digest,
+                })
+            }
+            Err(cause) => Err(RemoteAgentReplayFreshPreflightErrorV2 {
+                cause,
+                current_final: self,
+                verified_ingress,
+            }),
+        }
+    }
+
+    fn try_build_fresh_preflight(
+        &self,
+        verified_ingress: &VerifiedRemoteAgentAccessApplyIngressV2<'_, '_>,
+    ) -> Result<
+        (
+            RemoteAgentPendingAccessSnapshotV2,
+            RemoteAgentReplayBurnV2,
+            Digest32,
+        ),
+        RemoteAgentAccessStateErrorV2,
+    > {
         self.validate_marker()?;
         let live_carrier_binding_digest = verified_ingress
             .carrier_binding_digest()
@@ -2720,8 +2884,8 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
         if live_carrier_binding_digest != self.current_carrier_binding_digest {
             return Err(RemoteAgentAccessStateErrorV2::CasMismatch);
         }
-        let current = self.snapshot;
-        let fresh = bind_fresh_request_v2(&verified_ingress, self.current_runtime_host_epoch)?;
+        let current = &self.snapshot;
+        let fresh = bind_fresh_request_v2(verified_ingress, self.current_runtime_host_epoch)?;
         let request = fresh.request;
         let inner = inner_request_v2(request)?;
         let resolved_current_s1_cas = current.resolved_current_s1_cas()?;
@@ -2741,8 +2905,7 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
         {
             return Err(RemoteAgentAccessStateErrorV2::CasMismatch);
         }
-        durable_replay_checked.validate(&current, &fresh)?;
-        validate_fresh_replay_fence_v2(&current, &fresh)?;
+        validate_fresh_replay_fence_v2(current, &fresh)?;
         let mode = inner.target_execution().mode();
         let current_head = current.resolved_active_head_for_replacement()?;
         match (mode, current_head.as_ref()) {
@@ -2825,8 +2988,9 @@ impl RemoteAgentCurrentFinalAccessSnapshotV2 {
             snapshot_digest: zero_digest(),
         })?;
         let pending = RemoteAgentPendingAccessSnapshotV2 { snapshot };
-        drop(verified_ingress);
-        Ok(pending)
+        let burn = RemoteAgentReplayBurnV2::from_fresh_request(&fresh)?;
+        let pending_candidate_snapshot_digest = pending.snapshot.snapshot_digest;
+        Ok((pending, burn, pending_candidate_snapshot_digest))
     }
 
     /// Re-mints one-edge authority only after D2 has committed and exactly read
@@ -2858,17 +3022,242 @@ impl RemoteAgentPendingAccessSnapshotV2 {
     }
 }
 
-impl RemoteAgentDurableReplayCheckedV2 {
-    fn validate(
-        self,
-        current: &RemoteAgentAccessSnapshotV2,
+impl RemoteAgentReplayBurnV2 {
+    fn from_fresh_request(
         fresh: &RemoteAgentFreshAccessRequestV2<'_>,
-    ) -> Result<(), RemoteAgentAccessStateErrorV2> {
+    ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
         let inner = inner_request_v2(fresh.request)?;
-        if self.current_snapshot_digest != current.snapshot_digest
-            || self.operation_id != *inner.operation_id().as_bytes()
-            || self.tenure_nonce_identity != fresh.admission.tenure_nonce_identity
-            || self.request_nonce_identity != fresh.admission.request_nonce_identity
+        Ok(Self {
+            operation_id: *inner.operation_id().as_bytes(),
+            tenure_nonce_identity: fresh.admission.tenure_nonce_identity,
+            request_nonce_identity: fresh.admission.request_nonce_identity,
+        })
+    }
+
+    fn from_snapshot_operation(
+        snapshot: &RemoteAgentAccessSnapshotV2,
+    ) -> Result<Option<Self>, RemoteAgentReplayJournalStateErrorV2> {
+        match (&snapshot.operation_request, snapshot.admission) {
+            (None, None) if snapshot.phase == RemoteAgentAccessDurablePhaseV2::InitializedAbsent => {
+                Ok(None)
+            }
+            (Some(request), Some(admission)) => {
+                let inner = inner_request_v2(request)
+                    .map_err(|_| RemoteAgentReplayJournalStateErrorV2::PxrsMismatch)?;
+                Ok(Some(Self {
+                    operation_id: *inner.operation_id().as_bytes(),
+                    tenure_nonce_identity: admission.tenure_nonce_identity,
+                    request_nonce_identity: admission.request_nonce_identity,
+                }))
+            }
+            _ => Err(RemoteAgentReplayJournalStateErrorV2::PxrsMismatch),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_exact_axes_for_test(
+        operation_id: [u8; 16],
+        tenure_nonce_identity: Digest32,
+        request_nonce_identity: Digest32,
+    ) -> Self {
+        Self {
+            operation_id,
+            tenure_nonce_identity,
+            request_nonce_identity,
+        }
+    }
+}
+
+impl<'request, 'running> RemoteAgentReplayFreshPreflightV2<'request, 'running> {
+    #[must_use]
+    pub(crate) const fn journal_identity(&self) -> RemoteAgentReplayJournalIdentityPinsV2 {
+        replay_journal_identity_for_pxrs_v2(&self.current_final.snapshot)
+    }
+
+    #[must_use]
+    pub(crate) const fn writer_runtime_host_epoch(&self) -> u64 {
+        self.current_final.snapshot.writer_runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
+        self.current_final.snapshot.sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn source_snapshot_digest(&self) -> Digest32 {
+        self.current_final.snapshot.snapshot_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn operation_id(&self) -> [u8; 16] {
+        self.burn.operation_id
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(&self) -> Digest32 {
+        self.burn.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(&self) -> Digest32 {
+        self.burn.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn pending_candidate_snapshot_digest(&self) -> Digest32 {
+        self.pending_candidate_snapshot_digest
+    }
+
+    /// Store-private, inert view used to finish every fallible candidate check
+    /// before PXRJ PendingEdge publication. It carries no transition authority.
+    #[must_use]
+    pub(crate) const fn pending_snapshot_for_store_precommit(
+        &self,
+    ) -> &RemoteAgentAccessSnapshotV2 {
+        self.pending.snapshot()
+    }
+
+    /// Store-private canonical bytes for prepublication validation only. The
+    /// preflight retains ownership of both Pending and the live ingress Pin.
+    #[must_use]
+    pub(crate) fn pending_canonical_wire_for_store_precommit(&self) -> &[u8] {
+        self.pending.canonical_wire()
+    }
+
+    /// Recovers the original authorities only while PXRJ reservation was
+    /// rejected before publication. After a PendingEdge commit the store must
+    /// instead consume this preflight through the exact-readback seam below.
+    #[must_use]
+    pub(crate) fn into_rejected_parts(
+        self,
+    ) -> (
+        RemoteAgentCurrentFinalAccessSnapshotV2,
+        VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    ) {
+        (self.current_final, self.verified_ingress)
+    }
+
+    /// Consumes the store's exact PendingEdge readback authority and releases
+    /// the already-built candidate only inside a store-consumable wrapper. No
+    /// encode, allocation or request parse occurs after the authority check.
+    pub(crate) fn try_authorize_from_replay_journal_v2(
+        self,
+        authority: RemoteAgentReplayJournalPendingAuthorityV2,
+    ) -> Result<
+        RemoteAgentJournalAuthorizedFreshV2<'request, 'running>,
+        RemoteAgentAccessStateErrorV2,
+    > {
+        let durable_replay_checked =
+            RemoteAgentDurableReplayCheckedV2::from_pending_journal_exact_readback(authority);
+        durable_replay_checked.validate_preflight(&self)?;
+        let Self {
+            current_final,
+            verified_ingress,
+            pending,
+            burn: _,
+            pending_candidate_snapshot_digest: _,
+        } = self;
+        Ok(RemoteAgentJournalAuthorizedFreshV2 {
+            current_final,
+            verified_ingress,
+            pending,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_authorize_from_replay_ledger_for_test(
+        self,
+        seen_operation_ids: &[[u8; 16]],
+        seen_tenure_nonce_identities: &[Digest32],
+        seen_request_nonce_identities: &[Digest32],
+    ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
+        let durable_replay_checked =
+            RemoteAgentDurableReplayCheckedV2::from_preflight_for_test(
+                &self,
+                seen_operation_ids,
+                seen_tenure_nonce_identities,
+                seen_request_nonce_identities,
+            )?;
+        durable_replay_checked.validate_preflight(&self)?;
+        let Self {
+            current_final,
+            verified_ingress,
+            pending,
+            burn: _,
+            pending_candidate_snapshot_digest: _,
+        } = self;
+        drop(current_final);
+        drop(verified_ingress);
+        Ok(pending)
+    }
+}
+
+impl<'request, 'running> RemoteAgentJournalAuthorizedFreshV2<'request, 'running> {
+    #[must_use]
+    pub(crate) const fn snapshot_for_store(&self) -> &RemoteAgentAccessSnapshotV2 {
+        self.pending.snapshot()
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_wire_for_store(&self) -> &[u8] {
+        self.pending.canonical_wire()
+    }
+}
+
+impl<'request, 'running> Drop for RemoteAgentJournalAuthorizedFreshV2<'request, 'running> {
+    fn drop(&mut self) {
+        let _current_final_guard = &self.current_final;
+        let _verified_ingress_guard = &self.verified_ingress;
+    }
+}
+
+impl<'request, 'running> RemoteAgentReplayFreshPreflightErrorV2<'request, 'running> {
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RemoteAgentAccessStateErrorV2,
+        RemoteAgentCurrentFinalAccessSnapshotV2,
+        VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+    ) {
+        (self.cause, self.current_final, self.verified_ingress)
+    }
+}
+
+impl fmt::Display for RemoteAgentReplayFreshPreflightErrorV2<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cause.fmt(formatter)
+    }
+}
+
+impl RemoteAgentDurableReplayCheckedV2 {
+    fn from_pending_journal_exact_readback(
+        authority: RemoteAgentReplayJournalPendingAuthorityV2,
+    ) -> Self {
+        let checked = Self {
+            current_snapshot_sequence: authority.source_pxrs_sequence(),
+            current_snapshot_digest: authority.source_pxrs_digest(),
+            operation_id: authority.operation_id(),
+            tenure_nonce_identity: authority.tenure_nonce_identity(),
+            request_nonce_identity: authority.request_nonce_identity(),
+            pending_candidate_snapshot_digest: authority.pending_candidate_snapshot_digest(),
+        };
+        drop(authority);
+        checked
+    }
+
+    fn validate_preflight(
+        self,
+        preflight: &RemoteAgentReplayFreshPreflightV2<'_, '_>,
+    ) -> Result<(), RemoteAgentAccessStateErrorV2> {
+        if self.current_snapshot_sequence != preflight.source_snapshot_sequence()
+            || self.current_snapshot_digest != preflight.source_snapshot_digest()
+            || self.operation_id != preflight.operation_id()
+            || self.tenure_nonce_identity != preflight.tenure_nonce_identity()
+            || self.request_nonce_identity != preflight.request_nonce_identity()
+            || self.pending_candidate_snapshot_digest
+                != preflight.pending_candidate_snapshot_digest()
         {
             return Err(RemoteAgentAccessStateErrorV2::InvalidReplayAuthority);
         }
@@ -2876,31 +3265,764 @@ impl RemoteAgentDurableReplayCheckedV2 {
     }
 
     #[cfg(test)]
-    fn from_durable_replay_ledger_for_test(
-        current: &RemoteAgentAccessSnapshotV2,
-        request: &RemoteAgentAccessRequestV2,
-        admitted_at_nanos: u64,
+    fn from_preflight_for_test(
+        preflight: &RemoteAgentReplayFreshPreflightV2<'_, '_>,
         seen_operation_ids: &[[u8; 16]],
         seen_tenure_nonce_identities: &[Digest32],
         seen_request_nonce_identities: &[Digest32],
     ) -> Result<Self, RemoteAgentAccessStateErrorV2> {
-        let inner = inner_request_v2(request)?;
-        let admission = derive_admission_facts_v2(request, admitted_at_nanos)?;
-        let operation_id = *inner.operation_id().as_bytes();
+        let operation_id = preflight.operation_id();
         if seen_operation_ids.contains(&operation_id)
-            || seen_tenure_nonce_identities.contains(&admission.tenure_nonce_identity)
-            || seen_request_nonce_identities.contains(&admission.request_nonce_identity)
+            || seen_tenure_nonce_identities.contains(&preflight.tenure_nonce_identity())
+            || seen_request_nonce_identities.contains(&preflight.request_nonce_identity())
         {
             return Err(RemoteAgentAccessStateErrorV2::ReplayDetected);
         }
         Ok(Self {
-            current_snapshot_digest: current.snapshot_digest,
+            current_snapshot_sequence: preflight.source_snapshot_sequence(),
+            current_snapshot_digest: preflight.source_snapshot_digest(),
             operation_id,
-            tenure_nonce_identity: admission.tenure_nonce_identity,
-            request_nonce_identity: admission.request_nonce_identity,
+            tenure_nonce_identity: preflight.tenure_nonce_identity(),
+            request_nonce_identity: preflight.request_nonce_identity(),
+            pending_candidate_snapshot_digest: preflight.pending_candidate_snapshot_digest(),
         })
     }
 }
+
+impl From<RemoteAgentAccessStaticIdentityPinsV2> for RemoteAgentReplayJournalIdentityPinsV2 {
+    fn from(identity: RemoteAgentAccessStaticIdentityPinsV2) -> Self {
+        Self {
+            target: identity.target,
+            store_instance_id: identity.store_instance_id,
+            owner_target_fingerprint: identity.owner_target_fingerprint,
+            transition_projection_digest: identity.transition_projection_digest,
+        }
+    }
+}
+
+impl RemoteAgentReplayJournalSnapshotV2 {
+    fn try_build(mut snapshot: Self) -> Result<Self, RemoteAgentReplayJournalStateErrorV2> {
+        snapshot.validate_shape()?;
+        let (canonical_wire, snapshot_digest) = snapshot.encode()?;
+        snapshot.canonical_wire = canonical_wire;
+        snapshot.snapshot_digest = snapshot_digest;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn decode(
+        frame: &[u8],
+        expected_identity: RemoteAgentReplayJournalIdentityPinsV2,
+    ) -> Result<Self, RemoteAgentReplayJournalStateErrorV2> {
+        if frame.len() > MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES {
+            return Err(RemoteAgentReplayJournalStateErrorV2::FrameTooLarge);
+        }
+        if frame.len()
+            < REPLAY_JOURNAL_HEADER_BYTES_V2 + REPLAY_JOURNAL_DIGEST_BYTES_V2
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::Truncated);
+        }
+        let payload_bytes = frame
+            .len()
+            .checked_sub(REPLAY_JOURNAL_HEADER_BYTES_V2 + REPLAY_JOURNAL_DIGEST_BYTES_V2)
+            .ok_or(RemoteAgentReplayJournalStateErrorV2::InvalidLength)?;
+        if payload_bytes % REPLAY_JOURNAL_BURN_BYTES_V2 != 0
+            || payload_bytes / REPLAY_JOURNAL_BURN_BYTES_V2
+                > MAX_REMOTE_AGENT_REPLAY_JOURNAL_BURNS_V2
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidLength);
+        }
+
+        let mut cursor = RemoteAgentReplayJournalCursorV2::new(frame);
+        if cursor.array::<4>()? != *REPLAY_JOURNAL_MAGIC_V2
+            || cursor.u16()? != REPLAY_JOURNAL_VERSION_V2
+            || usize::from(cursor.u16()?) != REPLAY_JOURNAL_HEADER_BYTES_V2
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::UnsupportedWire);
+        }
+        if cursor.usize_u32()? != frame.len() {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidLength);
+        }
+        let phase = RemoteAgentReplayJournalPhaseV2::decode(cursor.u8()?)?;
+        if !bytes_are_zero_v2(&cursor.array::<REPLAY_JOURNAL_HEADER_RESERVED_BYTES_V2>()?) {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidReserved);
+        }
+        let revision = cursor.u64()?;
+        let applied_burn_ordinal = cursor.u16()?;
+        if !bytes_are_zero_v2(&cursor.array::<REPLAY_JOURNAL_ORDINAL_RESERVED_BYTES_V2>()?) {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidReserved);
+        }
+        let writer_runtime_host_epoch = cursor.u64()?;
+        let pending_source_snapshot_sequence = cursor.u64()?;
+        let identity = RemoteAgentReplayJournalIdentityPinsV2 {
+            target: RuntimeHostId::from_bytes(cursor.array()?),
+            store_instance_id: cursor.array()?,
+            owner_target_fingerprint: Digest32::from_bytes(cursor.array()?),
+            transition_projection_digest: Digest32::from_bytes(cursor.array()?),
+        };
+        let pending_source_snapshot_digest = Digest32::from_bytes(cursor.array()?);
+        let pending_candidate_snapshot_digest = Digest32::from_bytes(cursor.array()?);
+        if cursor.offset != REPLAY_JOURNAL_HEADER_BYTES_V2 {
+            return Err(RemoteAgentReplayJournalStateErrorV2::NonCanonical);
+        }
+
+        let burn_count = payload_bytes / REPLAY_JOURNAL_BURN_BYTES_V2;
+        let mut burns = Vec::with_capacity(burn_count);
+        for _ in 0..burn_count {
+            burns.push(RemoteAgentReplayBurnV2 {
+                operation_id: cursor.array()?,
+                tenure_nonce_identity: Digest32::from_bytes(cursor.array()?),
+                request_nonce_identity: Digest32::from_bytes(cursor.array()?),
+            });
+        }
+        let encoded_snapshot_digest = Digest32::from_bytes(cursor.array()?);
+        cursor.finish()?;
+        if remote_agent_replay_journal_digest_v2(
+            &frame[..frame.len() - REPLAY_JOURNAL_DIGEST_BYTES_V2],
+        ) != encoded_snapshot_digest
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::ChecksumMismatch);
+        }
+        if identity != expected_identity {
+            return Err(RemoteAgentReplayJournalStateErrorV2::IdentityMismatch);
+        }
+        let snapshot = Self::try_build(Self {
+            identity,
+            writer_runtime_host_epoch,
+            phase,
+            revision,
+            applied_burn_ordinal,
+            pending_source_snapshot_sequence,
+            pending_source_snapshot_digest,
+            pending_candidate_snapshot_digest,
+            burns: burns.into_boxed_slice(),
+            canonical_wire: Box::new([]),
+            snapshot_digest: zero_digest(),
+        })?;
+        if snapshot.snapshot_digest != encoded_snapshot_digest || snapshot.canonical_wire() != frame
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::NonCanonical);
+        }
+        Ok(snapshot)
+    }
+
+    fn encode(
+        &self,
+    ) -> Result<(Box<[u8]>, Digest32), RemoteAgentReplayJournalStateErrorV2> {
+        self.validate_shape()?;
+        let total_length = REPLAY_JOURNAL_HEADER_BYTES_V2
+            .checked_add(
+                self.burns
+                    .len()
+                    .checked_mul(REPLAY_JOURNAL_BURN_BYTES_V2)
+                    .ok_or(RemoteAgentReplayJournalStateErrorV2::FrameTooLarge)?,
+            )
+            .and_then(|length| length.checked_add(REPLAY_JOURNAL_DIGEST_BYTES_V2))
+            .ok_or(RemoteAgentReplayJournalStateErrorV2::FrameTooLarge)?;
+        if total_length > MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES {
+            return Err(RemoteAgentReplayJournalStateErrorV2::FrameTooLarge);
+        }
+        let total_length_u32 = u32::try_from(total_length)
+            .map_err(|_| RemoteAgentReplayJournalStateErrorV2::FrameTooLarge)?;
+        let mut wire = Vec::with_capacity(total_length);
+        wire.extend_from_slice(REPLAY_JOURNAL_MAGIC_V2);
+        wire.extend_from_slice(&REPLAY_JOURNAL_VERSION_V2.to_be_bytes());
+        wire.extend_from_slice(&(REPLAY_JOURNAL_HEADER_BYTES_V2 as u16).to_be_bytes());
+        wire.extend_from_slice(&total_length_u32.to_be_bytes());
+        wire.push(self.phase as u8);
+        wire.extend_from_slice(&[0; REPLAY_JOURNAL_HEADER_RESERVED_BYTES_V2]);
+        wire.extend_from_slice(&self.revision.to_be_bytes());
+        wire.extend_from_slice(&self.applied_burn_ordinal.to_be_bytes());
+        wire.extend_from_slice(&[0; REPLAY_JOURNAL_ORDINAL_RESERVED_BYTES_V2]);
+        wire.extend_from_slice(&self.writer_runtime_host_epoch.to_be_bytes());
+        wire.extend_from_slice(&self.pending_source_snapshot_sequence.to_be_bytes());
+        wire.extend_from_slice(self.identity.target.as_bytes());
+        wire.extend_from_slice(&self.identity.store_instance_id);
+        wire.extend_from_slice(self.identity.owner_target_fingerprint.as_bytes());
+        wire.extend_from_slice(self.identity.transition_projection_digest.as_bytes());
+        wire.extend_from_slice(self.pending_source_snapshot_digest.as_bytes());
+        wire.extend_from_slice(self.pending_candidate_snapshot_digest.as_bytes());
+        if wire.len() != REPLAY_JOURNAL_HEADER_BYTES_V2 {
+            return Err(RemoteAgentReplayJournalStateErrorV2::NonCanonical);
+        }
+        for burn in &self.burns {
+            wire.extend_from_slice(&burn.operation_id);
+            wire.extend_from_slice(burn.tenure_nonce_identity.as_bytes());
+            wire.extend_from_slice(burn.request_nonce_identity.as_bytes());
+        }
+        let snapshot_digest = remote_agent_replay_journal_digest_v2(&wire);
+        wire.extend_from_slice(snapshot_digest.as_bytes());
+        if wire.len() != total_length {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidLength);
+        }
+        Ok((wire.into_boxed_slice(), snapshot_digest))
+    }
+
+    fn validate_shape(&self) -> Result<(), RemoteAgentReplayJournalStateErrorV2> {
+        if self.identity.target.as_bytes().iter().all(|byte| *byte == 0)
+            || self.identity.store_instance_id.iter().all(|byte| *byte == 0)
+            || digest_is_zero(self.identity.owner_target_fingerprint)
+            || digest_is_zero(self.identity.transition_projection_digest)
+            || self.writer_runtime_host_epoch == 0
+            || self.burns.len() > MAX_REMOTE_AGENT_REPLAY_JOURNAL_BURNS_V2
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidState);
+        }
+        for (index, burn) in self.burns.iter().enumerate() {
+            if bytes_are_zero_v2(&burn.operation_id)
+                || digest_is_zero(burn.tenure_nonce_identity)
+                || digest_is_zero(burn.request_nonce_identity)
+            {
+                return Err(RemoteAgentReplayJournalStateErrorV2::InvalidBurn);
+            }
+            if self.burns[..index].iter().any(|prior| {
+                prior.operation_id == burn.operation_id
+                    || prior.tenure_nonce_identity == burn.tenure_nonce_identity
+                    || prior.request_nonce_identity == burn.request_nonce_identity
+            }) {
+                return Err(RemoteAgentReplayJournalStateErrorV2::ReplayDetected);
+            }
+        }
+        let burn_count = u64::try_from(self.burns.len())
+            .map_err(|_| RemoteAgentReplayJournalStateErrorV2::InvalidRevision)?;
+        let expected_revision = burn_count
+            .checked_mul(2)
+            .and_then(|revision| {
+                if self.phase == RemoteAgentReplayJournalPhaseV2::Stable {
+                    revision.checked_add(1)
+                } else {
+                    Some(revision)
+                }
+            })
+            .ok_or(RemoteAgentReplayJournalStateErrorV2::InvalidRevision)?;
+        if self.revision != expected_revision {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidRevision);
+        }
+        let applied = usize::from(self.applied_burn_ordinal);
+        match self.phase {
+            RemoteAgentReplayJournalPhaseV2::Stable => {
+                if applied > self.burns.len()
+                    || self.pending_source_snapshot_sequence != 0
+                    || !digest_is_zero(self.pending_source_snapshot_digest)
+                    || !digest_is_zero(self.pending_candidate_snapshot_digest)
+                {
+                    return Err(RemoteAgentReplayJournalStateErrorV2::InvalidStableShape);
+                }
+            }
+            RemoteAgentReplayJournalPhaseV2::PendingEdge => {
+                if self.burns.is_empty()
+                    || applied >= self.burns.len()
+                    || self.pending_source_snapshot_sequence == 0
+                    || digest_is_zero(self.pending_source_snapshot_digest)
+                    || digest_is_zero(self.pending_candidate_snapshot_digest)
+                {
+                    return Err(RemoteAgentReplayJournalStateErrorV2::InvalidPendingShape);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrows exact Stable state and creates one opaque PendingEdge candidate.
+    /// All historical entries participate in a three-column OR fence, including
+    /// burned-but-unapplied trailing entries.
+    pub(crate) fn try_prepare_edge(
+        &self,
+        preflight: &RemoteAgentReplayFreshPreflightV2<'_, '_>,
+    ) -> Result<RemoteAgentReplayJournalPendingCandidateV2, RemoteAgentReplayJournalStateErrorV2>
+    {
+        if self.phase != RemoteAgentReplayJournalPhaseV2::Stable
+            || self.identity != preflight.journal_identity()
+            || self.writer_runtime_host_epoch != preflight.writer_runtime_host_epoch()
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::SourceMismatch);
+        }
+        validate_replay_journal_applied_pxrs_v2(
+            self,
+            &preflight.current_final.snapshot,
+        )?;
+        if self.burns.iter().any(|burn| {
+            burn.operation_id == preflight.burn.operation_id
+                || burn.tenure_nonce_identity == preflight.burn.tenure_nonce_identity
+                || burn.request_nonce_identity == preflight.burn.request_nonce_identity
+        }) {
+            return Err(RemoteAgentReplayJournalStateErrorV2::ReplayDetected);
+        }
+        if self.burns.len() == MAX_REMOTE_AGENT_REPLAY_JOURNAL_BURNS_V2 {
+            return Err(RemoteAgentReplayJournalStateErrorV2::CapacityExhausted);
+        }
+        let mut burns = self.burns.to_vec();
+        burns.push(preflight.burn);
+        let snapshot = Self::try_build(Self {
+            identity: self.identity,
+            writer_runtime_host_epoch: self.writer_runtime_host_epoch,
+            phase: RemoteAgentReplayJournalPhaseV2::PendingEdge,
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or(RemoteAgentReplayJournalStateErrorV2::RevisionExhausted)?,
+            applied_burn_ordinal: self.applied_burn_ordinal,
+            pending_source_snapshot_sequence: preflight.source_snapshot_sequence(),
+            pending_source_snapshot_digest: preflight.source_snapshot_digest(),
+            pending_candidate_snapshot_digest: preflight.pending_candidate_snapshot_digest(),
+            burns: burns.into_boxed_slice(),
+            canonical_wire: Box::new([]),
+            snapshot_digest: zero_digest(),
+        })?;
+        Ok(RemoteAgentReplayJournalPendingCandidateV2 { snapshot })
+    }
+
+    /// Builds Stable only when the exact structural destination is the one
+    /// Prepared PXRS edge reserved by this PendingEdge value.
+    pub(crate) fn try_apply_edge(
+        &self,
+        destination: &RemoteAgentAccessSnapshotV2,
+    ) -> Result<RemoteAgentReplayJournalStableCandidateV2, RemoteAgentReplayJournalStateErrorV2>
+    {
+        validate_replay_journal_pending_destination_v2(self, destination)?;
+        let applied_burn_ordinal = u16::try_from(self.burns.len())
+            .map_err(|_| RemoteAgentReplayJournalStateErrorV2::InvalidAppliedOrdinal)?;
+        let snapshot = Self::try_build(Self {
+            identity: self.identity,
+            writer_runtime_host_epoch: self.writer_runtime_host_epoch,
+            phase: RemoteAgentReplayJournalPhaseV2::Stable,
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or(RemoteAgentReplayJournalStateErrorV2::RevisionExhausted)?,
+            applied_burn_ordinal,
+            pending_source_snapshot_sequence: 0,
+            pending_source_snapshot_digest: zero_digest(),
+            pending_candidate_snapshot_digest: zero_digest(),
+            burns: self.burns.clone(),
+            canonical_wire: Box::new([]),
+            snapshot_digest: zero_digest(),
+        })?;
+        Ok(RemoteAgentReplayJournalStableCandidateV2 { snapshot })
+    }
+
+    #[must_use]
+    pub(crate) const fn identity(&self) -> RemoteAgentReplayJournalIdentityPinsV2 {
+        self.identity
+    }
+
+    #[must_use]
+    pub(crate) const fn writer_runtime_host_epoch(&self) -> u64 {
+        self.writer_runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn phase(&self) -> RemoteAgentReplayJournalPhaseV2 {
+        self.phase
+    }
+
+    #[must_use]
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub(crate) const fn applied_burn_ordinal(&self) -> u16 {
+        self.applied_burn_ordinal
+    }
+
+    #[must_use]
+    pub(crate) fn burn_count(&self) -> usize {
+        self.burns.len()
+    }
+
+    #[must_use]
+    pub(crate) fn pending_source_snapshot_sequence(&self) -> Option<u64> {
+        (self.phase == RemoteAgentReplayJournalPhaseV2::PendingEdge)
+            .then_some(self.pending_source_snapshot_sequence)
+    }
+
+    #[must_use]
+    pub(crate) fn pending_source_snapshot_digest(&self) -> Option<Digest32> {
+        (self.phase == RemoteAgentReplayJournalPhaseV2::PendingEdge)
+            .then_some(self.pending_source_snapshot_digest)
+    }
+
+    #[must_use]
+    pub(crate) fn pending_candidate_snapshot_digest(&self) -> Option<Digest32> {
+        (self.phase == RemoteAgentReplayJournalPhaseV2::PendingEdge)
+            .then_some(self.pending_candidate_snapshot_digest)
+    }
+
+    #[must_use]
+    pub(crate) fn pending_last_operation_id(&self) -> Option<[u8; 16]> {
+        if self.phase == RemoteAgentReplayJournalPhaseV2::PendingEdge {
+            self.burns.last().map(|burn| burn.operation_id)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn pending_last_tenure_nonce_identity(&self) -> Option<Digest32> {
+        if self.phase == RemoteAgentReplayJournalPhaseV2::PendingEdge {
+            self.burns.last().map(|burn| burn.tenure_nonce_identity)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn pending_last_request_nonce_identity(&self) -> Option<Digest32> {
+        if self.phase == RemoteAgentReplayJournalPhaseV2::PendingEdge {
+            self.burns.last().map(|burn| burn.request_nonce_identity)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub(crate) const fn snapshot_digest(&self) -> Digest32 {
+        self.snapshot_digest
+    }
+
+}
+
+impl RemoteAgentReplayJournalGenesisCandidateV2 {
+    pub(crate) fn try_from_pxrs_genesis(
+        pxrs: &RemoteAgentAccessGenesisCandidateV2,
+    ) -> Result<Self, RemoteAgentReplayJournalStateErrorV2> {
+        Self::try_from_pxrs_genesis_snapshot(pxrs.snapshot())
+    }
+
+    fn try_from_pxrs_genesis_snapshot(
+        pxrs: &RemoteAgentAccessSnapshotV2,
+    ) -> Result<Self, RemoteAgentReplayJournalStateErrorV2> {
+        if pxrs.sequence != 1
+            || pxrs.previous_snapshot_digest.is_some()
+            || pxrs.phase != RemoteAgentAccessDurablePhaseV2::InitializedAbsent
+        {
+            return Err(RemoteAgentReplayJournalStateErrorV2::PxrsMismatch);
+        }
+        let snapshot = RemoteAgentReplayJournalSnapshotV2::try_build(
+            RemoteAgentReplayJournalSnapshotV2 {
+                identity: replay_journal_identity_for_pxrs_v2(pxrs),
+                writer_runtime_host_epoch: pxrs.writer_runtime_host_epoch,
+                phase: RemoteAgentReplayJournalPhaseV2::Stable,
+                revision: 1,
+                applied_burn_ordinal: 0,
+                pending_source_snapshot_sequence: 0,
+                pending_source_snapshot_digest: zero_digest(),
+                pending_candidate_snapshot_digest: zero_digest(),
+                burns: Box::new([]),
+                canonical_wire: Box::new([]),
+                snapshot_digest: zero_digest(),
+            },
+        )?;
+        Ok(Self { snapshot })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_from_pxrs_genesis_snapshot_for_test(
+        pxrs: &RemoteAgentAccessSnapshotV2,
+    ) -> Result<Self, RemoteAgentReplayJournalStateErrorV2> {
+        Self::try_from_pxrs_genesis_snapshot(pxrs)
+    }
+
+    #[must_use]
+    pub(crate) const fn snapshot(&self) -> &RemoteAgentReplayJournalSnapshotV2 {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_wire(&self) -> &[u8] {
+        self.snapshot.canonical_wire()
+    }
+
+    #[must_use]
+    pub(crate) fn into_snapshot(self) -> RemoteAgentReplayJournalSnapshotV2 {
+        self.snapshot
+    }
+}
+
+macro_rules! impl_remote_agent_replay_journal_candidate_v2 {
+    ($candidate:ty) => {
+        impl $candidate {
+            #[must_use]
+            pub(crate) const fn snapshot(&self) -> &RemoteAgentReplayJournalSnapshotV2 {
+                &self.snapshot
+            }
+
+            #[must_use]
+            pub(crate) fn canonical_wire(&self) -> &[u8] {
+                self.snapshot.canonical_wire()
+            }
+
+            #[must_use]
+            pub(crate) fn into_snapshot(self) -> RemoteAgentReplayJournalSnapshotV2 {
+                self.snapshot
+            }
+        }
+    };
+}
+
+impl_remote_agent_replay_journal_candidate_v2!(RemoteAgentReplayJournalPendingCandidateV2);
+impl_remote_agent_replay_journal_candidate_v2!(RemoteAgentReplayJournalStableCandidateV2);
+
+#[cfg(test)]
+impl RemoteAgentReplayJournalPendingCandidateV2 {
+    pub(crate) fn into_unapplied_stable_for_test(
+        self,
+    ) -> Result<RemoteAgentReplayJournalStableCandidateV2, RemoteAgentReplayJournalStateErrorV2>
+    {
+        if self.snapshot.phase != RemoteAgentReplayJournalPhaseV2::PendingEdge {
+            return Err(RemoteAgentReplayJournalStateErrorV2::InvalidPendingShape);
+        }
+        let snapshot = self.snapshot;
+        let stable = RemoteAgentReplayJournalSnapshotV2::try_build(
+            RemoteAgentReplayJournalSnapshotV2 {
+                identity: snapshot.identity,
+                writer_runtime_host_epoch: snapshot.writer_runtime_host_epoch,
+                phase: RemoteAgentReplayJournalPhaseV2::Stable,
+                revision: snapshot
+                    .revision
+                    .checked_add(1)
+                    .ok_or(RemoteAgentReplayJournalStateErrorV2::RevisionExhausted)?,
+                applied_burn_ordinal: snapshot.applied_burn_ordinal,
+                pending_source_snapshot_sequence: 0,
+                pending_source_snapshot_digest: zero_digest(),
+                pending_candidate_snapshot_digest: zero_digest(),
+                burns: snapshot.burns,
+                canonical_wire: Box::new([]),
+                snapshot_digest: zero_digest(),
+            },
+        )?;
+        Ok(RemoteAgentReplayJournalStableCandidateV2 { snapshot: stable })
+    }
+}
+
+#[must_use]
+pub(crate) fn classify_remote_agent_replay_startup_pair_v2(
+    pxrs: Option<&RemoteAgentAccessSnapshotV2>,
+    journal: Option<&RemoteAgentReplayJournalSnapshotV2>,
+    current_runtime_host_epoch: u64,
+) -> RemoteAgentReplayStartupPairClassificationV2 {
+    let (Some(pxrs), Some(journal)) = (pxrs, journal) else {
+        return if pxrs.is_none() && journal.is_none() {
+            RemoteAgentReplayStartupPairClassificationV2::Absent
+        } else {
+            RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired
+        };
+    };
+    if current_runtime_host_epoch == 0
+        || journal.identity != replay_journal_identity_for_pxrs_v2(pxrs)
+        || journal.writer_runtime_host_epoch != pxrs.writer_runtime_host_epoch
+    {
+        return RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired;
+    }
+    let old_epoch = if journal.writer_runtime_host_epoch == current_runtime_host_epoch {
+        false
+    } else if journal.writer_runtime_host_epoch < current_runtime_host_epoch {
+        true
+    } else {
+        return RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired;
+    };
+    match journal.phase {
+        RemoteAgentReplayJournalPhaseV2::Stable => {
+            if validate_replay_journal_applied_pxrs_v2(journal, pxrs).is_err() {
+                RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired
+            } else if old_epoch {
+                RemoteAgentReplayStartupPairClassificationV2::OldEpochStable
+            } else {
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochStable
+            }
+        }
+        RemoteAgentReplayJournalPhaseV2::PendingEdge
+            if pxrs.sequence == journal.pending_source_snapshot_sequence
+                && pxrs.snapshot_digest == journal.pending_source_snapshot_digest =>
+        {
+            if validate_replay_journal_applied_pxrs_v2(journal, pxrs).is_err() {
+                RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired
+            } else if old_epoch {
+                RemoteAgentReplayStartupPairClassificationV2::OldEpochPendingAtSource
+            } else {
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochPendingAtSource
+            }
+        }
+        RemoteAgentReplayJournalPhaseV2::PendingEdge => {
+            if validate_replay_journal_pending_destination_v2(journal, pxrs).is_err() {
+                RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired
+            } else if old_epoch {
+                RemoteAgentReplayStartupPairClassificationV2::OldEpochPendingDestinationObserved
+            } else {
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochPendingDestinationObserved
+            }
+        }
+    }
+}
+
+const fn replay_journal_identity_for_pxrs_v2(
+    pxrs: &RemoteAgentAccessSnapshotV2,
+) -> RemoteAgentReplayJournalIdentityPinsV2 {
+    RemoteAgentReplayJournalIdentityPinsV2 {
+        target: pxrs.identity.target,
+        store_instance_id: pxrs.identity.store_instance_id,
+        owner_target_fingerprint: pxrs.identity.owner_target_fingerprint,
+        transition_projection_digest: pxrs.identity.transition_projection_digest,
+    }
+}
+
+fn validate_replay_journal_applied_pxrs_v2(
+    journal: &RemoteAgentReplayJournalSnapshotV2,
+    pxrs: &RemoteAgentAccessSnapshotV2,
+) -> Result<(), RemoteAgentReplayJournalStateErrorV2> {
+    if journal.identity != replay_journal_identity_for_pxrs_v2(pxrs)
+        || journal.writer_runtime_host_epoch != pxrs.writer_runtime_host_epoch
+    {
+        return Err(RemoteAgentReplayJournalStateErrorV2::PxrsMismatch);
+    }
+    let applied = usize::from(journal.applied_burn_ordinal);
+    let operation = RemoteAgentReplayBurnV2::from_snapshot_operation(pxrs)?;
+    match (applied, operation) {
+        (0, None) => Ok(()),
+        (1.., Some(operation))
+            if journal.burns.get(applied - 1).copied() == Some(operation) =>
+        {
+            Ok(())
+        }
+        _ => Err(RemoteAgentReplayJournalStateErrorV2::PxrsMismatch),
+    }
+}
+
+fn validate_replay_journal_pending_destination_v2(
+    journal: &RemoteAgentReplayJournalSnapshotV2,
+    destination: &RemoteAgentAccessSnapshotV2,
+) -> Result<(), RemoteAgentReplayJournalStateErrorV2> {
+    if journal.phase != RemoteAgentReplayJournalPhaseV2::PendingEdge
+        || journal.identity != replay_journal_identity_for_pxrs_v2(destination)
+        || journal.writer_runtime_host_epoch != destination.writer_runtime_host_epoch
+        || journal
+            .pending_source_snapshot_sequence
+            .checked_add(1)
+            .is_none_or(|sequence| destination.sequence != sequence)
+        || destination.previous_snapshot_digest != Some(journal.pending_source_snapshot_digest)
+        || destination.phase != RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+    {
+        return Err(RemoteAgentReplayJournalStateErrorV2::DestinationMismatch);
+    }
+    let destination_burn = RemoteAgentReplayBurnV2::from_snapshot_operation(destination)?
+        .ok_or(RemoteAgentReplayJournalStateErrorV2::DestinationMismatch)?;
+    if journal.burns.last().copied() != Some(destination_burn)
+        || destination.snapshot_digest != journal.pending_candidate_snapshot_digest
+    {
+        return Err(RemoteAgentReplayJournalStateErrorV2::DestinationMismatch);
+    }
+    Ok(())
+}
+
+fn remote_agent_replay_journal_digest_v2(prefix: &[u8]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(REPLAY_JOURNAL_DIGEST_DOMAIN_V2);
+    hasher.update((prefix.len() as u64).to_be_bytes());
+    hasher.update(prefix);
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+struct RemoteAgentReplayJournalCursorV2<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RemoteAgentReplayJournalCursorV2<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(
+        &mut self,
+        length: usize,
+    ) -> Result<&'a [u8], RemoteAgentReplayJournalStateErrorV2> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(RemoteAgentReplayJournalStateErrorV2::Truncated)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(RemoteAgentReplayJournalStateErrorV2::Truncated)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(
+        &mut self,
+    ) -> Result<[u8; N], RemoteAgentReplayJournalStateErrorV2> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| RemoteAgentReplayJournalStateErrorV2::Truncated)
+    }
+
+    fn u8(&mut self) -> Result<u8, RemoteAgentReplayJournalStateErrorV2> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, RemoteAgentReplayJournalStateErrorV2> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, RemoteAgentReplayJournalStateErrorV2> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn usize_u32(&mut self) -> Result<usize, RemoteAgentReplayJournalStateErrorV2> {
+        usize::try_from(u32::from_be_bytes(self.array()?))
+            .map_err(|_| RemoteAgentReplayJournalStateErrorV2::InvalidLength)
+    }
+
+    fn finish(self) -> Result<(), RemoteAgentReplayJournalStateErrorV2> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(RemoteAgentReplayJournalStateErrorV2::TrailingBytes)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteAgentReplayJournalStateErrorV2 {
+    FrameTooLarge,
+    Truncated,
+    UnsupportedWire,
+    InvalidLength,
+    InvalidReserved,
+    UnknownPhase,
+    IdentityMismatch,
+    ChecksumMismatch,
+    NonCanonical,
+    TrailingBytes,
+    InvalidState,
+    InvalidRevision,
+    RevisionExhausted,
+    InvalidAppliedOrdinal,
+    InvalidStableShape,
+    InvalidPendingShape,
+    InvalidBurn,
+    ReplayDetected,
+    CapacityExhausted,
+    SourceMismatch,
+    DestinationMismatch,
+    PxrsMismatch,
+}
+
+impl fmt::Display for RemoteAgentReplayJournalStateErrorV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "remote Agent replay authority journal v2 failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for RemoteAgentReplayJournalStateErrorV2 {}
 
 impl RemoteAgentAuthorizedTransitionV2 {
     #[must_use]
@@ -7597,17 +8719,21 @@ mod tests {
             let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
             let verified_ingress =
                 verified_ingress_v2(request, clock, &dependencies, &provisioning)?;
-            let durable_replay_checked =
-                RemoteAgentDurableReplayCheckedV2::from_durable_replay_ledger_for_test(
-                    &snapshot,
-                    request,
-                    verified_ingress.admitted_at_nanos(),
-                    seen_operation_ids,
-                    seen_tenure_nonce_identities,
-                    seen_request_nonce_identities,
-                )?;
             let current = current_final_v2(snapshot, mutate)?;
-            current.try_authorize_fresh(verified_ingress, durable_replay_checked)
+            let preflight = match current.try_preflight_fresh(verified_ingress) {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    let (cause, current_final, verified_ingress) = error.into_parts();
+                    drop(current_final);
+                    drop(verified_ingress);
+                    return Err(cause);
+                }
+            };
+            preflight.try_authorize_from_replay_ledger_for_test(
+                seen_operation_ids,
+                seen_tenure_nonce_identities,
+                seen_request_nonce_identities,
+            )
         }
 
         fn readback_pending_v2(
@@ -8836,15 +9962,17 @@ mod tests {
         fn pxrs2_public_outer_marker_and_raw_clock_cannot_bypass_private_apply_admission() {
             let source = include_str!("remote_agent_access_state.rs");
             let signature_start = source
-                .find("pub(crate) fn try_authorize_fresh(")
-                .unwrap_or_else(|| panic!("PXRS2 fresh authority entrypoint must exist"));
+                .find("pub(crate) fn try_preflight_fresh<'request, 'running>(")
+                .unwrap_or_else(|| panic!("PXRS2 fresh preflight entrypoint must exist"));
             let signature_tail = &source[signature_start..];
             let signature_end = signature_tail
-                .find(") -> Result<RemoteAgentPendingAccessSnapshotV2")
-                .unwrap_or_else(|| panic!("PXRS2 fresh authority signature must terminate"));
+                .find("> {")
+                .unwrap_or_else(|| panic!("PXRS2 fresh preflight signature must terminate"));
             let signature = &signature_tail[..signature_end];
-            assert!(signature.contains("VerifiedRemoteAgentAccessApplyIngressV2<'_, '_>"));
-            assert!(signature.contains("RemoteAgentDurableReplayCheckedV2"));
+            assert!(signature.contains("VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>"));
+            assert!(signature.contains("RemoteAgentReplayFreshPreflightV2<'request, 'running>"));
+            assert!(signature.contains("RemoteAgentReplayFreshPreflightErrorV2<'request, 'running>"));
+            assert!(!signature.contains("RemoteAgentPendingAccessSnapshotV2"));
             assert!(!signature.contains("ControllerAuthenticatedRemoteAgentAccessRequestV2"));
             assert!(!signature.contains("ClockReading"));
 
@@ -8892,7 +10020,7 @@ mod tests {
                 fresh_marker.contains("carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>")
             );
             let fresh_transition = source
-                .split_once("pub(crate) fn try_authorize_fresh(")
+                .split_once("fn try_build_fresh_preflight(")
                 .and_then(|(_, tail)| {
                     tail.split_once("/// Re-mints one-edge authority")
                         .map(|(implementation, _)| implementation)
@@ -8917,13 +10045,26 @@ mod tests {
                     "fresh CurrentFinal check missing: {exact_check}",
                 );
             }
-            let release = fresh_transition
-                .find("drop(verified_ingress);")
-                .unwrap_or_else(|| panic!("fresh live carrier Pin release missing"));
-            assert!(
-                build < release,
-                "fresh marker must retain the live carrier Pin through the complete Pending build",
-            );
+            assert!(build < fresh_transition.len());
+            let authorized = source
+                .split_once("pub(crate) struct RemoteAgentJournalAuthorizedFreshV2")
+                .and_then(|(_, tail)| tail.split_once("}").map(|(body, _)| body))
+                .unwrap_or_else(|| panic!("journal-authorized fresh wrapper missing"));
+            assert!(authorized.contains("verified_ingress:"));
+            assert!(authorized.contains("pending: RemoteAgentPendingAccessSnapshotV2"));
+            let release = source
+                .split_once("pub(crate) fn try_authorize_from_replay_journal_v2(")
+                .and_then(|(_, tail)| {
+                    tail.split_once("#[cfg(test)]")
+                        .map(|(implementation, _)| implementation)
+                })
+                .unwrap_or_else(|| panic!("PXRJ-authorized release seam missing"));
+            assert!(release.contains("RemoteAgentReplayJournalPendingAuthorityV2"));
+            assert!(release.contains("RemoteAgentJournalAuthorizedFreshV2<'request, 'running>"));
+            assert!(release.contains("Result<"));
+            assert!(release.contains("durable_replay_checked.validate_preflight(&self)?;"));
+            assert!(!release.contains("RemoteAgentAccessSnapshotV2::try_build"));
+            assert!(!release.contains("drop(verified_ingress)"));
 
             let valid = active_request_v2();
             let forged_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
@@ -9003,22 +10144,27 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("other PXAR11 admission rejected: {error}"));
             let initial = initial_snapshot_v2();
-            let mismatched_replay =
-                RemoteAgentDurableReplayCheckedV2::from_durable_replay_ledger_for_test(
-                    &initial,
-                    &request,
-                    clock.now().value(),
-                    &[],
-                    &[],
-                    &[],
-                )
-                .unwrap_or_else(|error| panic!("durable replay marker rejected: {error}"));
+            let first = current_final_v2(initial.clone(), |_| {})
+                .unwrap_or_else(|error| panic!("first CurrentFinal rejected: {error}"))
+                .try_preflight_fresh(marker)
+                .unwrap_or_else(|error| panic!("first fresh preflight rejected: {error}"));
+            let mismatched_replay = RemoteAgentDurableReplayCheckedV2::from_preflight_for_test(
+                &first,
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap_or_else(|error| panic!("durable replay marker rejected: {error}"));
+            let other = current_final_v2(initial, |_| {})
+                .unwrap_or_else(|error| panic!("other CurrentFinal rejected: {error}"))
+                .try_preflight_fresh(other_marker)
+                .unwrap_or_else(|error| panic!("other fresh preflight rejected: {error}"));
             assert!(matches!(
-                current_final_v2(initial, |_| {}).and_then(|current| {
-                    current.try_authorize_fresh(other_marker, mismatched_replay)
-                }),
+                mismatched_replay.validate_preflight(&other),
                 Err(RemoteAgentAccessStateErrorV2::InvalidReplayAuthority)
             ));
+            drop(first);
+            drop(other);
         }
 
         #[test]
@@ -10048,6 +11194,551 @@ mod tests {
             assert_eq!(terminal.first_effect_observed_at_nanos, 1_001);
             assert!(terminal.first_effect_observed_at_nanos < admission.absolute_deadline_nanos);
             assert!(progress.selection_observed_at_nanos > admission.absolute_deadline_nanos);
+        }
+
+        #[test]
+        fn pxrj2_empty_stable_pending_destination_and_restart_pair_are_exact() {
+            let initial = initial_snapshot_v2();
+            let identity = replay_journal_identity_for_pxrs_v2(&initial);
+            let genesis =
+                RemoteAgentReplayJournalGenesisCandidateV2::try_from_pxrs_genesis_snapshot_for_test(
+                    &initial,
+                )
+                .unwrap_or_else(|error| panic!("PXRJ genesis rejected: {error}"));
+            assert_eq!(genesis.snapshot().phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+            assert_eq!(genesis.snapshot().revision(), 1);
+            assert_eq!(genesis.snapshot().applied_burn_ordinal(), 0);
+            assert_eq!(genesis.snapshot().burn_count(), 0);
+            assert_eq!(genesis.canonical_wire().len(), 256);
+            let stable = RemoteAgentReplayJournalSnapshotV2::decode(
+                genesis.canonical_wire(),
+                identity,
+            )
+            .unwrap_or_else(|error| panic!("empty PXRJ readback rejected: {error}"));
+            assert_eq!(stable, genesis.into_snapshot());
+            assert_eq!(
+                classify_remote_agent_replay_startup_pair_v2(
+                    Some(&initial),
+                    Some(&stable),
+                    RUNTIME_EPOCH,
+                ),
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochStable,
+            );
+
+            let request = active_request_v2();
+            let provisioning = terminal_provisioning_v2(&request);
+            let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
+            let ingress = verified_ingress_v2(
+                &request,
+                clock_for_request_v2(&request, 100),
+                &dependencies,
+                &provisioning,
+            )
+            .unwrap_or_else(|error| panic!("PXRJ ingress rejected: {error}"));
+            let preflight = current_final_v2(initial.clone(), |_| {})
+                .unwrap_or_else(|error| panic!("PXRJ CurrentFinal rejected: {error}"))
+                .try_preflight_fresh(ingress)
+                .unwrap_or_else(|error| panic!("PXRJ preflight rejected: {error}"));
+            assert_eq!(
+                preflight.pending_snapshot_for_store_precommit(),
+                preflight.pending.snapshot(),
+            );
+            assert_eq!(
+                preflight.pending_canonical_wire_for_store_precommit(),
+                preflight.pending.canonical_wire(),
+            );
+            let pending_candidate = stable
+                .try_prepare_edge(&preflight)
+                .unwrap_or_else(|error| panic!("PXRJ PendingEdge rejected: {error}"));
+            let pending = RemoteAgentReplayJournalSnapshotV2::decode(
+                pending_candidate.canonical_wire(),
+                identity,
+            )
+            .unwrap_or_else(|error| panic!("PXRJ PendingEdge readback rejected: {error}"));
+            assert_eq!(pending, pending_candidate.into_snapshot());
+            assert_eq!(pending.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
+            assert_eq!(pending.revision(), 2);
+            assert_eq!(pending.applied_burn_ordinal(), 0);
+            assert_eq!(pending.burn_count(), 1);
+            assert_eq!(
+                pending.pending_source_snapshot_sequence(),
+                Some(initial.sequence())
+            );
+            assert_eq!(
+                pending.pending_source_snapshot_digest(),
+                Some(initial.snapshot_digest())
+            );
+            assert_eq!(
+                pending.pending_candidate_snapshot_digest(),
+                Some(preflight.pending_candidate_snapshot_digest())
+            );
+            assert_eq!(pending.pending_last_operation_id(), Some(preflight.operation_id()));
+            assert_eq!(
+                pending.pending_last_tenure_nonce_identity(),
+                Some(preflight.tenure_nonce_identity()),
+            );
+            assert_eq!(
+                pending.pending_last_request_nonce_identity(),
+                Some(preflight.request_nonce_identity()),
+            );
+            assert_eq!(
+                classify_remote_agent_replay_startup_pair_v2(
+                    Some(&initial),
+                    Some(&pending),
+                    RUNTIME_EPOCH,
+                ),
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochPendingAtSource,
+            );
+            assert_eq!(
+                classify_remote_agent_replay_startup_pair_v2(
+                    Some(preflight.pending.snapshot()),
+                    Some(&pending),
+                    RUNTIME_EPOCH,
+                ),
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochPendingDestinationObserved,
+            );
+            assert_eq!(
+                classify_remote_agent_replay_startup_pair_v2(
+                    Some(preflight.pending.snapshot()),
+                    Some(&pending),
+                    RUNTIME_EPOCH + 1,
+                ),
+                RemoteAgentReplayStartupPairClassificationV2::OldEpochPendingDestinationObserved,
+            );
+
+            let stable_candidate = pending
+                .try_apply_edge(preflight.pending.snapshot())
+                .unwrap_or_else(|error| panic!("PXRJ Stable completion rejected: {error}"));
+            let completed = RemoteAgentReplayJournalSnapshotV2::decode(
+                stable_candidate.canonical_wire(),
+                identity,
+            )
+            .unwrap_or_else(|error| panic!("completed PXRJ readback rejected: {error}"));
+            assert_eq!(completed, stable_candidate.into_snapshot());
+            assert_eq!(completed.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+            assert_eq!(completed.revision(), 3);
+            assert_eq!(completed.applied_burn_ordinal(), 1);
+            assert_eq!(completed.burn_count(), 1);
+            assert_eq!(completed.pending_source_snapshot_sequence(), None);
+            assert_eq!(completed.pending_source_snapshot_digest(), None);
+            assert_eq!(completed.pending_candidate_snapshot_digest(), None);
+            assert_eq!(
+                classify_remote_agent_replay_startup_pair_v2(
+                    Some(preflight.pending.snapshot()),
+                    Some(&completed),
+                    RUNTIME_EPOCH,
+                ),
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochStable,
+            );
+            drop(preflight);
+        }
+
+        #[test]
+        fn pxrj2_unapplied_stable_keeps_burn_and_matches_original_pxrs() {
+            let initial = initial_snapshot_v2();
+            let stable = RemoteAgentReplayJournalGenesisCandidateV2::try_from_pxrs_genesis_snapshot_for_test(
+                &initial,
+            )
+            .unwrap_or_else(|error| panic!("PXRJ genesis rejected: {error}"))
+            .into_snapshot();
+            let request = active_request_v2();
+            let provisioning = terminal_provisioning_v2(&request);
+            let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
+            let ingress = verified_ingress_v2(
+                &request,
+                clock_for_request_v2(&request, 100),
+                &dependencies,
+                &provisioning,
+            )
+            .unwrap_or_else(|error| panic!("PXRJ ingress rejected: {error}"));
+            let preflight = current_final_v2(initial.clone(), |_| {})
+                .unwrap_or_else(|error| panic!("PXRJ CurrentFinal rejected: {error}"))
+                .try_preflight_fresh(ingress)
+                .unwrap_or_else(|error| panic!("PXRJ preflight rejected: {error}"));
+            let unapplied = stable
+                .try_prepare_edge(&preflight)
+                .and_then(|pending| pending.into_unapplied_stable_for_test())
+                .unwrap_or_else(|error| panic!("unapplied Stable conversion rejected: {error}"))
+                .into_snapshot();
+
+            assert_eq!(unapplied.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+            assert_eq!(unapplied.revision(), 3);
+            assert_eq!(unapplied.applied_burn_ordinal(), 0);
+            assert_eq!(unapplied.burn_count(), 1);
+            assert_eq!(unapplied.pending_source_snapshot_sequence(), None);
+            assert_eq!(unapplied.pending_source_snapshot_digest(), None);
+            assert_eq!(unapplied.pending_candidate_snapshot_digest(), None);
+            assert_eq!(
+                classify_remote_agent_replay_startup_pair_v2(
+                    Some(&initial),
+                    Some(&unapplied),
+                    RUNTIME_EPOCH,
+                ),
+                RemoteAgentReplayStartupPairClassificationV2::SameEpochStable,
+            );
+            assert!(matches!(
+                unapplied.try_prepare_edge(&preflight),
+                Err(RemoteAgentReplayJournalStateErrorV2::ReplayDetected)
+            ));
+            drop(preflight);
+        }
+
+        #[test]
+        fn pxrj2_three_axis_history_rejects_a_b_a_and_third_edge_skips_trailing_burns() {
+            macro_rules! with_preflight {
+                ($snapshot:expr, $request:expr, $ticks:expr, |$preflight:ident| $body:block) => {{
+                    let provisioning = terminal_provisioning_v2($request);
+                    let dependencies = terminal_endpoint_dependencies_v2($request.carrier());
+                    let ingress = verified_ingress_v2(
+                        $request,
+                        clock_for_request_v2($request, $ticks),
+                        &dependencies,
+                        &provisioning,
+                    )
+                    .unwrap_or_else(|error| panic!("PXRJ ingress rejected: {error}"));
+                    let $preflight = current_final_v2($snapshot, |_| {})
+                        .unwrap_or_else(|error| panic!("PXRJ CurrentFinal rejected: {error}"))
+                        .try_preflight_fresh(ingress)
+                        .unwrap_or_else(|error| panic!("PXRJ preflight rejected: {error}"));
+                    $body
+                }};
+            }
+
+            let initial = initial_snapshot_v2();
+            let stable = RemoteAgentReplayJournalGenesisCandidateV2::try_from_pxrs_genesis_snapshot_for_test(
+                &initial,
+            )
+            .unwrap_or_else(|error| panic!("PXRJ genesis rejected: {error}"))
+            .into_snapshot();
+            let s1 = RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                .unwrap_or_else(|error| panic!("absent S1 rejected: {error}"));
+            let request_a = rebuilt_active_request_with_identities_v2(
+                s1,
+                ApplyOperationId::from_bytes([0xa1; 16]),
+                &[0xa2; 16],
+                &[0xa3; 16],
+                &[0xa4; 16],
+            );
+            let stable_a = with_preflight!(initial.clone(), &request_a, 100, |preflight| {
+                stable
+                    .try_prepare_edge(&preflight)
+                    .and_then(|pending| pending.into_unapplied_stable_for_test())
+                    .unwrap_or_else(|error| panic!("first abandoned burn rejected: {error}"))
+                    .into_snapshot()
+            });
+            assert_eq!(stable_a.applied_burn_ordinal(), 0);
+            assert_eq!(stable_a.burn_count(), 1);
+
+            let request_b = rebuilt_active_request_with_identities_v2(
+                s1,
+                ApplyOperationId::from_bytes([0xb1; 16]),
+                &[0xb2; 16],
+                &[0xb3; 16],
+                &[0xb4; 16],
+            );
+            let stable_b = with_preflight!(initial.clone(), &request_b, 101, |preflight| {
+                stable_a
+                    .try_prepare_edge(&preflight)
+                    .and_then(|pending| pending.into_unapplied_stable_for_test())
+                    .unwrap_or_else(|error| panic!("second abandoned burn rejected: {error}"))
+                    .into_snapshot()
+            });
+            assert_eq!(stable_b.revision(), 5);
+            assert_eq!(stable_b.applied_burn_ordinal(), 0);
+            assert_eq!(stable_b.burn_count(), 2);
+
+            for replay in [
+                rebuilt_active_request_with_identities_v2(
+                    s1,
+                    ApplyOperationId::from_bytes([0xa1; 16]),
+                    &[0xc2; 16],
+                    &[0xc3; 16],
+                    &[0xc4; 16],
+                ),
+                rebuilt_active_request_with_identities_v2(
+                    s1,
+                    ApplyOperationId::from_bytes([0xc1; 16]),
+                    &[0xa2; 16],
+                    &[0xc3; 16],
+                    &[0xc4; 16],
+                ),
+                rebuilt_active_request_with_identities_v2(
+                    s1,
+                    ApplyOperationId::from_bytes([0xd1; 16]),
+                    &[0xd2; 16],
+                    &[0xa3; 16],
+                    &[0xd4; 16],
+                ),
+            ] {
+                with_preflight!(initial.clone(), &replay, 102, |preflight| {
+                    assert!(matches!(
+                        stable_b.try_prepare_edge(&preflight),
+                        Err(RemoteAgentReplayJournalStateErrorV2::ReplayDetected)
+                    ));
+                });
+            }
+
+            let request_c = rebuilt_active_request_with_identities_v2(
+                s1,
+                ApplyOperationId::from_bytes([0xe1; 16]),
+                &[0xe2; 16],
+                &[0xe3; 16],
+                &[0xe4; 16],
+            );
+            with_preflight!(initial, &request_c, 103, |preflight| {
+                let pending = stable_b
+                    .try_prepare_edge(&preflight)
+                    .unwrap_or_else(|error| panic!("third PendingEdge rejected: {error}"));
+                let completed = pending
+                    .snapshot()
+                    .try_apply_edge(preflight.pending.snapshot())
+                    .unwrap_or_else(|error| panic!("third Stable edge rejected: {error}"))
+                    .into_snapshot();
+                assert_eq!(completed.revision(), 7);
+                assert_eq!(completed.applied_burn_ordinal(), 3);
+                assert_eq!(completed.burn_count(), 3);
+                assert_eq!(
+                    classify_remote_agent_replay_startup_pair_v2(
+                        Some(preflight.pending.snapshot()),
+                        Some(&completed),
+                        RUNTIME_EPOCH,
+                    ),
+                    RemoteAgentReplayStartupPairClassificationV2::SameEpochStable,
+                );
+            });
+        }
+
+        #[test]
+        fn pxrj2_fixed_capacity_has_no_eviction_and_codec_is_strict() {
+            let initial = initial_snapshot_v2();
+            let identity = replay_journal_identity_for_pxrs_v2(&initial);
+            let mut burns = Vec::with_capacity(MAX_REMOTE_AGENT_REPLAY_JOURNAL_BURNS_V2);
+            for ordinal in 0..MAX_REMOTE_AGENT_REPLAY_JOURNAL_BURNS_V2 {
+                let ordinal = u16::try_from(ordinal)
+                    .unwrap_or_else(|_| panic!("PXRJ test ordinal exceeded u16"));
+                let mut operation_id = [0x40; 16];
+                operation_id[14..].copy_from_slice(&ordinal.to_be_bytes());
+                let mut tenure = [0x50; 32];
+                tenure[30..].copy_from_slice(&ordinal.to_be_bytes());
+                let mut request = [0x60; 32];
+                request[30..].copy_from_slice(&ordinal.to_be_bytes());
+                burns.push(RemoteAgentReplayBurnV2::from_exact_axes_for_test(
+                    operation_id,
+                    Digest32::from_bytes(tenure),
+                    Digest32::from_bytes(request),
+                ));
+            }
+            let full = RemoteAgentReplayJournalSnapshotV2::try_build(
+                RemoteAgentReplayJournalSnapshotV2 {
+                    identity,
+                    writer_runtime_host_epoch: RUNTIME_EPOCH,
+                    phase: RemoteAgentReplayJournalPhaseV2::Stable,
+                    revision: 513,
+                    applied_burn_ordinal: 0,
+                    pending_source_snapshot_sequence: 0,
+                    pending_source_snapshot_digest: zero_digest(),
+                    pending_candidate_snapshot_digest: zero_digest(),
+                    burns: burns.into_boxed_slice(),
+                    canonical_wire: Box::new([]),
+                    snapshot_digest: zero_digest(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("full PXRJ rejected: {error}"));
+            assert_eq!(
+                full.canonical_wire().len(),
+                MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES
+            );
+            assert_eq!(
+                RemoteAgentReplayJournalSnapshotV2::decode(full.canonical_wire(), identity)
+                    .unwrap_or_else(|error| panic!("full PXRJ readback rejected: {error}")),
+                full,
+            );
+
+            let duplicate_request = rebuilt_active_request_with_identities_v2(
+                RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                    .unwrap_or_else(|error| panic!("absent S1 rejected: {error}")),
+                ApplyOperationId::from_bytes([0x40; 16]),
+                &[0x82; 16],
+                &[0x83; 16],
+                &[0x84; 16],
+            );
+            let duplicate_provisioning = terminal_provisioning_v2(&duplicate_request);
+            let duplicate_dependencies =
+                terminal_endpoint_dependencies_v2(duplicate_request.carrier());
+            let duplicate_ingress = verified_ingress_v2(
+                &duplicate_request,
+                clock_for_request_v2(&duplicate_request, 104),
+                &duplicate_dependencies,
+                &duplicate_provisioning,
+            )
+            .unwrap_or_else(|error| panic!("duplicate ingress rejected: {error}"));
+            let duplicate_preflight = current_final_v2(initial.clone(), |_| {})
+                .unwrap_or_else(|error| panic!("duplicate CurrentFinal rejected: {error}"))
+                .try_preflight_fresh(duplicate_ingress)
+                .unwrap_or_else(|error| panic!("duplicate preflight rejected: {error}"));
+            assert!(matches!(
+                full.try_prepare_edge(&duplicate_preflight),
+                Err(RemoteAgentReplayJournalStateErrorV2::ReplayDetected)
+            ));
+            drop(duplicate_preflight);
+
+            let request = rebuilt_active_request_with_identities_v2(
+                RemoteAgentActiveS1CasV2::try_expect_absent(0, 1)
+                    .unwrap_or_else(|error| panic!("absent S1 rejected: {error}")),
+                ApplyOperationId::from_bytes([0xf1; 16]),
+                &[0xf2; 16],
+                &[0xf3; 16],
+                &[0xf4; 16],
+            );
+            let provisioning = terminal_provisioning_v2(&request);
+            let dependencies = terminal_endpoint_dependencies_v2(request.carrier());
+            let ingress = verified_ingress_v2(
+                &request,
+                clock_for_request_v2(&request, 104),
+                &dependencies,
+                &provisioning,
+            )
+            .unwrap_or_else(|error| panic!("capacity ingress rejected: {error}"));
+            let preflight = current_final_v2(initial.clone(), |_| {})
+                .unwrap_or_else(|error| panic!("capacity CurrentFinal rejected: {error}"))
+                .try_preflight_fresh(ingress)
+                .unwrap_or_else(|error| panic!("capacity preflight rejected: {error}"));
+            assert!(matches!(
+                full.try_prepare_edge(&preflight),
+                Err(RemoteAgentReplayJournalStateErrorV2::CapacityExhausted)
+            ));
+            drop(preflight);
+
+            let genesis =
+                RemoteAgentReplayJournalGenesisCandidateV2::try_from_pxrs_genesis_snapshot_for_test(
+                    &initial,
+                )
+                .unwrap_or_else(|error| panic!("PXRJ genesis rejected: {error}"))
+                .into_snapshot();
+            let wire = genesis.canonical_wire();
+            assert!(matches!(
+                RemoteAgentReplayJournalSnapshotV2::decode(
+                    &vec![0; MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES + 1],
+                    identity,
+                ),
+                Err(RemoteAgentReplayJournalStateErrorV2::FrameTooLarge)
+            ));
+            assert!(matches!(
+                RemoteAgentReplayJournalSnapshotV2::decode(&wire[..wire.len() - 1], identity),
+                Err(RemoteAgentReplayJournalStateErrorV2::InvalidLength)
+                    | Err(RemoteAgentReplayJournalStateErrorV2::Truncated)
+            ));
+            let mut checksum = wire.to_vec();
+            let last = checksum
+                .last_mut()
+                .unwrap_or_else(|| panic!("PXRJ checksum byte missing"));
+            *last ^= 1;
+            assert!(matches!(
+                RemoteAgentReplayJournalSnapshotV2::decode(&checksum, identity),
+                Err(RemoteAgentReplayJournalStateErrorV2::ChecksumMismatch)
+            ));
+            let mut reserved = wire.to_vec();
+            reserved[13] = 1;
+            reseal_replay_journal_v2(&mut reserved);
+            assert!(matches!(
+                RemoteAgentReplayJournalSnapshotV2::decode(&reserved, identity),
+                Err(RemoteAgentReplayJournalStateErrorV2::InvalidReserved)
+            ));
+            let mut stable_source = wire.to_vec();
+            stable_source[40..48].copy_from_slice(&1_u64.to_be_bytes());
+            stable_source[160..192].fill(0x71);
+            stable_source[192..224].fill(0x72);
+            reseal_replay_journal_v2(&mut stable_source);
+            assert!(matches!(
+                RemoteAgentReplayJournalSnapshotV2::decode(&stable_source, identity),
+                Err(RemoteAgentReplayJournalStateErrorV2::InvalidStableShape)
+            ));
+            let mut wrong_identity = identity;
+            wrong_identity.transition_projection_digest = Digest32::from_bytes([0x7f; 32]);
+            assert!(matches!(
+                RemoteAgentReplayJournalSnapshotV2::decode(wire, wrong_identity),
+                Err(RemoteAgentReplayJournalStateErrorV2::IdentityMismatch)
+            ));
+            let mut trailing = wire.to_vec();
+            trailing.push(0);
+            assert!(matches!(
+                RemoteAgentReplayJournalSnapshotV2::decode(&trailing, identity),
+                Err(RemoteAgentReplayJournalStateErrorV2::InvalidLength)
+            ));
+        }
+
+        #[test]
+        fn pxrj2_authority_construction_is_genesis_and_exact_readback_only() {
+            let source = include_str!("remote_agent_access_state.rs");
+            let genesis = source
+                .split_once("impl RemoteAgentReplayJournalGenesisCandidateV2 {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("macro_rules! impl_remote_agent_replay_journal_candidate_v2")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("PXRJ genesis implementation missing"));
+            assert!(genesis.contains(
+                "pub(crate) fn try_from_pxrs_genesis(\n        pxrs: &RemoteAgentAccessGenesisCandidateV2,"
+            ));
+            assert!(genesis.contains(
+                "#[cfg(test)]\n    pub(crate) fn try_from_pxrs_genesis_snapshot_for_test("
+            ));
+            let token = source
+                .split_once("impl RemoteAgentDurableReplayCheckedV2 {")
+                .and_then(|(_, tail)| {
+                    tail.split_once("impl From<RemoteAgentAccessStaticIdentityPinsV2>")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| panic!("durable replay token implementation missing"));
+            assert!(token.contains(
+                "fn from_pending_journal_exact_readback(\n        authority: RemoteAgentReplayJournalPendingAuthorityV2,"
+            ));
+            assert!(!token.contains("pub(crate) fn from_pending_journal_exact_readback"));
+            assert!(token.contains("#[cfg(test)]\n    fn from_preflight_for_test("));
+            let authorized = source
+                .split_once("pub(crate) struct RemoteAgentJournalAuthorizedFreshV2")
+                .and_then(|(_, tail)| tail.split_once("}").map(|(body, _)| body))
+                .unwrap_or_else(|| panic!("journal-authorized fresh wrapper missing"));
+            assert!(authorized.contains("verified_ingress:"));
+            assert!(authorized.contains("pending: RemoteAgentPendingAccessSnapshotV2"));
+            assert!(source.contains(
+                "pub(crate) fn pending_snapshot_for_store_precommit(\n        &self,"
+            ));
+            assert!(source.contains(
+                "pub(crate) fn pending_canonical_wire_for_store_precommit(&self) -> &[u8]"
+            ));
+            assert!(source.contains("pub(crate) fn pending_last_operation_id(&self)"));
+            assert!(source.contains(
+                "pub(crate) fn pending_last_tenure_nonce_identity(&self)"
+            ));
+            assert!(source.contains(
+                "pub(crate) fn pending_last_request_nonce_identity(&self)"
+            ));
+            assert!(source.contains(
+                "pub(crate) fn try_authorize_from_replay_journal_v2(\n        self,"
+            ));
+            assert!(source.contains(concat!(
+                "#[cfg(test)]\nimpl RemoteAgentReplayJournalPendingCandidateV2 {\n",
+                "    pub(crate) fn into_unapplied_stable_for_test("
+            )));
+            assert!(!source.contains(concat!("fn stabilize_", "unapplied_for_test")));
+            assert!(!source.contains(concat!(
+                "pub(crate) fn authorize_from_",
+                "replay_journal_v2"
+            )));
+            assert!(!source.contains(concat!(
+                "pub(crate) fn into_pending_",
+                "for_store"
+            )));
+        }
+
+        fn reseal_replay_journal_v2(wire: &mut [u8]) {
+            let digest_start = wire
+                .len()
+                .checked_sub(REPLAY_JOURNAL_DIGEST_BYTES_V2)
+                .unwrap_or_else(|| panic!("PXRJ frame is shorter than its digest"));
+            let digest = remote_agent_replay_journal_digest_v2(&wire[..digest_start]);
+            wire[digest_start..].copy_from_slice(digest.as_bytes());
         }
     }
 }

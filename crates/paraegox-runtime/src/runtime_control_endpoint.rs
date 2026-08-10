@@ -183,8 +183,10 @@ use crate::{
         RuntimeProvisioningError, RuntimeProvisioningV1, validate_canonical_absolute_path,
     },
     runtime_store::{
-        ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessCommitErrorV2,
-        RemoteAgentAccessStartupSlotV2, RuntimeStore, RuntimeStoreError, RuntimeStoreOpenError,
+        ManagedFabricStore, ManagedFabricStoreError,
+        RemoteAgentAccessGenesisInitializeCommitErrorV2, RemoteAgentAccessStartupSlotV2,
+        RemoteAgentReplayJournalStartupSlotV2, RuntimeStore, RuntimeStoreError,
+        RuntimeStoreOpenError,
     },
 };
 
@@ -344,6 +346,8 @@ impl RestrictedRuntimeEndpointConfigV1 {
 /// decoded request, or recovered PXRS value can construct this pin.
 pub(crate) struct RuntimeRestrictedApplyCarrierPinV1<'running> {
     owner: RuntimeRestrictedApplyCarrierPinOwnerV1<'running>,
+    #[cfg(test)]
+    drop_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 enum RuntimeRestrictedApplyCarrierPinOwnerV1<'running> {
@@ -364,6 +368,8 @@ impl<'running> RuntimeRestrictedApplyCarrierPinV1<'running> {
         )?;
         Ok(Self {
             owner: RuntimeRestrictedApplyCarrierPinOwnerV1::Live(running),
+            #[cfg(test)]
+            drop_counter: None,
         })
     }
 
@@ -379,7 +385,18 @@ impl<'running> RuntimeRestrictedApplyCarrierPinV1<'running> {
         )?;
         Ok(Self {
             owner: RuntimeRestrictedApplyCarrierPinOwnerV1::Fixture(dependencies),
+            drop_counter: None,
         })
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_drop_counter_for_test(
+        mut self,
+        drop_counter: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.drop_counter = Some(drop_counter);
+        self
     }
 
     /// Returns the exact carrier only while its live composition still
@@ -407,7 +424,12 @@ impl<'running> RuntimeRestrictedApplyCarrierPinV1<'running> {
 /// keeps the complete live endpoint borrow until the Pin is explicitly
 /// consumed at the state transition boundary.
 impl Drop for RuntimeRestrictedApplyCarrierPinV1<'_> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(drop_counter) = &self.drop_counter {
+            drop_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// Exact owner-current Agent facts captured without accepting a caller-selected
@@ -1949,24 +1971,40 @@ impl StartedManagedFabricService {
             1,
         );
         let remote_agent_access_startup_v2 = if store.remote_agent_access_startup_required_v2() {
-            let startup = store.adjudicate_remote_agent_access_startup_v2(
-                RemoteAgentAccessStaticIdentityPinsV2 {
-                    target: projection.target(),
-                    store_instance_id: expected_store_instance_id,
-                    owner_target_fingerprint: provisioning.owner_target_fingerprint(),
-                    transition_projection_digest: projection_digest,
-                },
+            let static_identity = RemoteAgentAccessStaticIdentityPinsV2 {
+                target: projection.target(),
+                store_instance_id: expected_store_instance_id,
+                owner_target_fingerprint: provisioning.owner_target_fingerprint(),
+                transition_projection_digest: projection_digest,
+            };
+            let replay_journal_absent = match store
+                .adjudicate_remote_agent_replay_journal_startup_v2(
+                    static_identity,
+                    runtime_host_epoch,
+                )?
+            {
+                RemoteAgentReplayJournalStartupSlotV2::Absent(absent) => absent,
+                RemoteAgentReplayJournalStartupSlotV2::Stable(_)
+                | RemoteAgentReplayJournalStartupSlotV2::Pending(_)
+                | RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(_) => {
+                    return Err(
+                        ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired.into(),
+                    );
+                }
+            };
+            let access_absent = match store.adjudicate_remote_agent_access_startup_v2(
+                static_identity,
                 runtime_host_epoch,
-            )?;
-            match startup {
-                startup @ RemoteAgentAccessStartupSlotV2::Absent(_) => Some(startup),
+            )? {
+                RemoteAgentAccessStartupSlotV2::Absent(absent) => absent,
                 RemoteAgentAccessStartupSlotV2::SameEpoch(_)
                 | RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
                     return Err(
                         ManagedFabricRuntimeError::RemoteAgentAccessReconcileRequired.into(),
                     );
                 }
-            }
+            };
+            Some((access_absent, replay_journal_absent))
         } else {
             None
         };
@@ -1983,8 +2021,11 @@ impl StartedManagedFabricService {
                 response_signer: provisioning.response_signer().clone(),
             },
         )?;
-        if let Some(startup) = remote_agent_access_startup_v2 {
-            core.install_remote_agent_access_startup_v2(startup)?;
+        if let Some((access_absent, replay_journal_absent)) = remote_agent_access_startup_v2 {
+            core.install_remote_agent_access_startup_v2(
+                access_absent,
+                replay_journal_absent,
+            )?;
         }
         let stack_projection =
             ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(projection)?;
@@ -3835,12 +3876,11 @@ fn map_remote_agent_access_genesis_initialize_error_v2(
     match error {
         RemoteAgentAccessGenesisInitializeErrorV2::Core(error) => map_managed_fabric_error(error),
         RemoteAgentAccessGenesisInitializeErrorV2::Commit(
-            RemoteAgentAccessCommitErrorV2::ProvenNotCommitted { .. }
-            | RemoteAgentAccessCommitErrorV2::OutcomeUncertain(_),
+            RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_),
         ) => RuntimeControlRequestError::Unavailable,
         RemoteAgentAccessGenesisInitializeErrorV2::State(_)
         | RemoteAgentAccessGenesisInitializeErrorV2::Commit(
-            RemoteAgentAccessCommitErrorV2::Rejected { .. },
+            RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_),
         ) => {
             RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::InvalidStartedState)
         }
@@ -4005,7 +4045,8 @@ pub(crate) fn run_runtime_bootstrap_process(
 /// marker; the listener and socket identity remain unchanged across cutover.
 /// That predecessor listener is the deliberate startup-order exception: it
 /// cannot decode or dispatch PXRA v2, and the managed owner still runs the
-/// PXRS v2 gate before any managed recovery, capability, or remote listener.
+/// joint PXRS/PXRJ v2 gate before any managed recovery, capability, or remote
+/// listener.
 pub(crate) async fn serve_runtime_developer_local_until<F, R>(
     state_directory: &Path,
     expected_store_instance_id: [u8; 32],
@@ -6546,7 +6587,7 @@ mod tests {
     use paraegox_agent_service::DeterministicEchoModelProvider;
     use paraegox_evidence::{EvidenceOwnerRefV1, EvidenceRetentionPolicyV1, EvidenceStoreEpochV1};
     use paraegox_fabric::ResolvedRemoteMtlsIdentityFiles;
-    use paraegox_kernel::time::BoundedDuration;
+    use paraegox_kernel::time::{BoundedDuration, ClockReading, MonotonicInstant};
     use paraegox_model::{
         ModelBackendFuture, ModelBackendIdentityV1, ModelBackendV1, ModelCancellationViewV1,
         ModelInvocationOutcomeV1, ModelInvocationRequestV1,
@@ -6618,8 +6659,16 @@ mod tests {
             ReferenceQueryResponseV1, ReferenceQuerySelectorV1, ReferenceTargetExecutionPlanV4,
             ValidatedReferenceLifecycleBudgetsV1,
         },
+        remote_agent_access::{
+            ControllerAuthenticatedRemoteAgentAccessRequestV2,
+            RemoteAgentAccessRequestDraftV2, RemoteAgentAccessRequestFieldsV2,
+            RemoteAgentAccessRequestIdV2, RemoteAgentAccessRequestV2,
+        },
         remote_agent_data_plane_plan::{
-            RemoteAgentActiveS1CasV2, RemoteAgentRetainedS0CasFieldsV2, RemoteAgentRetainedS0CasV2,
+            RemoteAgentActiveS1CasV2, RemoteAgentDataPlaneApplyRequestDraftV2,
+            RemoteAgentDataPlaneProfileFieldsV1, RemoteAgentDataPlaneProfileV1,
+            RemoteAgentDataPlaneProjectionV1, RemoteAgentDataPlaneTargetExecutionV2,
+            RemoteAgentRetainedS0CasFieldsV2, RemoteAgentRetainedS0CasV2,
         },
         temporal::{ApplyTemporalConstraint, TemporalConstraintId},
         wire::ApplyRequestAuthClaim,
@@ -6633,9 +6682,15 @@ mod tests {
     use crate::managed_model_runtime::{
         RuntimeModelBackendResolveError, RuntimeResolvedModelBackendV1,
     };
+    use crate::managed_fabric_runtime::{
+        RemoteAgentAccessFreshCommitRejectCauseV2,
+        RemoteAgentAccessManagedFreshCommitErrorV2,
+    };
     use crate::remote_agent_access_state::{
         RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessSnapshotIdentityPinsV2,
-        RemoteAgentAccessSnapshotV2,
+        RemoteAgentAccessSnapshotV2, RemoteAgentReplayJournalIdentityPinsV2,
+        RemoteAgentReplayJournalPhaseV2, RemoteAgentReplayJournalSnapshotV2,
+        RemoteAgentReplayJournalStateErrorV2,
     };
     use crate::runtime_agent_provider::{
         RuntimeAgentProviderResolveError, RuntimeResolvedAgentProviderV1,
@@ -6656,7 +6711,8 @@ mod tests {
     };
     use crate::runtime_provisioning::RuntimeProvisioningInputV1;
     use crate::runtime_store::{
-        ManagedFabricStore,
+        ManagedFabricStore, RemoteAgentAccessCommitFailpointV2,
+        RemoteAgentReplayJournalCommitFailpointV2,
         tests::{TestDirectory, managed_fabric_store_fixture_from_snapshot},
     };
 
@@ -8004,18 +8060,33 @@ mod tests {
     }
 
     #[test]
-    fn pxrs2_startup_gate_precedes_successor_recovery_and_listener_publication() {
+    fn joint_pxrs_pxrj_startup_gate_precedes_core_recovery_and_listener_publication() {
         let source = include_str!("runtime_control_endpoint.rs");
         let startup = section(
             source,
             "    fn try_start_from_store(",
             "pub(crate) struct ManagedFabricControlService",
         );
-        let adjudication = startup
+        let joint_adjudication = startup
+            .find(".adjudicate_remote_agent_replay_journal_startup_v2(")
+            .unwrap_or_else(|| panic!("joint PXRS/PXRJ startup adjudication disappeared"));
+        let joint_absent = startup
+            .find("RemoteAgentReplayJournalStartupSlotV2::Absent(absent)")
+            .unwrap_or_else(|| panic!("joint absent-only continuation disappeared"));
+        let stable = startup
+            .find("RemoteAgentReplayJournalStartupSlotV2::Stable(_)")
+            .unwrap_or_else(|| panic!("same-epoch Stable fail-stop disappeared"));
+        let pending = startup
+            .find("RemoteAgentReplayJournalStartupSlotV2::Pending(_)")
+            .unwrap_or_else(|| panic!("Pending replay-journal fail-stop disappeared"));
+        let reconcile = startup
+            .find("RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(_)")
+            .unwrap_or_else(|| panic!("old/mismatched/residue fail-stop disappeared"));
+        let access_adjudication = startup
             .find(".adjudicate_remote_agent_access_startup_v2(")
             .unwrap_or_else(|| panic!("PXRS v2 startup adjudication disappeared"));
-        let absent = startup
-            .find("startup @ RemoteAgentAccessStartupSlotV2::Absent(_)")
+        let access_absent = startup
+            .find("RemoteAgentAccessStartupSlotV2::Absent(absent)")
             .unwrap_or_else(|| panic!("PXRS v2 absent-only continuation disappeared"));
         let same_epoch = startup
             .find("RemoteAgentAccessStartupSlotV2::SameEpoch(_)")
@@ -8026,6 +8097,9 @@ mod tests {
         let core = startup
             .find("ManagedFabricRuntimeCore::from_preopened_store(")
             .unwrap_or_else(|| panic!("managed Fabric core construction disappeared"));
+        let install = startup
+            .find("core.install_remote_agent_access_startup_v2(")
+            .unwrap_or_else(|| panic!("joint absent lease installation disappeared"));
         let model_stack = startup
             .find("ManagedModelAgentStackRuntimeCore::open(")
             .unwrap_or_else(|| panic!("managed Model+Agent child open disappeared"));
@@ -8036,14 +8110,21 @@ mod tests {
             .find("DistributedAgentStackRuntimeCore::open(")
             .unwrap_or_else(|| panic!("distributed Agent child open disappeared"));
         assert!(
-            adjudication < absent
-                && absent < same_epoch
+            joint_adjudication < joint_absent
+                && joint_absent < stable
+                && stable < pending
+                && pending < reconcile
+                && reconcile < access_adjudication
+                && access_adjudication < access_absent
+                && access_absent < same_epoch
                 && same_epoch < restart
                 && restart < core
-                && core < model_stack
-                && core < stack
-                && core < distributed
+                && core < install
+                && install < model_stack
+                && install < stack
+                && install < distributed
         );
+        assert!(startup.contains("Some((access_absent, replay_journal_absent))"));
 
         let existing_channel = section(
             source,
@@ -8514,6 +8595,196 @@ mod tests {
             nonce,
         )
         .unwrap_or_else(|error| panic!("managed auth claim rejected: {error}"))
+    }
+
+    fn signed_managed_remote_agent_access_apply_v2(
+        stack_request: &ManagedAgentStackApplyRequestV1,
+        retained_s0_cas: RemoteAgentRetainedS0CasV2,
+        expected_s1_cas: RemoteAgentActiveS1CasV2,
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        intended_client: PrincipalRef,
+        runtime_host_epoch: u64,
+        clock_generation: ClockGeneration,
+        operation_id: [u8; 16],
+        tenure_nonce: &[u8],
+        request_nonce: &[u8],
+        outer_nonce: &[u8],
+        temporal_seed: u8,
+    ) -> RemoteAgentAccessRequestV2 {
+        let predecessor = stack_request.target_execution().clone();
+        let projection = RemoteAgentDataPlaneProjectionV1::try_from_managed_agent_stack_projection(
+            predecessor.projection().clone(),
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent projection rejected: {error}"));
+        let base_loopback_listen_endpoint = predecessor
+            .fabric()
+            .listen_endpoint()
+            .unwrap_or_else(|| panic!("active managed Agent stack lost its loopback endpoint"))
+            .as_str();
+        let profile = RemoteAgentDataPlaneProfileV1::try_new(
+            RemoteAgentDataPlaneProfileFieldsV1 {
+                target: TARGET,
+                base_loopback_listen_endpoint,
+                ubuntu_tls_listener_endpoint: "tls/192.0.2.61:7461",
+                endpoint_ref: [0xe1; 16],
+                endpoint_generation: 1,
+                trust_domain_ref: DistributedFabricTrustDomainRefV1::try_from_bytes([0xe2; 16])
+                    .unwrap_or_else(|error| {
+                        panic!("remote-Agent trust domain rejected: {error}")
+                    }),
+                trust_anchor_ref: DistributedFabricTrustAnchorRefV1::try_from_bytes([0xe3; 16])
+                    .unwrap_or_else(|error| {
+                        panic!("remote-Agent trust anchor rejected: {error}")
+                    }),
+                mac_connector_credential_ref: DistributedFabricCredentialRefV1::try_from_bytes(
+                    [0xe4; 16],
+                )
+                .unwrap_or_else(|error| {
+                    panic!("remote-Agent connector credential rejected: {error}")
+                }),
+                ubuntu_listener_credential_ref:
+                    DistributedFabricCredentialRefV1::try_from_bytes([0xe5; 16]).unwrap_or_else(
+                        |error| panic!("remote-Agent listener credential rejected: {error}"),
+                    ),
+                mac_agent_client_principal: intended_client,
+                ubuntu_agent_listener_principal: PrincipalRef::from_bytes([0xe6; 16]),
+                operation_timeout_nanos: RESTRICTED_OPERATION_TIMEOUT_NANOS,
+            },
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent profile rejected: {error}"));
+        let execution = RemoteAgentDataPlaneTargetExecutionV2::try_remote_access_active(
+            projection,
+            predecessor,
+            retained_s0_cas,
+            expected_s1_cas,
+            profile,
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent target execution rejected: {error}"));
+        let provenance = PlanProvenance::new(
+            SOURCE_SCOPE,
+            SourcePlanRef::from_bytes([0xe7; 16]),
+            SourcePlanRevision::new(2),
+            SourcePlanDigest::new(digest(0xe8)),
+        );
+        let operation_id = ApplyOperationId::from_bytes(operation_id);
+        let control = RuntimeApplyControl::new(
+            managed_writer_context(2, 1, tenure_nonce),
+            ExpectedActive::None,
+            operation_id,
+        );
+        let inner_draft = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+            execution,
+            provenance,
+            control,
+            managed_temporal(clock_generation, temporal_seed),
+            STORE_INSTANCE_ID,
+            managed_auth(request_nonce),
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent PXAR11 draft rejected: {error}"));
+        let inner_signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                inner_draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("remote-Agent PXAR11 transcript rejected: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        let inner = inner_draft
+            .finalize(&inner_signature)
+            .unwrap_or_else(|error| panic!("remote-Agent PXAR11 rejected: {error}"));
+        let outer_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+            RemoteAgentAccessRequestFieldsV2 {
+                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
+                    *operation_id.as_bytes(),
+                )
+                .unwrap_or_else(|error| panic!("remote-Agent PXRA2 request ID rejected: {error}")),
+                carrier,
+                target: TARGET,
+                expected_runtime_store_instance_id: STORE_INSTANCE_ID,
+                expected_runtime_host_epoch: runtime_host_epoch,
+                auth_claim: managed_auth(outer_nonce),
+            },
+            inner,
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent PXRA2 draft rejected: {error}"));
+        let outer_signature = SigningKey::from_bytes(&CONTROLLER_SEED)
+            .sign(
+                outer_draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| {
+                        panic!("remote-Agent PXRA2 transcript rejected: {error}")
+                    })
+                    .as_bytes(),
+            )
+            .to_bytes();
+        outer_draft
+            .finalize(&outer_signature)
+            .unwrap_or_else(|error| panic!("remote-Agent PXRA2 rejected: {error}"))
+    }
+
+    fn authenticate_managed_remote_agent_access_apply_v2<'request>(
+        request: &'request RemoteAgentAccessRequestV2,
+        expected_carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> ControllerAuthenticatedRemoteAgentAccessRequestV2<'request> {
+        request
+            .verify_controller_apply_request(
+                |principal, key, algorithm, version, transcript, signature| {
+                    let Ok(signature) = Signature::from_slice(signature) else {
+                        return false;
+                    };
+                    principal == CONTROLLER_PRINCIPAL
+                        && key == CONTROLLER_KEY_REF
+                        && algorithm.value() == ED25519_ALGORITHM
+                        && version == ED25519_ALGORITHM_VERSION
+                        && SigningKey::from_bytes(&CONTROLLER_SEED)
+                            .verifying_key()
+                            .verify_strict(transcript, &signature)
+                            .is_ok()
+                },
+                |principal, key, fingerprint, transcript, signature| {
+                    let Ok(signature) = Signature::from_slice(signature) else {
+                        return false;
+                    };
+                    principal == CONTROLLER_PRINCIPAL
+                        && key == CONTROLLER_KEY_REF
+                        && fingerprint == expected_carrier.controller_request_key_fingerprint()
+                        && SigningKey::from_bytes(&CONTROLLER_SEED)
+                            .verifying_key()
+                            .verify_strict(transcript, &signature)
+                            .is_ok()
+                },
+            )
+            .unwrap_or_else(|error| panic!("remote-Agent PXRA2 authentication failed: {error}"))
+    }
+
+    fn verify_managed_remote_agent_access_ingress_v2<'request, 'running>(
+        request: &'request RemoteAgentAccessRequestV2,
+        dependencies: &'running RuntimeRestrictedApplyEndpointDependenciesV1,
+        provisioning: &RuntimeProvisioningV1,
+        clock_generation: ClockGeneration,
+        pin_drops: Arc<AtomicU64>,
+    ) -> crate::admission::VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running> {
+        let authenticated = authenticate_managed_remote_agent_access_apply_v2(
+            request,
+            &dependencies.expected_carrier,
+        );
+        let ingress_pin = runtime_restricted_apply_carrier_pin_for_test(dependencies, provisioning)
+            .unwrap_or_else(|error| panic!("fresh ingress Pin rejected: {error}"))
+            .with_drop_counter_for_test(pin_drops);
+        provisioning
+            .admission_policy()
+            .verify_remote_agent_access_apply_ingress_v2(
+                authenticated,
+                ingress_pin,
+                ClockReading::new(
+                    ClockDomainRef::from_bytes(CLOCK_DOMAIN),
+                    clock_generation,
+                    MonotonicInstant::from_ticks(1_000_000_000),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("fresh PXRA2 admission rejected: {error}"))
     }
 
     fn managed_fabric_active_request(
@@ -9141,6 +9412,7 @@ mod tests {
         ManagedFabricControlService,
         RuntimeRestrictedApplyEndpointDependenciesV1,
         PrincipalRef,
+        ManagedAgentStackApplyRequestV1,
     ) {
         let (state_directory, mut control, stack_request) =
             managed_control_with_active_stack(socket_path).await;
@@ -9179,7 +9451,124 @@ mod tests {
             .unwrap_or_else(|error| panic!("live-lower Describe failed: {error:?}"));
         let dependencies =
             restricted_endpoint_dependencies_from_profile(&profile, RESTRICTED_PROFILE_REF);
-        (state_directory, control, dependencies, intended_client)
+        (
+            state_directory,
+            control,
+            dependencies,
+            intended_client,
+            stack_request,
+        )
+    }
+
+    async fn managed_control_with_current_final_v2(
+        socket_path: PathBuf,
+    ) -> (
+        TestDirectory,
+        ManagedFabricControlService,
+        RuntimeRestrictedApplyEndpointDependenciesV1,
+        PrincipalRef,
+        ManagedAgentStackApplyRequestV1,
+        RemoteAgentAccessCurrentFinalLeaseBundleV2,
+    ) {
+        let (state_directory, mut control, dependencies, intended_client, stack_request) =
+            managed_control_with_descriptor_evidence_v2(socket_path).await;
+        let pin =
+            runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
+                .unwrap_or_else(|error| panic!("CurrentFinal fixture Pin rejected: {error}"));
+        let current = control
+            .initialize_and_bind_remote_agent_access_current_final_genesis_v2(pin)
+            .await
+            .unwrap_or_else(|error| panic!("CurrentFinal fixture genesis failed: {error:?}"));
+        (
+            state_directory,
+            control,
+            dependencies,
+            intended_client,
+            stack_request,
+            current,
+        )
+    }
+
+    fn assert_managed_remote_agent_replay_rejected_v2(
+        control: &mut ManagedFabricControlService,
+        dependencies: &RuntimeRestrictedApplyEndpointDependenciesV1,
+        current: RemoteAgentAccessCurrentFinalLeaseBundleV2,
+        request: &RemoteAgentAccessRequestV2,
+        clock_generation: ClockGeneration,
+        pxrs_path: &Path,
+        pxrj_path: &Path,
+        expected_pxrs: &[u8],
+        expected_pxrj: &[u8],
+        expected_pxrs_inode: u64,
+        expected_pxrj_inode: u64,
+    ) -> RemoteAgentAccessCurrentFinalLeaseBundleV2 {
+        let current_snapshot_digest = current
+            .current_final_for_test()
+            .snapshot_for_test()
+            .snapshot_digest();
+        let current_pxap = current.exact_pxap_for_test().to_vec();
+        let pin_drops = Arc::new(AtomicU64::new(0));
+        let verified_ingress = verify_managed_remote_agent_access_ingress_v2(
+            request,
+            dependencies,
+            &control.provisioning,
+            clock_generation,
+            Arc::clone(&pin_drops),
+        );
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 0);
+        let error = match control
+            .core
+            .commit_remote_agent_access_fresh_v2(current, verified_ingress)
+        {
+            Ok(_) => panic!("three-axis replay unexpectedly committed"),
+            Err(error) => error,
+        };
+        let (cause, current, verified_ingress) = error
+            .into_rejected_parts()
+            .unwrap_or_else(|| panic!("pre-journal replay rejection lost its authorities"));
+        assert!(matches!(
+            cause,
+            RemoteAgentAccessFreshCommitRejectCauseV2::Store(
+                ManagedFabricStoreError::RemoteAgentReplayJournalState(
+                    RemoteAgentReplayJournalStateErrorV2::ReplayDetected,
+                ),
+            )
+        ));
+        assert_eq!(
+            current
+                .current_final_for_test()
+                .snapshot_for_test()
+                .snapshot_digest(),
+            current_snapshot_digest,
+        );
+        assert_eq!(current.exact_pxap_for_test(), current_pxap.as_slice());
+        assert_eq!(verified_ingress.request(), request);
+        assert_eq!(
+            pin_drops.load(Ordering::SeqCst),
+            0,
+            "a pure replay rejection must return the still-live ingress Pin",
+        );
+        let actual_pxrs = fs::read(pxrs_path)
+            .unwrap_or_else(|error| panic!("replay PXRS readback failed: {error}"));
+        let actual_pxrj = fs::read(pxrj_path)
+            .unwrap_or_else(|error| panic!("replay PXRJ readback failed: {error}"));
+        assert_eq!(actual_pxrs.as_slice(), expected_pxrs);
+        assert_eq!(actual_pxrj.as_slice(), expected_pxrj);
+        assert_eq!(
+            fs::metadata(pxrs_path)
+                .unwrap_or_else(|error| panic!("replay PXRS metadata failed: {error}"))
+                .ino(),
+            expected_pxrs_inode,
+        );
+        assert_eq!(
+            fs::metadata(pxrj_path)
+                .unwrap_or_else(|error| panic!("replay PXRJ metadata failed: {error}"))
+                .ino(),
+            expected_pxrj_inode,
+        );
+        drop(verified_ingress);
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 1);
+        current
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9189,7 +9578,7 @@ mod tests {
         }
 
         let socket_directory = TestSocketDirectory::create();
-        let (_state_directory, mut control, dependencies, _intended_client) =
+        let (_state_directory, mut control, dependencies, _intended_client, _stack_request) =
             managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
         let drift_pin =
             runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
@@ -9238,7 +9627,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_lower_genesis_is_exact_post_readback_and_second_initialize_is_unavailable() {
         let socket_directory = TestSocketDirectory::create();
-        let (state_directory, mut control, dependencies, intended_client) =
+        let (state_directory, mut control, dependencies, intended_client, _stack_request) =
             managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
         let pin =
             runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
@@ -9391,7 +9780,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn current_final_genesis_binder_retains_exact_pxap_fixed_facts_and_sole_lease() {
         let socket_directory = TestSocketDirectory::create();
-        let (_state_directory, mut control, dependencies, intended_client) =
+        let (_state_directory, mut control, dependencies, intended_client, _stack_request) =
             managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
         let expected_carrier_binding_digest = dependencies.expected_carrier.binding_digest();
         let pin =
@@ -9461,9 +9850,490 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_final_fresh_commit_uses_real_signatures_and_finishes_joint_stable() {
+        let socket_directory = TestSocketDirectory::create();
+        let (
+            state_directory,
+            mut control,
+            dependencies,
+            intended_client,
+            stack_request,
+            current_bundle,
+        ) = managed_control_with_current_final_v2(socket_directory.socket_path.clone()).await;
+        let current = current_bundle.current_final_for_test();
+        let current_identity = current.current_identity_for_test();
+        let journal_identity = RemoteAgentReplayJournalIdentityPinsV2 {
+            target: current_identity.target,
+            store_instance_id: current_identity.store_instance_id,
+            owner_target_fingerprint: current_identity.owner_target_fingerprint,
+            transition_projection_digest: current_identity.transition_projection_digest,
+        };
+        let genesis_snapshot_digest = current.snapshot_for_test().snapshot_digest();
+        let retained_s0_cas = current.current_retained_s0_cas_for_test();
+        let expected_s1_cas = current.current_s1_cas_for_test();
+        let expected_pxap = current_bundle.exact_pxap_for_test().to_vec();
+        let runtime_host_epoch = current.current_runtime_host_epoch_for_test();
+        let clock_generation = control
+            .core
+            .clock_reading()
+            .unwrap_or_else(|error| panic!("fresh Runtime clock unavailable: {error}"))
+            .generation();
+        let pxrs_path = state_directory
+            .path()
+            .join("remote-agent-access.snapshot-v2");
+        let pxrj_path = state_directory
+            .path()
+            .join("remote-agent-access-replay-journal.snapshot-v2");
+        let initial_journal_wire = fs::read(&pxrj_path)
+            .unwrap_or_else(|error| panic!("fresh genesis PXRJ readback failed: {error}"));
+        let initial_journal =
+            RemoteAgentReplayJournalSnapshotV2::decode(&initial_journal_wire, journal_identity)
+                .unwrap_or_else(|error| panic!("fresh genesis PXRJ decode failed: {error}"));
+        assert_eq!(
+            initial_journal.phase(),
+            RemoteAgentReplayJournalPhaseV2::Stable
+        );
+        assert_eq!(initial_journal.revision(), 1);
+        assert_eq!(initial_journal.applied_burn_ordinal(), 0);
+        assert_eq!(initial_journal.burn_count(), 0);
+
+        let request = signed_managed_remote_agent_access_apply_v2(
+            &stack_request,
+            retained_s0_cas,
+            expected_s1_cas,
+            dependencies.expected_carrier.clone(),
+            intended_client,
+            runtime_host_epoch,
+            clock_generation,
+            [0xea; 16],
+            b"remote-agent-fresh-tenure-nonce",
+            b"remote-agent-fresh-request-nonce",
+            b"remote-agent-fresh-outer-nonce",
+            0xeb,
+        );
+        let pin_drops = Arc::new(AtomicU64::new(0));
+        let verified_ingress = verify_managed_remote_agent_access_ingress_v2(
+            &request,
+            &dependencies,
+            &control.provisioning,
+            clock_generation,
+            Arc::clone(&pin_drops),
+        );
+        assert_eq!(pin_drops.load(Ordering::SeqCst), 0);
+
+        let committed = control
+            .core
+            .commit_remote_agent_access_fresh_v2(current_bundle, verified_ingress)
+            .unwrap_or_else(|error| panic!("joint fresh commit failed: {error:?}"));
+        assert_eq!(
+            pin_drops.load(Ordering::SeqCst),
+            1,
+            "the live ingress Pin must be released only by the completed joint transaction",
+        );
+        let snapshot = committed.same_epoch_snapshot_for_test();
+        assert_eq!(
+            snapshot.phase(),
+            RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+        );
+        assert_eq!(snapshot.sequence(), 2);
+        assert_eq!(
+            snapshot.previous_snapshot_digest(),
+            Some(genesis_snapshot_digest)
+        );
+        assert_eq!(committed.exact_pxap_for_test(), expected_pxap.as_slice());
+        let stored_pxrs = fs::read(&pxrs_path)
+            .unwrap_or_else(|error| panic!("fresh PXRS readback failed: {error}"));
+        assert_eq!(stored_pxrs.as_slice(), snapshot.canonical_wire());
+        let stored_journal = fs::read(&pxrj_path)
+            .unwrap_or_else(|error| panic!("fresh Stable PXRJ readback failed: {error}"));
+        let stable = RemoteAgentReplayJournalSnapshotV2::decode(&stored_journal, journal_identity)
+            .unwrap_or_else(|error| panic!("fresh Stable PXRJ decode failed: {error}"));
+        assert_eq!(stable.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+        assert_eq!(stable.revision(), 3);
+        assert_eq!(stable.applied_burn_ordinal(), 1);
+        assert_eq!(stable.burn_count(), 1);
+        assert_eq!(stable.pending_source_snapshot_sequence(), None);
+        assert_eq!(stable.pending_source_snapshot_digest(), None);
+        assert_eq!(stable.pending_candidate_snapshot_digest(), None);
+        drop(committed);
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("fresh joint commit cleanup failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_final_three_axis_replays_are_pure_and_reconstruct_every_authority() {
+        let socket_directory = TestSocketDirectory::create();
+        let (
+            state_directory,
+            mut control,
+            dependencies,
+            intended_client,
+            stack_request,
+            current,
+        ) = managed_control_with_current_final_v2(socket_directory.socket_path.clone()).await;
+        let current_final = current.current_final_for_test();
+        let retained_s0_cas = current_final.current_retained_s0_cas_for_test();
+        let expected_s1_cas = current_final.current_s1_cas_for_test();
+        let runtime_host_epoch = current_final.current_runtime_host_epoch_for_test();
+        let current_identity = current_final.current_identity_for_test();
+        let journal_identity = RemoteAgentReplayJournalIdentityPinsV2 {
+            target: current_identity.target,
+            store_instance_id: current_identity.store_instance_id,
+            owner_target_fingerprint: current_identity.owner_target_fingerprint,
+            transition_projection_digest: current_identity.transition_projection_digest,
+        };
+        let clock_generation = control
+            .core
+            .clock_reading()
+            .unwrap_or_else(|error| panic!("replay Runtime clock unavailable: {error}"))
+            .generation();
+        let pxrs_path = state_directory
+            .path()
+            .join("remote-agent-access.snapshot-v2");
+        let pxrj_path = state_directory
+            .path()
+            .join("remote-agent-access-replay-journal.snapshot-v2");
+        let genesis_pxrs = fs::read(&pxrs_path)
+            .unwrap_or_else(|error| panic!("preburn PXRS readback failed: {error}"));
+        let genesis_pxrs_inode = fs::metadata(&pxrs_path)
+            .unwrap_or_else(|error| panic!("preburn PXRS metadata failed: {error}"))
+            .ino();
+
+        let base_request = signed_managed_remote_agent_access_apply_v2(
+            &stack_request,
+            retained_s0_cas,
+            expected_s1_cas,
+            dependencies.expected_carrier.clone(),
+            intended_client,
+            runtime_host_epoch,
+            clock_generation,
+            [0xea; 16],
+            b"remote-agent-replay-base-tenure",
+            b"remote-agent-replay-base-request",
+            b"remote-agent-replay-base-outer",
+            0xea,
+        );
+        let base_pin_drops = Arc::new(AtomicU64::new(0));
+        let base_ingress = verify_managed_remote_agent_access_ingress_v2(
+            &base_request,
+            &dependencies,
+            &control.provisioning,
+            clock_generation,
+            Arc::clone(&base_pin_drops),
+        );
+        let (mut current, base_ingress) = control
+            .core
+            .seed_remote_agent_replay_unapplied_stable_for_test(current, base_ingress)
+            .unwrap_or_else(|error| panic!("unapplied replay burn seed failed: {error:?}"));
+        assert_eq!(base_pin_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(base_ingress.request(), &base_request);
+        drop(base_ingress);
+        assert_eq!(base_pin_drops.load(Ordering::SeqCst), 1);
+        let burned_pxrs = fs::read(&pxrs_path)
+            .unwrap_or_else(|error| panic!("burned PXRS readback failed: {error}"));
+        let burned_pxrj = fs::read(&pxrj_path)
+            .unwrap_or_else(|error| panic!("burned PXRJ readback failed: {error}"));
+        let burned_pxrs_inode = fs::metadata(&pxrs_path)
+            .unwrap_or_else(|error| panic!("burned PXRS metadata failed: {error}"))
+            .ino();
+        let burned_pxrj_inode = fs::metadata(&pxrj_path)
+            .unwrap_or_else(|error| panic!("burned PXRJ metadata failed: {error}"))
+            .ino();
+        assert_eq!(burned_pxrs, genesis_pxrs);
+        assert_eq!(burned_pxrs_inode, genesis_pxrs_inode);
+        let burned = RemoteAgentReplayJournalSnapshotV2::decode(&burned_pxrj, journal_identity)
+            .unwrap_or_else(|error| panic!("burned Stable PXRJ decode failed: {error}"));
+        assert_eq!(burned.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+        assert_eq!(burned.revision(), 3);
+        assert_eq!(burned.applied_burn_ordinal(), 0);
+        assert_eq!(burned.burn_count(), 1);
+
+        let operation_replay = signed_managed_remote_agent_access_apply_v2(
+            &stack_request,
+            retained_s0_cas,
+            expected_s1_cas,
+            dependencies.expected_carrier.clone(),
+            intended_client,
+            runtime_host_epoch,
+            clock_generation,
+            [0xea; 16],
+            b"remote-agent-replay-operation-tenure",
+            b"remote-agent-replay-operation-request",
+            b"remote-agent-replay-operation-outer",
+            0xeb,
+        );
+        current = assert_managed_remote_agent_replay_rejected_v2(
+            &mut control,
+            &dependencies,
+            current,
+            &operation_replay,
+            clock_generation,
+            &pxrs_path,
+            &pxrj_path,
+            &burned_pxrs,
+            &burned_pxrj,
+            burned_pxrs_inode,
+            burned_pxrj_inode,
+        );
+
+        let tenure_replay = signed_managed_remote_agent_access_apply_v2(
+            &stack_request,
+            retained_s0_cas,
+            expected_s1_cas,
+            dependencies.expected_carrier.clone(),
+            intended_client,
+            runtime_host_epoch,
+            clock_generation,
+            [0xec; 16],
+            b"remote-agent-replay-base-tenure",
+            b"remote-agent-replay-tenure-request",
+            b"remote-agent-replay-tenure-outer",
+            0xec,
+        );
+        current = assert_managed_remote_agent_replay_rejected_v2(
+            &mut control,
+            &dependencies,
+            current,
+            &tenure_replay,
+            clock_generation,
+            &pxrs_path,
+            &pxrj_path,
+            &burned_pxrs,
+            &burned_pxrj,
+            burned_pxrs_inode,
+            burned_pxrj_inode,
+        );
+
+        let request_replay = signed_managed_remote_agent_access_apply_v2(
+            &stack_request,
+            retained_s0_cas,
+            expected_s1_cas,
+            dependencies.expected_carrier.clone(),
+            intended_client,
+            runtime_host_epoch,
+            clock_generation,
+            [0xed; 16],
+            b"remote-agent-replay-request-tenure",
+            b"remote-agent-replay-base-request",
+            b"remote-agent-replay-request-outer",
+            0xed,
+        );
+        current = assert_managed_remote_agent_replay_rejected_v2(
+            &mut control,
+            &dependencies,
+            current,
+            &request_replay,
+            clock_generation,
+            &pxrs_path,
+            &pxrj_path,
+            &burned_pxrs,
+            &burned_pxrj,
+            burned_pxrs_inode,
+            burned_pxrj_inode,
+        );
+        assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
+        drop(current);
+
+        shutdown_managed_successor_chain(
+            &mut control.distributed,
+            &mut control.model_stack,
+            &mut control.stack,
+            &mut control.core,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("three-axis replay cleanup failed: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_three_stage_publish_uncertainty_returns_no_authority_and_drops_pin() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Stage {
+            PendingJournal,
+            AccessSnapshot,
+            StableJournal,
+        }
+
+        for (stage, pending_failpoint, access_failpoint, stable_failpoint, operation_byte) in [
+            (
+                Stage::PendingJournal,
+                RemoteAgentReplayJournalCommitFailpointV2::AfterDirectorySyncBeforeReadBack,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                0xf1,
+            ),
+            (
+                Stage::AccessSnapshot,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessCommitFailpointV2::AfterDirectorySyncBeforeReadBack,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                0xf2,
+            ),
+            (
+                Stage::StableJournal,
+                RemoteAgentReplayJournalCommitFailpointV2::None,
+                RemoteAgentAccessCommitFailpointV2::None,
+                RemoteAgentReplayJournalCommitFailpointV2::AfterDirectorySyncBeforeReadBack,
+                0xf3,
+            ),
+        ] {
+            let socket_directory = TestSocketDirectory::create();
+            let (
+                state_directory,
+                mut control,
+                dependencies,
+                intended_client,
+                stack_request,
+                current,
+            ) = managed_control_with_current_final_v2(socket_directory.socket_path.clone()).await;
+            let current_final = current.current_final_for_test();
+            let retained_s0_cas = current_final.current_retained_s0_cas_for_test();
+            let expected_s1_cas = current_final.current_s1_cas_for_test();
+            let runtime_host_epoch = current_final.current_runtime_host_epoch_for_test();
+            let current_identity = current_final.current_identity_for_test();
+            let static_identity = RemoteAgentAccessStaticIdentityPinsV2 {
+                target: current_identity.target,
+                store_instance_id: current_identity.store_instance_id,
+                owner_target_fingerprint: current_identity.owner_target_fingerprint,
+                transition_projection_digest: current_identity.transition_projection_digest,
+            };
+            let journal_identity = RemoteAgentReplayJournalIdentityPinsV2 {
+                target: current_identity.target,
+                store_instance_id: current_identity.store_instance_id,
+                owner_target_fingerprint: current_identity.owner_target_fingerprint,
+                transition_projection_digest: current_identity.transition_projection_digest,
+            };
+            let clock_generation = control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| panic!("failpoint Runtime clock unavailable: {error}"))
+                .generation();
+            let pxrs_path = state_directory
+                .path()
+                .join("remote-agent-access.snapshot-v2");
+            let pxrj_path = state_directory
+                .path()
+                .join("remote-agent-access-replay-journal.snapshot-v2");
+            let initial_pxrs = fs::read(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRS read failed: {error}"));
+            let initial_pxrj = fs::read(&pxrj_path)
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRJ read failed: {error}"));
+            let initial_pxrs_inode = fs::metadata(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRS metadata failed: {error}"))
+                .ino();
+            let initial_pxrj_inode = fs::metadata(&pxrj_path)
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRJ metadata failed: {error}"))
+                .ino();
+            let request = signed_managed_remote_agent_access_apply_v2(
+                &stack_request,
+                retained_s0_cas,
+                expected_s1_cas,
+                dependencies.expected_carrier.clone(),
+                intended_client,
+                runtime_host_epoch,
+                clock_generation,
+                [operation_byte; 16],
+                &[operation_byte, 0x01, 0x02],
+                &[operation_byte, 0x03, 0x04],
+                &[operation_byte, 0x05, 0x06],
+                operation_byte,
+            );
+            let pin_drops = Arc::new(AtomicU64::new(0));
+            let verified_ingress = verify_managed_remote_agent_access_ingress_v2(
+                &request,
+                &dependencies,
+                &control.provisioning,
+                clock_generation,
+                Arc::clone(&pin_drops),
+            );
+            assert_eq!(pin_drops.load(Ordering::SeqCst), 0);
+            let error = match control
+                .core
+                .commit_remote_agent_access_fresh_v2_at_failpoints(
+                    current,
+                    verified_ingress,
+                    pending_failpoint,
+                    access_failpoint,
+                    stable_failpoint,
+                )
+            {
+                Ok(_) => panic!("{stage:?} failpoint unexpectedly returned a joint lease"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(_)
+            ));
+            assert_eq!(
+                pin_drops.load(Ordering::SeqCst),
+                1,
+                "{stage:?} uncertainty retained the live ingress Pin",
+            );
+            assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
+
+            let disk_pxrs = fs::read(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRS read failed: {error}"));
+            let disk_pxrj = fs::read(&pxrj_path)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ read failed: {error}"));
+            let disk_pxrs_inode = fs::metadata(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRS metadata failed: {error}"))
+                .ino();
+            let disk_pxrj_inode = fs::metadata(&pxrj_path)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ metadata failed: {error}"))
+                .ino();
+            let pxrs = RemoteAgentAccessSnapshotV2::decode(&disk_pxrs, static_identity)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRS decode failed: {error}"));
+            let pxrj = RemoteAgentReplayJournalSnapshotV2::decode(&disk_pxrj, journal_identity)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ decode failed: {error}"));
+            assert_ne!(disk_pxrj, initial_pxrj);
+            match stage {
+                Stage::PendingJournal => {
+                    assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
+                    assert_eq!(disk_pxrs, initial_pxrs);
+                    assert_eq!(disk_pxrs_inode, initial_pxrs_inode);
+                    assert_eq!(pxrs.phase(), RemoteAgentAccessDurablePhaseV2::InitializedAbsent);
+                    assert_eq!(pxrs.sequence(), 1);
+                    assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
+                    assert_eq!(pxrj.revision(), 2);
+                    assert_eq!(pxrj.applied_burn_ordinal(), 0);
+                    assert_eq!(pxrj.pending_source_snapshot_sequence(), Some(1));
+                }
+                Stage::AccessSnapshot => {
+                    assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
+                    assert_ne!(disk_pxrs, initial_pxrs);
+                    assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
+                    assert_eq!(pxrs.phase(), RemoteAgentAccessDurablePhaseV2::PreparedNoEffects);
+                    assert_eq!(pxrs.sequence(), 2);
+                    assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
+                    assert_eq!(pxrj.revision(), 2);
+                    assert_eq!(pxrj.applied_burn_ordinal(), 0);
+                    assert_eq!(pxrj.pending_source_snapshot_sequence(), Some(1));
+                }
+                Stage::StableJournal => {
+                    assert_ne!(disk_pxrs, initial_pxrs);
+                    assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
+                    assert_eq!(pxrs.phase(), RemoteAgentAccessDurablePhaseV2::PreparedNoEffects);
+                    assert_eq!(pxrs.sequence(), 2);
+                    assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+                    assert_eq!(pxrj.revision(), 3);
+                    assert_eq!(pxrj.applied_burn_ordinal(), 1);
+                    assert_eq!(pxrj.pending_source_snapshot_sequence(), None);
+                }
+            }
+            drop(control);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn current_final_binder_same_bytes_new_inode_is_fail_stop_without_current_final() {
         let socket_directory = TestSocketDirectory::create();
-        let (state_directory, mut control, dependencies, _intended_client) =
+        let (state_directory, mut control, dependencies, _intended_client, _stack_request) =
             managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
         let pin =
             runtime_restricted_apply_carrier_pin_for_test(&dependencies, &control.provisioning)
