@@ -2567,11 +2567,7 @@ fn encode_tui_attach_frame(
     locator: &LocalTuiAttachLocatorV1,
     frame_kind: TuiAttachFrameKindV1,
 ) -> Result<Vec<u8>, LocalProcessError> {
-    encode_tui_attach_frame_for_owner(
-        locator,
-        frame_kind,
-        TuiAttachOwnerIdentityV1::effective(),
-    )
+    encode_tui_attach_frame_for_owner(locator, frame_kind, TuiAttachOwnerIdentityV1::effective())
 }
 
 fn encode_tui_attach_frame_for_owner(
@@ -2799,8 +2795,7 @@ fn decode_tui_attach_frame_for_owner(
         conversation,
         inspection,
     };
-    if encode_tui_attach_frame_for_owner(&locator, frame_kind, expected_owner)?.as_slice()
-        != frame
+    if encode_tui_attach_frame_for_owner(&locator, frame_kind, expected_owner)?.as_slice() != frame
     {
         return Err(error);
     }
