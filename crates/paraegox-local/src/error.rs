@@ -152,15 +152,11 @@ impl LocalProcessError {
             Self::LocalDeployLifecycle => {
                 "compiled local deployment did not reach the running owner generation"
             }
-            Self::LocalDeployQuery => {
-                "compiled local deployment projection query failed closed"
-            }
+            Self::LocalDeployQuery => "compiled local deployment projection query failed closed",
             Self::LocalDeployEvidence => {
                 "compiled local deployment terminal evidence failed strict validation"
             }
-            Self::LocalDeployJsonOutput => {
-                "compiled local deployment JSON output failed"
-            }
+            Self::LocalDeployJsonOutput => "compiled local deployment JSON output failed",
             Self::UnsafeExecutionIdentity => {
                 "DeveloperLocal commands require a non-root user and group"
             }

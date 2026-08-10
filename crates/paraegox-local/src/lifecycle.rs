@@ -425,10 +425,7 @@ struct InternalDeployResponseV1 {
 }
 
 impl InternalDeployResponseV1 {
-    fn from_verified(
-        generation: &str,
-        projection: VerifiedLocalDeploymentProjectionV1,
-    ) -> Self {
+    fn from_verified(generation: &str, projection: VerifiedLocalDeploymentProjectionV1) -> Self {
         Self {
             generation: generation.into(),
             deployment_revision: projection.controller_revision(),
@@ -449,8 +446,8 @@ impl InternalDeployResponseV1 {
         self,
         expected_generation: [u8; 16],
     ) -> Result<LocalDeployProjectionV1, LocalProcessError> {
-        let observed_generation =
-            decode_generation(&self.generation).map_err(|_| LocalProcessError::LocalDeployEvidence)?;
+        let observed_generation = decode_generation(&self.generation)
+            .map_err(|_| LocalProcessError::LocalDeployEvidence)?;
         let runtime_apply_request_digest = decode_lower_hex_32(&self.runtime_apply_request_digest)
             .map_err(|_| LocalProcessError::LocalDeployEvidence)?;
         let runtime_terminal_receipt_digest =
@@ -748,10 +745,7 @@ pub(crate) fn run_local_deploy(
             ));
         }
     };
-    if !up.ok()
-        || up.state() != LocalLifecycleStateV1::Running
-        || !up.owner_readiness_observed()
-    {
+    if !up.ok() || up.state() != LocalLifecycleStateV1::Running || !up.owner_readiness_observed() {
         return Err(local_deploy_non_running_failure(&up));
     }
     let generation = up.generation().ok_or_else(|| {
@@ -781,9 +775,7 @@ pub(crate) fn run_local_deploy(
     })
 }
 
-fn local_deploy_non_running_failure(
-    up: &LocalLifecycleObservationV1,
-) -> LocalDeployFailureV1 {
+fn local_deploy_non_running_failure(up: &LocalLifecycleObservationV1) -> LocalDeployFailureV1 {
     if up.diagnostic().is_some_and(|diagnostic| {
         diagnostic.code() == LocalProcessError::LifecycleConfiguration.code()
     }) {
@@ -1218,9 +1210,8 @@ fn deployment_response_for_request(
     {
         return None;
     }
-    projection.map(|projection| {
-        InternalDeployResponseV1::from_verified(&record.generation, projection)
-    })
+    projection
+        .map(|projection| InternalDeployResponseV1::from_verified(&record.generation, projection))
 }
 
 async fn sleep_until_deadline(deadline: Instant) {
@@ -1610,10 +1601,7 @@ async fn query_local_deployment_async(
     {
         return Err(LocalProcessError::LocalDeployQuery);
     }
-    let request = encode_internal_deploy_query(
-        config.config_commitment(),
-        expected_generation,
-    );
+    let request = encode_internal_deploy_query(config.config_commitment(), expected_generation);
     timeout(CLIENT_IO_TIMEOUT, stream.write_all(&request))
         .await
         .map_err(|_| LocalProcessError::LocalDeployQuery)?
@@ -1654,8 +1642,10 @@ fn encode_internal_deploy_query(
     expected_generation: [u8; 16],
 ) -> [u8; INTERNAL_DEPLOY_QUERY_BYTES] {
     let mut request = [0_u8; INTERNAL_DEPLOY_QUERY_BYTES];
-    request[..INTERNAL_REQUEST_BYTES]
-        .copy_from_slice(&encode_internal_request(InternalActionV1::Deploy, commitment));
+    request[..INTERNAL_REQUEST_BYTES].copy_from_slice(&encode_internal_request(
+        InternalActionV1::Deploy,
+        commitment,
+    ));
     request[INTERNAL_REQUEST_BYTES..].copy_from_slice(&expected_generation);
     request
 }
@@ -2234,7 +2224,10 @@ mod tests {
         with_unknown
             .as_object_mut()
             .expect("response object")
-            .insert("path".to_owned(), serde_json::Value::String("forbidden".to_owned()));
+            .insert(
+                "path".to_owned(),
+                serde_json::Value::String("forbidden".to_owned()),
+            );
         assert!(serde_json::from_value::<InternalDeployResponseV1>(with_unknown).is_err());
 
         let mut mismatch = response.clone();
@@ -2262,12 +2255,7 @@ mod tests {
             owner_readiness_observed: true,
         };
         let projection = VerifiedLocalDeploymentProjectionV1::for_test(
-            7,
-            11,
-            [0x73; 32],
-            [0x74; 32],
-            false,
-            false,
+            7, 11, [0x73; 32], [0x74; 32], false, false,
         );
         assert!(
             deployment_response_for_request(&record, false, generation, Some(projection)).is_some()

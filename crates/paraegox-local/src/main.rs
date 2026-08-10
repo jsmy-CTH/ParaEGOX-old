@@ -135,10 +135,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch_local_deploy_to(
-    output: &mut impl Write,
-    arguments: &[OsString],
-) -> DispatchOutcome {
+fn dispatch_local_deploy_to(output: &mut impl Write, arguments: &[OsString]) -> DispatchOutcome {
     let command = match config::parse_local_deploy(arguments) {
         Ok(Some(command)) => command,
         Ok(None) => unreachable!("local deploy intent is checked before dispatch"),
@@ -160,9 +157,7 @@ fn dispatch_local_deploy_to(
                     DispatchOutcome::DiagnosticFailure
                 }
             }
-            Err(failure) => {
-                finish_local_deploy_result(output, failure.changed(), failure.error())
-            }
+            Err(failure) => finish_local_deploy_result(output, failure.changed(), failure.error()),
         }
     }
     #[cfg(not(unix))]
@@ -206,10 +201,8 @@ fn write_local_deploy_success_json_line(
     let projection = observation.projection();
     let deployment_revision = projection.controller_revision().to_string();
     let controller_snapshot_sequence = projection.controller_snapshot_sequence().to_string();
-    let runtime_apply_request_digest =
-        lower_hex(&projection.runtime_apply_request_digest());
-    let runtime_terminal_receipt_digest =
-        lower_hex(&projection.runtime_terminal_receipt_digest());
+    let runtime_apply_request_digest = lower_hex(&projection.runtime_apply_request_digest());
+    let runtime_terminal_receipt_digest = lower_hex(&projection.runtime_terminal_receipt_digest());
     serde_json::to_writer(
         &mut *output,
         &json!({
@@ -1258,15 +1251,9 @@ mod tests {
         assert_eq!(parsed["changed"], true);
         assert_eq!(parsed["generation"], "00112233445566778899aabbccddeeff");
         assert_eq!(parsed["deployment_revision"], u64::MAX.to_string());
-        assert_eq!(
-            parsed["controller_snapshot_sequence"],
-            "9007199254740992"
-        );
+        assert_eq!(parsed["controller_snapshot_sequence"], "9007199254740992");
         assert_eq!(parsed["runtime_apply_request_digest"], "ab".repeat(32));
-        assert_eq!(
-            parsed["runtime_terminal_receipt_digest"],
-            "cd".repeat(32)
-        );
+        assert_eq!(parsed["runtime_terminal_receipt_digest"], "cd".repeat(32));
         assert_eq!(parsed["terminal_outcome"], "active_ready");
         assert_eq!(parsed["current_health_checked"], false);
         assert_eq!(parsed["diagnostics"], json!([]));
@@ -1282,8 +1269,7 @@ mod tests {
                 LocalProcessError::LocalDeployQuery,
             )
             .expect("local deploy error JSON");
-            let parsed: Value =
-                serde_json::from_slice(&output).expect("local deploy error object");
+            let parsed: Value = serde_json::from_slice(&output).expect("local deploy error object");
             assert_eq!(parsed.as_object().expect("JSON object").len(), 14);
             assert_eq!(parsed["ok"], false);
             assert_eq!(parsed["changed"], expected);
@@ -1876,9 +1862,7 @@ mod tests {
         assert!(text.contains("paraegox up --config <absolute-paraegox.toml> --json"));
         assert!(text.contains("paraegox status --config <absolute-paraegox.toml> --json"));
         assert!(text.contains("paraegox down --config <absolute-paraegox.toml> --json"));
-        assert!(text.contains(
-            "paraegox deploy --local --config <absolute-paraegox.toml> --json"
-        ));
+        assert!(text.contains("paraegox deploy --local --config <absolute-paraegox.toml> --json"));
         assert!(text.contains("reports only the authenticated local lifecycle state"));
         assert!(text.contains("never use a PID as control authority"));
         assert!(text.contains("restart and crash recovery are not part"));
