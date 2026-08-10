@@ -227,6 +227,98 @@ pub(crate) struct PreparedHeadlessChatV1 {
     peer: DeveloperLocalPeerIdentityV1,
 }
 
+/// Narrow, immutable projection of the already-completed deterministic
+/// DeploymentController/Runtime activation used by the local deploy CLI.
+///
+/// This value is created only from the real activation outcome and is handed
+/// to the lifecycle supervisor only after the existing Inspection startup has
+/// independently decoded, authenticated, and accepted the same PXMT terminal
+/// receipt as `ActiveReady`. It owns no mutation or current-health authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedLocalDeploymentProjectionV1 {
+    controller_revision: u64,
+    controller_snapshot_sequence: u64,
+    runtime_apply_request_digest: [u8; 32],
+    runtime_terminal_receipt_digest: [u8; 32],
+    fabric_replayed: bool,
+    model_agent_replayed: bool,
+}
+
+impl VerifiedLocalDeploymentProjectionV1 {
+    fn try_from_outcome(
+        outcome: &DeveloperLocalDeploymentOutcomeV1,
+    ) -> Result<Option<Self>, LocalProcessError> {
+        let DeveloperLocalDeploymentOutcomeV1::Fixture(outcome) = outcome else {
+            return Ok(None);
+        };
+        let projection = Self {
+            controller_revision: outcome.controller_revision(),
+            controller_snapshot_sequence: outcome.controller_snapshot_sequence(),
+            runtime_apply_request_digest: outcome.model_agent_request_digest().into_bytes(),
+            runtime_terminal_receipt_digest: outcome.model_agent_receipt_digest().into_bytes(),
+            fabric_replayed: outcome.fabric_replayed(),
+            model_agent_replayed: outcome.model_agent_replayed(),
+        };
+        if projection.controller_revision == 0
+            || projection.controller_snapshot_sequence == 0
+            || projection
+                .runtime_apply_request_digest
+                .iter()
+                .all(|byte| *byte == 0)
+            || projection
+                .runtime_terminal_receipt_digest
+                .iter()
+                .all(|byte| *byte == 0)
+        {
+            return Err(LocalProcessError::DeploymentActivation);
+        }
+        Ok(Some(projection))
+    }
+
+    pub(crate) const fn controller_revision(self) -> u64 {
+        self.controller_revision
+    }
+
+    pub(crate) const fn controller_snapshot_sequence(self) -> u64 {
+        self.controller_snapshot_sequence
+    }
+
+    pub(crate) const fn runtime_apply_request_digest(self) -> [u8; 32] {
+        self.runtime_apply_request_digest
+    }
+
+    pub(crate) const fn runtime_terminal_receipt_digest(self) -> [u8; 32] {
+        self.runtime_terminal_receipt_digest
+    }
+
+    pub(crate) const fn fabric_replayed(self) -> bool {
+        self.fabric_replayed
+    }
+
+    pub(crate) const fn model_agent_replayed(self) -> bool {
+        self.model_agent_replayed
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        controller_revision: u64,
+        controller_snapshot_sequence: u64,
+        runtime_apply_request_digest: [u8; 32],
+        runtime_terminal_receipt_digest: [u8; 32],
+        fabric_replayed: bool,
+        model_agent_replayed: bool,
+    ) -> Self {
+        Self {
+            controller_revision,
+            controller_snapshot_sequence,
+            runtime_apply_request_digest,
+            runtime_terminal_receipt_digest,
+            fabric_replayed,
+            model_agent_replayed,
+        }
+    }
+}
+
 enum PreparedHeadlessChatOwnerV1 {
     Fixture(Box<DeveloperFixtureConfigV1>),
     Provisioned {
@@ -1230,6 +1322,7 @@ pub(crate) fn run_distributed(
                 .agent_ipc_bootstrap_path()
                 .to_path_buf(),
             inspection: None,
+            local_deployment_projection: None,
             expected_uid: Uid::effective().as_raw(),
             expected_gid: Gid::effective().as_raw(),
         })
@@ -1386,6 +1479,8 @@ fn run_prepared(
             return Err(primary);
         }
     };
+    let local_deployment_projection =
+        VerifiedLocalDeploymentProjectionV1::try_from_outcome(&deployment)?;
     let conversation_result = (|| {
         let conversation_handle = stack
             .runtime()
@@ -1410,6 +1505,7 @@ fn run_prepared(
                 ipc_socket_path: layout.inspection_ipc_socket_path().to_path_buf(),
                 ipc_bootstrap_path: layout.inspection_ipc_bootstrap_path().to_path_buf(),
             }),
+            local_deployment_projection,
             expected_uid: Uid::effective().as_raw(),
             expected_gid: Gid::effective().as_raw(),
         })
@@ -2158,6 +2254,7 @@ struct ConversationRunInput {
     ipc_socket_path: PathBuf,
     ipc_bootstrap_path: PathBuf,
     inspection: Option<ConversationInspectionInput>,
+    local_deployment_projection: Option<VerifiedLocalDeploymentProjectionV1>,
     expected_uid: u32,
     expected_gid: u32,
 }
@@ -2169,11 +2266,15 @@ struct ConversationInspectionInput {
 }
 
 /// Narrow lifecycle seam for the hidden managed-chat supervisor. It conveys
-/// no Runtime, Node, Deployment, Fabric, Model, or Agent facts; those remain
-/// owned by the composition above. Implementations must not report readiness
-/// until this module calls `mark_ready`.
+/// no mutation or current-health authority; those remain owned by the
+/// composition above. For the deterministic profile it may carry one verified
+/// terminal deployment projection for read-only D0a queries. Implementations
+/// must not report readiness until this module calls `mark_ready`.
 pub(crate) trait HeadlessLifecycleControlV1 {
-    fn mark_ready(&mut self) -> Result<(), LocalProcessError>;
+    fn mark_ready(
+        &mut self,
+        deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+    ) -> Result<(), LocalProcessError>;
 
     fn wait_for_shutdown(&mut self) -> Result<(), LocalProcessError>;
 }
@@ -2238,7 +2339,7 @@ where
 
         let lifecycle_result = self
             .control
-            .mark_ready()
+            .mark_ready(input.local_deployment_projection)
             .and_then(|()| self.control.wait_for_shutdown());
         let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
             endpoint
@@ -4137,14 +4238,19 @@ mod tests {
     struct ImmediateHeadlessControl {
         ready: bool,
         shutdown_waited: bool,
+        deployment: Option<VerifiedLocalDeploymentProjectionV1>,
     }
 
     impl HeadlessLifecycleControlV1 for ImmediateHeadlessControl {
-        fn mark_ready(&mut self) -> Result<(), LocalProcessError> {
+        fn mark_ready(
+            &mut self,
+            deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        ) -> Result<(), LocalProcessError> {
             if self.ready || self.shutdown_waited {
                 return Err(LocalProcessError::LifecycleStartup);
             }
             self.ready = true;
+            self.deployment = deployment;
             Ok(())
         }
 

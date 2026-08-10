@@ -44,6 +44,7 @@ use zeroize::Zeroizing;
 
 const CHAT_COMMAND: &str = "chat";
 const INIT_COMMAND: &str = "init";
+const DEPLOY_COMMAND: &str = "deploy";
 const NODE_COMMAND: &str = "node";
 const DEPLOYMENT_COMMAND: &str = "deployment";
 const VERSION_COMMAND: &str = "version";
@@ -54,6 +55,7 @@ const UP_COMMAND: &str = "up";
 const STATUS_COMMAND: &str = "status";
 const DOWN_COMMAND: &str = "down";
 const CONFIG_OPTION: &str = "--config";
+const LOCAL_OPTION: &str = "--local";
 const OFFLINE_OPTION: &str = "--offline";
 const JSON_OPTION: &str = "--json";
 const DIRECTORY_OPTION: &str = "--directory";
@@ -226,6 +228,22 @@ impl LocalLifecycleJsonIntentV1 {
 pub(crate) struct LocalLifecycleCommandV1 {
     action: LocalLifecycleActionV1,
     config: LocalManagedChatConfigV1,
+}
+
+/// Parsed input for the one compiled-in DeveloperLocal deployment command.
+///
+/// The exact chat configuration stays whole and is consumed only by the
+/// existing lifecycle owner. This value carries no Artifact, Installation,
+/// target, retry, or replacement authority.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct LocalDeployCommandV1 {
+    config: LocalManagedChatConfigV1,
+}
+
+impl LocalDeployCommandV1 {
+    pub(crate) fn into_config(self) -> LocalManagedChatConfigV1 {
+        self.config
+    }
 }
 
 impl LocalLifecycleCommandV1 {
@@ -1475,6 +1493,10 @@ impl LocalManagedChatConfigV1 {
         self.config_commitment
     }
 
+    pub(crate) const fn selects_deterministic_fixture(&self) -> bool {
+        matches!(&self.owner, LocalManagedChatOwnerConfigV1::Fixture(_))
+    }
+
     pub(crate) fn into_owner_config(self) -> LocalManagedChatOwnerConfigV1 {
         self.owner
     }
@@ -1800,6 +1822,8 @@ pub(crate) enum ConfigError {
     DuplicateOption,
     InvalidInitGrammar,
     InvalidInitDirectory,
+    InvalidLocalDeployGrammar,
+    UnsupportedLocalDeployProfile,
     MissingStateRoot,
     MissingFabricListenA,
     MissingFabricListenB,
@@ -1881,6 +1905,8 @@ impl ConfigError {
             Self::DuplicateOption => "PXLC-OPTION-DUPLICATE",
             Self::InvalidInitGrammar => "PXLC-INIT-GRAMMAR",
             Self::InvalidInitDirectory => "PXLC-INIT-DIRECTORY-INVALID",
+            Self::InvalidLocalDeployGrammar => "PXLC-DEPLOY-GRAMMAR",
+            Self::UnsupportedLocalDeployProfile => "PXLC-DEPLOY-PROFILE-UNSUPPORTED",
             Self::MissingStateRoot => "PXLC-STATE-ROOT-MISSING",
             Self::MissingFabricListenA => "PXLC-FABRIC-LISTEN-A-MISSING",
             Self::MissingFabricListenB => "PXLC-FABRIC-LISTEN-B-MISSING",
@@ -1975,6 +2001,12 @@ impl ConfigError {
             }
             Self::InvalidInitDirectory => {
                 "init directory must be a bounded non-root lexically canonical absolute path"
+            }
+            Self::InvalidLocalDeployGrammar => {
+                "deploy requires exactly --local --config <absolute-paraegox.toml> --json"
+            }
+            Self::UnsupportedLocalDeployProfile => {
+                "local deploy supports only the deterministic-echo-v1 profile"
             }
             Self::MissingStateRoot => "the selected DeveloperLocal mode requires --state-root",
             Self::MissingFabricListenA => "internal distributed fixture requires --fabric-listen-a",
@@ -2155,6 +2187,14 @@ pub(crate) fn init_json_intent(arguments: &[OsString]) -> bool {
         .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(INIT_COMMAND))
 }
 
+/// Recognizes every invocation of the public `deploy` command before grammar
+/// validation so its failures remain on the exact deploy JSON channel.
+pub(crate) fn local_deploy_json_intent(arguments: &[OsString]) -> bool {
+    arguments
+        .first()
+        .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(DEPLOY_COMMAND))
+}
+
 /// Parses the one exact public initializer grammar without opening the
 /// filesystem, resolving a Secret, accessing the network, or starting an
 /// owner.
@@ -2176,6 +2216,34 @@ pub(crate) fn parse_init(arguments: &[OsString]) -> Result<InitCommandV1, Config
     Ok(InitCommandV1 {
         directory: parse_init_directory(directory)?,
     })
+}
+
+/// Parses the sole compiled-in local deployment grammar without resolving a
+/// Secret, starting an owner, or touching lifecycle/domain state.
+pub(crate) fn parse_local_deploy(
+    arguments: &[OsString],
+) -> Result<Option<LocalDeployCommandV1>, ConfigError> {
+    if !local_deploy_json_intent(arguments) {
+        return Ok(None);
+    }
+    if arguments.len() != 5
+        || arguments.get(1).and_then(|value| value.to_str()) != Some(LOCAL_OPTION)
+        || arguments.get(2).and_then(|value| value.to_str()) != Some(CONFIG_OPTION)
+        || arguments.get(4).and_then(|value| value.to_str()) != Some(JSON_OPTION)
+    {
+        return Err(ConfigError::InvalidLocalDeployGrammar);
+    }
+    ensure_unix_developer_local()?;
+    let config = parse_managed_chat_config_file(
+        arguments
+            .get(3)
+            .cloned()
+            .ok_or(ConfigError::InvalidLocalDeployGrammar)?,
+    )?;
+    if !config.selects_deterministic_fixture() {
+        return Err(ConfigError::UnsupportedLocalDeployProfile);
+    }
+    Ok(Some(LocalDeployCommandV1 { config }))
 }
 
 /// Parses one public managed-local lifecycle command without starting owners.
@@ -4155,6 +4223,16 @@ limits_profile = "developer-agent-bootstrap-v1"
         ]
     }
 
+    fn local_deploy_arguments(config_path: OsString) -> Vec<OsString> {
+        vec![
+            OsString::from(DEPLOY_COMMAND),
+            OsString::from(LOCAL_OPTION),
+            OsString::from(CONFIG_OPTION),
+            config_path,
+            OsString::from(JSON_OPTION),
+        ]
+    }
+
     #[cfg(unix)]
     fn unresolved_deployment_document(root: &Path) -> String {
         let root = root.to_str().expect("UTF-8 unresolved Deployment root");
@@ -5292,6 +5370,61 @@ client_private_key_file = "{root}/node/controller-key.pem"
         assert_eq!(
             parse_init(&arguments),
             Err(ConfigError::InvalidInitDirectory)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_deploy_accepts_only_exact_deterministic_chat_config() {
+        let chat = valid_arguments();
+        let arguments = local_deploy_arguments(chat[2].clone());
+        assert!(local_deploy_json_intent(&arguments));
+        let command = parse_local_deploy(&arguments)
+            .expect("valid local deploy grammar")
+            .expect("local deploy command");
+        let config = command.into_config();
+        assert!(config.selects_deterministic_fixture());
+        assert_eq!(config.state_root(), Path::new("/tmp/paraegox-local-test"));
+
+        let provisioned = valid_openai_arguments();
+        let provisioned = local_deploy_arguments(provisioned[2].clone());
+        assert_eq!(
+            parse_local_deploy(&provisioned),
+            Err(ConfigError::UnsupportedLocalDeployProfile)
+        );
+    }
+
+    #[test]
+    fn local_deploy_rejects_reordered_incomplete_or_extended_grammar() {
+        let path = OsString::from("/private/tmp/paraegox.toml");
+        for arguments in [
+            vec![OsString::from(DEPLOY_COMMAND)],
+            vec![
+                OsString::from(DEPLOY_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                path.clone(),
+                OsString::from(LOCAL_OPTION),
+                OsString::from(JSON_OPTION),
+            ],
+            vec![
+                OsString::from(DEPLOY_COMMAND),
+                OsString::from(LOCAL_OPTION),
+                OsString::from(CONFIG_OPTION),
+                path.clone(),
+                OsString::from(JSON_OPTION),
+                OsString::from("--retry"),
+            ],
+        ] {
+            assert!(local_deploy_json_intent(&arguments));
+            assert_eq!(
+                parse_local_deploy(&arguments),
+                Err(ConfigError::InvalidLocalDeployGrammar)
+            );
+        }
+        assert!(!local_deploy_json_intent(&[OsString::from(CHAT_COMMAND)]));
+        assert_eq!(
+            parse_local_deploy(&[OsString::from(CHAT_COMMAND)]),
+            Ok(None)
         );
     }
 

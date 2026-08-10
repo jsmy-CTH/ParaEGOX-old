@@ -13,7 +13,7 @@ use config::{
     OfflineCommandV1, OfflineConfigSummaryV1, OfflineJsonIntentV1,
 };
 #[cfg(unix)]
-use config::{LocalLifecycleCommandV1, LocalManagedChatConfigV1};
+use config::{LocalDeployCommandV1, LocalLifecycleCommandV1, LocalManagedChatConfigV1};
 use error::LocalProcessError;
 use serde_json::json;
 
@@ -38,6 +38,9 @@ pub(crate) const NODE_OBSERVATION_BOOTSTRAP_FILE_OPTION: &str = "--node-observat
 const OFFLINE_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const LIFECYCLE_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const INIT_OUTPUT_SCHEMA_VERSION: u16 = 1;
+const LOCAL_DEPLOY_OUTPUT_SCHEMA_VERSION: u16 = 1;
+#[cfg(unix)]
+const LOCAL_DEPLOY_PROFILE: &str = "deterministic-echo-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchOutcome {
@@ -98,6 +101,9 @@ fn main() -> ExitCode {
     if config::init_json_intent(&arguments) {
         return dispatch_init_to(&mut io::stdout().lock(), &arguments).exit_code();
     }
+    if config::local_deploy_json_intent(&arguments) {
+        return dispatch_local_deploy_to(&mut io::stdout().lock(), &arguments).exit_code();
+    }
     let offline_json_intent = config::offline_json_intent(&arguments);
     let lifecycle_json_intent = config::lifecycle_json_intent(&arguments);
     match dispatch(arguments) {
@@ -127,6 +133,147 @@ fn main() -> ExitCode {
             }
         },
     }
+}
+
+fn dispatch_local_deploy_to(
+    output: &mut impl Write,
+    arguments: &[OsString],
+) -> DispatchOutcome {
+    let command = match config::parse_local_deploy(arguments) {
+        Ok(Some(command)) => command,
+        Ok(None) => unreachable!("local deploy intent is checked before dispatch"),
+        Err(error) => {
+            return finish_local_deploy_result(
+                output,
+                Some(false),
+                LocalProcessError::Configuration(error),
+            );
+        }
+    };
+    #[cfg(unix)]
+    {
+        match run_local_deploy_command(command) {
+            Ok(observation) => {
+                if write_local_deploy_success_json_line(output, &observation).is_ok() {
+                    DispatchOutcome::Success
+                } else {
+                    DispatchOutcome::DiagnosticFailure
+                }
+            }
+            Err(failure) => {
+                finish_local_deploy_result(output, failure.changed(), failure.error())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        unreachable!("local deploy parser rejects the unsupported non-Unix platform")
+    }
+}
+
+#[cfg(unix)]
+fn run_local_deploy_command(
+    command: LocalDeployCommandV1,
+) -> Result<lifecycle::LocalDeployObservationV1, lifecycle::LocalDeployFailureV1> {
+    let config = command.into_config();
+    lifecycle::run_local_deploy(&config)
+}
+
+fn finish_local_deploy_result(
+    output: &mut impl Write,
+    changed: Option<bool>,
+    error: LocalProcessError,
+) -> DispatchOutcome {
+    if matches!(error, LocalProcessError::LocalDeployJsonOutput) {
+        return DispatchOutcome::DiagnosticFailure;
+    }
+    if write_local_deploy_error_json_line(output, changed, error).is_err() {
+        return DispatchOutcome::DiagnosticFailure;
+    }
+    if error.exit_code() == 2 {
+        DispatchOutcome::ConfigurationFailure
+    } else {
+        DispatchOutcome::DiagnosticFailure
+    }
+}
+
+#[cfg(unix)]
+fn write_local_deploy_success_json_line(
+    output: &mut impl Write,
+    observation: &lifecycle::LocalDeployObservationV1,
+) -> Result<(), LocalProcessError> {
+    let projection = observation.projection();
+    let deployment_revision = projection.controller_revision().to_string();
+    let controller_snapshot_sequence = projection.controller_snapshot_sequence().to_string();
+    let runtime_apply_request_digest =
+        lower_hex(&projection.runtime_apply_request_digest());
+    let runtime_terminal_receipt_digest =
+        lower_hex(&projection.runtime_terminal_receipt_digest());
+    serde_json::to_writer(
+        &mut *output,
+        &json!({
+            "schema_version": LOCAL_DEPLOY_OUTPUT_SCHEMA_VERSION,
+            "command": "deploy",
+            "mode": "local",
+            "ok": true,
+            "profile": LOCAL_DEPLOY_PROFILE,
+            "changed": observation.changed(),
+            "generation": observation.generation(),
+            "deployment_revision": deployment_revision,
+            "controller_snapshot_sequence": controller_snapshot_sequence,
+            "runtime_apply_request_digest": runtime_apply_request_digest,
+            "runtime_terminal_receipt_digest": runtime_terminal_receipt_digest,
+            "terminal_outcome": "active_ready",
+            "current_health_checked": false,
+            "diagnostics": [],
+        }),
+    )
+    .map_err(|_| LocalProcessError::LocalDeployJsonOutput)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| LocalProcessError::LocalDeployJsonOutput)
+}
+
+fn write_local_deploy_error_json_line(
+    output: &mut impl Write,
+    changed: Option<bool>,
+    error: LocalProcessError,
+) -> Result<(), LocalProcessError> {
+    serde_json::to_writer(
+        &mut *output,
+        &json!({
+            "schema_version": LOCAL_DEPLOY_OUTPUT_SCHEMA_VERSION,
+            "command": "deploy",
+            "mode": "local",
+            "ok": false,
+            "profile": null,
+            "changed": changed,
+            "generation": null,
+            "deployment_revision": null,
+            "controller_snapshot_sequence": null,
+            "runtime_apply_request_digest": null,
+            "runtime_terminal_receipt_digest": null,
+            "terminal_outcome": null,
+            "current_health_checked": false,
+            "diagnostics": [{"code": error.code(), "message": error.message()}],
+        }),
+    )
+    .map_err(|_| LocalProcessError::LocalDeployJsonOutput)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| LocalProcessError::LocalDeployJsonOutput)
+}
+
+#[cfg(unix)]
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    value
 }
 
 fn dispatch_init_to(output: &mut impl Write, arguments: &[OsString]) -> DispatchOutcome {
@@ -908,6 +1055,7 @@ fn usage() -> &'static str {
        paraegox up --config <absolute-paraegox.toml> --json
        paraegox status --config <absolute-paraegox.toml> --json
        paraegox down --config <absolute-paraegox.toml> --json
+       paraegox deploy --local --config <absolute-paraegox.toml> --json
        paraegox node --config <absolute-paraegox-node.toml>
        paraegox deployment --config <absolute-paraegox-deployment.toml>
        paraegox version --json
@@ -932,6 +1080,11 @@ or health result. down asks the still-owning supervisor to perform joined
 shutdown and reports stopped only after that cleanup completes. These commands
 never use a PID as control authority. restart and crash recovery are not part
 of this first lifecycle slice.
+
+deploy --local ensures the sole compiled-in deterministic-echo-v1 profile is
+running through that same lifecycle owner, then returns one generation-bound
+point-in-time ActiveReady deployment projection. It does not install Artifact
+bytes, check current health, retry, replace, restart, or roll back.
 
 chat starts the configured ParaEGOX conversation owner chain and Textual console.
 The absolute versioned configuration is the sole public input for provider and
@@ -1077,6 +1230,120 @@ mod tests {
                 "message": LocalProcessError::InitWorkspaceConflict.message(),
             }])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_deploy_success_json_has_exact_string_safe_terminal_projection() {
+        let observation = lifecycle::LocalDeployObservationV1::for_test(
+            "00112233445566778899aabbccddeeff",
+            true,
+            u64::MAX,
+            9_007_199_254_740_992,
+            [0xab; 32],
+            [0xcd; 32],
+        );
+        let mut output = Vec::new();
+        write_local_deploy_success_json_line(&mut output, &observation)
+            .expect("local deploy success JSON");
+        assert_eq!(output.last(), Some(&b'\n'));
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let parsed: Value = serde_json::from_slice(&output).expect("local deploy JSON object");
+        assert_eq!(parsed.as_object().expect("JSON object").len(), 14);
+        assert_eq!(parsed["schema_version"], LOCAL_DEPLOY_OUTPUT_SCHEMA_VERSION);
+        assert_eq!(parsed["command"], "deploy");
+        assert_eq!(parsed["mode"], "local");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["profile"], LOCAL_DEPLOY_PROFILE);
+        assert_eq!(parsed["changed"], true);
+        assert_eq!(parsed["generation"], "00112233445566778899aabbccddeeff");
+        assert_eq!(parsed["deployment_revision"], u64::MAX.to_string());
+        assert_eq!(
+            parsed["controller_snapshot_sequence"],
+            "9007199254740992"
+        );
+        assert_eq!(parsed["runtime_apply_request_digest"], "ab".repeat(32));
+        assert_eq!(
+            parsed["runtime_terminal_receipt_digest"],
+            "cd".repeat(32)
+        );
+        assert_eq!(parsed["terminal_outcome"], "active_ready");
+        assert_eq!(parsed["current_health_checked"], false);
+        assert_eq!(parsed["diagnostics"], json!([]));
+    }
+
+    #[test]
+    fn local_deploy_error_json_has_exact_null_projection_and_truthful_changed() {
+        for (changed, expected) in [(Some(false), Value::Bool(false)), (None, Value::Null)] {
+            let mut output = Vec::new();
+            write_local_deploy_error_json_line(
+                &mut output,
+                changed,
+                LocalProcessError::LocalDeployQuery,
+            )
+            .expect("local deploy error JSON");
+            let parsed: Value =
+                serde_json::from_slice(&output).expect("local deploy error object");
+            assert_eq!(parsed.as_object().expect("JSON object").len(), 14);
+            assert_eq!(parsed["ok"], false);
+            assert_eq!(parsed["changed"], expected);
+            for field in [
+                "profile",
+                "generation",
+                "deployment_revision",
+                "controller_snapshot_sequence",
+                "runtime_apply_request_digest",
+                "runtime_terminal_receipt_digest",
+                "terminal_outcome",
+            ] {
+                assert_eq!(parsed[field], Value::Null, "unexpected {field} value");
+            }
+            assert_eq!(parsed["current_health_checked"], false);
+            assert_eq!(
+                parsed["diagnostics"],
+                json!([{
+                    "code": LocalProcessError::LocalDeployQuery.code(),
+                    "message": LocalProcessError::LocalDeployQuery.message(),
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_local_deploy_stays_on_exact_json_channel_and_exit_two() {
+        let mut output = Vec::new();
+        let outcome = dispatch_local_deploy_to(
+            &mut output,
+            &[
+                OsString::from("deploy"),
+                OsString::from("--config"),
+                OsString::from("/private/tmp/paraegox.toml"),
+                OsString::from("--local"),
+                OsString::from("--json"),
+            ],
+        );
+        assert_eq!(outcome, DispatchOutcome::ConfigurationFailure);
+        let parsed: Value = serde_json::from_slice(&output).expect("deploy grammar JSON");
+        assert_eq!(parsed["changed"], false);
+        assert_eq!(parsed["diagnostics"][0]["code"], "PXLC-DEPLOY-GRAMMAR");
+    }
+
+    #[test]
+    fn partial_local_deploy_json_failure_never_attempts_a_second_object() {
+        let mut output = FaultingJsonOutput::with_successful_byte_budget(31);
+        let error = write_local_deploy_error_json_line(
+            &mut output,
+            None,
+            LocalProcessError::LocalDeployQuery,
+        )
+        .expect_err("partial local deploy JSON must fail closed");
+        let attempts = output.write_attempts;
+        assert_eq!(error, LocalProcessError::LocalDeployJsonOutput);
+        assert_eq!(
+            finish_local_deploy_result(&mut output, None, error),
+            DispatchOutcome::DiagnosticFailure
+        );
+        assert_eq!(output.write_attempts, attempts);
     }
 
     #[cfg(unix)]
@@ -1587,13 +1854,14 @@ mod tests {
     fn usage_exposes_runtime_and_offline_commands_without_internal_modes() {
         let text = usage();
         assert_eq!(
-            text.lines().take(11).collect::<Vec<_>>(),
+            text.lines().take(12).collect::<Vec<_>>(),
             [
                 "Usage: paraegox chat --config <absolute-paraegox.toml>",
                 "       paraegox init --directory <absolute-directory> --json",
                 "       paraegox up --config <absolute-paraegox.toml> --json",
                 "       paraegox status --config <absolute-paraegox.toml> --json",
                 "       paraegox down --config <absolute-paraegox.toml> --json",
+                "       paraegox deploy --local --config <absolute-paraegox.toml> --json",
                 "       paraegox node --config <absolute-paraegox-node.toml>",
                 "       paraegox deployment --config <absolute-paraegox-deployment.toml>",
                 "       paraegox version --json",
@@ -1608,9 +1876,14 @@ mod tests {
         assert!(text.contains("paraegox up --config <absolute-paraegox.toml> --json"));
         assert!(text.contains("paraegox status --config <absolute-paraegox.toml> --json"));
         assert!(text.contains("paraegox down --config <absolute-paraegox.toml> --json"));
+        assert!(text.contains(
+            "paraegox deploy --local --config <absolute-paraegox.toml> --json"
+        ));
         assert!(text.contains("reports only the authenticated local lifecycle state"));
         assert!(text.contains("never use a PID as control authority"));
         assert!(text.contains("restart and crash recovery are not part"));
+        assert!(text.contains("one generation-bound\npoint-in-time ActiveReady"));
+        assert!(text.contains("does not install Artifact\nbytes"));
         assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));
         assert!(text.contains("paraegox deployment --config <absolute-paraegox-deployment.toml>"));
         assert!(text.contains("paraegox version --json"));

@@ -26,8 +26,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::composition::{
-    HeadlessLifecycleControlV1, PreparedHeadlessChatV1, prepare_headless_chat,
-    run_prepared_headless_chat,
+    HeadlessLifecycleControlV1, PreparedHeadlessChatV1, VerifiedLocalDeploymentProjectionV1,
+    prepare_headless_chat, run_prepared_headless_chat,
 };
 use crate::config::{LocalLifecycleActionV1, LocalManagedChatConfigV1};
 use crate::error::LocalProcessError;
@@ -51,6 +51,7 @@ const CONTROL_SOCKET_FILE: &str = "control-v1.sock";
 const RECORD_SCHEMA_VERSION: u16 = 1;
 const INTERNAL_PROTOCOL_VERSION: u8 = 1;
 const INTERNAL_REQUEST_BYTES: usize = 38;
+const INTERNAL_DEPLOY_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
 const MAX_RECORD_BYTES: u64 = 4 * 1024;
 const MAX_INTERNAL_RESPONSE_BYTES: usize = 4 * 1024;
 const MAX_DOWN_WAITERS: usize = 16;
@@ -215,6 +216,117 @@ impl LocalLifecycleObservationV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LocalDeployProjectionV1 {
+    controller_revision: u64,
+    controller_snapshot_sequence: u64,
+    runtime_apply_request_digest: [u8; 32],
+    runtime_terminal_receipt_digest: [u8; 32],
+    model_agent_replayed: bool,
+}
+
+impl LocalDeployProjectionV1 {
+    pub(crate) const fn controller_revision(self) -> u64 {
+        self.controller_revision
+    }
+
+    pub(crate) const fn controller_snapshot_sequence(self) -> u64 {
+        self.controller_snapshot_sequence
+    }
+
+    pub(crate) const fn runtime_apply_request_digest(self) -> [u8; 32] {
+        self.runtime_apply_request_digest
+    }
+
+    pub(crate) const fn runtime_terminal_receipt_digest(self) -> [u8; 32] {
+        self.runtime_terminal_receipt_digest
+    }
+
+    pub(crate) const fn model_agent_replayed(self) -> bool {
+        self.model_agent_replayed
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalDeployObservationV1 {
+    generation: Box<str>,
+    changed: bool,
+    projection: LocalDeployProjectionV1,
+}
+
+impl LocalDeployObservationV1 {
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub(crate) const fn changed(&self) -> bool {
+        self.changed
+    }
+
+    pub(crate) const fn projection(&self) -> LocalDeployProjectionV1 {
+        self.projection
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        generation: &str,
+        changed: bool,
+        controller_revision: u64,
+        controller_snapshot_sequence: u64,
+        runtime_apply_request_digest: [u8; 32],
+        runtime_terminal_receipt_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            generation: generation.into(),
+            changed,
+            projection: LocalDeployProjectionV1 {
+                controller_revision,
+                controller_snapshot_sequence,
+                runtime_apply_request_digest,
+                runtime_terminal_receipt_digest,
+                model_agent_replayed: false,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LocalDeployFailureV1 {
+    error: LocalProcessError,
+    changed: Option<bool>,
+}
+
+impl LocalDeployFailureV1 {
+    pub(crate) const fn error(self) -> LocalProcessError {
+        self.error
+    }
+
+    pub(crate) const fn changed(self) -> Option<bool> {
+        self.changed
+    }
+
+    const fn before_effect(error: LocalProcessError) -> Self {
+        Self {
+            error,
+            changed: Some(false),
+        }
+    }
+
+    const fn after_up(error: LocalProcessError, up_changed: bool) -> Self {
+        Self {
+            error,
+            changed: if up_changed { None } else { Some(false) },
+        }
+    }
+
+    const fn uncertain(error: LocalProcessError) -> Self {
+        Self {
+            error,
+            changed: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LifecycleRecordV1 {
@@ -271,6 +383,7 @@ impl InternalObservationV1 {
 enum InternalActionV1 {
     Status,
     Down,
+    Deploy,
 }
 
 impl InternalActionV1 {
@@ -278,6 +391,7 @@ impl InternalActionV1 {
         match self {
             Self::Status => b'S',
             Self::Down => b'D',
+            Self::Deploy => b'P',
         }
     }
 
@@ -285,8 +399,81 @@ impl InternalActionV1 {
         match value {
             b'S' => Some(Self::Status),
             b'D' => Some(Self::Down),
+            b'P' => Some(Self::Deploy),
             _ => None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InternalRequestV1 {
+    action: InternalActionV1,
+    expected_generation: Option<[u8; 16]>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InternalDeployResponseV1 {
+    generation: Box<str>,
+    deployment_revision: u64,
+    controller_snapshot_sequence: u64,
+    runtime_apply_request_digest: Box<str>,
+    runtime_terminal_receipt_digest: Box<str>,
+    terminal_outcome: Box<str>,
+    fabric_replayed: bool,
+    model_agent_replayed: bool,
+}
+
+impl InternalDeployResponseV1 {
+    fn from_verified(
+        generation: &str,
+        projection: VerifiedLocalDeploymentProjectionV1,
+    ) -> Self {
+        Self {
+            generation: generation.into(),
+            deployment_revision: projection.controller_revision(),
+            controller_snapshot_sequence: projection.controller_snapshot_sequence(),
+            runtime_apply_request_digest: lower_hex(&projection.runtime_apply_request_digest())
+                .into_boxed_str(),
+            runtime_terminal_receipt_digest: lower_hex(
+                &projection.runtime_terminal_receipt_digest(),
+            )
+            .into_boxed_str(),
+            terminal_outcome: "active_ready".into(),
+            fabric_replayed: projection.fabric_replayed(),
+            model_agent_replayed: projection.model_agent_replayed(),
+        }
+    }
+
+    fn into_projection(
+        self,
+        expected_generation: [u8; 16],
+    ) -> Result<LocalDeployProjectionV1, LocalProcessError> {
+        let observed_generation =
+            decode_generation(&self.generation).map_err(|_| LocalProcessError::LocalDeployEvidence)?;
+        let runtime_apply_request_digest = decode_lower_hex_32(&self.runtime_apply_request_digest)
+            .map_err(|_| LocalProcessError::LocalDeployEvidence)?;
+        let runtime_terminal_receipt_digest =
+            decode_lower_hex_32(&self.runtime_terminal_receipt_digest)
+                .map_err(|_| LocalProcessError::LocalDeployEvidence)?;
+        if observed_generation != expected_generation
+            || self.deployment_revision == 0
+            || self.controller_snapshot_sequence == 0
+            || self.terminal_outcome.as_ref() != "active_ready"
+            || runtime_apply_request_digest.iter().all(|byte| *byte == 0)
+            || runtime_terminal_receipt_digest
+                .iter()
+                .all(|byte| *byte == 0)
+        {
+            return Err(LocalProcessError::LocalDeployEvidence);
+        }
+        Ok(LocalDeployProjectionV1 {
+            controller_revision: self.deployment_revision,
+            controller_snapshot_sequence: self.controller_snapshot_sequence,
+            runtime_apply_request_digest,
+            runtime_terminal_receipt_digest,
+            model_agent_replayed: self.model_agent_replayed,
+        })
     }
 }
 
@@ -321,9 +508,12 @@ struct HeadlessControlV1 {
 }
 
 impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
-    fn mark_ready(&mut self) -> Result<(), LocalProcessError> {
+    fn mark_ready(
+        &mut self,
+        deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+    ) -> Result<(), LocalProcessError> {
         self.events
-            .send(SupervisorEventV1::Ready)
+            .send(SupervisorEventV1::Ready(deployment))
             .map_err(|_| LocalProcessError::LifecycleControl)
     }
 
@@ -335,7 +525,7 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
 }
 
 enum SupervisorEventV1 {
-    Ready,
+    Ready(Option<VerifiedLocalDeploymentProjectionV1>),
     Exited(Result<(), LocalProcessError>),
 }
 
@@ -532,6 +722,82 @@ pub(crate) fn run_down(
         }
         Err(error) => config_drift_after_control_failure(config, error),
     }
+}
+
+/// Ensures the sole compiled-in deterministic deployment is running, then
+/// performs exactly one generation-bound read of the supervisor's verified
+/// terminal projection. The query never retries and never starts a second
+/// Controller or re-applies desired state.
+pub(crate) fn run_local_deploy(
+    config: &LocalManagedChatConfigV1,
+) -> Result<LocalDeployObservationV1, LocalDeployFailureV1> {
+    let up = match run_up(config) {
+        Ok(observation) => observation,
+        Err(error)
+            if matches!(
+                error,
+                LocalProcessError::UnsafeExecutionIdentity
+                    | LocalProcessError::LifecycleConfiguration
+            ) =>
+        {
+            return Err(LocalDeployFailureV1::before_effect(error));
+        }
+        Err(_) => {
+            return Err(LocalDeployFailureV1::uncertain(
+                LocalProcessError::LocalDeployLifecycle,
+            ));
+        }
+    };
+    if !up.ok()
+        || up.state() != LocalLifecycleStateV1::Running
+        || !up.owner_readiness_observed()
+    {
+        return Err(local_deploy_non_running_failure(&up));
+    }
+    let generation = up.generation().ok_or_else(|| {
+        LocalDeployFailureV1::after_up(LocalProcessError::LocalDeployEvidence, up.changed())
+    })?;
+    let expected_generation = decode_generation(generation).map_err(|_| {
+        LocalDeployFailureV1::after_up(LocalProcessError::LocalDeployEvidence, up.changed())
+    })?;
+    let response = match query_local_deployment(config, expected_generation) {
+        Ok(response) => response,
+        Err(error) => {
+            let error = match config_authority_drift(config) {
+                Ok(Some(_)) => LocalProcessError::LifecycleConfiguration,
+                Ok(None) => error,
+                Err(_) => LocalProcessError::LocalDeployQuery,
+            };
+            return Err(LocalDeployFailureV1::after_up(error, up.changed()));
+        }
+    };
+    let projection = response
+        .into_projection(expected_generation)
+        .map_err(|error| LocalDeployFailureV1::after_up(error, up.changed()))?;
+    Ok(LocalDeployObservationV1 {
+        generation: generation.into(),
+        changed: local_deploy_changed(up.changed(), projection.model_agent_replayed()),
+        projection,
+    })
+}
+
+fn local_deploy_non_running_failure(
+    up: &LocalLifecycleObservationV1,
+) -> LocalDeployFailureV1 {
+    if up.diagnostic().is_some_and(|diagnostic| {
+        diagnostic.code() == LocalProcessError::LifecycleConfiguration.code()
+    }) {
+        return LocalDeployFailureV1::before_effect(LocalProcessError::LifecycleConfiguration);
+    }
+    // A failed/non-Running observation cannot prove this invocation's
+    // candidate generation was never accepted: down plus a successor up can
+    // replace the durable record before the original child is observed.
+    // Never turn that ambiguity into `changed = false`.
+    LocalDeployFailureV1::uncertain(LocalProcessError::LocalDeployLifecycle)
+}
+
+const fn local_deploy_changed(up_changed: bool, model_agent_replayed: bool) -> bool {
+    up_changed && !model_agent_replayed
 }
 
 pub(crate) fn run_supervisor(
@@ -816,6 +1082,7 @@ async fn supervise(
     let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut stopping = false;
     let mut failure = None;
+    let mut deployment_projection = None;
 
     loop {
         tokio::select! {
@@ -824,11 +1091,11 @@ async fn supervise(
                 if !peer_matches(&stream, expected_uid, expected_gid) {
                     continue;
                 }
-                let action = match read_internal_request(&mut stream, commitment).await {
-                    Ok(action) => action,
+                let request = match read_internal_request(&mut stream, commitment).await {
+                    Ok(request) => request,
                     Err(_) => continue,
                 };
-                match action {
+                match request.action {
                     InternalActionV1::Status => {
                         let _ = write_internal_observation(
                             &mut stream,
@@ -852,14 +1119,29 @@ async fn supervise(
                             }
                         }
                     }
+                    InternalActionV1::Deploy => {
+                        let Some(expected_generation) = request.expected_generation else {
+                            continue;
+                        };
+                        let Some(response) = deployment_response_for_request(
+                            record,
+                            stopping,
+                            expected_generation,
+                            deployment_projection,
+                        ) else {
+                            continue;
+                        };
+                        let _ = write_internal_deploy_response(&mut stream, &response).await;
+                    }
                 }
             }
             event = events.recv() => {
                 match event {
-                    Some(SupervisorEventV1::Ready) => {
+                    Some(SupervisorEventV1::Ready(deployment)) => {
                         // Readiness is a monotonic historical latch even when
                         // shutdown won the race. Keep Stopping, but durably
                         // remember that this generation crossed the boundary.
+                        deployment_projection = deployment;
                         apply_ready_observation(record, stopping);
                         publish_record(paths, record)?;
                     }
@@ -921,6 +1203,24 @@ fn apply_ready_observation(record: &mut LifecycleRecordV1, stopping: bool) {
         record.state = LocalLifecycleStateV1::Running;
     }
     record.owner_readiness_observed = true;
+}
+
+fn deployment_response_for_request(
+    record: &LifecycleRecordV1,
+    stopping: bool,
+    expected_generation: [u8; 16],
+    projection: Option<VerifiedLocalDeploymentProjectionV1>,
+) -> Option<InternalDeployResponseV1> {
+    if stopping
+        || record.state != LocalLifecycleStateV1::Running
+        || !record.owner_readiness_observed
+        || decode_generation(&record.generation).ok()? != expected_generation
+    {
+        return None;
+    }
+    projection.map(|projection| {
+        InternalDeployResponseV1::from_verified(&record.generation, projection)
+    })
 }
 
 async fn sleep_until_deadline(deadline: Instant) {
@@ -1281,6 +1581,65 @@ async fn query_live_async(
     serde_json::from_slice(&response).map_err(|_| LocalProcessError::LifecycleControl)
 }
 
+fn query_local_deployment(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<InternalDeployResponseV1, LocalProcessError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    runtime.block_on(query_local_deployment_async(config, expected_generation))
+}
+
+async fn query_local_deployment_async(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<InternalDeployResponseV1, LocalProcessError> {
+    let paths = LifecyclePathsV1::from_state_root(config.state_root())
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    let mut stream = timeout(CLIENT_IO_TIMEOUT, UnixStream::connect(&paths.socket))
+        .await
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    let credentials = stream
+        .peer_cred()
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    if credentials.uid() != Uid::effective().as_raw()
+        || credentials.gid() != Gid::effective().as_raw()
+    {
+        return Err(LocalProcessError::LocalDeployQuery);
+    }
+    let request = encode_internal_deploy_query(
+        config.config_commitment(),
+        expected_generation,
+    );
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(&request))
+        .await
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    let mut response = Vec::new();
+    let response_limit = u64::try_from(MAX_INTERNAL_RESPONSE_BYTES + 1)
+        .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    timeout(
+        CLIENT_IO_TIMEOUT,
+        (&mut stream)
+            .take(response_limit)
+            .read_to_end(&mut response),
+    )
+    .await
+    .map_err(|_| LocalProcessError::LocalDeployQuery)?
+    .map_err(|_| LocalProcessError::LocalDeployQuery)?;
+    if response.is_empty() || response.len() > MAX_INTERNAL_RESPONSE_BYTES {
+        return Err(LocalProcessError::LocalDeployQuery);
+    }
+    serde_json::from_slice(&response).map_err(|_| LocalProcessError::LocalDeployEvidence)
+}
+
 fn encode_internal_request(action: InternalActionV1, commitment: [u8; 32]) -> [u8; 38] {
     let mut request = [0_u8; INTERNAL_REQUEST_BYTES];
     request[..4].copy_from_slice(&INTERNAL_MAGIC);
@@ -1290,10 +1649,21 @@ fn encode_internal_request(action: InternalActionV1, commitment: [u8; 32]) -> [u
     request
 }
 
+fn encode_internal_deploy_query(
+    commitment: [u8; 32],
+    expected_generation: [u8; 16],
+) -> [u8; INTERNAL_DEPLOY_QUERY_BYTES] {
+    let mut request = [0_u8; INTERNAL_DEPLOY_QUERY_BYTES];
+    request[..INTERNAL_REQUEST_BYTES]
+        .copy_from_slice(&encode_internal_request(InternalActionV1::Deploy, commitment));
+    request[INTERNAL_REQUEST_BYTES..].copy_from_slice(&expected_generation);
+    request
+}
+
 async fn read_internal_request(
     stream: &mut UnixStream,
     expected_commitment: [u8; 32],
-) -> Result<InternalActionV1, LocalProcessError> {
+) -> Result<InternalRequestV1, LocalProcessError> {
     let mut request = [0_u8; INTERNAL_REQUEST_BYTES];
     timeout(CLIENT_IO_TIMEOUT, stream.read_exact(&mut request))
         .await
@@ -1305,7 +1675,24 @@ async fn read_internal_request(
     {
         return Err(LocalProcessError::LifecycleConfiguration);
     }
-    InternalActionV1::decode(request[5]).ok_or(LocalProcessError::LifecycleControl)
+    let action = InternalActionV1::decode(request[5]).ok_or(LocalProcessError::LifecycleControl)?;
+    let expected_generation = if action == InternalActionV1::Deploy {
+        let mut generation = [0_u8; 16];
+        timeout(CLIENT_IO_TIMEOUT, stream.read_exact(&mut generation))
+            .await
+            .map_err(|_| LocalProcessError::LifecycleControl)?
+            .map_err(|_| LocalProcessError::LifecycleControl)?;
+        if generation.iter().all(|byte| *byte == 0) {
+            return Err(LocalProcessError::LifecycleControl);
+        }
+        Some(generation)
+    } else {
+        None
+    };
+    Ok(InternalRequestV1 {
+        action,
+        expected_generation,
+    })
 }
 
 async fn write_internal_observation(
@@ -1314,6 +1701,24 @@ async fn write_internal_observation(
 ) -> Result<(), LocalProcessError> {
     let wire = serde_json::to_vec(observation).map_err(|_| LocalProcessError::LifecycleControl)?;
     if wire.len() > MAX_INTERNAL_RESPONSE_BYTES {
+        return Err(LocalProcessError::LifecycleControl);
+    }
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(&wire))
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)?
+        .map_err(|_| LocalProcessError::LifecycleControl)?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)
+}
+
+async fn write_internal_deploy_response(
+    stream: &mut UnixStream,
+    response: &InternalDeployResponseV1,
+) -> Result<(), LocalProcessError> {
+    let wire = serde_json::to_vec(response).map_err(|_| LocalProcessError::LifecycleControl)?;
+    if wire.is_empty() || wire.len() > MAX_INTERNAL_RESPONSE_BYTES {
         return Err(LocalProcessError::LifecycleControl);
     }
     timeout(CLIENT_IO_TIMEOUT, stream.write_all(&wire))
@@ -1784,6 +2189,139 @@ mod tests {
         assert_eq!(&status[6..], &commitment);
         assert_eq!(down[5], b'D');
         assert_ne!(status, down);
+
+        let expected_generation = [0x6b; 16];
+        let deploy = encode_internal_deploy_query(commitment, expected_generation);
+        assert_eq!(deploy.len(), INTERNAL_DEPLOY_QUERY_BYTES);
+        assert_eq!(&deploy[..4], &INTERNAL_MAGIC);
+        assert_eq!(deploy[4], INTERNAL_PROTOCOL_VERSION);
+        assert_eq!(deploy[5], b'P');
+        assert_eq!(&deploy[6..INTERNAL_REQUEST_BYTES], &commitment);
+        assert_eq!(&deploy[INTERNAL_REQUEST_BYTES..], &expected_generation);
+    }
+
+    #[test]
+    fn internal_deploy_response_is_strict_and_preserves_exact_owner_evidence() {
+        let generation = [0x41; 16];
+        let verified = VerifiedLocalDeploymentProjectionV1::for_test(
+            u64::MAX,
+            9_007_199_254_740_992,
+            [0x52; 32],
+            [0x63; 32],
+            true,
+            false,
+        );
+        let response = InternalDeployResponseV1::from_verified(&lower_hex(&generation), verified);
+        let wire = serde_json::to_vec(&response).expect("internal deploy response");
+        assert!(wire.len() <= MAX_INTERNAL_RESPONSE_BYTES);
+        let decoded: InternalDeployResponseV1 =
+            serde_json::from_slice(&wire).expect("strict internal deploy response");
+        let projection = decoded
+            .into_projection(generation)
+            .expect("verified local deploy projection");
+        assert_eq!(projection.controller_revision(), u64::MAX);
+        assert_eq!(
+            projection.controller_snapshot_sequence(),
+            9_007_199_254_740_992
+        );
+        assert_eq!(projection.runtime_apply_request_digest(), [0x52; 32]);
+        assert_eq!(projection.runtime_terminal_receipt_digest(), [0x63; 32]);
+        assert!(response.fabric_replayed);
+        assert!(!projection.model_agent_replayed());
+
+        let mut with_unknown: serde_json::Value =
+            serde_json::from_slice(&wire).expect("internal response value");
+        with_unknown
+            .as_object_mut()
+            .expect("response object")
+            .insert("path".to_owned(), serde_json::Value::String("forbidden".to_owned()));
+        assert!(serde_json::from_value::<InternalDeployResponseV1>(with_unknown).is_err());
+
+        let mut mismatch = response.clone();
+        mismatch.generation = lower_hex(&[0x42; 16]).into_boxed_str();
+        assert_eq!(
+            mismatch.into_projection(generation),
+            Err(LocalProcessError::LocalDeployEvidence)
+        );
+        let mut invalid_outcome = response;
+        invalid_outcome.terminal_outcome = "unknown".into();
+        assert_eq!(
+            invalid_outcome.into_projection(generation),
+            Err(LocalProcessError::LocalDeployEvidence)
+        );
+    }
+
+    #[test]
+    fn deploy_query_is_generation_bound_fails_during_down_and_never_retries() {
+        let generation = [0x71; 16];
+        let record = LifecycleRecordV1 {
+            schema_version: RECORD_SCHEMA_VERSION,
+            config_commitment: lower_hex(&[0x72; 32]).into_boxed_str(),
+            generation: lower_hex(&generation).into_boxed_str(),
+            state: LocalLifecycleStateV1::Running,
+            owner_readiness_observed: true,
+        };
+        let projection = VerifiedLocalDeploymentProjectionV1::for_test(
+            7,
+            11,
+            [0x73; 32],
+            [0x74; 32],
+            false,
+            false,
+        );
+        assert!(
+            deployment_response_for_request(&record, false, generation, Some(projection)).is_some()
+        );
+        assert!(
+            deployment_response_for_request(&record, false, [0x75; 16], Some(projection)).is_none()
+        );
+        assert!(
+            deployment_response_for_request(&record, true, generation, Some(projection)).is_none()
+        );
+        assert_eq!(record.state, LocalLifecycleStateV1::Running);
+
+        let accepted_then_query_failed =
+            LocalDeployFailureV1::after_up(LocalProcessError::LocalDeployQuery, true);
+        assert_eq!(accepted_then_query_failed.changed(), None);
+        let follower_then_query_failed =
+            LocalDeployFailureV1::after_up(LocalProcessError::LocalDeployQuery, false);
+        assert_eq!(follower_then_query_failed.changed(), Some(false));
+
+        let successor_replaced_accepted_generation =
+            LocalLifecycleObservationV1::failed_with_evidence(
+                Some(lower_hex(&[0x76; 16]).into_boxed_str()),
+                true,
+                LocalProcessError::LifecycleStartup,
+            )
+            .with_changed(false);
+        assert_eq!(
+            local_deploy_non_running_failure(&successor_replaced_accepted_generation).changed(),
+            None
+        );
+        let pre_effect_config_drift = LocalLifecycleObservationV1::unknown_with(
+            Some(lower_hex(&[0x77; 16]).into_boxed_str()),
+            false,
+            LocalProcessError::LifecycleConfiguration,
+        );
+        assert_eq!(
+            local_deploy_non_running_failure(&pre_effect_config_drift).changed(),
+            Some(false)
+        );
+
+        assert!(local_deploy_changed(true, false));
+        assert!(!local_deploy_changed(true, true));
+        assert!(!local_deploy_changed(false, false));
+        assert!(!local_deploy_changed(false, true));
+
+        let source = include_str!("lifecycle.rs");
+        let deploy = source
+            .split("pub(crate) fn run_local_deploy(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn run_supervisor(").next())
+            .expect("bounded local deploy source");
+        assert_eq!(deploy.matches("query_local_deployment(").count(), 1);
+        assert!(!deploy.contains("loop {"));
+        assert!(!deploy.contains("retry"));
     }
 
     #[test]

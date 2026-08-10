@@ -17,6 +17,10 @@ pub(crate) enum LocalProcessError {
     LifecycleShutdown,
     LifecycleReconcileRequired,
     LifecycleJsonOutput,
+    LocalDeployLifecycle,
+    LocalDeployQuery,
+    LocalDeployEvidence,
+    LocalDeployJsonOutput,
     UnsafeExecutionIdentity,
     SignalHandling,
     IdentityManifest,
@@ -74,6 +78,10 @@ impl LocalProcessError {
             Self::LifecycleShutdown => "PXLC-LIFECYCLE-SHUTDOWN",
             Self::LifecycleReconcileRequired => "PXLC-LIFECYCLE-RECONCILE-REQUIRED",
             Self::LifecycleJsonOutput => "PXLC-LIFECYCLE-JSON-OUTPUT",
+            Self::LocalDeployLifecycle => "PXLC-DEPLOY-LIFECYCLE",
+            Self::LocalDeployQuery => "PXLC-DEPLOY-QUERY",
+            Self::LocalDeployEvidence => "PXLC-DEPLOY-EVIDENCE",
+            Self::LocalDeployJsonOutput => "PXLC-DEPLOY-JSON-OUTPUT",
             Self::UnsafeExecutionIdentity => "PXLC-EXECUTION-IDENTITY",
             Self::SignalHandling => "PXLC-SIGNAL-HANDLING",
             Self::IdentityManifest => "PXLC-IDENTITY-MANIFEST",
@@ -141,6 +149,18 @@ impl LocalProcessError {
                 "managed-local lifecycle authority is uncertain and requires explicit recovery"
             }
             Self::LifecycleJsonOutput => "managed-local lifecycle JSON output failed",
+            Self::LocalDeployLifecycle => {
+                "compiled local deployment did not reach the running owner generation"
+            }
+            Self::LocalDeployQuery => {
+                "compiled local deployment projection query failed closed"
+            }
+            Self::LocalDeployEvidence => {
+                "compiled local deployment terminal evidence failed strict validation"
+            }
+            Self::LocalDeployJsonOutput => {
+                "compiled local deployment JSON output failed"
+            }
             Self::UnsafeExecutionIdentity => {
                 "DeveloperLocal commands require a non-root user and group"
             }
@@ -267,6 +287,26 @@ mod tests {
         let lifecycle_output = LocalProcessError::LifecycleJsonOutput;
         assert_eq!(lifecycle_output.exit_code(), 1);
         assert_eq!(lifecycle_output.code(), "PXLC-LIFECYCLE-JSON-OUTPUT");
+
+        for failure in [
+            LocalProcessError::LocalDeployLifecycle,
+            LocalProcessError::LocalDeployQuery,
+            LocalProcessError::LocalDeployEvidence,
+            LocalProcessError::LocalDeployJsonOutput,
+        ] {
+            assert_eq!(failure.exit_code(), 1);
+            assert!(failure.code().starts_with("PXLC-DEPLOY-"));
+            assert!(!failure.message().is_empty());
+        }
+
+        for failure in [
+            ConfigError::InvalidLocalDeployGrammar,
+            ConfigError::UnsupportedLocalDeployProfile,
+        ] {
+            let failure = LocalProcessError::Configuration(failure);
+            assert_eq!(failure.exit_code(), 2);
+            assert!(failure.code().starts_with("PXLC-DEPLOY-"));
+        }
 
         let init_conflict = LocalProcessError::InitWorkspaceConflict;
         assert_eq!(init_conflict.exit_code(), 2);
