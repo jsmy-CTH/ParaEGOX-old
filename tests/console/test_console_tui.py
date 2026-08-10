@@ -700,6 +700,8 @@ def test_hidden_tui_attach_mode_is_exact_silent_and_loads_latest_before_ui(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     events: list[str] = []
+    terminal_output = SimpleNamespace(isatty=lambda: True)
+    original_driver_output = object()
     conversation_pin = object()
     inspection_pin = object()
     handoff = SimpleNamespace(
@@ -755,6 +757,8 @@ def test_hidden_tui_attach_mode_is_exact_silent_and_loads_latest_before_ui(
             events.append("app-init")
 
         def run(self) -> None:
+            assert sys.__stderr__ is terminal_output
+            assert sys.__stderr__ is sys.__stdout__
             events.append("app-run")
 
         def _close_client(self) -> None:
@@ -773,6 +777,8 @@ def test_hidden_tui_attach_mode_is_exact_silent_and_loads_latest_before_ui(
     monkeypatch.setattr(console_tui, "RuntimeAgentConversationClientV1", ConversationFactory)
     monkeypatch.setattr(console_tui, "DeveloperLocalInspectionClientV2", InspectionFactory)
     monkeypatch.setattr(console_tui, "ParaEGOXConsoleApp", App)
+    monkeypatch.setattr(sys, "__stdout__", terminal_output)
+    monkeypatch.setattr(sys, "__stderr__", original_driver_output)
 
     invalid = [
         ["--tui-attach-fd"],
@@ -798,9 +804,55 @@ def test_hidden_tui_attach_mode_is_exact_silent_and_loads_latest_before_ui(
     assert inspection.latest_calls == 1
     assert conversation.close_calls == 1
     assert inspection.close_calls == 1
+    assert sys.__stderr__ is original_driver_output
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_hidden_tui_attach_restores_driver_output_after_app_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal_output = SimpleNamespace(isatty=lambda: True)
+    original_driver_output = object()
+
+    class FailingApp:
+        @staticmethod
+        def run() -> None:
+            assert sys.__stderr__ is terminal_output
+            assert sys.__stderr__ is sys.__stdout__
+            raise RuntimeError("private app failure")
+
+    monkeypatch.setattr(sys, "__stdout__", terminal_output)
+    monkeypatch.setattr(sys, "__stderr__", original_driver_output)
+    with pytest.raises(RuntimeError, match="private app failure"):
+        console_tui._run_attached_tui_app(FailingApp())
+    assert sys.__stderr__ is original_driver_output
+
+
+def test_hidden_tui_attach_rejects_missing_or_non_terminal_driver_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal_output = SimpleNamespace(isatty=lambda: True)
+    non_terminal_output = SimpleNamespace(isatty=lambda: False)
+    original_driver_output = object()
+
+    class App:
+        @staticmethod
+        def run() -> None:
+            pytest.fail("the app must not run without both terminal streams")
+
+    for stdout, stderr in (
+        (None, original_driver_output),
+        (non_terminal_output, original_driver_output),
+        (terminal_output, None),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "__stdout__", stdout)
+            patch.setattr(sys, "__stderr__", stderr)
+            with pytest.raises(RuntimeError, match="terminal output is unavailable"):
+                console_tui._run_attached_tui_app(App())
+            assert sys.__stderr__ is stderr
 
 
 @pytest.mark.parametrize(

@@ -791,6 +791,18 @@ def _inspection_private_exit(error: Exception) -> int:
     return _TUI_ATTACH_PROTOCOL_EXIT
 
 
+def _run_attached_tui_app(app: ParaEGOXConsoleApp) -> None:
+    terminal_output = sys.__stdout__
+    original_driver_output = sys.__stderr__
+    if terminal_output is None or original_driver_output is None or not terminal_output.isatty():
+        raise RuntimeError("DeveloperLocal TUI terminal output is unavailable")
+    sys.__stderr__ = terminal_output
+    try:
+        app.run()
+    finally:
+        sys.__stderr__ = original_driver_output
+
+
 def _run_tui_attach() -> int:
     try:
         handoff = _read_tui_attach_handoff_fd(_TUI_ATTACH_FD)
@@ -830,7 +842,7 @@ def _run_tui_attach() -> int:
             inspection_client=inspection_client,
         )
         try:
-            app.run()
+            _run_attached_tui_app(app)
         except Exception:
             return _TUI_ATTACH_CHILD_EXIT
         finally:

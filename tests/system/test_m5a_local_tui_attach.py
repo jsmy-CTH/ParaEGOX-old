@@ -950,7 +950,11 @@ def _replace_inspection_endpoint(bootstrap_path: Path) -> Iterator[InspectionEnd
         raise RuntimeError("Inspection fixture must expose one canonical socket pin")
     pin_path = pins[0]
     socket_backup = socket_path.with_name(socket_path.name + ".m5a-owner-backup")
-    pin_backup = pin_path.with_name(pin_path.name + ".m5a-owner-backup")
+    # The client deliberately rejects every non-canonical entry whose name
+    # begins with `.pxi-`. Keep the temporarily displaced owner pin outside
+    # that namespace so this fixture reaches the replacement endpoint instead
+    # of correctly failing during the pre-connect directory scan.
+    pin_backup = pin_path.with_name(".m5a-owner-backup-inspection-pin")
     socket_path.rename(socket_backup)
     pin_path.rename(pin_backup)
     replacement = InspectionEndpointReplacement(
