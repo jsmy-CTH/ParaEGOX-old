@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
+from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
@@ -28,6 +30,7 @@ from paraegox_sdk.agent_worker.protocol import (
 )
 from paraegox_sdk.console_client import (
     DeveloperLocalInspectionClientError,
+    DeveloperLocalInspectionClientErrorCode,
     DeveloperLocalInspectionClientV2,
     InspectionFreshnessV1,
     InspectionHealthV1,
@@ -38,7 +41,16 @@ from paraegox_sdk.console_client import (
     LocalInspectionSnapshotV2,
     NodeInspectionRecordV2,
     RuntimeAgentConversationCancelResultV1,
+    RuntimeAgentConversationClientError,
+    RuntimeAgentConversationClientErrorCode,
     RuntimeAgentConversationClientV1,
+    _read_tui_attach_handoff_fd,
+    _TuiAttachAgentBootstrapIdentityError,
+    _TuiAttachAgentSocketError,
+    _TuiAttachHandoffError,
+    _TuiAttachHandoffErrorCode,
+    _TuiAttachInspectionBootstrapIdentityError,
+    _TuiAttachInspectionSocketError,
 )
 
 
@@ -50,6 +62,23 @@ class _ConversationClient(Protocol):
     async def cancel_pending(self) -> RuntimeAgentConversationCancelResultV1: ...
 
     def close(self) -> None: ...
+
+
+class _InspectionClient(Protocol):
+    async def watch(self, after_revision: int) -> LocalInspectionSnapshotV2 | None: ...
+
+    def close(self) -> None: ...
+
+
+_MAX_TRANSCRIPT_LINES = 1_000
+_INSPECTION_WATCH_FLOOR_SECONDS = 1.0
+_TUI_ATTACH_FD = 3
+_TUI_ATTACH_HANDOFF_EXIT = 20
+_TUI_ATTACH_BOOTSTRAP_EXIT = 21
+_TUI_ATTACH_PEER_EXIT = 22
+_TUI_ATTACH_PROTOCOL_EXIT = 23
+_TUI_ATTACH_IO_EXIT = 24
+_TUI_ATTACH_CHILD_EXIT = 1
 
 
 _FAILURE_MESSAGES = {
@@ -130,18 +159,23 @@ class ParaEGOXConsoleApp(App[None]):
         client: _ConversationClient,
         *,
         inspection_snapshot: LocalInspectionSnapshotV2 | None = None,
+        inspection_client: _InspectionClient | None = None,
     ) -> None:
         super().__init__()
         self._client = client
+        self._inspection_client = inspection_client
         self._inspection_snapshot = inspection_snapshot
         self._connected = False
+        self._conversation_unavailable = False
+        self._inspection_unavailable = False
         self._pending = False
         self._cancel_requested = False
-        self._client_closed = False
-        self._transcript: list[str] = []
+        self._clients_closed = False
+        self._transcript: deque[str] = deque(maxlen=_MAX_TRANSCRIPT_LINES)
         self._next_request_generation = 1
         self._pending_generation: int | None = None
         self._submit_worker: Worker[None] | None = None
+        self._inspection_worker: Worker[None] | None = None
         self._last_rendered_terminal_key: tuple[bytes, bytes, bytes, bytes] | None = None
 
     @property
@@ -158,13 +192,22 @@ class ParaEGOXConsoleApp(App[None]):
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def inspection_available(self) -> bool:
+        return not self._inspection_unavailable and self._inspection_snapshot is not None
+
     def compose(self) -> ComposeResult:
         yield Static("ParaEGOX Agent Chat", id="title")
         yield Static("Connection: connecting · Request: idle", id="connection-status")
         inspection_status = (
             "Inspection: no startup snapshot"
             if self._inspection_snapshot is None
-            else "\n".join(_inspection_status_lines(self._inspection_snapshot))
+            else "\n".join(
+                _inspection_status_lines(
+                    self._inspection_snapshot,
+                    live=self._inspection_client is not None,
+                )
+            )
         )
         yield Static(inspection_status, id="inspection-status")
         yield RichLog(
@@ -172,7 +215,7 @@ class ParaEGOXConsoleApp(App[None]):
             wrap=True,
             markup=False,
             highlight=False,
-            max_lines=1_000,
+            max_lines=_MAX_TRANSCRIPT_LINES,
         )
         yield Input(
             placeholder="Message ParaEGOX, or enter /help",
@@ -190,6 +233,14 @@ class ParaEGOXConsoleApp(App[None]):
             exclusive=True,
             exit_on_error=False,
         )
+        if self._inspection_client is not None:
+            self._inspection_worker = self.run_worker(
+                self._watch_inspection(),
+                name="watch typed Inspection client",
+                group="inspection-watch",
+                exclusive=True,
+                exit_on_error=False,
+            )
 
     async def _open_client(self) -> None:
         try:
@@ -198,15 +249,71 @@ class ParaEGOXConsoleApp(App[None]):
             raise
         except Exception as error:
             self._connected = False
-            self._write_line(f"System: connection failed — {_display_safe_error(error)}")
+            self._conversation_unavailable = True
+            self._write_line(
+                f"System: conversation unavailable — {_display_safe_conversation_error(error)}"
+            )
         else:
-            self._connected = True
-            chat_input = self.query_one("#chat-input", Input)
-            chat_input.disabled = False
-            chat_input.focus()
-            self._write_line("System: connected. Enter /help for local console commands.")
+            if not self._clients_closed:
+                self._connected = True
+                chat_input = self.query_one("#chat-input", Input)
+                chat_input.disabled = False
+                chat_input.focus()
+                self._write_line("System: connected. Enter /help for local console commands.")
         finally:
             self._refresh_status()
+
+    async def _watch_inspection(self) -> None:
+        client = self._inspection_client
+        snapshot = self._inspection_snapshot
+        if client is None or snapshot is None:
+            self._mark_inspection_unavailable(
+                "the typed Inspection startup snapshot is unavailable"
+            )
+            return
+        previous_start: float | None = None
+        loop = asyncio.get_running_loop()
+        while not self._clients_closed and not self._inspection_unavailable:
+            if previous_start is not None:
+                await _wait_for_inspection_watch_floor(previous_start, loop)
+                if self._clients_closed:
+                    return
+            previous_start = loop.time()
+            cursor = snapshot.projection_revision
+            try:
+                updated = await client.watch(cursor)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._mark_inspection_unavailable(_display_safe_inspection_operation_error(error))
+                return
+            if updated is not None:
+                snapshot = updated
+                self._inspection_snapshot = updated
+                self._refresh_inspection_status()
+
+    def _mark_inspection_unavailable(self, message: str) -> None:
+        self._inspection_unavailable = True
+        try:
+            self.query_one("#inspection-status", Static).update(
+                f"Inspection: unavailable — {message}"
+            )
+        except Exception:
+            # The App can be unmounting while one final one-shot Watch resolves.
+            pass
+
+    def _refresh_inspection_status(self) -> None:
+        if self._inspection_unavailable:
+            return
+        snapshot = self._inspection_snapshot
+        if snapshot is None:
+            self._mark_inspection_unavailable(
+                "the typed Inspection startup snapshot is unavailable"
+            )
+            return
+        self.query_one("#inspection-status", Static).update(
+            "\n".join(_inspection_status_lines(snapshot, live=True))
+        )
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         entered = event.value
@@ -288,7 +395,11 @@ class ParaEGOXConsoleApp(App[None]):
         except Exception as error:
             if self._pending_generation == generation:
                 self._cancel_requested = False
-            self._write_line(f"System: cancellation failed — {_display_safe_error(error)}")
+            self._write_line(
+                f"System: cancellation failed — {_display_safe_conversation_error(error)}"
+            )
+            if _conversation_error_makes_unavailable(error):
+                self._mark_conversation_unavailable()
         else:
             if result.outcome is AgentConversationCancelOutcomeV1.INTENT_RECORDED:
                 self._write_line(
@@ -322,7 +433,9 @@ class ParaEGOXConsoleApp(App[None]):
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self._write_line(f"System: request failed — {_display_safe_error(error)}")
+            self._write_line(f"System: request failed — {_display_safe_conversation_error(error)}")
+            if _conversation_error_makes_unavailable(error):
+                self._mark_conversation_unavailable()
         else:
             self._render_terminal(terminal)
         finally:
@@ -360,7 +473,9 @@ class ParaEGOXConsoleApp(App[None]):
         self.query_one("#chat-log", RichLog).write(line)
 
     def _refresh_status(self) -> None:
-        if self._connected:
+        if self._conversation_unavailable:
+            connection = "unavailable"
+        elif self._connected:
             connection = "connected"
         else:
             connection = "disconnected"
@@ -374,6 +489,15 @@ class ParaEGOXConsoleApp(App[None]):
             f"Connection: {connection} · Request: {request}"
         )
 
+    def _mark_conversation_unavailable(self) -> None:
+        self._conversation_unavailable = True
+        self._connected = False
+        try:
+            self.query_one("#chat-input", Input).disabled = True
+        except Exception:
+            pass
+        self._refresh_status()
+
     def action_request_exit(self) -> None:
         self._close_client()
         self.exit()
@@ -382,11 +506,13 @@ class ParaEGOXConsoleApp(App[None]):
         self._close_client()
 
     def _close_client(self) -> None:
-        if self._client_closed:
+        if self._clients_closed:
             return
-        self._client_closed = True
+        self._clients_closed = True
         if self._submit_worker is not None and not self._submit_worker.is_finished:
             self._submit_worker.cancel()
+        if self._inspection_worker is not None and not self._inspection_worker.is_finished:
+            self._inspection_worker.cancel()
         try:
             self._client.close()
         except Exception:
@@ -394,22 +520,42 @@ class ParaEGOXConsoleApp(App[None]):
             # client owns transport cleanup and is required to make close
             # idempotent; the TUI neither retries nor exposes private details.
             pass
+        if self._inspection_client is not None:
+            try:
+                self._inspection_client.close()
+            except Exception:
+                pass
 
 
-def _inspection_status_lines(snapshot: LocalInspectionSnapshotV2) -> tuple[str, str, str]:
+def _inspection_watch_delay(previous_start: float, current_time: float) -> float:
+    elapsed = max(0.0, current_time - previous_start)
+    return max(0.0, _INSPECTION_WATCH_FLOOR_SECONDS - elapsed)
+
+
+async def _wait_for_inspection_watch_floor(
+    previous_start: float,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    while (delay := _inspection_watch_delay(previous_start, loop.time())) > 0:
+        await asyncio.sleep(delay)
+
+
+def _inspection_status_lines(
+    snapshot: LocalInspectionSnapshotV2,
+    *,
+    live: bool = False,
+) -> tuple[str, str, str]:
     node = snapshot.node
     coordinate = (
         ""
         if node.registration_epoch is None or node.status_sequence is None
-        else (
-            f" · registration e{node.registration_epoch}"
-            f" · status s{node.status_sequence}"
-        )
+        else (f" · registration e{node.registration_epoch} · status s{node.status_sequence}")
     )
     records = snapshot.base_snapshot.records
+    snapshot_label = "Inspection cache" if live else "Node-local startup snapshot"
     return (
         (
-            f"Node-local startup snapshot {_overall_label(snapshot.overall)} "
+            f"{snapshot_label} {_overall_label(snapshot.overall)} "
             f"r{snapshot.projection_revision} | NodeDaemon {_projected_node_label(node)}"
             f"{coordinate}"
         ),
@@ -489,15 +635,33 @@ def _five_owner_health_label(
     return f"health {healthy} healthy/{degraded} degraded/{faulted} faulted"
 
 
-def _display_safe_error(error: Exception) -> str:
-    message = str(error).strip()
-    return message or "the typed conversation operation failed"
+def _display_safe_conversation_error(error: Exception) -> str:
+    if isinstance(error, RuntimeAgentConversationClientError):
+        return str(error)
+    return "the typed conversation operation failed"
 
 
 def _display_safe_inspection_error(error: Exception) -> str:
     if isinstance(error, DeveloperLocalInspectionClientError):
         return str(error)
     return "the typed Inspection startup read failed"
+
+
+def _display_safe_inspection_operation_error(error: Exception) -> str:
+    if isinstance(error, DeveloperLocalInspectionClientError):
+        return str(error)
+    return "the typed Inspection operation failed"
+
+
+def _conversation_error_makes_unavailable(error: Exception) -> bool:
+    if not isinstance(error, RuntimeAgentConversationClientError):
+        return True
+    return error.code not in {
+        RuntimeAgentConversationClientErrorCode.OPERATION_REJECTED,
+        RuntimeAgentConversationClientErrorCode.OVERLOADED,
+        RuntimeAgentConversationClientErrorCode.REQUEST_PENDING,
+        RuntimeAgentConversationClientErrorCode.NO_PENDING_REQUEST,
+    }
 
 
 class _StorePathOnce(argparse.Action):
@@ -556,23 +720,153 @@ def _load_inspection_snapshot_once(path: Path) -> LocalInspectionSnapshotV2:
         inspection_client.close()
 
 
+_RUNTIME_BOOTSTRAP_FAILURES = frozenset(
+    {
+        RuntimeAgentConversationClientErrorCode.INVALID_PATH,
+        RuntimeAgentConversationClientErrorCode.SYMLINK_REJECTED,
+        RuntimeAgentConversationClientErrorCode.INSECURE_PERMISSIONS,
+        RuntimeAgentConversationClientErrorCode.BOOTSTRAP_OPEN_FAILED,
+        RuntimeAgentConversationClientErrorCode.INVALID_BOOTSTRAP,
+        RuntimeAgentConversationClientErrorCode.DIGEST_MISMATCH,
+    }
+)
+_INSPECTION_BOOTSTRAP_FAILURES = frozenset(
+    {
+        DeveloperLocalInspectionClientErrorCode.INVALID_PATH,
+        DeveloperLocalInspectionClientErrorCode.SYMLINK_REJECTED,
+        DeveloperLocalInspectionClientErrorCode.INSECURE_PERMISSIONS,
+        DeveloperLocalInspectionClientErrorCode.BOOTSTRAP_OPEN_FAILED,
+        DeveloperLocalInspectionClientErrorCode.INVALID_BOOTSTRAP,
+        DeveloperLocalInspectionClientErrorCode.DIGEST_MISMATCH,
+    }
+)
+
+
+def _runtime_private_exit(error: Exception) -> int:
+    if isinstance(error, _TuiAttachAgentBootstrapIdentityError):
+        return _TUI_ATTACH_BOOTSTRAP_EXIT
+    if isinstance(error, _TuiAttachAgentSocketError):
+        return _TUI_ATTACH_PEER_EXIT
+    if not isinstance(error, RuntimeAgentConversationClientError):
+        return _TUI_ATTACH_CHILD_EXIT
+    if error.code is RuntimeAgentConversationClientErrorCode.PEER_CREDENTIALS_MISMATCH:
+        return _TUI_ATTACH_PEER_EXIT
+    if error.code in {
+        RuntimeAgentConversationClientErrorCode.INVALID_SOCKET,
+        RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+    }:
+        return _TUI_ATTACH_PEER_EXIT
+    if error.code in _RUNTIME_BOOTSTRAP_FAILURES:
+        return _TUI_ATTACH_BOOTSTRAP_EXIT
+    if error.code in {
+        RuntimeAgentConversationClientErrorCode.IO,
+        RuntimeAgentConversationClientErrorCode.OPERATION_TIMED_OUT,
+        RuntimeAgentConversationClientErrorCode.ENTROPY_UNAVAILABLE,
+    }:
+        return _TUI_ATTACH_IO_EXIT
+    return _TUI_ATTACH_PROTOCOL_EXIT
+
+
+def _inspection_private_exit(error: Exception) -> int:
+    if isinstance(error, _TuiAttachInspectionBootstrapIdentityError):
+        return _TUI_ATTACH_BOOTSTRAP_EXIT
+    if isinstance(error, _TuiAttachInspectionSocketError):
+        return _TUI_ATTACH_PEER_EXIT
+    if not isinstance(error, DeveloperLocalInspectionClientError):
+        return _TUI_ATTACH_CHILD_EXIT
+    if error.code is DeveloperLocalInspectionClientErrorCode.PEER_CREDENTIALS_MISMATCH:
+        return _TUI_ATTACH_PEER_EXIT
+    if error.code in {
+        DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET,
+        DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+    }:
+        return _TUI_ATTACH_PEER_EXIT
+    if error.code in _INSPECTION_BOOTSTRAP_FAILURES:
+        return _TUI_ATTACH_BOOTSTRAP_EXIT
+    if error.code in {
+        DeveloperLocalInspectionClientErrorCode.IO,
+        DeveloperLocalInspectionClientErrorCode.OPERATION_TIMED_OUT,
+    }:
+        return _TUI_ATTACH_IO_EXIT
+    return _TUI_ATTACH_PROTOCOL_EXIT
+
+
+def _run_tui_attach() -> int:
+    try:
+        handoff = _read_tui_attach_handoff_fd(_TUI_ATTACH_FD)
+    except _TuiAttachHandoffError as error:
+        if error.code is _TuiAttachHandoffErrorCode.PEER_CREDENTIALS_MISMATCH:
+            return _TUI_ATTACH_PEER_EXIT
+        if error.code is _TuiAttachHandoffErrorCode.IO:
+            return _TUI_ATTACH_IO_EXIT
+        return _TUI_ATTACH_HANDOFF_EXIT
+    except Exception:
+        return _TUI_ATTACH_CHILD_EXIT
+
+    conversation_pin = handoff.conversation
+    inspection_pin = handoff.inspection
+    del handoff
+    try:
+        conversation_client = RuntimeAgentConversationClientV1._from_tui_attach_pin(
+            conversation_pin
+        )
+    except Exception as error:
+        return _runtime_private_exit(error)
+    del conversation_pin
+    try:
+        inspection_client = DeveloperLocalInspectionClientV2._from_tui_attach_pin(inspection_pin)
+    except Exception as error:
+        conversation_client.close()
+        return _inspection_private_exit(error)
+    del inspection_pin
+    try:
+        try:
+            inspection_snapshot = asyncio.run(inspection_client.latest())
+        except Exception as error:
+            return _inspection_private_exit(error)
+        app = ParaEGOXConsoleApp(
+            conversation_client,
+            inspection_snapshot=inspection_snapshot,
+            inspection_client=inspection_client,
+        )
+        try:
+            app.run()
+        except Exception:
+            return _TUI_ATTACH_CHILD_EXIT
+        finally:
+            app._close_client()
+        return 0
+    finally:
+        conversation_client.close()
+        inspection_client.close()
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
-    parsed = _parse_arguments(arguments)
+    argv = tuple(sys.argv[1:] if arguments is None else arguments)
+    hidden_intent = any(
+        argument == "--tui-attach-fd" or argument.startswith("--tui-attach-fd=")
+        for argument in argv
+    )
+    if hidden_intent:
+        if argv != ("--tui-attach-fd", str(_TUI_ATTACH_FD)):
+            return _TUI_ATTACH_HANDOFF_EXIT
+        return _run_tui_attach()
+
+    parsed = _parse_arguments(argv)
     try:
         client = RuntimeAgentConversationClientV1.from_private_bootstrap_file(
             parsed.runtime_bootstrap_file
         )
     except Exception as error:
         raise SystemExit(
-            f"paraegox-console: unable to load Runtime bootstrap — {_display_safe_error(error)}"
+            "paraegox-console: unable to load Runtime bootstrap — "
+            f"{_display_safe_conversation_error(error)}"
         ) from None
 
     inspection_snapshot = None
     if parsed.inspection_bootstrap_file is not None:
         try:
-            inspection_snapshot = _load_inspection_snapshot_once(
-                parsed.inspection_bootstrap_file
-            )
+            inspection_snapshot = _load_inspection_snapshot_once(parsed.inspection_bootstrap_file)
         except Exception as error:
             client.close()
             raise SystemExit(

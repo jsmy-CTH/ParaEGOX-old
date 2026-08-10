@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import os
 import shutil
 import socket
@@ -10,7 +11,7 @@ import struct
 import tempfile
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -62,9 +63,7 @@ _INSPECTION_CLOCK_REF = bytes([0x31]) * 16
 _INSPECTION_TOKEN = bytes([0x5B]) * 32
 _INSPECTION_REQUEST_SEED = bytes([0x6C]) * 16
 _INSPECTION_TIMEOUT_NANOS = 2_000_000_000
-_RUST_INSPECTION_FIXTURES = (
-    Path(__file__).parents[2] / "crates/paraegox-inspection/tests/fixtures"
-)
+_RUST_INSPECTION_FIXTURES = Path(__file__).parents[2] / "crates/paraegox-inspection/tests/fixtures"
 
 
 def _inspection_fixture(name: str) -> bytes:
@@ -154,6 +153,73 @@ def _write_inspection_bootstrap(path: Path, socket_path: Path) -> None:
     path.chmod(0o600)
 
 
+def _tui_attach_pin(
+    path: Path,
+    kind: bytes,
+) -> console_client._TuiAttachBootstrapPinV1:
+    metadata = path.stat()
+    content = path.read_bytes()
+    return console_client._TuiAttachBootstrapPinV1(
+        kind=kind,
+        path=os.fsencode(path),
+        content_length=len(content),
+        content_sha256=hashlib.sha256(content).digest(),
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+        mode=metadata.st_mode & 0o7777,
+        link_count=metadata.st_nlink,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+    )
+
+
+def _inspection_snapshot_with_revision(revision: int) -> bytes:
+    wire = bytearray(_inspection_fixture("local_inspection_snapshot_v2.hex"))
+    wire[48:56] = revision.to_bytes(8, "big")
+    base_start = 112
+    wire[base_start + 48 : base_start + 56] = revision.to_bytes(8, "big")
+    wire[base_start + 80 : base_start + 112] = _rust_canonical_digest(
+        b"paraegox.inspection.local-snapshot.v1",
+        (
+            bytes(wire[base_start : base_start + 80]),
+            bytes(wire[base_start + 112 : base_start + 592]),
+        ),
+    )
+    wire[80:112] = _rust_canonical_digest(
+        b"paraegox.inspection.local-snapshot.v2",
+        (bytes(wire[:80]), bytes(wire[112:])),
+    )
+    return bytes(wire)
+
+
+def _inspection_response(
+    request: bytes,
+    outcome: console_client._InspectionResponseOutcomeV2,
+    *,
+    current_revision: int,
+    snapshot_wire: bytes = b"",
+) -> bytes:
+    frame = bytearray(144 + len(snapshot_wire))
+    frame[:4] = b"PXIP"
+    frame[4:6] = (2).to_bytes(2, "big")
+    frame[6:8] = (144).to_bytes(2, "big")
+    frame[8:12] = len(frame).to_bytes(4, "big")
+    frame[12:16] = len(snapshot_wire).to_bytes(4, "big")
+    frame[16] = int(outcome)
+    frame[17] = request[12]
+    frame[24:40] = request[16:32]
+    frame[40:56] = request[32:48]
+    frame[56:64] = request[48:56]
+    frame[64:72] = current_revision.to_bytes(8, "big")
+    frame[72:104] = request[64:96]
+    frame[144:] = snapshot_wire
+    frame[112:144] = _rust_canonical_digest(
+        b"paraegox.inspection.protocol-response.v2",
+        (bytes(frame[:112]), snapshot_wire),
+    )
+    return bytes(frame)
+
+
 @contextmanager
 def _private_directory() -> Iterator[Path]:
     created = Path(tempfile.mkdtemp(prefix="px-console-"))
@@ -214,6 +280,160 @@ def test_bootstrap_and_ipc_codecs_match_rust_golden_vectors() -> None:
     assert console_client._decode_ipc_frame(b"PXAI", wire) == frame
 
 
+def _fixed_tui_handoff() -> console_client._TuiAttachHandoffV1:
+    return console_client._TuiAttachHandoffV1(
+        generation=bytes([0x41]) * 16,
+        config_commitment=bytes([0x42]) * 32,
+        conversation=console_client._TuiAttachBootstrapPinV1(
+            kind=b"C",
+            path=b"/private/run/conversation.pxab",
+            content_length=144,
+            content_sha256=bytes([0x43]) * 32,
+            uid=501,
+            gid=20,
+            mode=0o600,
+            link_count=1,
+            device=7,
+            inode=11,
+        ),
+        inspection=console_client._TuiAttachBootstrapPinV1(
+            kind=b"I",
+            path=b"/private/run/inspection.pxib",
+            content_length=128,
+            content_sha256=bytes([0x44]) * 32,
+            uid=501,
+            gid=20,
+            mode=0o600,
+            link_count=1,
+            device=7,
+            inode=12,
+        ),
+    )
+
+
+def test_tui_attach_handoff_v1_is_canonical_bounded_and_token_free() -> None:
+    handoff = _fixed_tui_handoff()
+    wire = console_client._encode_tui_attach_handoff_v1(handoff)
+
+    assert wire[:4] == b"PXTH"
+    assert wire[4:6] == (1).to_bytes(2, "big")
+    assert wire[6:8] == b"TR"
+    assert wire[8:10] == (288).to_bytes(2, "big")
+    assert wire[10:12] == (2).to_bytes(2, "big")
+    assert int.from_bytes(wire[12:16], "big") == len(wire)
+    assert wire[64] == ord("C")
+    assert wire[160] == ord("I")
+    assert len(wire) <= 8_480
+    assert _GENERATION_TOKEN not in wire
+    expected_digest = hashlib.sha256(
+        b"paraegox.local.tui-attach-handoff.v1" + wire[:256] + wire[288:]
+    ).digest()
+    assert wire[256:288] == expected_digest
+    assert (
+        console_client._decode_tui_attach_handoff_v1(
+            wire,
+            expected_uid=501,
+            expected_gid=20,
+        )
+        == handoff
+    )
+
+    corruptions = [0, 4, 6, 7, 8, 10, 12, 16, 32, 64, 65, 68, 72, 76, 80, 84, 88, 112, 144]
+    for offset in corruptions:
+        corrupted = bytearray(wire)
+        corrupted[offset] ^= 1
+        with pytest.raises(console_client._TuiAttachHandoffError):
+            console_client._decode_tui_attach_handoff_v1(
+                bytes(corrupted),
+                expected_uid=501,
+                expected_gid=20,
+            )
+
+    with pytest.raises(console_client._TuiAttachHandoffError):
+        console_client._decode_tui_attach_handoff_v1(
+            wire + b"x",
+            expected_uid=501,
+            expected_gid=20,
+        )
+
+    invalid_handoffs = [
+        replace(
+            handoff,
+            conversation=replace(handoff.conversation, path=b"/private//conversation.pxab"),
+        ),
+        replace(
+            handoff,
+            conversation=replace(
+                handoff.conversation,
+                path=handoff.inspection.path,
+            ),
+        ),
+        replace(
+            handoff,
+            inspection=replace(handoff.inspection, content_sha256=bytes(32)),
+        ),
+        replace(
+            handoff,
+            inspection=replace(handoff.inspection, link_count=2),
+        ),
+        replace(
+            handoff,
+            inspection=replace(handoff.inspection, path=b"/" + b"a" * 4_096),
+        ),
+    ]
+    for invalid in invalid_handoffs:
+        with pytest.raises(console_client._TuiAttachHandoffError):
+            console_client._encode_tui_attach_handoff_v1(invalid)
+
+
+def test_tui_attach_fd_requires_one_same_peer_frame_and_exact_eof() -> None:
+    wire = console_client._encode_tui_attach_handoff_v1(
+        console_client._TuiAttachHandoffV1(
+            generation=bytes([0x41]) * 16,
+            config_commitment=bytes([0x42]) * 32,
+            conversation=replace(
+                _fixed_tui_handoff().conversation,
+                uid=os.geteuid(),
+                gid=os.getegid(),
+            ),
+            inspection=replace(
+                _fixed_tui_handoff().inspection,
+                uid=os.geteuid(),
+                gid=os.getegid(),
+            ),
+        )
+    )
+    reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        writer.sendall(wire)
+        writer.shutdown(socket.SHUT_WR)
+        decoded = console_client._read_tui_attach_handoff_fd(os.dup(reader.fileno()))
+        assert decoded.generation == bytes([0x41]) * 16
+    finally:
+        reader.close()
+        writer.close()
+
+    for payload in (wire[:-1], wire + b"trailing"):
+        reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            writer.sendall(payload)
+            writer.shutdown(socket.SHUT_WR)
+            with pytest.raises(console_client._TuiAttachHandoffError):
+                console_client._read_tui_attach_handoff_fd(os.dup(reader.fileno()))
+        finally:
+            reader.close()
+            writer.close()
+
+    class TimedOutSocket:
+        @staticmethod
+        def recv(_length: int) -> bytes:
+            raise TimeoutError
+
+    with pytest.raises(console_client._TuiAttachHandoffError) as timed_out:
+        console_client._receive_exact(TimedOutSocket(), 1)  # type: ignore[arg-type]
+    assert timed_out.value.code is console_client._TuiAttachHandoffErrorCode.IO
+
+
 def test_private_bootstrap_reader_checks_permissions_digest_and_socket() -> None:
     with _private_directory() as directory, _bound_private_socket(directory) as socket_path:
         bootstrap_path = directory / "agent.bootstrap"
@@ -227,8 +447,7 @@ def test_private_bootstrap_reader_checks_permissions_digest_and_socket() -> None
         with pytest.raises(RuntimeAgentConversationClientError) as permissions:
             RuntimeAgentConversationClientV1.from_private_bootstrap_file(bootstrap_path)
         assert (
-            permissions.value.code
-            is RuntimeAgentConversationClientErrorCode.INSECURE_PERMISSIONS
+            permissions.value.code is RuntimeAgentConversationClientErrorCode.INSECURE_PERMISSIONS
         )
 
         bootstrap_path.chmod(0o600)
@@ -254,10 +473,199 @@ def test_bootstrap_reader_rejects_insecure_parent() -> None:
         with pytest.raises(RuntimeAgentConversationClientError) as permissions:
             RuntimeAgentConversationClientV1.from_private_bootstrap_file(bootstrap_path)
         assert (
-            permissions.value.code
-            is RuntimeAgentConversationClientErrorCode.INSECURE_PERMISSIONS
+            permissions.value.code is RuntimeAgentConversationClientErrorCode.INSECURE_PERMISSIONS
         )
         directory.chmod(0o700)
+
+
+def test_agent_client_entropy_failure_is_typed_and_zeroizes_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap = console_client._BootstrapV1(
+        socket_path=b"/private/agent.sock",
+        generation_token=bytearray(_GENERATION_TOKEN),
+        deck_run_id=_DECK_RUN_ID,
+        session_id=_SESSION_ID,
+        request_deadline_budget_nanos=_DEADLINE_NANOS,
+        operation_timeout_nanos=_OPERATION_TIMEOUT_NANOS,
+        command_capacity=_COMMAND_CAPACITY,
+        server_uid=os.geteuid(),
+        server_gid=os.getegid(),
+    )
+    monkeypatch.setattr(
+        console_client.secrets,
+        "token_bytes",
+        lambda _length: (_ for _ in ()).throw(OSError()),
+    )
+    with pytest.raises(RuntimeAgentConversationClientError) as unavailable:
+        RuntimeAgentConversationClientV1._from_bootstrap(bootstrap)
+    assert unavailable.value.code is RuntimeAgentConversationClientErrorCode.ENTROPY_UNAVAILABLE
+    assert not any(bootstrap.generation_token)
+
+
+def test_tui_attach_pinned_bootstrap_loaders_bind_exact_file_bytes_and_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _private_directory() as directory:
+        agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        inspection_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        agent_socket_path = directory / "agent.sock"
+        inspection_socket_path = directory / "inspection.sock"
+        agent_socket.bind(os.fspath(agent_socket_path))
+        inspection_socket.bind(os.fspath(inspection_socket_path))
+        agent_socket_path.chmod(0o600)
+        inspection_socket_path.chmod(0o600)
+        os.link(
+            inspection_socket_path,
+            directory / ".pxi-0123456789abcdef0123456789abcdef-socket.pin",
+        )
+        agent_bootstrap = directory / "agent.pxab"
+        inspection_bootstrap = directory / "inspection.pxib"
+        _write_bootstrap(agent_bootstrap, agent_socket_path)
+        _write_inspection_bootstrap(inspection_bootstrap, inspection_socket_path)
+        agent_pin = _tui_attach_pin(agent_bootstrap, b"C")
+        inspection_pin = _tui_attach_pin(inspection_bootstrap, b"I")
+        try:
+            RuntimeAgentConversationClientV1._from_tui_attach_pin(agent_pin).close()
+            console_client.DeveloperLocalInspectionClientV2._from_tui_attach_pin(
+                inspection_pin
+            ).close()
+
+            real_read = console_client.os.read
+
+            def fail_read(_descriptor: int, _remaining: int) -> bytes:
+                raise OSError
+
+            monkeypatch.setattr(console_client.os, "read", fail_read)
+            with pytest.raises(RuntimeAgentConversationClientError) as read_failed:
+                RuntimeAgentConversationClientV1._from_tui_attach_pin(agent_pin)
+            assert read_failed.value.code is RuntimeAgentConversationClientErrorCode.IO
+            monkeypatch.setattr(console_client.os, "read", real_read)
+
+            agent_wire = agent_bootstrap.read_bytes()
+            tampered = bytearray(agent_wire)
+            tampered[112] ^= 1
+            agent_bootstrap.write_bytes(tampered)
+            with pytest.raises(RuntimeAgentConversationClientError) as digest:
+                RuntimeAgentConversationClientV1._from_tui_attach_pin(agent_pin)
+            assert digest.value.code is RuntimeAgentConversationClientErrorCode.DIGEST_MISMATCH
+            agent_bootstrap.write_bytes(agent_wire)
+
+            replacement = directory / "replacement.pxab"
+            replacement.write_bytes(agent_wire)
+            replacement.chmod(0o600)
+            os.replace(replacement, agent_bootstrap)
+            with pytest.raises(RuntimeAgentConversationClientError) as replaced:
+                RuntimeAgentConversationClientV1._from_tui_attach_pin(agent_pin)
+            assert isinstance(
+                replaced.value,
+                console_client._TuiAttachAgentBootstrapIdentityError,
+            )
+            assert replaced.value.code is (
+                RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED
+            )
+
+            inspection_wire = inspection_bootstrap.read_bytes()
+            tampered_inspection = bytearray(inspection_wire)
+            tampered_inspection[96] ^= 1
+            inspection_bootstrap.write_bytes(tampered_inspection)
+            with pytest.raises(
+                console_client.DeveloperLocalInspectionClientError
+            ) as inspection_digest:
+                console_client.DeveloperLocalInspectionClientV2._from_tui_attach_pin(inspection_pin)
+            assert inspection_digest.value.code is (
+                console_client.DeveloperLocalInspectionClientErrorCode.DIGEST_MISMATCH
+            )
+        finally:
+            agent_socket.close()
+            inspection_socket.close()
+
+
+def test_tui_attach_pinned_loaders_reject_a_symlinked_path_component() -> None:
+    with _private_directory() as directory:
+        actual = directory / "actual"
+        actual.mkdir(mode=0o700)
+        alias = directory / "alias"
+        alias.symlink_to(actual, target_is_directory=True)
+        agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        inspection_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        agent_socket_path = actual / "agent.sock"
+        inspection_socket_path = actual / "inspection.sock"
+        agent_socket.bind(os.fspath(agent_socket_path))
+        inspection_socket.bind(os.fspath(inspection_socket_path))
+        agent_socket_path.chmod(0o600)
+        inspection_socket_path.chmod(0o600)
+        os.link(
+            inspection_socket_path,
+            actual / ".pxi-0123456789abcdef0123456789abcdef-socket.pin",
+        )
+        agent_bootstrap = actual / "agent.pxab"
+        inspection_bootstrap = actual / "inspection.pxib"
+        _write_bootstrap(agent_bootstrap, agent_socket_path)
+        _write_inspection_bootstrap(inspection_bootstrap, inspection_socket_path)
+        agent_pin = replace(
+            _tui_attach_pin(agent_bootstrap, b"C"),
+            path=os.fsencode(alias / agent_bootstrap.name),
+        )
+        inspection_pin = replace(
+            _tui_attach_pin(inspection_bootstrap, b"I"),
+            path=os.fsencode(alias / inspection_bootstrap.name),
+        )
+        try:
+            with pytest.raises(RuntimeAgentConversationClientError) as agent_rejected:
+                RuntimeAgentConversationClientV1._from_tui_attach_pin(agent_pin)
+            assert agent_rejected.value.code is (
+                RuntimeAgentConversationClientErrorCode.SYMLINK_REJECTED
+            )
+            with pytest.raises(
+                console_client.DeveloperLocalInspectionClientError
+            ) as inspection_rejected:
+                console_client.DeveloperLocalInspectionClientV2._from_tui_attach_pin(inspection_pin)
+            assert inspection_rejected.value.code is (
+                console_client.DeveloperLocalInspectionClientErrorCode.SYMLINK_REJECTED
+            )
+        finally:
+            agent_socket.close()
+            inspection_socket.close()
+
+
+@pytest.mark.parametrize("socket_pin_case", ["missing", "noncanonical", "duplicate", "wrong"])
+def test_inspection_socket_pin_is_unique_canonical_and_same_inode(
+    socket_pin_case: str,
+) -> None:
+    with _private_directory() as directory:
+        endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        other = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        socket_path = directory / "inspection.sock"
+        other_path = directory / "other.sock"
+        endpoint.bind(os.fspath(socket_path))
+        other.bind(os.fspath(other_path))
+        socket_path.chmod(0o600)
+        other_path.chmod(0o600)
+        canonical = directory / ".pxi-0123456789abcdef0123456789abcdef-socket.pin"
+        try:
+            if socket_pin_case == "missing":
+                os.link(socket_path, directory / "inspection.anchor")
+            elif socket_pin_case == "noncanonical":
+                os.link(socket_path, directory / ".pxi-NOTHEX-socket.pin")
+            elif socket_pin_case == "duplicate":
+                os.link(socket_path, canonical)
+                os.link(other_path, directory / ".pxi-fedcba9876543210fedcba9876543210-socket.pin")
+            else:
+                os.link(socket_path, directory / "inspection.anchor")
+                os.link(other_path, canonical)
+            bootstrap_path = directory / "inspection.pxib"
+            _write_inspection_bootstrap(bootstrap_path, socket_path)
+            with pytest.raises(console_client.DeveloperLocalInspectionClientError) as rejected:
+                console_client.DeveloperLocalInspectionClientV2.from_private_bootstrap_file(
+                    bootstrap_path
+                )
+            assert rejected.value.code is (
+                console_client.DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET
+            )
+        finally:
+            endpoint.close()
+            other.close()
 
 
 def test_unknown_response_status_is_rejected_even_with_a_valid_digest() -> None:
@@ -310,9 +718,7 @@ async def _write_response(
 
 
 async def _with_fake_server(
-    scenario: Callable[
-        [Path, Path, list[BaseException]], Awaitable[None]
-    ],
+    scenario: Callable[[Path, Path, list[BaseException]], Awaitable[None]],
 ) -> None:
     with _private_directory() as directory:
         socket_path = directory / "agent.sock"
@@ -351,7 +757,7 @@ async def _with_fake_server(
 
 
 async def _with_fake_inspection_server(
-    response_wire: bytes,
+    response_wire: bytes | Callable[[bytes, int], bytes | Awaitable[bytes]],
     scenario: Callable[
         [console_client.DeveloperLocalInspectionClientV2, list[bytes]], Awaitable[None]
     ],
@@ -371,8 +777,13 @@ async def _with_fake_inspection_server(
                     assert authenticated_request[:32] == _INSPECTION_TOKEN
                     request = authenticated_request[32:]
                     requests.append(request)
-                    assert request == _inspection_fixture("inspection_latest_request_v2.hex")
-                    writer.write(len(response_wire).to_bytes(4, "big") + response_wire)
+                    produced = (
+                        response_wire(request, len(requests))
+                        if callable(response_wire)
+                        else response_wire
+                    )
+                    response = await produced if inspect.isawaitable(produced) else produced
+                    writer.write(len(response).to_bytes(4, "big") + response)
                     await writer.drain()
                     if writer.can_write_eof():
                         writer.write_eof()
@@ -389,6 +800,10 @@ async def _with_fake_inspection_server(
 
         server = await asyncio.start_unix_server(start_handler, path=socket_path)
         socket_path.chmod(0o600)
+        os.link(
+            socket_path,
+            directory / ".pxi-0123456789abcdef0123456789abcdef-socket.pin",
+        )
         _write_inspection_bootstrap(bootstrap_path, socket_path)
         client = console_client.DeveloperLocalInspectionClientV2.from_private_bootstrap_file(
             bootstrap_path
@@ -463,6 +878,50 @@ def test_exchange_rejects_response_correlation_mismatch() -> None:
         ).canonical_wire()
         wrong = bytes([request.correlation[0] ^ 1]) + request.correlation[1:]
         await _write_response(writer, request, body, correlation=wrong)
+
+    scenario.handler = handler  # type: ignore[attr-defined]
+    asyncio.run(_with_fake_server(scenario))
+
+
+def test_agent_exchange_revalidates_socket_identity_after_exact_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(
+        bootstrap_path: Path,
+        _socket_path: Path,
+        _errors: list[BaseException],
+    ) -> None:
+        client = RuntimeAgentConversationClientV1.from_private_bootstrap_file(bootstrap_path)
+        real_validate = console_client._validate_socket_path
+        calls = 0
+
+        def changing_identity(
+            bootstrap: console_client._BootstrapV1,
+        ) -> console_client._FileIdentity:
+            nonlocal calls
+            calls += 1
+            identity = real_validate(bootstrap)
+            if calls == 3:
+                return replace(identity, inode=identity.inode + 1)
+            return identity
+
+        monkeypatch.setattr(console_client, "_validate_socket_path", changing_identity)
+        with pytest.raises(RuntimeAgentConversationClientError) as changed:
+            await client.open()
+        assert changed.value.code is (
+            RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED
+        )
+        assert calls == 3
+        client.close()
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        request = await _read_request(reader)
+        body = AgentConversationControlV1.open_result(
+            _DECK_RUN_ID,
+            _SESSION_ID,
+            AgentConversationOpenOutcomeV1.OPENED,
+        ).canonical_wire()
+        await _write_response(writer, request, body)
 
     scenario.handler = handler  # type: ignore[attr-defined]
     asyncio.run(_with_fake_server(scenario))
@@ -790,9 +1249,8 @@ def test_inspection_v2_decodes_all_rust_generated_fixtures(
     )
     request_wire = _inspection_fixture("inspection_latest_request_v2.hex")
     assert request.canonical_wire == request_wire
-    assert (
-        bytes(bootstrap.generation_token) + request.canonical_wire
-        == _inspection_fixture("developer_local_inspection_authenticated_request_v2.hex")
+    assert bytes(bootstrap.generation_token) + request.canonical_wire == _inspection_fixture(
+        "developer_local_inspection_authenticated_request_v2.hex"
     )
 
     snapshot_wire = _inspection_fixture("local_inspection_snapshot_v2.hex")
@@ -814,12 +1272,14 @@ def test_inspection_v2_decodes_all_rust_generated_fixtures(
         request,
     )
     assert response_snapshot == snapshot
-    assert (
+    with pytest.raises(console_client.DeveloperLocalInspectionClientError) as unavailable:
         console_client._decode_inspection_response_v2(
             _inspection_fixture("inspection_not_found_response_v2.hex"),
             request,
         )
-        is None
+    assert (
+        unavailable.value.code
+        is console_client.DeveloperLocalInspectionClientErrorCode.SNAPSHOT_UNAVAILABLE
     )
     with pytest.raises(FrozenInstanceError):
         setattr(snapshot, "overall", console_client.LocalInspectionOverallV1.READY)
@@ -831,6 +1291,8 @@ def test_inspection_v2_rejects_digest_owner_order_and_aggregate_corruption() -> 
     request = console_client._InspectionRequestV2(
         request_id=request_wire[16:32],
         projection_id=request_wire[32:48],
+        kind=console_client._InspectionRequestKindV2.LATEST,
+        after_revision=0,
         request_digest=request_wire[64:96],
         canonical_wire=request_wire,
     )
@@ -839,8 +1301,7 @@ def test_inspection_v2_rejects_digest_owner_order_and_aggregate_corruption() -> 
     with pytest.raises(console_client.DeveloperLocalInspectionClientError) as digest:
         console_client._decode_inspection_response_v2(bytes(response), request)
     assert (
-        digest.value.code
-        is console_client.DeveloperLocalInspectionClientErrorCode.DIGEST_MISMATCH
+        digest.value.code is console_client.DeveloperLocalInspectionClientErrorCode.DIGEST_MISMATCH
     )
 
     correlation = bytearray(_inspection_fixture("inspection_snapshot_response_v2.hex"))
@@ -865,8 +1326,7 @@ def test_inspection_v2_rejects_digest_owner_order_and_aggregate_corruption() -> 
     with pytest.raises(console_client.DeveloperLocalInspectionClientError) as noncanonical:
         console_client._decode_local_inspection_snapshot_v2(bytes(reserved))
     assert (
-        noncanonical.value.code
-        is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
+        noncanonical.value.code is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
     )
 
     aggregate = bytearray(_inspection_fixture("local_inspection_snapshot_v2.hex"))
@@ -899,8 +1359,7 @@ def test_inspection_v2_rejects_digest_owner_order_and_aggregate_corruption() -> 
     with pytest.raises(console_client.DeveloperLocalInspectionClientError) as invalid_order:
         console_client._decode_local_inspection_snapshot_v2(bytes(owner_order))
     assert (
-        invalid_order.value.code
-        is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
+        invalid_order.value.code is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
     )
 
     node_coordinate = bytearray(_inspection_fixture("local_inspection_snapshot_v2.hex"))
@@ -913,8 +1372,7 @@ def test_inspection_v2_rejects_digest_owner_order_and_aggregate_corruption() -> 
     with pytest.raises(console_client.DeveloperLocalInspectionClientError) as invalid_node:
         console_client._decode_local_inspection_snapshot_v2(bytes(node_coordinate))
     assert (
-        invalid_node.value.code
-        is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
+        invalid_node.value.code is console_client.DeveloperLocalInspectionClientErrorCode.PROTOCOL
     )
 
 
@@ -935,8 +1393,7 @@ def test_inspection_v2_real_uds_reads_latest_exactly_once_and_closes() -> None:
         with pytest.raises(console_client.DeveloperLocalInspectionClientError) as reused:
             await client.latest()
         assert (
-            reused.value.code
-            is console_client.DeveloperLocalInspectionClientErrorCode.ALREADY_USED
+            reused.value.code is console_client.DeveloperLocalInspectionClientErrorCode.ALREADY_USED
         )
         client.close()
         client.close()
@@ -949,6 +1406,214 @@ def test_inspection_v2_real_uds_reads_latest_exactly_once_and_closes() -> None:
             scenario,
         )
     )
+
+
+def test_inspection_v2_latest_then_watch_tracks_cursor_without_retry_or_queue() -> None:
+    revision_eight = _inspection_snapshot_with_revision(8)
+
+    def response_for(request: bytes, sequence: int) -> bytes:
+        if sequence == 1:
+            assert request[12] == int(console_client._InspectionRequestKindV2.LATEST)
+            return _inspection_response(
+                request,
+                console_client._InspectionResponseOutcomeV2.SNAPSHOT,
+                current_revision=7,
+                snapshot_wire=_inspection_fixture("local_inspection_snapshot_v2.hex"),
+            )
+        if sequence == 2:
+            assert request[12] == int(console_client._InspectionRequestKindV2.WATCH)
+            assert int.from_bytes(request[48:56], "big") == 7
+            return _inspection_response(
+                request,
+                console_client._InspectionResponseOutcomeV2.NOT_MODIFIED,
+                current_revision=7,
+            )
+        assert sequence == 3
+        assert int.from_bytes(request[48:56], "big") == 7
+        return _inspection_response(
+            request,
+            console_client._InspectionResponseOutcomeV2.SNAPSHOT,
+            current_revision=8,
+            snapshot_wire=revision_eight,
+        )
+
+    async def scenario(
+        client: console_client.DeveloperLocalInspectionClientV2,
+        requests: list[bytes],
+    ) -> None:
+        with pytest.raises(console_client.DeveloperLocalInspectionClientError) as first_watch:
+            await client.watch(7)
+        assert first_watch.value.code is (
+            console_client.DeveloperLocalInspectionClientErrorCode.LATEST_REQUIRED
+        )
+
+        latest = await client.latest()
+        assert latest.projection_revision == 7
+        assert await client.watch(7) is None
+        assert client._cursor_revision == 7
+        updated = await client.watch(7)
+        assert updated is not None
+        assert updated.projection_revision == 8
+        assert client._cursor_revision == 8
+        assert len(requests) == 3
+        assert len({request[16:32] for request in requests}) == 3
+
+        with pytest.raises(console_client.DeveloperLocalInspectionClientError) as stale_cursor:
+            await client.watch(7)
+        assert stale_cursor.value.code is (
+            console_client.DeveloperLocalInspectionClientErrorCode.CORRELATION_MISMATCH
+        )
+        assert len(requests) == 3
+
+    asyncio.run(_with_fake_inspection_server(response_for, scenario))
+
+
+def test_inspection_v2_rejects_concurrent_watch_and_sends_no_second_exchange() -> None:
+    watch_started = asyncio.Event()
+    release_watch = asyncio.Event()
+
+    async def response_for(request: bytes, sequence: int) -> bytes:
+        if sequence == 1:
+            return _inspection_response(
+                request,
+                console_client._InspectionResponseOutcomeV2.SNAPSHOT,
+                current_revision=7,
+                snapshot_wire=_inspection_fixture("local_inspection_snapshot_v2.hex"),
+            )
+        assert sequence == 2
+        watch_started.set()
+        await release_watch.wait()
+        return _inspection_response(
+            request,
+            console_client._InspectionResponseOutcomeV2.NOT_MODIFIED,
+            current_revision=7,
+        )
+
+    async def scenario(
+        client: console_client.DeveloperLocalInspectionClientV2,
+        requests: list[bytes],
+    ) -> None:
+        await client.latest()
+        pending = asyncio.create_task(client.watch(7))
+        await watch_started.wait()
+        with pytest.raises(console_client.DeveloperLocalInspectionClientError) as concurrent:
+            await client.watch(7)
+        assert concurrent.value.code is (
+            console_client.DeveloperLocalInspectionClientErrorCode.REQUEST_PENDING
+        )
+        assert len(requests) == 2
+        release_watch.set()
+        assert await pending is None
+        assert len(requests) == 2
+
+    asyncio.run(_with_fake_inspection_server(response_for, scenario))
+
+
+def test_inspection_v2_watch_not_found_is_terminal_for_that_single_exchange() -> None:
+    def response_for(request: bytes, sequence: int) -> bytes:
+        if sequence == 1:
+            return _inspection_response(
+                request,
+                console_client._InspectionResponseOutcomeV2.SNAPSHOT,
+                current_revision=7,
+                snapshot_wire=_inspection_fixture("local_inspection_snapshot_v2.hex"),
+            )
+        assert sequence == 2
+        return _inspection_response(
+            request,
+            console_client._InspectionResponseOutcomeV2.NOT_FOUND,
+            current_revision=0,
+        )
+
+    async def scenario(
+        client: console_client.DeveloperLocalInspectionClientV2,
+        requests: list[bytes],
+    ) -> None:
+        await client.latest()
+        with pytest.raises(console_client.DeveloperLocalInspectionClientError) as unavailable:
+            await client.watch(7)
+        assert unavailable.value.code is (
+            console_client.DeveloperLocalInspectionClientErrorCode.SNAPSHOT_UNAVAILABLE
+        )
+        assert len(requests) == 2
+
+    asyncio.run(_with_fake_inspection_server(response_for, scenario))
+
+
+def test_inspection_v2_timeout_attempts_exactly_one_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NeverRespondingReader:
+        async def readexactly(self, _count: int) -> bytes:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class Writer:
+        def __init__(self) -> None:
+            self.closed = False
+            self.writes = 0
+
+        def get_extra_info(self, name: str) -> object | None:
+            return object() if name == "socket" else None
+
+        def write(self, _wire: bytes | bytearray) -> None:
+            self.writes += 1
+
+        async def drain(self) -> None:
+            return None
+
+        def can_write_eof(self) -> bool:
+            return True
+
+        def write_eof(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        writer = Writer()
+        connection_calls = 0
+
+        async def open_connection(*, path: bytes) -> tuple[NeverRespondingReader, Writer]:
+            nonlocal connection_calls
+            assert path == b"/private/inspection.sock"
+            connection_calls += 1
+            return NeverRespondingReader(), writer
+
+        bootstrap = console_client._InspectionBootstrapV2(
+            socket_path=b"/private/inspection.sock",
+            projection_id=_INSPECTION_PROJECTION_ID,
+            generation_token=bytearray(_INSPECTION_TOKEN),
+            server_uid=os.geteuid(),
+            server_gid=os.getegid(),
+            operation_timeout_nanos=5_000_000,
+            request_seed=bytearray(_INSPECTION_REQUEST_SEED),
+        )
+        identity = console_client._FileIdentity(1, 2, stat.S_IFSOCK | 0o600)
+        monkeypatch.setattr(console_client.asyncio, "open_unix_connection", open_connection)
+        monkeypatch.setattr(
+            console_client,
+            "_validate_inspection_socket_path",
+            lambda _bootstrap: identity,
+        )
+        monkeypatch.setattr(
+            console_client,
+            "_peer_credentials",
+            lambda _socket: (os.geteuid(), os.getegid()),
+        )
+        client = console_client.DeveloperLocalInspectionClientV2(bootstrap)
+        with pytest.raises(console_client.DeveloperLocalInspectionClientError) as timed_out:
+            await client.latest()
+        assert timed_out.value.code is (
+            console_client.DeveloperLocalInspectionClientErrorCode.OPERATION_TIMED_OUT
+        )
+        assert connection_calls == 1
+        assert writer.writes == 1
+        assert writer.closed
+        client.close()
+
+    asyncio.run(scenario())
 
 
 def test_inspection_v2_not_found_and_closed_client_fail_closed() -> None:

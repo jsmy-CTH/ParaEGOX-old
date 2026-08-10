@@ -58,10 +58,18 @@ const INTERNAL_PROTOCOL_VERSION: u8 = 1;
 const INTERNAL_REQUEST_BYTES: usize = 38;
 const INTERNAL_DEPLOY_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
 const INTERNAL_INSPECTION_LOCATOR_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
+const INTERNAL_TUI_ATTACH_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
 const INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES: usize = 160;
 const MAX_INSPECTION_LOCATOR_PATH_BYTES: usize = 4_096;
 const MAX_INSPECTION_LOCATOR_RESPONSE_BYTES: usize =
     INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES + MAX_INSPECTION_LOCATOR_PATH_BYTES;
+const TUI_ATTACH_FRAME_HEADER_BYTES: usize = 288;
+const TUI_ATTACH_PIN_RECORD_BYTES: usize = 96;
+const MAX_TUI_ATTACH_PATH_BYTES: usize = 4_096;
+const MAX_TUI_ATTACH_FRAME_BYTES: usize =
+    TUI_ATTACH_FRAME_HEADER_BYTES + MAX_TUI_ATTACH_PATH_BYTES * 2;
+const CONVERSATION_BOOTSTRAP_MIN_BYTES: usize = 144;
+const CONVERSATION_BOOTSTRAP_MAX_BYTES: usize = 656;
 const MAX_RECORD_BYTES: u64 = 4 * 1024;
 const MAX_INTERNAL_RESPONSE_BYTES: usize = 4 * 1024;
 const MAX_DOWN_WAITERS: usize = 16;
@@ -79,6 +87,13 @@ const INSPECTION_LOCATOR_RESPONSE_VERSION: u16 = 1;
 const INSPECTION_LOCATOR_READY_OUTCOME: u8 = b'R';
 const INSPECTION_LOCATOR_RESPONSE_DIGEST_DOMAIN: &[u8] =
     b"paraegox.local.inspection-locator-response.v1";
+const TUI_ATTACH_LOCATOR_RESPONSE_MAGIC: [u8; 4] = *b"PXTL";
+const TUI_ATTACH_HANDOFF_MAGIC: [u8; 4] = *b"PXTH";
+const TUI_ATTACH_FRAME_VERSION: u16 = 1;
+const TUI_ATTACH_READY_OUTCOME: u8 = b'R';
+const TUI_ATTACH_LOCATOR_RESPONSE_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.local.tui-attach-locator-response.v1";
+const TUI_ATTACH_HANDOFF_DIGEST_DOMAIN: &[u8] = b"paraegox.local.tui-attach-handoff.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -400,6 +415,7 @@ enum InternalActionV1 {
     Down,
     Deploy,
     Inspection,
+    TuiAttach,
 }
 
 impl InternalActionV1 {
@@ -409,6 +425,7 @@ impl InternalActionV1 {
             Self::Down => b'D',
             Self::Deploy => b'P',
             Self::Inspection => b'I',
+            Self::TuiAttach => b'T',
         }
     }
 
@@ -418,6 +435,7 @@ impl InternalActionV1 {
             b'D' => Some(Self::Down),
             b'P' => Some(Self::Deploy),
             b'I' => Some(Self::Inspection),
+            b'T' => Some(Self::TuiAttach),
             _ => None,
         }
     }
@@ -434,6 +452,63 @@ struct InternalInspectionLocatorResponseV1 {
     generation: [u8; 16],
     config_commitment: [u8; 32],
     locator: LocalInspectionBootstrapLocatorV1,
+}
+
+/// One exact owner-private bootstrap file pinned before the lifecycle Ready
+/// event. The pin contains no bootstrap bytes or capability token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalTuiBootstrapPinV1 {
+    kind: u8,
+    path: PathBuf,
+    content_length: u32,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    link_count: u64,
+    device: u64,
+    inode: u64,
+    content_sha256: [u8; 32],
+}
+
+/// Atomic conversation+Inspection locator for one lifecycle generation.
+///
+/// It is transient request evidence and is canonicalized into a token-free
+/// PXTH frame before the presentation child is created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalTuiAttachLocatorV1 {
+    generation: [u8; 16],
+    config_commitment: [u8; 32],
+    conversation: LocalTuiBootstrapPinV1,
+    inspection: LocalTuiBootstrapPinV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiAttachFrameKindV1 {
+    Locator,
+    Handoff,
+}
+
+impl TuiAttachFrameKindV1 {
+    const fn magic(self) -> [u8; 4] {
+        match self {
+            Self::Locator => TUI_ATTACH_LOCATOR_RESPONSE_MAGIC,
+            Self::Handoff => TUI_ATTACH_HANDOFF_MAGIC,
+        }
+    }
+
+    const fn digest_domain(self) -> &'static [u8] {
+        match self {
+            Self::Locator => TUI_ATTACH_LOCATOR_RESPONSE_DIGEST_DOMAIN,
+            Self::Handoff => TUI_ATTACH_HANDOFF_DIGEST_DOMAIN,
+        }
+    }
+
+    const fn error(self) -> LocalProcessError {
+        match self {
+            Self::Locator => LocalProcessError::LocalTuiLocator,
+            Self::Handoff => LocalProcessError::LocalTuiHandoff,
+        }
+    }
 }
 
 /// Exact PXIB file generation pinned by the current lifecycle supervisor.
@@ -586,16 +661,27 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
     fn mark_ready(
         &mut self,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        conversation_bootstrap_path: PathBuf,
         inspection_bootstrap_path: Option<PathBuf>,
     ) -> Result<(), LocalProcessError> {
         let inspection_bootstrap_locator = inspection_bootstrap_path
             .as_deref()
             .map(capture_inspection_bootstrap_locator)
             .transpose()?;
+        let tui_attach_locators = inspection_bootstrap_path
+            .as_deref()
+            .map(|inspection_path| {
+                capture_tui_attach_bootstrap_pair(
+                    &conversation_bootstrap_path,
+                    inspection_path,
+                )
+            })
+            .transpose()?;
         self.events
             .send(SupervisorEventV1::Ready {
                 deployment,
                 inspection_bootstrap_locator,
+                tui_attach_locators,
             })
             .map_err(|_| LocalProcessError::LifecycleControl)
     }
@@ -611,6 +697,7 @@ enum SupervisorEventV1 {
     Ready {
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
         inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
+        tui_attach_locators: Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
     },
     Exited(Result<(), LocalProcessError>),
 }
@@ -845,6 +932,51 @@ pub(crate) fn locate_local_inspection_bootstrap(
             Ok(None) | Err(_) => Err(LocalProcessError::LocalInspectionLocator),
         },
     }
+}
+
+/// Resolves one atomic conversation+Inspection locator for exactly the current
+/// Running generation. The operation performs one read-only Status observation
+/// followed by one generation-bound `T` exchange and has no retry, recovery,
+/// or lifecycle mutation path.
+pub(crate) fn locate_local_tui_attach(
+    config: &LocalManagedChatConfigV1,
+) -> Result<LocalTuiAttachLocatorV1, LocalProcessError> {
+    validate_execution_identity()?;
+    let status = observe(config)?;
+    if status.diagnostic().is_some_and(|diagnostic| {
+        diagnostic.code() == LocalProcessError::LifecycleConfiguration.code()
+    }) {
+        return Err(LocalProcessError::LifecycleConfiguration);
+    }
+    if !status.ok()
+        || status.state() != LocalLifecycleStateV1::Running
+        || !status.owner_readiness_observed()
+    {
+        return Err(LocalProcessError::LocalTuiNotRunning);
+    }
+    let generation = status
+        .generation()
+        .ok_or(LocalProcessError::LocalTuiLocator)?;
+    let expected_generation =
+        decode_generation(generation).map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    match query_local_tui_attach(config, expected_generation) {
+        Ok(response) => Ok(response),
+        Err(error) => match config_authority_drift(config) {
+            Ok(Some(_)) => Err(LocalProcessError::LifecycleConfiguration),
+            Ok(None) if error == LocalProcessError::LifecycleConfiguration => {
+                Err(LocalProcessError::LifecycleConfiguration)
+            }
+            Ok(None) | Err(_) => Err(LocalProcessError::LocalTuiLocator),
+        },
+    }
+}
+
+/// Canonically re-encodes an authenticated PXTL response as the token-free
+/// PXTH frame accepted by the hidden Python direct-client mode.
+pub(crate) fn encode_local_tui_handoff(
+    locator: &LocalTuiAttachLocatorV1,
+) -> Result<Vec<u8>, LocalProcessError> {
+    encode_tui_attach_frame(locator, TuiAttachFrameKindV1::Handoff)
 }
 
 /// Ensures the sole compiled-in deterministic deployment is running, then
@@ -1202,6 +1334,7 @@ async fn supervise(
     let mut failure = None;
     let mut deployment_projection = None;
     let mut inspection_bootstrap_locator = None;
+    let mut tui_attach_locators = None;
 
     loop {
         tokio::select! {
@@ -1268,6 +1401,22 @@ async fn supervise(
                         let _ = write_internal_inspection_locator_response(&mut stream, &response)
                             .await;
                     }
+                    InternalActionV1::TuiAttach => {
+                        let Some(expected_generation) = request.expected_generation else {
+                            continue;
+                        };
+                        let Some(response) = tui_attach_locator_response_for_request(
+                            record,
+                            stopping,
+                            expected_generation,
+                            commitment,
+                            tui_attach_locators.as_ref(),
+                        ) else {
+                            continue;
+                        };
+                        let _ = write_internal_tui_attach_locator_response(&mut stream, &response)
+                            .await;
+                    }
                 }
             }
             event = events.recv() => {
@@ -1275,6 +1424,7 @@ async fn supervise(
                     Some(SupervisorEventV1::Ready {
                         deployment,
                         inspection_bootstrap_locator: ready_inspection_bootstrap_locator,
+                        tui_attach_locators: ready_tui_attach_locators,
                     }) => {
                         // Readiness is a monotonic historical latch even when
                         // shutdown won the race. Keep Stopping, but durably
@@ -1284,8 +1434,10 @@ async fn supervise(
                             stopping,
                             &mut deployment_projection,
                             &mut inspection_bootstrap_locator,
+                            &mut tui_attach_locators,
                             deployment,
                             ready_inspection_bootstrap_locator,
+                            ready_tui_attach_locators,
                         );
                         publish_record(paths, record)?;
                     }
@@ -1347,12 +1499,15 @@ fn apply_supervisor_ready_event(
     stopping: bool,
     deployment_projection: &mut Option<VerifiedLocalDeploymentProjectionV1>,
     inspection_bootstrap_locator: &mut Option<LocalInspectionBootstrapLocatorV1>,
+    tui_attach_locators: &mut Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
     ready_deployment_projection: Option<VerifiedLocalDeploymentProjectionV1>,
     ready_inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
+    ready_tui_attach_locators: Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
 ) {
     *deployment_projection = ready_deployment_projection;
     if !stopping {
         *inspection_bootstrap_locator = ready_inspection_bootstrap_locator;
+        *tui_attach_locators = ready_tui_attach_locators;
     }
     apply_ready_observation(record, stopping);
 }
@@ -1401,6 +1556,34 @@ fn inspection_locator_response_for_request(
         config_commitment,
         locator: locator?.clone(),
     })
+    .ok()
+}
+
+fn tui_attach_locator_response_for_request(
+    record: &LifecycleRecordV1,
+    stopping: bool,
+    expected_generation: [u8; 16],
+    config_commitment: [u8; 32],
+    locators: Option<&(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
+) -> Option<Vec<u8>> {
+    if stopping
+        || record.state != LocalLifecycleStateV1::Running
+        || !record.owner_readiness_observed
+        || decode_generation(&record.generation).ok()? != expected_generation
+        || decode_lower_hex_32(&record.config_commitment).ok()? != config_commitment
+    {
+        return None;
+    }
+    let (conversation, inspection) = locators?;
+    encode_tui_attach_frame(
+        &LocalTuiAttachLocatorV1 {
+            generation: expected_generation,
+            config_commitment,
+            conversation: conversation.clone(),
+            inspection: inspection.clone(),
+        },
+        TuiAttachFrameKindV1::Locator,
+    )
     .ok()
 }
 
@@ -1472,6 +1655,126 @@ fn capture_inspection_bootstrap_locator(
         device: opened.dev(),
         inode: opened.ino(),
     })
+}
+
+fn capture_tui_attach_bootstrap_pair(
+    conversation_path: &Path,
+    inspection_path: &Path,
+) -> Result<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1), LocalProcessError> {
+    if conversation_path == inspection_path {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let conversation = capture_tui_bootstrap_pin(
+        conversation_path,
+        b'C',
+        CONVERSATION_BOOTSTRAP_MIN_BYTES,
+        CONVERSATION_BOOTSTRAP_MAX_BYTES,
+    )?;
+    let inspection = capture_tui_bootstrap_pin(
+        inspection_path,
+        b'I',
+        DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES,
+        MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES,
+    )?;
+    Ok((conversation, inspection))
+}
+
+fn capture_tui_bootstrap_pin(
+    path: &Path,
+    kind: u8,
+    minimum_content_length: usize,
+    maximum_content_length: usize,
+) -> Result<LocalTuiBootstrapPinV1, LocalProcessError> {
+    let path_bytes = path
+        .to_str()
+        .ok_or(LocalProcessError::LifecycleStartup)?
+        .as_bytes();
+    if !matches!(kind, b'C' | b'I')
+        || !is_lexically_absolute_file(path)
+        || path_bytes.is_empty()
+        || path_bytes.len() > MAX_TUI_ATTACH_PATH_BYTES
+        || minimum_content_length == 0
+        || minimum_content_length > maximum_content_length
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let expected_uid = Uid::effective().as_raw();
+    let expected_gid = Gid::effective().as_raw();
+    let before = fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_tui_bootstrap_metadata(&before, expected_uid, expected_gid)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let after = fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_tui_bootstrap_metadata(&opened, expected_uid, expected_gid)?;
+    validate_tui_bootstrap_metadata(&after, expected_uid, expected_gid)?;
+    if before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let content_length =
+        usize::try_from(opened.len()).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    if !(minimum_content_length..=maximum_content_length).contains(&content_length) {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let read_limit = u64::try_from(maximum_content_length + 1)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let mut content = Vec::with_capacity(content_length);
+    (&file)
+        .take(read_limit)
+        .read_to_end(&mut content)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let final_metadata =
+        fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_tui_bootstrap_metadata(&final_metadata, expected_uid, expected_gid)?;
+    if content.len() != content_length
+        || final_metadata.dev() != opened.dev()
+        || final_metadata.ino() != opened.ino()
+        || final_metadata.len() != opened.len()
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let content_sha256: [u8; 32] = Sha256::digest(&content).into();
+    if content_sha256.iter().all(|byte| *byte == 0) {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    Ok(LocalTuiBootstrapPinV1 {
+        kind,
+        path: path.to_path_buf(),
+        content_length: u32::try_from(content_length)
+            .map_err(|_| LocalProcessError::LifecycleStartup)?,
+        uid: opened.uid(),
+        gid: opened.gid(),
+        mode: opened.permissions().mode() & 0o7777,
+        link_count: opened.nlink(),
+        device: opened.dev(),
+        inode: opened.ino(),
+        content_sha256,
+    })
+}
+
+fn validate_tui_bootstrap_metadata(
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), LocalProcessError> {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_gid
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    Ok(())
 }
 
 fn validate_inspection_bootstrap_metadata(
@@ -1959,6 +2262,65 @@ async fn query_local_inspection_locator_async(
     )
 }
 
+fn query_local_tui_attach(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<LocalTuiAttachLocatorV1, LocalProcessError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    runtime.block_on(query_local_tui_attach_async(config, expected_generation))
+}
+
+async fn query_local_tui_attach_async(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<LocalTuiAttachLocatorV1, LocalProcessError> {
+    let paths = LifecyclePathsV1::from_state_root(config.state_root())
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    let mut stream = timeout(CLIENT_IO_TIMEOUT, UnixStream::connect(&paths.socket))
+        .await
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    let credentials = stream
+        .peer_cred()
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    if credentials.uid() != Uid::effective().as_raw()
+        || credentials.gid() != Gid::effective().as_raw()
+    {
+        return Err(LocalProcessError::LocalTuiLocator);
+    }
+    let request = encode_internal_tui_attach_query(
+        config.config_commitment(),
+        expected_generation,
+    );
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(&request))
+        .await
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    accept_client_write_half_shutdown(stream.shutdown().await)
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    let mut response = Vec::new();
+    let response_limit = u64::try_from(MAX_TUI_ATTACH_FRAME_BYTES + 1)
+        .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    timeout(
+        CLIENT_IO_TIMEOUT,
+        (&mut stream)
+            .take(response_limit)
+            .read_to_end(&mut response),
+    )
+    .await
+    .map_err(|_| LocalProcessError::LocalTuiLocator)?
+    .map_err(|_| LocalProcessError::LocalTuiLocator)?;
+    decode_tui_attach_frame(
+        &response,
+        TuiAttachFrameKindV1::Locator,
+        expected_generation,
+        config.config_commitment(),
+    )
+}
+
 /// Completes one client request without discarding an already-buffered reply.
 ///
 /// On macOS, `shutdown(Write)` returns `NotConnected` when the peer has already
@@ -2002,6 +2364,19 @@ fn encode_internal_inspection_locator_query(
     let mut request = [0_u8; INTERNAL_INSPECTION_LOCATOR_QUERY_BYTES];
     request[..INTERNAL_REQUEST_BYTES].copy_from_slice(&encode_internal_request(
         InternalActionV1::Inspection,
+        commitment,
+    ));
+    request[INTERNAL_REQUEST_BYTES..].copy_from_slice(&expected_generation);
+    request
+}
+
+fn encode_internal_tui_attach_query(
+    commitment: [u8; 32],
+    expected_generation: [u8; 16],
+) -> [u8; INTERNAL_TUI_ATTACH_QUERY_BYTES] {
+    let mut request = [0_u8; INTERNAL_TUI_ATTACH_QUERY_BYTES];
+    request[..INTERNAL_REQUEST_BYTES].copy_from_slice(&encode_internal_request(
+        InternalActionV1::TuiAttach,
         commitment,
     ));
     request[INTERNAL_REQUEST_BYTES..].copy_from_slice(&expected_generation);
@@ -2177,6 +2552,289 @@ fn inspection_locator_response_digest(prefix: &[u8], path: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn encode_tui_attach_frame(
+    locator: &LocalTuiAttachLocatorV1,
+    frame_kind: TuiAttachFrameKindV1,
+) -> Result<Vec<u8>, LocalProcessError> {
+    let error = frame_kind.error();
+    if locator.generation.iter().all(|byte| *byte == 0)
+        || locator.config_commitment.iter().all(|byte| *byte == 0)
+    {
+        return Err(error);
+    }
+    let conversation_path = validate_tui_attach_pin(&locator.conversation, b'C', error)?;
+    let inspection_path = validate_tui_attach_pin(&locator.inspection, b'I', error)?;
+    if conversation_path == inspection_path {
+        return Err(error);
+    }
+    let payload_length = conversation_path
+        .len()
+        .checked_add(inspection_path.len())
+        .ok_or(error)?;
+    let frame_length = TUI_ATTACH_FRAME_HEADER_BYTES
+        .checked_add(payload_length)
+        .ok_or(error)?;
+    if frame_length > MAX_TUI_ATTACH_FRAME_BYTES {
+        return Err(error);
+    }
+    let mut frame = vec![0_u8; frame_length];
+    frame[..4].copy_from_slice(&frame_kind.magic());
+    frame[4..6].copy_from_slice(&TUI_ATTACH_FRAME_VERSION.to_be_bytes());
+    frame[6] = InternalActionV1::TuiAttach.wire();
+    frame[7] = TUI_ATTACH_READY_OUTCOME;
+    frame[8..10].copy_from_slice(
+        &u16::try_from(TUI_ATTACH_FRAME_HEADER_BYTES)
+            .map_err(|_| error)?
+            .to_be_bytes(),
+    );
+    frame[10..12].copy_from_slice(&2_u16.to_be_bytes());
+    frame[12..16].copy_from_slice(
+        &u32::try_from(frame_length)
+            .map_err(|_| error)?
+            .to_be_bytes(),
+    );
+    frame[16..32].copy_from_slice(&locator.generation);
+    frame[32..64].copy_from_slice(&locator.config_commitment);
+    encode_tui_attach_pin_record(
+        &mut frame[64..160],
+        &locator.conversation,
+        conversation_path.len(),
+        error,
+    )?;
+    encode_tui_attach_pin_record(
+        &mut frame[160..256],
+        &locator.inspection,
+        inspection_path.len(),
+        error,
+    )?;
+    let conversation_end = TUI_ATTACH_FRAME_HEADER_BYTES + conversation_path.len();
+    frame[TUI_ATTACH_FRAME_HEADER_BYTES..conversation_end]
+        .copy_from_slice(conversation_path);
+    frame[conversation_end..].copy_from_slice(inspection_path);
+    let digest = tui_attach_frame_digest(
+        frame_kind.digest_domain(),
+        &frame[..256],
+        &frame[TUI_ATTACH_FRAME_HEADER_BYTES..],
+    );
+    if digest.iter().all(|byte| *byte == 0) {
+        return Err(error);
+    }
+    frame[256..TUI_ATTACH_FRAME_HEADER_BYTES].copy_from_slice(&digest);
+    Ok(frame)
+}
+
+fn validate_tui_attach_pin<'a>(
+    pin: &'a LocalTuiBootstrapPinV1,
+    expected_kind: u8,
+    error: LocalProcessError,
+) -> Result<&'a [u8], LocalProcessError> {
+    let path = pin.path.to_str().ok_or(error)?.as_bytes();
+    let content_bounds = match expected_kind {
+        b'C' => CONVERSATION_BOOTSTRAP_MIN_BYTES..=CONVERSATION_BOOTSTRAP_MAX_BYTES,
+        b'I' => DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES
+            ..=MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES,
+        _ => return Err(error),
+    };
+    if pin.kind != expected_kind
+        || !is_lexically_absolute_file(&pin.path)
+        || !(1..=MAX_TUI_ATTACH_PATH_BYTES).contains(&path.len())
+        || !content_bounds.contains(&usize::try_from(pin.content_length).map_err(|_| error)?)
+        || pin.uid == 0
+        || pin.gid == 0
+        || pin.uid != Uid::effective().as_raw()
+        || pin.gid != Gid::effective().as_raw()
+        || pin.mode != 0o600
+        || pin.link_count != 1
+        || pin.content_sha256.iter().all(|byte| *byte == 0)
+    {
+        return Err(error);
+    }
+    Ok(path)
+}
+
+fn encode_tui_attach_pin_record(
+    record: &mut [u8],
+    pin: &LocalTuiBootstrapPinV1,
+    path_length: usize,
+    error: LocalProcessError,
+) -> Result<(), LocalProcessError> {
+    if record.len() != TUI_ATTACH_PIN_RECORD_BYTES {
+        return Err(error);
+    }
+    record.fill(0);
+    record[0] = pin.kind;
+    record[2..4].copy_from_slice(
+        &u16::try_from(TUI_ATTACH_PIN_RECORD_BYTES)
+            .map_err(|_| error)?
+            .to_be_bytes(),
+    );
+    record[4..8].copy_from_slice(
+        &u32::try_from(path_length)
+            .map_err(|_| error)?
+            .to_be_bytes(),
+    );
+    record[8..12].copy_from_slice(&pin.content_length.to_be_bytes());
+    record[12..16].copy_from_slice(&pin.uid.to_be_bytes());
+    record[16..20].copy_from_slice(&pin.gid.to_be_bytes());
+    record[20..24].copy_from_slice(&pin.mode.to_be_bytes());
+    record[24..32].copy_from_slice(&pin.link_count.to_be_bytes());
+    record[32..40].copy_from_slice(&pin.device.to_be_bytes());
+    record[40..48].copy_from_slice(&pin.inode.to_be_bytes());
+    record[48..80].copy_from_slice(&pin.content_sha256);
+    Ok(())
+}
+
+fn decode_tui_attach_frame(
+    frame: &[u8],
+    frame_kind: TuiAttachFrameKindV1,
+    expected_generation: [u8; 16],
+    expected_config_commitment: [u8; 32],
+) -> Result<LocalTuiAttachLocatorV1, LocalProcessError> {
+    let error = frame_kind.error();
+    if frame.len() < TUI_ATTACH_FRAME_HEADER_BYTES
+        || frame.len() > MAX_TUI_ATTACH_FRAME_BYTES
+        || frame[..4] != frame_kind.magic()
+        || read_u16_be(frame, 4) != TUI_ATTACH_FRAME_VERSION
+        || frame[6] != InternalActionV1::TuiAttach.wire()
+        || frame[7] != TUI_ATTACH_READY_OUTCOME
+        || usize::from(read_u16_be(frame, 8)) != TUI_ATTACH_FRAME_HEADER_BYTES
+        || read_u16_be(frame, 10) != 2
+        || usize::try_from(read_u32_be(frame, 12)).map_err(|_| error)? != frame.len()
+    {
+        return Err(error);
+    }
+    let generation: [u8; 16] = frame[16..32].try_into().map_err(|_| error)?;
+    let config_commitment: [u8; 32] = frame[32..64].try_into().map_err(|_| error)?;
+    if generation != expected_generation
+        || config_commitment != expected_config_commitment
+        || generation.iter().all(|byte| *byte == 0)
+        || config_commitment.iter().all(|byte| *byte == 0)
+    {
+        return Err(error);
+    }
+    let conversation_path_length =
+        usize::try_from(read_u32_be(frame, 64 + 4)).map_err(|_| error)?;
+    let inspection_path_length =
+        usize::try_from(read_u32_be(frame, 160 + 4)).map_err(|_| error)?;
+    if !(1..=MAX_TUI_ATTACH_PATH_BYTES).contains(&conversation_path_length)
+        || !(1..=MAX_TUI_ATTACH_PATH_BYTES).contains(&inspection_path_length)
+        || TUI_ATTACH_FRAME_HEADER_BYTES
+            .checked_add(conversation_path_length)
+            .and_then(|length| length.checked_add(inspection_path_length))
+            != Some(frame.len())
+    {
+        return Err(error);
+    }
+    let conversation_end = TUI_ATTACH_FRAME_HEADER_BYTES + conversation_path_length;
+    let conversation_path = std::str::from_utf8(
+        &frame[TUI_ATTACH_FRAME_HEADER_BYTES..conversation_end],
+    )
+    .map_err(|_| error)?;
+    let inspection_path =
+        std::str::from_utf8(&frame[conversation_end..]).map_err(|_| error)?;
+    let conversation = decode_tui_attach_pin_record(
+        &frame[64..160],
+        b'C',
+        PathBuf::from(conversation_path),
+        error,
+    )?;
+    let inspection = decode_tui_attach_pin_record(
+        &frame[160..256],
+        b'I',
+        PathBuf::from(inspection_path),
+        error,
+    )?;
+    let declared_digest: [u8; 32] = frame[256..TUI_ATTACH_FRAME_HEADER_BYTES]
+        .try_into()
+        .map_err(|_| error)?;
+    let expected_digest = tui_attach_frame_digest(
+        frame_kind.digest_domain(),
+        &frame[..256],
+        &frame[TUI_ATTACH_FRAME_HEADER_BYTES..],
+    );
+    if declared_digest.iter().all(|byte| *byte == 0) || declared_digest != expected_digest {
+        return Err(error);
+    }
+    let locator = LocalTuiAttachLocatorV1 {
+        generation,
+        config_commitment,
+        conversation,
+        inspection,
+    };
+    if encode_tui_attach_frame(&locator, frame_kind)?.as_slice() != frame {
+        return Err(error);
+    }
+    Ok(locator)
+}
+
+fn decode_tui_attach_pin_record(
+    record: &[u8],
+    expected_kind: u8,
+    path: PathBuf,
+    error: LocalProcessError,
+) -> Result<LocalTuiBootstrapPinV1, LocalProcessError> {
+    if record.len() != TUI_ATTACH_PIN_RECORD_BYTES
+        || record[0] != expected_kind
+        || record[1] != 0
+        || usize::from(read_u16_be(record, 2)) != TUI_ATTACH_PIN_RECORD_BYTES
+        || record[80..96].iter().any(|byte| *byte != 0)
+    {
+        return Err(error);
+    }
+    let pin = LocalTuiBootstrapPinV1 {
+        kind: expected_kind,
+        path,
+        content_length: read_u32_be(record, 8),
+        uid: read_u32_be(record, 12),
+        gid: read_u32_be(record, 16),
+        mode: read_u32_be(record, 20),
+        link_count: read_u64_be(record, 24),
+        device: read_u64_be(record, 32),
+        inode: read_u64_be(record, 40),
+        content_sha256: record[48..80].try_into().map_err(|_| error)?,
+    };
+    let declared_path_length = usize::try_from(read_u32_be(record, 4)).map_err(|_| error)?;
+    if pin.path.as_os_str().as_bytes().len() != declared_path_length {
+        return Err(error);
+    }
+    validate_tui_attach_pin(&pin, expected_kind, error)?;
+    Ok(pin)
+}
+
+fn tui_attach_frame_digest(domain: &[u8], prefix: &[u8], paths: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(prefix);
+    digest.update(paths);
+    digest.finalize().into()
+}
+
+fn read_u16_be(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32_be(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn read_u64_be(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
 fn is_lexically_absolute_file(path: &Path) -> bool {
     if !path.is_absolute() || path.file_name().is_none() || path.as_os_str().as_bytes().contains(&0)
     {
@@ -2214,7 +2872,7 @@ async fn read_internal_request(
     let action = InternalActionV1::decode(request[5]).ok_or(LocalProcessError::LifecycleControl)?;
     let expected_generation = if matches!(
         action,
-        InternalActionV1::Deploy | InternalActionV1::Inspection
+        InternalActionV1::Deploy | InternalActionV1::Inspection | InternalActionV1::TuiAttach
     ) {
         let mut generation = [0_u8; 16];
         timeout(CLIENT_IO_TIMEOUT, stream.read_exact(&mut generation))
@@ -2285,6 +2943,25 @@ async fn write_internal_inspection_locator_response(
 ) -> Result<(), LocalProcessError> {
     if response.len() < INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES
         || response.len() > MAX_INSPECTION_LOCATOR_RESPONSE_BYTES
+    {
+        return Err(LocalProcessError::LifecycleControl);
+    }
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(response))
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)?
+        .map_err(|_| LocalProcessError::LifecycleControl)?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)
+}
+
+async fn write_internal_tui_attach_locator_response(
+    stream: &mut UnixStream,
+    response: &[u8],
+) -> Result<(), LocalProcessError> {
+    if response.len() < TUI_ATTACH_FRAME_HEADER_BYTES
+        || response.len() > MAX_TUI_ATTACH_FRAME_BYTES
     {
         return Err(LocalProcessError::LifecycleControl);
     }
@@ -2765,6 +3442,14 @@ mod tests {
         assert_eq!(deploy[5], b'P');
         assert_eq!(&deploy[6..INTERNAL_REQUEST_BYTES], &commitment);
         assert_eq!(&deploy[INTERNAL_REQUEST_BYTES..], &expected_generation);
+
+        let tui = encode_internal_tui_attach_query(commitment, expected_generation);
+        assert_eq!(tui.len(), INTERNAL_TUI_ATTACH_QUERY_BYTES);
+        assert_eq!(&tui[..4], &INTERNAL_MAGIC);
+        assert_eq!(tui[4], INTERNAL_PROTOCOL_VERSION);
+        assert_eq!(tui[5], b'T');
+        assert_eq!(&tui[6..INTERNAL_REQUEST_BYTES], &commitment);
+        assert_eq!(&tui[INTERNAL_REQUEST_BYTES..], &expected_generation);
     }
 
     #[test]
@@ -2887,6 +3572,165 @@ mod tests {
                 .expect("trailing request task panicked");
             assert_eq!(trailing_result, Err(LocalProcessError::LifecycleControl));
         });
+    }
+
+    fn tui_test_pin(kind: u8, path: &str, content_length: u32) -> LocalTuiBootstrapPinV1 {
+        LocalTuiBootstrapPinV1 {
+            kind,
+            path: PathBuf::from(path),
+            content_length,
+            uid: Uid::effective().as_raw(),
+            gid: Gid::effective().as_raw(),
+            mode: 0o600,
+            link_count: 1,
+            device: if kind == b'C' { 0x0102 } else { 0x0304 },
+            inode: if kind == b'C' { 0x1112 } else { 0x1314 },
+            content_sha256: if kind == b'C' { [0x51; 32] } else { [0x52; 32] },
+        }
+    }
+
+    #[test]
+    fn tui_attach_locator_and_handoff_frames_are_exact_strict_and_domain_separated() {
+        let generation = [0x31; 16];
+        let commitment = [0x42; 32];
+        let query = encode_internal_tui_attach_query(commitment, generation);
+        assert_eq!(query.len(), 54);
+        assert_eq!(&query[..4], b"PXLO");
+        assert_eq!(query[4], 1);
+        assert_eq!(query[5], b'T');
+        assert_eq!(&query[6..38], &commitment);
+        assert_eq!(&query[38..54], &generation);
+
+        let locator = LocalTuiAttachLocatorV1 {
+            generation,
+            config_commitment: commitment,
+            conversation: tui_test_pin(
+                b'C',
+                "/private/tmp/paraegox-m5a/c.pxab",
+                u32::try_from(CONVERSATION_BOOTSTRAP_MIN_BYTES).expect("PXAB length"),
+            ),
+            inspection: tui_test_pin(
+                b'I',
+                "/private/tmp/paraegox-m5a/i.pxib",
+                u32::try_from(DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES)
+                    .expect("PXIB length"),
+            ),
+        };
+        let pxlt = encode_tui_attach_frame(&locator, TuiAttachFrameKindV1::Locator)
+            .expect("canonical PXTL");
+        let pxth = encode_local_tui_handoff(&locator).expect("canonical PXTH");
+        let expected_length = TUI_ATTACH_FRAME_HEADER_BYTES
+            + locator.conversation.path.as_os_str().as_bytes().len()
+            + locator.inspection.path.as_os_str().as_bytes().len();
+        assert_eq!(pxlt.len(), expected_length);
+        assert_eq!(pxth.len(), expected_length);
+        assert_eq!(&pxlt[..4], b"PXTL");
+        assert_eq!(&pxth[..4], b"PXTH");
+        assert_eq!(read_u16_be(&pxlt, 4), 1);
+        assert_eq!(pxlt[6], b'T');
+        assert_eq!(pxlt[7], b'R');
+        assert_eq!(read_u16_be(&pxlt, 8), 288);
+        assert_eq!(read_u16_be(&pxlt, 10), 2);
+        assert_eq!(usize::try_from(read_u32_be(&pxlt, 12)), Ok(pxlt.len()));
+        assert_eq!(&pxlt[16..32], &generation);
+        assert_eq!(&pxlt[32..64], &commitment);
+        assert_eq!(pxlt[64], b'C');
+        assert_eq!(read_u16_be(&pxlt, 66), 96);
+        assert_eq!(pxlt[160], b'I');
+        assert_eq!(read_u16_be(&pxlt, 162), 96);
+        assert_ne!(&pxlt[256..288], &pxth[256..288]);
+        assert_eq!(&pxlt[288..], &pxth[288..]);
+        assert_eq!(
+            decode_tui_attach_frame(
+                &pxlt,
+                TuiAttachFrameKindV1::Locator,
+                generation,
+                commitment,
+            ),
+            Ok(locator.clone())
+        );
+        assert_eq!(
+            decode_tui_attach_frame(
+                &pxth,
+                TuiAttachFrameKindV1::Handoff,
+                generation,
+                commitment,
+            ),
+            Ok(locator.clone())
+        );
+
+        let mut trailing = pxlt.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_tui_attach_frame(
+                &trailing,
+                TuiAttachFrameKindV1::Locator,
+                generation,
+                commitment,
+            ),
+            Err(LocalProcessError::LocalTuiLocator)
+        );
+        assert_eq!(
+            decode_tui_attach_frame(
+                &pxlt,
+                TuiAttachFrameKindV1::Locator,
+                [0x32; 16],
+                commitment,
+            ),
+            Err(LocalProcessError::LocalTuiLocator)
+        );
+        assert_eq!(
+            decode_tui_attach_frame(
+                &pxlt,
+                TuiAttachFrameKindV1::Locator,
+                generation,
+                [0x43; 32],
+            ),
+            Err(LocalProcessError::LocalTuiLocator)
+        );
+        for offset in [0, 4, 6, 7, 8, 10, 12, 64, 65, 66, 80, 160, 161, 162, 176, 256] {
+            let mut invalid = pxlt.clone();
+            invalid[offset] ^= 1;
+            assert_eq!(
+                decode_tui_attach_frame(
+                    &invalid,
+                    TuiAttachFrameKindV1::Locator,
+                    generation,
+                    commitment,
+                ),
+                Err(LocalProcessError::LocalTuiLocator),
+                "unexpectedly accepted PXTL mutation at offset {offset}"
+            );
+        }
+
+        let record = LifecycleRecordV1 {
+            schema_version: RECORD_SCHEMA_VERSION,
+            config_commitment: lower_hex(&commitment).into_boxed_str(),
+            generation: lower_hex(&generation).into_boxed_str(),
+            state: LocalLifecycleStateV1::Running,
+            owner_readiness_observed: true,
+        };
+        let pins = (locator.conversation.clone(), locator.inspection.clone());
+        assert_eq!(
+            tui_attach_locator_response_for_request(
+                &record,
+                false,
+                generation,
+                commitment,
+                Some(&pins),
+            ),
+            Some(pxlt)
+        );
+        assert!(
+            tui_attach_locator_response_for_request(
+                &record,
+                true,
+                generation,
+                commitment,
+                Some(&pins),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3084,7 +3928,7 @@ mod tests {
         let locator_read = source
             .split("pub(crate) fn locate_local_inspection_bootstrap(")
             .nth(1)
-            .and_then(|tail| tail.split("pub(crate) fn run_local_deploy(").next())
+            .and_then(|tail| tail.split("pub(crate) fn locate_local_tui_attach(").next())
             .expect("bounded locator read source");
         assert_eq!(
             locator_read
@@ -3095,6 +3939,21 @@ mod tests {
         assert!(!locator_read.contains("run_up("));
         assert!(!locator_read.contains("loop {"));
         assert!(!locator_read.contains("retry"));
+    }
+
+    #[test]
+    fn tui_attach_uses_one_status_and_one_atomic_locator_without_owner_mutation() {
+        let source = include_str!("lifecycle.rs");
+        let locator_read = source
+            .split("pub(crate) fn locate_local_tui_attach(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn encode_local_tui_handoff(").next())
+            .expect("bounded TUI locator read source");
+        assert_eq!(locator_read.matches("observe(config)?").count(), 1);
+        assert_eq!(locator_read.matches("query_local_tui_attach(").count(), 1);
+        assert!(!locator_read.contains("run_up("));
+        assert!(!locator_read.contains("run_down("));
+        assert!(!locator_read.contains("loop {"));
     }
 
     #[test]
@@ -3116,17 +3975,21 @@ mod tests {
         };
         let mut deployment = None;
         let mut cached_locator = None;
+        let mut cached_tui_locators = None;
         apply_supervisor_ready_event(
             &mut record,
             true,
             &mut deployment,
             &mut cached_locator,
+            &mut cached_tui_locators,
             None,
             Some(locator),
+            None,
         );
         assert_eq!(record.state, LocalLifecycleStateV1::Stopping);
         assert!(record.owner_readiness_observed);
         assert!(cached_locator.is_none());
+        assert!(cached_tui_locators.is_none());
         assert!(
             inspection_locator_response_for_request(
                 &record,
@@ -3147,10 +4010,14 @@ mod tests {
         let capture = ready
             .find("capture_inspection_bootstrap_locator")
             .expect("PXIB pin capture");
+        let dual_capture = ready
+            .find("capture_tui_attach_bootstrap_pair")
+            .expect("atomic TUI dual-pin capture");
         let send = ready
             .find(".send(SupervisorEventV1::Ready")
             .expect("Ready send");
         assert!(capture < send);
+        assert!(dual_capture < send);
     }
 
     #[test]
@@ -3225,6 +4092,58 @@ mod tests {
 
         fs::remove_file(&path).expect("remove PXIB fixture");
         fs::remove_dir(&directory).expect("remove PXIB fixture directory");
+    }
+
+    #[test]
+    fn tui_ready_capture_requires_both_safe_distinct_bootstrap_files() {
+        let parent = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+        let directory = parent.join(format!(
+            "paraegox-tui-pin-test-{}",
+            new_generation().expect("unique test generation")
+        ));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .expect("private test directory");
+        let conversation_path = directory.join("c.pxab");
+        let inspection_path = directory.join("i.pxib");
+        let conversation_content = vec![0x61; CONVERSATION_BOOTSTRAP_MIN_BYTES];
+        let inspection_content =
+            vec![0x62; DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES];
+        fs::write(&conversation_path, &conversation_content).expect("write PXAB fixture");
+        fs::write(&inspection_path, &inspection_content).expect("write PXIB fixture");
+        fs::set_permissions(&conversation_path, fs::Permissions::from_mode(0o600))
+            .expect("private PXAB mode");
+        fs::set_permissions(&inspection_path, fs::Permissions::from_mode(0o600))
+            .expect("private PXIB mode");
+
+        let (conversation, inspection) =
+            capture_tui_attach_bootstrap_pair(&conversation_path, &inspection_path)
+                .expect("verified dual pins");
+        assert_eq!(conversation.kind, b'C');
+        assert_eq!(conversation.path, conversation_path);
+        assert_eq!(conversation.content_length, 144);
+        assert_eq!(conversation.mode, 0o600);
+        assert_eq!(conversation.link_count, 1);
+        assert_eq!(inspection.kind, b'I');
+        assert_eq!(inspection.path, inspection_path);
+        assert_eq!(inspection.content_length, 128);
+        assert_ne!(conversation.content_sha256, inspection.content_sha256);
+
+        assert_eq!(
+            capture_tui_attach_bootstrap_pair(&conversation_path, &conversation_path),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+        fs::set_permissions(&inspection_path, fs::Permissions::from_mode(0o640))
+            .expect("insecure PXIB mode");
+        assert_eq!(
+            capture_tui_attach_bootstrap_pair(&conversation_path, &inspection_path),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+
+        fs::remove_file(&conversation_path).expect("remove PXAB fixture");
+        fs::remove_file(&inspection_path).expect("remove PXIB fixture");
+        fs::remove_dir(&directory).expect("remove pin fixture directory");
     }
 
     #[test]

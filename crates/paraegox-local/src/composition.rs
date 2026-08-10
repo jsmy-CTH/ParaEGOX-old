@@ -2,7 +2,9 @@
 
 use std::env;
 use std::fs::{self, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
+use std::net::Shutdown;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -13,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use nix::fcntl::{OFlag, open};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::stat::Mode;
 use nix::unistd::{Gid, Pid, Uid};
@@ -156,6 +158,15 @@ use crate::{identity, layout};
 const CONSOLE_COMMAND: &str = "paraegox-console";
 const RUNTIME_BOOTSTRAP_FILE_OPTION: &str = "--runtime-bootstrap-file";
 const INSPECTION_BOOTSTRAP_FILE_OPTION: &str = "--inspection-bootstrap-file";
+const TUI_ATTACH_FD_OPTION: &str = "--tui-attach-fd";
+const TUI_ATTACH_CHILD_FD: u8 = 3;
+const TUI_ATTACH_MAX_HANDOFF_BYTES: usize = 8_480;
+const TUI_ATTACH_SIGNAL_GRACE: Duration = Duration::from_secs(5);
+const TUI_ATTACH_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const TUI_ATTACH_SHELL: &str =
+    "exec 3<&0 || exit 125\nexec </dev/tty || exit 125\nexec \"$0\" \"$1\" \"$2\"";
+const TUI_ATTACH_ALLOWED_ENVIRONMENT: [&str; 6] =
+    ["PATH", "TERM", "COLORTERM", "LANG", "LC_ALL", "NO_COLOR"];
 const OPENAI_SECRET_REF_DOMAIN: &[u8] = b"paraegox.local.developer-openai-secret-ref.sha256.v1";
 const DEEPSEEK_SECRET_REF_DOMAIN: &[u8] = b"paraegox.local.developer-deepseek-secret-ref.sha256.v1";
 const DEVELOPER_MODEL_SERVICE_MAX_IN_FLIGHT: usize = 1;
@@ -2269,13 +2280,14 @@ struct ConversationInspectionInput {
 /// no mutation or current-health authority; those remain owned by the
 /// composition above. For the deterministic profile it may carry one verified
 /// terminal deployment projection for read-only D0a queries. Implementations
-/// may synchronously pin the already-created Inspection bootstrap before
-/// accepting readiness, but must not report readiness until this module calls
-/// `mark_ready`.
+/// synchronously pins the already-created conversation and Inspection
+/// bootstraps before accepting readiness, but must not report readiness until
+/// this module calls `mark_ready`.
 pub(crate) trait HeadlessLifecycleControlV1 {
     fn mark_ready(
         &mut self,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        conversation_bootstrap_path: PathBuf,
         inspection_bootstrap_path: Option<PathBuf>,
     ) -> Result<(), LocalProcessError>;
 
@@ -2348,7 +2360,11 @@ where
 
         let lifecycle_result = self
             .control
-            .mark_ready(input.local_deployment_projection, inspection_bootstrap_path)
+            .mark_ready(
+                input.local_deployment_projection,
+                input.ipc_bootstrap_path.clone(),
+                inspection_bootstrap_path,
+            )
             .and_then(|()| self.control.wait_for_shutdown());
         let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
             endpoint
@@ -2467,6 +2483,302 @@ fn console_program_for_executable(executable: &Path) -> PathBuf {
     } else {
         PathBuf::from(CONSOLE_COMMAND)
     }
+}
+
+/// Runs the additive TUI attachment presentation without acquiring any owner
+/// lifecycle or domain authority. The caller supplies one canonical PXTH frame
+/// produced from the generation-bound lifecycle query.
+pub(crate) fn run_attached_tui(handoff: &[u8]) -> Result<(), LocalProcessError> {
+    if handoff.len() < 288
+        || handoff.len() > TUI_ATTACH_MAX_HANDOFF_BYTES
+        || handoff.get(..4) != Some(&b"PXTH"[..])
+    {
+        return Err(LocalProcessError::LocalTuiHandoff);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::LocalTuiChild)?;
+    runtime.block_on(run_attached_tui_with_signals(handoff))
+}
+
+async fn run_attached_tui_with_signals(handoff: &[u8]) -> Result<(), LocalProcessError> {
+    let mut interrupt =
+        signal(SignalKind::interrupt()).map_err(|_| LocalProcessError::LocalTuiChild)?;
+    let mut terminate =
+        signal(SignalKind::terminate()).map_err(|_| LocalProcessError::LocalTuiChild)?;
+    let mut terminal = SavedTuiTerminalStateV1::capture()?;
+    let result = spawn_and_supervise_attached_tui(handoff, &mut interrupt, &mut terminate).await;
+    if terminal.restore().is_err() {
+        return Err(LocalProcessError::LocalTuiChild);
+    }
+    result
+}
+
+async fn spawn_and_supervise_attached_tui(
+    handoff: &[u8],
+    interrupt: &mut TokioSignal,
+    terminate: &mut TokioSignal,
+) -> Result<(), LocalProcessError> {
+    let environment = validated_tui_child_environment()?;
+    let (mut parent_endpoint, child_endpoint) =
+        UnixStream::pair().map_err(|_| LocalProcessError::LocalTuiHandoff)?;
+    verify_close_on_exec(&parent_endpoint)?;
+    verify_close_on_exec(&child_endpoint)?;
+    parent_endpoint
+        .write_all(handoff)
+        .map_err(|_| LocalProcessError::LocalTuiHandoff)?;
+    parent_endpoint
+        .shutdown(Shutdown::Write)
+        .map_err(|_| LocalProcessError::LocalTuiHandoff)?;
+    let mut command = build_tui_attach_command(child_endpoint, &environment);
+    let mut child = TuiPresentationChildV1::spawn(&mut command)?;
+    drop(parent_endpoint);
+
+    loop {
+        if let Some(status) = child.poll_exit()? {
+            return classify_tui_child_status(status);
+        }
+        tokio::select! {
+            signal_value = interrupt.recv() => {
+                if signal_value.is_none() {
+                    return Err(LocalProcessError::LocalTuiChild);
+                }
+                return stop_signaled_tui_child(&mut child, Signal::SIGINT).await;
+            }
+            signal_value = terminate.recv() => {
+                if signal_value.is_none() {
+                    return Err(LocalProcessError::LocalTuiChild);
+                }
+                return stop_signaled_tui_child(&mut child, Signal::SIGTERM).await;
+            }
+            () = tokio::time::sleep(TUI_ATTACH_CHILD_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+fn build_tui_attach_command(
+    child_endpoint: UnixStream,
+    environment: &[(&'static str, std::ffi::OsString)],
+) -> Command {
+    let endpoint: OwnedFd = child_endpoint.into();
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(TUI_ATTACH_SHELL)
+        .arg(resolve_console_program())
+        .arg(TUI_ATTACH_FD_OPTION)
+        .arg(TUI_ATTACH_CHILD_FD.to_string())
+        .env_clear();
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command
+        .stdin(Stdio::from(endpoint))
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::null());
+    command
+}
+
+fn validated_tui_child_environment(
+) -> Result<Vec<(&'static str, std::ffi::OsString)>, LocalProcessError> {
+    validated_tui_child_environment_with(|name| env::var_os(name))
+}
+
+fn validated_tui_child_environment_with(
+    read_environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<(&'static str, std::ffi::OsString)>, LocalProcessError> {
+    let mut environment = Vec::with_capacity(TUI_ATTACH_ALLOWED_ENVIRONMENT.len());
+    for name in TUI_ATTACH_ALLOWED_ENVIRONMENT {
+        let value = read_environment(name);
+        if matches!(name, "PATH" | "TERM") && value.as_ref().is_none_or(|value| value.is_empty()) {
+            return Err(LocalProcessError::LocalTuiHandoff);
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        let text = value
+            .to_str()
+            .ok_or(LocalProcessError::LocalTuiHandoff)?;
+        let maximum_length = if name == "PATH" { 4_096 } else { 128 };
+        if text.len() > maximum_length || text.chars().any(|value| value.is_ascii_control()) {
+            return Err(LocalProcessError::LocalTuiHandoff);
+        }
+        environment.push((name, value));
+    }
+    Ok(environment)
+}
+
+fn verify_close_on_exec(stream: &UnixStream) -> Result<(), LocalProcessError> {
+    let flags = fcntl(stream, FcntlArg::F_GETFD).map_err(|_| LocalProcessError::LocalTuiHandoff)?;
+    if !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC) {
+        return Err(LocalProcessError::LocalTuiHandoff);
+    }
+    Ok(())
+}
+
+fn classify_tui_child_status(status: ExitStatus) -> Result<(), LocalProcessError> {
+    if status.success() {
+        return Ok(());
+    }
+    Err(match status.code() {
+        Some(20) => LocalProcessError::LocalTuiHandoff,
+        Some(21) => LocalProcessError::LocalTuiBootstrap,
+        Some(22) => LocalProcessError::LocalTuiPeer,
+        Some(23) => LocalProcessError::LocalTuiProtocol,
+        Some(24) => LocalProcessError::LocalTuiIo,
+        Some(_) | None => LocalProcessError::LocalTuiChild,
+    })
+}
+
+async fn stop_signaled_tui_child(
+    child: &mut TuiPresentationChildV1,
+    signal_value: Signal,
+) -> Result<(), LocalProcessError> {
+    let _ = child.signal(signal_value);
+    let deadline = Instant::now() + TUI_ATTACH_SIGNAL_GRACE;
+    loop {
+        if child.poll_exit()?.is_some() {
+            return Err(LocalProcessError::LocalTuiChild);
+        }
+        if Instant::now() >= deadline {
+            child.kill_and_reap()?;
+            return Err(LocalProcessError::LocalTuiChild);
+        }
+        tokio::time::sleep(TUI_ATTACH_CHILD_POLL_INTERVAL).await;
+    }
+}
+
+struct TuiPresentationChildV1 {
+    child: Option<Child>,
+}
+
+impl TuiPresentationChildV1 {
+    fn spawn(command: &mut Command) -> Result<Self, LocalProcessError> {
+        let child = command
+            .spawn()
+            .map_err(|_| LocalProcessError::LocalTuiChild)?;
+        Ok(Self { child: Some(child) })
+    }
+
+    fn signal(&self, signal_value: Signal) -> Result<(), LocalProcessError> {
+        let child = self.child.as_ref().ok_or(LocalProcessError::LocalTuiChild)?;
+        let pid = i32::try_from(child.id()).map_err(|_| LocalProcessError::LocalTuiChild)?;
+        kill(Pid::from_raw(pid), signal_value).map_err(|_| LocalProcessError::LocalTuiChild)
+    }
+
+    fn poll_exit(&mut self) -> Result<Option<ExitStatus>, LocalProcessError> {
+        let status = self
+            .child
+            .as_mut()
+            .ok_or(LocalProcessError::LocalTuiChild)?
+            .try_wait()
+            .map_err(|_| LocalProcessError::LocalTuiChild)?;
+        if status.is_some() {
+            self.child.take();
+        }
+        Ok(status)
+    }
+
+    fn kill_and_reap(&mut self) -> Result<(), LocalProcessError> {
+        let mut child = self.child.take().ok_or(LocalProcessError::LocalTuiChild)?;
+        let killed = child
+            .kill()
+            .map_err(|_| LocalProcessError::LocalTuiChild);
+        let reaped = child
+            .wait()
+            .map(|_| ())
+            .map_err(|_| LocalProcessError::LocalTuiChild);
+        killed.and(reaped)
+    }
+}
+
+impl Drop for TuiPresentationChildV1 {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+struct SavedTuiTerminalStateV1 {
+    stty_program: &'static str,
+    state: Box<str>,
+    restored: bool,
+}
+
+impl SavedTuiTerminalStateV1 {
+    fn capture() -> Result<Self, LocalProcessError> {
+        if !io::stdin().is_terminal()
+            || !io::stdout().is_terminal()
+            || !io::stderr().is_terminal()
+        {
+            return Err(LocalProcessError::LocalTuiTerminal);
+        }
+        let stty_program = resolve_stty_program().ok_or(LocalProcessError::LocalTuiTerminal)?;
+        let output = Command::new(stty_program)
+            .arg("-g")
+            .env_clear()
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|_| LocalProcessError::LocalTuiTerminal)?;
+        if !output.status.success() || output.stdout.len() > 1_024 {
+            return Err(LocalProcessError::LocalTuiTerminal);
+        }
+        let state = std::str::from_utf8(&output.stdout)
+            .map_err(|_| LocalProcessError::LocalTuiTerminal)?
+            .trim_end_matches(|value| matches!(value, '\r' | '\n'));
+        if state.is_empty()
+            || state
+                .chars()
+                .any(|value| value.is_ascii_control() || value.is_ascii_whitespace())
+        {
+            return Err(LocalProcessError::LocalTuiTerminal);
+        }
+        Ok(Self {
+            stty_program,
+            state: state.into(),
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), LocalProcessError> {
+        if self.restored {
+            return Ok(());
+        }
+        let status = Command::new(self.stty_program)
+            .arg(self.state.as_ref())
+            .env_clear()
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| LocalProcessError::LocalTuiChild)?;
+        if !status.success() {
+            return Err(LocalProcessError::LocalTuiChild);
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for SavedTuiTerminalStateV1 {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn resolve_stty_program() -> Option<&'static str> {
+    ["/bin/stty", "/usr/bin/stty"].into_iter().find(|path| {
+        fs::metadata(path).is_ok_and(|metadata| {
+            metadata.file_type().is_file()
+                && metadata.uid() == 0
+                && metadata.permissions().mode() & 0o111 != 0
+        })
+    })
 }
 
 struct JoinedChild {
@@ -4248,6 +4560,7 @@ mod tests {
         ready: bool,
         shutdown_waited: bool,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        conversation_bootstrap_path: Option<PathBuf>,
         inspection_bootstrap_path: Option<PathBuf>,
     }
 
@@ -4255,6 +4568,7 @@ mod tests {
         fn mark_ready(
             &mut self,
             deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+            conversation_bootstrap_path: PathBuf,
             inspection_bootstrap_path: Option<PathBuf>,
         ) -> Result<(), LocalProcessError> {
             if self.ready || self.shutdown_waited {
@@ -4262,6 +4576,7 @@ mod tests {
             }
             self.ready = true;
             self.deployment = deployment;
+            self.conversation_bootstrap_path = Some(conversation_bootstrap_path);
             self.inspection_bootstrap_path = inspection_bootstrap_path;
             Ok(())
         }
@@ -4893,6 +5208,174 @@ mod tests {
                 runtime_bootstrap.as_os_str().to_os_string(),
             ]
         );
+    }
+
+    #[test]
+    fn tui_attach_child_uses_fd_three_hidden_grammar_and_exact_environment_allowlist() {
+        let environment = validated_tui_child_environment_with(|name| match name {
+            "PATH" => Some(OsString::from("/usr/bin:/bin")),
+            "TERM" => Some(OsString::from("xterm-256color")),
+            "COLORTERM" => Some(OsString::from("truecolor")),
+            "LANG" => Some(OsString::from("C.UTF-8")),
+            "LC_ALL" | "NO_COLOR" => Some(OsString::new()),
+            "OPENAI_API_KEY" | "LD_PRELOAD" => Some(OsString::from("must-not-copy")),
+            _ => None,
+        })
+        .expect("strict TUI environment");
+        assert_eq!(
+            environment
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            TUI_ATTACH_ALLOWED_ENVIRONMENT
+        );
+
+        let (_parent, child) = UnixStream::pair().expect("TUI handoff pair");
+        let command = build_tui_attach_command(child, &environment);
+        assert_eq!(command.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(
+            command.get_args().map(OsString::from).collect::<Vec<_>>(),
+            vec![
+                OsString::from("-c"),
+                OsString::from(TUI_ATTACH_SHELL),
+                resolve_console_program().into_os_string(),
+                OsString::from(TUI_ATTACH_FD_OPTION),
+                OsString::from(TUI_ATTACH_CHILD_FD.to_string()),
+            ]
+        );
+        assert!(TUI_ATTACH_SHELL.contains("exec 3<&0"));
+        assert!(TUI_ATTACH_SHELL.contains("exec </dev/tty"));
+        assert!(TUI_ATTACH_SHELL.contains("exec \"$0\" \"$1\" \"$2\""));
+        let actual_environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_os_string(),
+                    value.expect("allowlisted value").to_os_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_environment.len(), TUI_ATTACH_ALLOWED_ENVIRONMENT.len());
+        for forbidden in [
+            "OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "LD_PRELOAD",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "PYTHONPATH",
+            "PYTHONNOUSERSITE",
+        ] {
+            assert!(
+                actual_environment
+                    .iter()
+                    .all(|(name, _)| name != OsStr::new(forbidden))
+            );
+        }
+    }
+
+    #[test]
+    fn tui_attach_environment_rejects_missing_oversized_or_control_values() {
+        for missing in ["PATH", "TERM"] {
+            assert_eq!(
+                validated_tui_child_environment_with(|name| {
+                    if name == missing {
+                        None
+                    } else if name == "PATH" {
+                        Some(OsString::from("/usr/bin"))
+                    } else if name == "TERM" {
+                        Some(OsString::from("xterm"))
+                    } else {
+                        None
+                    }
+                }),
+                Err(LocalProcessError::LocalTuiHandoff)
+            );
+        }
+        for (invalid_name, invalid_value) in [
+            ("PATH", "a".repeat(4_097)),
+            ("TERM", "a".repeat(129)),
+            ("LANG", "line\nleak".to_owned()),
+        ] {
+            assert_eq!(
+                validated_tui_child_environment_with(|name| {
+                    if name == invalid_name {
+                        Some(OsString::from(&invalid_value))
+                    } else if name == "PATH" {
+                        Some(OsString::from("/usr/bin"))
+                    } else if name == "TERM" {
+                        Some(OsString::from("xterm"))
+                    } else {
+                        None
+                    }
+                }),
+                Err(LocalProcessError::LocalTuiHandoff)
+            );
+        }
+    }
+
+    #[test]
+    fn tui_attach_private_child_statuses_map_to_one_public_taxonomy() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            classify_tui_child_status(ExitStatus::from_raw(0)),
+            Ok(())
+        );
+        for (private_status, expected) in [
+            (20, LocalProcessError::LocalTuiHandoff),
+            (21, LocalProcessError::LocalTuiBootstrap),
+            (22, LocalProcessError::LocalTuiPeer),
+            (23, LocalProcessError::LocalTuiProtocol),
+            (24, LocalProcessError::LocalTuiIo),
+            (25, LocalProcessError::LocalTuiChild),
+        ] {
+            assert_eq!(
+                classify_tui_child_status(ExitStatus::from_raw(private_status << 8)),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            classify_tui_child_status(ExitStatus::from_raw(Signal::SIGKILL as i32)),
+            Err(LocalProcessError::LocalTuiChild)
+        );
+    }
+
+    #[test]
+    fn tui_attach_supervision_has_no_owner_mutation_or_legacy_chat_rewrite() {
+        let source = include_str!("composition.rs");
+        let attach = source
+            .split("pub(crate) fn run_attached_tui(")
+            .nth(1)
+            .and_then(|tail| tail.split("struct JoinedChild").next())
+            .expect("bounded attach implementation");
+        assert!(!attach.contains("run_up("));
+        assert!(!attach.contains("run_down("));
+        assert!(!attach.contains("wait_for_shutdown"));
+        assert!(!attach.contains("RuntimeAgentConversationHandle"));
+        assert!(attach.contains("Signal::SIGINT"));
+        assert!(attach.contains("Signal::SIGTERM"));
+        assert!(attach.contains(".kill()"));
+        assert!(attach.contains("TUI_ATTACH_SIGNAL_GRACE"));
+
+        let legacy = build_console_command(
+            Path::new("/private/tmp/legacy.pxab"),
+            Some(Path::new("/private/tmp/legacy.pxib")),
+        );
+        assert_eq!(
+            legacy.get_args().map(OsString::from).collect::<Vec<_>>(),
+            vec![
+                OsString::from(RUNTIME_BOOTSTRAP_FILE_OPTION),
+                OsString::from("/private/tmp/legacy.pxab"),
+                OsString::from(INSPECTION_BOOTSTRAP_FILE_OPTION),
+                OsString::from("/private/tmp/legacy.pxib"),
+            ]
+        );
+        assert!(
+            legacy
+                .get_args()
+                .all(|argument| argument != OsStr::new(TUI_ATTACH_FD_OPTION))
+        );
+        assert_eq!(TUI_ATTACH_CHILD_FD, 3);
     }
 
     #[test]

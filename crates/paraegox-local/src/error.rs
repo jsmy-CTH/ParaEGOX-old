@@ -29,6 +29,15 @@ pub(crate) enum LocalProcessError {
     LocalInspectionNotFound,
     LocalInspectionIo,
     LocalInspectionJsonOutput,
+    LocalTuiNotRunning,
+    LocalTuiTerminal,
+    LocalTuiLocator,
+    LocalTuiHandoff,
+    LocalTuiBootstrap,
+    LocalTuiPeer,
+    LocalTuiProtocol,
+    LocalTuiIo,
+    LocalTuiChild,
     UnsafeExecutionIdentity,
     SignalHandling,
     IdentityManifest,
@@ -98,6 +107,15 @@ impl LocalProcessError {
             Self::LocalInspectionNotFound => "PXLC-INSPECTION-NOT-FOUND",
             Self::LocalInspectionIo => "PXLC-INSPECTION-IO",
             Self::LocalInspectionJsonOutput => "PXLC-INSPECTION-JSON-OUTPUT",
+            Self::LocalTuiNotRunning => "PXLC-TUI-NOT-RUNNING",
+            Self::LocalTuiTerminal => "PXLC-TUI-TERMINAL",
+            Self::LocalTuiLocator => "PXLC-TUI-LOCATOR",
+            Self::LocalTuiHandoff => "PXLC-TUI-HANDOFF",
+            Self::LocalTuiBootstrap => "PXLC-TUI-BOOTSTRAP",
+            Self::LocalTuiPeer => "PXLC-TUI-PEER",
+            Self::LocalTuiProtocol => "PXLC-TUI-PROTOCOL",
+            Self::LocalTuiIo => "PXLC-TUI-IO",
+            Self::LocalTuiChild => "PXLC-TUI-CHILD",
             Self::UnsafeExecutionIdentity => "PXLC-EXECUTION-IDENTITY",
             Self::SignalHandling => "PXLC-SIGNAL-HANDLING",
             Self::IdentityManifest => "PXLC-IDENTITY-MANIFEST",
@@ -189,6 +207,17 @@ impl LocalProcessError {
             }
             Self::LocalInspectionIo => "local Inspection one-shot exchange failed closed",
             Self::LocalInspectionJsonOutput => "local Inspection machine-readable output failed",
+            Self::LocalTuiNotRunning => {
+                "local TUI requires the current owner generation to be running"
+            }
+            Self::LocalTuiTerminal => "local TUI terminal state failed closed",
+            Self::LocalTuiLocator => "local TUI atomic owner locator query failed closed",
+            Self::LocalTuiHandoff => "local TUI child handoff failed strict validation",
+            Self::LocalTuiBootstrap => "local TUI bootstrap failed strict validation",
+            Self::LocalTuiPeer => "local TUI endpoint identity failed strict validation",
+            Self::LocalTuiProtocol => "local TUI response failed strict protocol validation",
+            Self::LocalTuiIo => "local TUI bounded exchange failed closed",
+            Self::LocalTuiChild => "local TUI presentation child failed joined execution",
             Self::UnsafeExecutionIdentity => {
                 "DeveloperLocal commands require a non-root user and group"
             }
@@ -364,16 +393,35 @@ mod tests {
             assert!(!failure.message().contains('/'));
         }
 
+        for (failure, code) in [
+            (LocalProcessError::LocalTuiNotRunning, "PXLC-TUI-NOT-RUNNING"),
+            (LocalProcessError::LocalTuiTerminal, "PXLC-TUI-TERMINAL"),
+            (LocalProcessError::LocalTuiLocator, "PXLC-TUI-LOCATOR"),
+            (LocalProcessError::LocalTuiHandoff, "PXLC-TUI-HANDOFF"),
+            (LocalProcessError::LocalTuiBootstrap, "PXLC-TUI-BOOTSTRAP"),
+            (LocalProcessError::LocalTuiPeer, "PXLC-TUI-PEER"),
+            (LocalProcessError::LocalTuiProtocol, "PXLC-TUI-PROTOCOL"),
+            (LocalProcessError::LocalTuiIo, "PXLC-TUI-IO"),
+            (LocalProcessError::LocalTuiChild, "PXLC-TUI-CHILD"),
+        ] {
+            assert_eq!(failure.exit_code(), 1);
+            assert_eq!(failure.code(), code);
+            assert!(!failure.message().is_empty());
+            assert!(!failure.message().contains('/'));
+        }
+
         for failure in [
             ConfigError::InvalidLocalDeployGrammar,
             ConfigError::UnsupportedLocalDeployProfile,
             ConfigError::InvalidInspectionSnapshotGrammar,
+            ConfigError::InvalidTuiGrammar,
         ] {
             let failure = LocalProcessError::Configuration(failure);
             assert_eq!(failure.exit_code(), 2);
             assert!(
                 failure.code().starts_with("PXLC-DEPLOY-")
                     || failure.code() == "PXLC-INSPECTION-GRAMMAR"
+                    || failure.code() == "PXLC-TUI-GRAMMAR"
             );
         }
 

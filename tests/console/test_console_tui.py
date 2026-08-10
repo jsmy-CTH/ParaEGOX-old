@@ -11,6 +11,7 @@ import termios
 import tty
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from textual.pilot import Pilot
@@ -110,7 +111,39 @@ class FakeConversationClient:
         self.close_calls += 1
 
 
-def _inspection_snapshot() -> console_client.LocalInspectionSnapshotV2:
+class FakeInspectionClient:
+    def __init__(
+        self,
+        responses: list[console_client.LocalInspectionSnapshotV2 | None | Exception],
+    ) -> None:
+        self._responses = list(responses)
+        self.watch_calls: list[int] = []
+        self.watch_start_times: list[float] = []
+        self.close_calls = 0
+        self.exhausted = asyncio.Event()
+
+    async def watch(
+        self,
+        after_revision: int,
+    ) -> console_client.LocalInspectionSnapshotV2 | None:
+        self.watch_calls.append(after_revision)
+        self.watch_start_times.append(asyncio.get_running_loop().time())
+        if not self._responses:
+            self.exhausted.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _inspection_snapshot(
+    revision: int = 7,
+) -> console_client.LocalInspectionSnapshotV2:
     records = tuple(
         console_client.LocalInspectionRecordV1(
             owner=owner,
@@ -131,7 +164,7 @@ def _inspection_snapshot() -> console_client.LocalInspectionSnapshotV2:
     base = console_client.LocalInspectionSnapshotV1(
         projection_id=bytes([0x21]) * 16,
         observation_clock_ref=bytes([0x31]) * 16,
-        projection_revision=7,
+        projection_revision=revision,
         projected_at_nanos=150,
         overall=console_client.LocalInspectionOverallV1.UNKNOWN,
         records=(records[0], records[1], records[2], records[3], records[4]),
@@ -216,17 +249,172 @@ def test_console_connects_and_submits_one_successful_turn() -> None:
     asyncio.run(scenario())
 
 
+def test_console_inspection_watch_is_single_flight_throttled_and_replaces_cache() -> None:
+    async def scenario() -> None:
+        conversation = FakeConversationClient()
+        inspection = FakeInspectionClient([None, _inspection_snapshot(8)])
+        app = ParaEGOXConsoleApp(
+            conversation,
+            inspection_snapshot=_inspection_snapshot(7),
+            inspection_client=inspection,
+        )
+        async with app.run_test(size=(100, 30)) as pilot:
+            await _wait_until(pilot, lambda: app.connected)
+            await _wait_until(pilot, lambda: len(inspection.watch_calls) == 1)
+            assert inspection.watch_calls == [7]
+            assert "r7" in str(app.query_one("#inspection-status", Static).content)
+            await asyncio.sleep(0.2)
+            await pilot.pause()
+            assert inspection.watch_calls == [7]
+
+            await asyncio.sleep(0.85)
+            await _wait_until(pilot, lambda: len(inspection.watch_calls) == 2)
+            assert inspection.watch_calls == [7, 7]
+            assert inspection.watch_start_times[1] - inspection.watch_start_times[0] >= 1.0
+            await _wait_until(
+                pilot,
+                lambda: "r8" in str(app.query_one("#inspection-status", Static).content),
+            )
+            assert app.inspection_available
+        assert conversation.close_calls == 1
+        assert inspection.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_console_inspection_failure_latches_unavailable_without_reconnect() -> None:
+    async def scenario() -> None:
+        conversation = FakeConversationClient(output="conversation remains usable")
+        inspection = FakeInspectionClient(
+            [
+                console_client.DeveloperLocalInspectionClientError(
+                    console_client.DeveloperLocalInspectionClientErrorCode.IO,
+                    "DeveloperLocal Inspection v2 exchange failed",
+                )
+            ]
+        )
+        app = ParaEGOXConsoleApp(
+            conversation,
+            inspection_snapshot=_inspection_snapshot(),
+            inspection_client=inspection,
+        )
+        async with app.run_test(size=(100, 30)) as pilot:
+            await _wait_until(pilot, lambda: app.connected)
+            await _wait_until(pilot, lambda: not app.inspection_available)
+            assert "Inspection: unavailable" in str(
+                app.query_one("#inspection-status", Static).content
+            )
+            assert inspection.watch_calls == [7]
+            await asyncio.sleep(1.05)
+            await pilot.pause()
+            assert inspection.watch_calls == [7]
+
+            await _enter(app, pilot, "still attached")
+            await _wait_until(
+                pilot,
+                lambda: "Agent: conversation remains usable" in app.transcript,
+            )
+            assert conversation.submit_calls == ["still attached"]
+        assert conversation.close_calls == 1
+        assert inspection.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_console_conversation_failure_does_not_disable_inspection_channel() -> None:
+    async def scenario() -> None:
+        conversation = FakeConversationClient(
+            open_error=console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.GENERATION_RETIRED,
+                "Runtime-managed Agent conversation generation is retired",
+            )
+        )
+        inspection = FakeInspectionClient([None])
+        app = ParaEGOXConsoleApp(
+            conversation,
+            inspection_snapshot=_inspection_snapshot(),
+            inspection_client=inspection,
+        )
+        async with app.run_test(size=(100, 30)) as pilot:
+            await _wait_until(
+                pilot,
+                lambda: any("conversation unavailable" in line for line in app.transcript),
+            )
+            await _wait_until(pilot, lambda: inspection.watch_calls == [7])
+            assert not app.connected
+            assert app.inspection_available
+            assert "Inspection cache" in str(app.query_one("#inspection-status", Static).content)
+        assert conversation.close_calls == 1
+        assert inspection.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_console_transcript_is_bounded_and_generic_errors_are_redacted() -> None:
+    async def scenario() -> None:
+        secret = "/private/bootstrap/API_KEY=secret"
+        conversation = FakeConversationClient(open_error=RuntimeError(secret))
+        app = ParaEGOXConsoleApp(conversation)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await _wait_until(
+                pilot,
+                lambda: any("conversation unavailable" in line for line in app.transcript),
+            )
+            assert secret not in "\n".join(app.transcript)
+            for index in range(1_100):
+                app._write_line(f"bounded-{index}")
+            assert len(app.transcript) == 1_000
+            assert app.transcript[0] == "bounded-100"
+            assert app.transcript[-1] == "bounded-1099"
+        assert conversation.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_inspection_watch_floor_is_exactly_one_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert console_tui._inspection_watch_delay(10.0, 10.0) == 1.0
+    assert console_tui._inspection_watch_delay(10.0, 10.25) == 0.75
+    assert console_tui._inspection_watch_delay(10.0, 11.0) == 0.0
+    assert console_tui._inspection_watch_delay(10.0, 12.0) == 0.0
+
+    class EarlyClock:
+        def __init__(self) -> None:
+            self._times = iter((10.2, 10.7, 11.0))
+
+        def time(self) -> float:
+            return next(self._times)
+
+    delays: list[float] = []
+
+    async def early_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(console_tui.asyncio, "sleep", early_sleep)
+    asyncio.run(console_tui._wait_for_inspection_watch_floor(10.0, EarlyClock()))  # type: ignore[arg-type]
+    assert delays == pytest.approx([0.8, 0.3])
+
+
 def test_console_renders_connection_and_terminal_failures_safely() -> None:
     async def connection_failure_scenario() -> None:
-        client = FakeConversationClient(open_error=RuntimeError("owner unavailable"))
+        client = FakeConversationClient(
+            open_error=console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.OWNER_UNAVAILABLE,
+                "Runtime-managed Agent conversation owner is unavailable",
+            )
+        )
         app = ParaEGOXConsoleApp(client)
         async with app.run_test(size=(100, 30)) as pilot:
             await _wait_until(
                 pilot,
-                lambda: any("connection failed" in line for line in app.transcript),
+                lambda: any("conversation unavailable" in line for line in app.transcript),
             )
             assert not app.connected
-            assert "owner unavailable" in app.transcript[-1]
+            assert "owner is unavailable" in app.transcript[-1]
+            assert str(app.query_one("#connection-status", Static).content).startswith(
+                "Connection: unavailable"
+            )
             assert app.query_one("#chat-input", Input).disabled
         assert client.close_calls == 1
 
@@ -505,6 +693,294 @@ def test_console_cli_accepts_only_explicit_absolute_bootstrap_paths(tmp_path: Pa
         with pytest.raises(SystemExit) as captured:
             _parse_arguments(arguments)
         assert captured.value.code == 2
+
+
+def test_hidden_tui_attach_mode_is_exact_silent_and_loads_latest_before_ui(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[str] = []
+    conversation_pin = object()
+    inspection_pin = object()
+    handoff = SimpleNamespace(
+        conversation=conversation_pin,
+        inspection=inspection_pin,
+    )
+
+    class ConversationClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class ConversationFactory:
+        @staticmethod
+        def _from_tui_attach_pin(pin: object) -> ConversationClient:
+            assert pin is conversation_pin
+            events.append("conversation-pin")
+            return conversation
+
+    class InspectionClient:
+        def __init__(self) -> None:
+            self.latest_calls = 0
+            self.close_calls = 0
+
+        async def latest(self) -> console_client.LocalInspectionSnapshotV2:
+            self.latest_calls += 1
+            events.append("latest")
+            return snapshot
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class InspectionFactory:
+        @staticmethod
+        def _from_tui_attach_pin(pin: object) -> InspectionClient:
+            assert pin is inspection_pin
+            events.append("inspection-pin")
+            return inspection
+
+    class App:
+        def __init__(
+            self,
+            client: ConversationClient,
+            *,
+            inspection_snapshot: console_client.LocalInspectionSnapshotV2,
+            inspection_client: InspectionClient,
+        ) -> None:
+            assert client is conversation
+            assert inspection_snapshot is snapshot
+            assert inspection_client is inspection
+            events.append("app-init")
+
+        def run(self) -> None:
+            events.append("app-run")
+
+        def _close_client(self) -> None:
+            events.append("app-close")
+
+    conversation = ConversationClient()
+    inspection = InspectionClient()
+    snapshot = _inspection_snapshot()
+
+    def read_handoff(fd: int) -> SimpleNamespace:
+        assert fd == 3
+        events.append("handoff")
+        return handoff
+
+    monkeypatch.setattr(console_tui, "_read_tui_attach_handoff_fd", read_handoff)
+    monkeypatch.setattr(console_tui, "RuntimeAgentConversationClientV1", ConversationFactory)
+    monkeypatch.setattr(console_tui, "DeveloperLocalInspectionClientV2", InspectionFactory)
+    monkeypatch.setattr(console_tui, "ParaEGOXConsoleApp", App)
+
+    invalid = [
+        ["--tui-attach-fd"],
+        ["--tui-attach-fd", "4"],
+        ["--tui-attach-fd=3"],
+        ["--tui-attach-fd", "3", "extra"],
+        ["--runtime-bootstrap-file", "/tmp/x", "--tui-attach-fd", "3"],
+    ]
+    for arguments in invalid:
+        assert console_tui.main(arguments) == 20
+    assert events == []
+
+    assert console_tui.main(["--tui-attach-fd", "3"]) == 0
+    assert events == [
+        "handoff",
+        "conversation-pin",
+        "inspection-pin",
+        "latest",
+        "app-init",
+        "app-run",
+        "app-close",
+    ]
+    assert inspection.latest_calls == 1
+    assert conversation.close_calls == 1
+    assert inspection.close_calls == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_exit"),
+    [
+        (
+            console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.INVALID_BOOTSTRAP,
+                "safe",
+            ),
+            21,
+        ),
+        (
+            console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.PEER_CREDENTIALS_MISMATCH,
+                "safe",
+            ),
+            22,
+        ),
+        (
+            console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.INVALID_SOCKET,
+                "safe",
+            ),
+            22,
+        ),
+        (
+            console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.INVALID_FRAME,
+                "safe",
+            ),
+            23,
+        ),
+        (
+            console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.OPERATION_TIMED_OUT,
+                "safe",
+            ),
+            24,
+        ),
+        (
+            console_client.RuntimeAgentConversationClientError(
+                console_client.RuntimeAgentConversationClientErrorCode.IO,
+                "safe",
+            ),
+            24,
+        ),
+    ],
+)
+def test_hidden_tui_attach_private_exit_mapping_is_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+    expected_exit: int,
+) -> None:
+    handoff = SimpleNamespace(conversation=object(), inspection=object())
+
+    class FailingConversationFactory:
+        @staticmethod
+        def _from_tui_attach_pin(_pin: object) -> object:
+            raise error
+
+    monkeypatch.setattr(console_tui, "_read_tui_attach_handoff_fd", lambda _fd: handoff)
+    monkeypatch.setattr(
+        console_tui,
+        "RuntimeAgentConversationClientV1",
+        FailingConversationFactory,
+    )
+    assert console_tui.main(["--tui-attach-fd", "3"]) == expected_exit
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_exit"),
+    [
+        (console_client.DeveloperLocalInspectionClientErrorCode.INVALID_BOOTSTRAP, 21),
+        (console_client.DeveloperLocalInspectionClientErrorCode.PEER_CREDENTIALS_MISMATCH, 22),
+        (console_client.DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET, 22),
+        (console_client.DeveloperLocalInspectionClientErrorCode.CORRELATION_MISMATCH, 23),
+        (console_client.DeveloperLocalInspectionClientErrorCode.IO, 24),
+    ],
+)
+def test_hidden_tui_attach_inspection_exit_mapping(
+    code: console_client.DeveloperLocalInspectionClientErrorCode,
+    expected_exit: int,
+) -> None:
+    error = console_client.DeveloperLocalInspectionClientError(code, "safe")
+    assert console_tui._inspection_private_exit(error) == expected_exit
+    assert console_tui._inspection_private_exit(RuntimeError("unclassified")) == 1
+    assert console_tui._runtime_private_exit(RuntimeError("unclassified")) == 1
+
+    runtime_bootstrap_race = console_client._TuiAttachAgentBootstrapIdentityError(
+        console_client.RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+        "safe",
+    )
+    runtime_socket_race = console_client._TuiAttachAgentSocketError(
+        console_client.RuntimeAgentConversationClientErrorCode.IO,
+        "safe",
+    )
+    inspection_bootstrap_race = console_client._TuiAttachInspectionBootstrapIdentityError(
+        console_client.DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+        "safe",
+    )
+    inspection_socket_race = console_client._TuiAttachInspectionSocketError(
+        console_client.DeveloperLocalInspectionClientErrorCode.INSECURE_PERMISSIONS,
+        "safe",
+    )
+    assert console_tui._runtime_private_exit(runtime_bootstrap_race) == 21
+    assert console_tui._runtime_private_exit(runtime_socket_race) == 22
+    assert console_tui._inspection_private_exit(inspection_bootstrap_race) == 21
+    assert console_tui._inspection_private_exit(inspection_socket_race) == 22
+
+
+def test_hidden_tui_attach_handoff_and_initial_not_found_map_without_ui(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    peer_error = console_client._TuiAttachHandoffError(
+        console_client._TuiAttachHandoffErrorCode.PEER_CREDENTIALS_MISMATCH,
+        "safe",
+    )
+    monkeypatch.setattr(
+        console_tui,
+        "_read_tui_attach_handoff_fd",
+        lambda _fd: (_ for _ in ()).throw(peer_error),
+    )
+    assert console_tui.main(["--tui-attach-fd", "3"]) == 22
+    io_error = console_client._TuiAttachHandoffError(
+        console_client._TuiAttachHandoffErrorCode.IO,
+        "safe",
+    )
+    monkeypatch.setattr(
+        console_tui,
+        "_read_tui_attach_handoff_fd",
+        lambda _fd: (_ for _ in ()).throw(io_error),
+    )
+    assert console_tui.main(["--tui-attach-fd", "3"]) == 24
+
+    class Conversation:
+        def close(self) -> None:
+            return None
+
+    class ConversationFactory:
+        @staticmethod
+        def _from_tui_attach_pin(_pin: object) -> Conversation:
+            return Conversation()
+
+    class Inspection:
+        async def latest(self) -> console_client.LocalInspectionSnapshotV2:
+            raise console_client.DeveloperLocalInspectionClientError(
+                console_client.DeveloperLocalInspectionClientErrorCode.SNAPSHOT_UNAVAILABLE,
+                "safe",
+            )
+
+        def close(self) -> None:
+            return None
+
+    class InspectionFactory:
+        @staticmethod
+        def _from_tui_attach_pin(_pin: object) -> Inspection:
+            return Inspection()
+
+    monkeypatch.setattr(
+        console_tui,
+        "_read_tui_attach_handoff_fd",
+        lambda _fd: SimpleNamespace(conversation=object(), inspection=object()),
+    )
+    monkeypatch.setattr(console_tui, "RuntimeAgentConversationClientV1", ConversationFactory)
+    monkeypatch.setattr(console_tui, "DeveloperLocalInspectionClientV2", InspectionFactory)
+    monkeypatch.setattr(
+        console_tui,
+        "ParaEGOXConsoleApp",
+        lambda *_args, **_kwargs: pytest.fail("UI must not start before initial Latest"),
+    )
+    assert console_tui.main(["--tui-attach-fd", "3"]) == 23
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_startup_inspection_loader_reads_once_and_closes(

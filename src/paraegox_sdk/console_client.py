@@ -74,20 +74,36 @@ _PXIS_OWNER_RECORD_BYTES = 96
 _PXIS_NODE_RECORD_BYTES = 128
 _MAX_INSPECTION_BOOTSTRAP_BYTES = _PXIB_HEADER_BYTES + _MAX_BOOTSTRAP_PATH_BYTES
 _MAX_INSPECTION_RESPONSE_BYTES = _PXIP_HEADER_BYTES + _PXIS_V2_BYTES
-_INSPECTION_BOOTSTRAP_DIGEST_DOMAIN = (
-    b"paraegox.inspection.developer-local.bootstrap.v2"
-)
+_INSPECTION_BOOTSTRAP_DIGEST_DOMAIN = b"paraegox.inspection.developer-local.bootstrap.v2"
 _INSPECTION_REQUEST_ID_DOMAIN = b"paraegox.inspection.developer-local.request-id.v2"
 _INSPECTION_REQUEST_DIGEST_DOMAIN = b"paraegox.inspection.protocol-request.v2"
 _INSPECTION_RESPONSE_DIGEST_DOMAIN = b"paraegox.inspection.protocol-response.v2"
 _INSPECTION_SNAPSHOT_V1_DIGEST_DOMAIN = b"paraegox.inspection.local-snapshot.v1"
 _INSPECTION_SNAPSHOT_V2_DIGEST_DOMAIN = b"paraegox.inspection.local-snapshot.v2"
+_TUI_ATTACH_HANDOFF_MAGIC = b"PXTH"
+_TUI_ATTACH_VERSION = 1
+_TUI_ATTACH_ACTION = b"T"
+_TUI_ATTACH_READY_OUTCOME = b"R"
+_TUI_ATTACH_HEADER_BYTES = 288
+_TUI_ATTACH_PIN_RECORD_BYTES = 96
+_TUI_ATTACH_LOCATOR_COUNT = 2
+_MAX_TUI_ATTACH_PATH_BYTES = 4_096
+_MAX_TUI_ATTACH_FRAME_BYTES = _TUI_ATTACH_HEADER_BYTES + 2 * _MAX_TUI_ATTACH_PATH_BYTES
+_TUI_ATTACH_HANDOFF_DIGEST_DOMAIN = b"paraegox.local.tui-attach-handoff.v1"
+_TUI_ATTACH_READ_TIMEOUT_SECONDS = 3.0
+_INSPECTION_SOCKET_PIN_PREFIX = b".pxi-"
+_INSPECTION_SOCKET_PIN_SUFFIX = b"-socket.pin"
+_INSPECTION_SOCKET_PIN_NONCE_HEX_BYTES = 32
+_MAX_ENDPOINT_DIRECTORY_SCAN_ENTRIES = 256
+_MAX_ENDPOINT_DIRECTORY_SCAN_NAME_BYTES = 16 * 1024
 _DIGEST_MAGIC = b"ParaEGOX\0canonical-digest"
 _DIGEST_VERSION = 1
 
 _PXAB_HEADER = struct.Struct(">4sHHIHHII32s16s16sQQHHI32s")
 _PXAI_HEADER = struct.Struct(">4sHHIBBH16s32sQII32s")
 _PXIB_HEADER = struct.Struct(">4sHHII16s32sIIQ16s32s")
+_TUI_ATTACH_PREFIX = struct.Struct(">4sHccHHI16s32s")
+_TUI_ATTACH_PIN_RECORD = struct.Struct(">cBHIIIIIQQQ32s16s")
 
 if _PXAB_HEADER.size != _PXAB_HEADER_BYTES:  # pragma: no cover
     raise RuntimeError("PXAB v1 header layout drifted")
@@ -95,6 +111,44 @@ if _PXAI_HEADER.size != _PXAI_HEADER_BYTES:  # pragma: no cover
     raise RuntimeError("PXAI v1 header layout drifted")
 if _PXIB_HEADER.size != _PXIB_HEADER_BYTES:
     raise RuntimeError("PXIB v2 header layout drifted")
+if _TUI_ATTACH_PREFIX.size != 64 or _TUI_ATTACH_PIN_RECORD.size != 96:
+    raise RuntimeError("PXTH v1 header layout drifted")
+
+
+class _TuiAttachHandoffErrorCode(IntEnum):
+    INVALID_HANDOFF = 1
+    PEER_CREDENTIALS_MISMATCH = 2
+    IO = 3
+
+
+class _TuiAttachHandoffError(RuntimeError):
+    """Private, display-safe failure while consuming one fd-3 PXTH frame."""
+
+    def __init__(self, code: _TuiAttachHandoffErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class _TuiAttachBootstrapPinV1:
+    kind: bytes
+    path: bytes
+    content_length: int
+    content_sha256: bytes = field(repr=False)
+    uid: int
+    gid: int
+    mode: int
+    link_count: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TuiAttachHandoffV1:
+    generation: bytes = field(repr=False)
+    config_commitment: bytes = field(repr=False)
+    conversation: _TuiAttachBootstrapPinV1
+    inspection: _TuiAttachBootstrapPinV1
 
 
 class RuntimeAgentConversationClientErrorCode(IntEnum):
@@ -141,6 +195,14 @@ class RuntimeAgentConversationClientError(RuntimeError):
         self.code = code
 
 
+class _TuiAttachAgentBootstrapIdentityError(RuntimeAgentConversationClientError):
+    """Private stage marker for a pinned PXAB identity race."""
+
+
+class _TuiAttachAgentSocketError(RuntimeAgentConversationClientError):
+    """Private stage marker for an Agent socket identity failure."""
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeAgentConversationCancelResultV1:
     """Usable cancel result after terminal and rejection outcomes are resolved."""
@@ -163,6 +225,20 @@ def _error(
     message: str,
 ) -> RuntimeAgentConversationClientError:
     return RuntimeAgentConversationClientError(code, message)
+
+
+def _agent_bootstrap_identity_error(
+    expected_pin: _TuiAttachBootstrapPinV1 | None,
+) -> RuntimeAgentConversationClientError:
+    error_type = (
+        _TuiAttachAgentBootstrapIdentityError
+        if expected_pin is not None
+        else RuntimeAgentConversationClientError
+    )
+    return error_type(
+        RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+        "DeveloperLocal Agent bootstrap identity changed",
+    )
 
 
 class _OperationKind(IntEnum):
@@ -232,6 +308,419 @@ def _canonical_digest(domain: bytes, fields: tuple[bytes, ...]) -> bytes:
     digest.update(b"\xff")
     digest.update(len(fields).to_bytes(4, "big"))
     return digest.digest()
+
+
+def _tui_attach_error(
+    code: _TuiAttachHandoffErrorCode,
+    message: str,
+) -> _TuiAttachHandoffError:
+    return _TuiAttachHandoffError(code, message)
+
+
+def _tui_attach_path(value: bytes) -> bytes:
+    if (
+        not isinstance(value, bytes)
+        or not 1 <= len(value) <= _MAX_TUI_ATTACH_PATH_BYTES
+        or value == b"/"
+        or not value.startswith(b"/")
+        or b"\0" in value
+    ):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff path is invalid",
+        )
+    try:
+        decoded = value.decode("utf-8")
+    except UnicodeDecodeError as cause:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff path is invalid",
+        ) from cause
+    if decoded.encode("utf-8") != value:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff path is invalid",
+        )
+    components = value.split(b"/")[1:]
+    if not components or any(component in {b"", b".", b".."} for component in components):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff path is non-canonical",
+        )
+    return value
+
+
+def _validate_tui_attach_pin(
+    pin: _TuiAttachBootstrapPinV1,
+    expected_kind: bytes,
+    *,
+    expected_uid: int | None = None,
+    expected_gid: int | None = None,
+) -> None:
+    if expected_kind not in {b"C", b"I"}:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff pin kind is invalid",
+        )
+    content_bounds = (
+        (_PXAB_HEADER_BYTES, _MAX_BOOTSTRAP_FRAME_BYTES)
+        if expected_kind == b"C"
+        else (_PXIB_HEADER_BYTES, _MAX_INSPECTION_BOOTSTRAP_BYTES)
+    )
+    if (
+        pin.kind != expected_kind
+        or not content_bounds[0] <= pin.content_length <= content_bounds[1]
+        or len(pin.content_sha256) != 32
+        or not any(pin.content_sha256)
+        or pin.uid <= 0
+        or pin.gid <= 0
+        or pin.mode != _BOOTSTRAP_MODE
+        or pin.link_count != 1
+        or not 0 <= pin.device <= (1 << 64) - 1
+        or not 0 <= pin.inode <= (1 << 64) - 1
+        or expected_uid is not None
+        and pin.uid != expected_uid
+        or expected_gid is not None
+        and pin.gid != expected_gid
+    ):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff pin is invalid",
+        )
+    _tui_attach_path(pin.path)
+
+
+def _encode_tui_attach_pin_record(pin: _TuiAttachBootstrapPinV1) -> bytes:
+    _validate_tui_attach_pin(pin, pin.kind)
+    try:
+        return _TUI_ATTACH_PIN_RECORD.pack(
+            pin.kind,
+            0,
+            _TUI_ATTACH_PIN_RECORD_BYTES,
+            len(pin.path),
+            pin.content_length,
+            pin.uid,
+            pin.gid,
+            pin.mode,
+            pin.link_count,
+            pin.device,
+            pin.inode,
+            pin.content_sha256,
+            bytes(16),
+        )
+    except struct.error as cause:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff pin is invalid",
+        ) from cause
+
+
+def _encode_tui_attach_handoff_v1(handoff: _TuiAttachHandoffV1) -> bytes:
+    if (
+        len(handoff.generation) != 16
+        or not any(handoff.generation)
+        or len(handoff.config_commitment) != 32
+        or not any(handoff.config_commitment)
+    ):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff identity is invalid",
+        )
+    _validate_tui_attach_pin(handoff.conversation, b"C")
+    _validate_tui_attach_pin(handoff.inspection, b"I")
+    if handoff.conversation.path == handoff.inspection.path:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff paths conflict",
+        )
+    payload = handoff.conversation.path + handoff.inspection.path
+    frame_length = _TUI_ATTACH_HEADER_BYTES + len(payload)
+    if frame_length > _MAX_TUI_ATTACH_FRAME_BYTES:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff length is invalid",
+        )
+    frame = bytearray(frame_length)
+    frame[:64] = _TUI_ATTACH_PREFIX.pack(
+        _TUI_ATTACH_HANDOFF_MAGIC,
+        _TUI_ATTACH_VERSION,
+        _TUI_ATTACH_ACTION,
+        _TUI_ATTACH_READY_OUTCOME,
+        _TUI_ATTACH_HEADER_BYTES,
+        _TUI_ATTACH_LOCATOR_COUNT,
+        frame_length,
+        handoff.generation,
+        handoff.config_commitment,
+    )
+    frame[64:160] = _encode_tui_attach_pin_record(handoff.conversation)
+    frame[160:256] = _encode_tui_attach_pin_record(handoff.inspection)
+    frame[_TUI_ATTACH_HEADER_BYTES:] = payload
+    digest = hashlib.sha256()
+    digest.update(_TUI_ATTACH_HANDOFF_DIGEST_DOMAIN)
+    digest.update(frame[:256])
+    digest.update(payload)
+    frame[256:_TUI_ATTACH_HEADER_BYTES] = digest.digest()
+    return bytes(frame)
+
+
+def _decode_tui_attach_pin_record(
+    frame: bytes,
+    base: int,
+    expected_kind: bytes,
+    path: bytes,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> _TuiAttachBootstrapPinV1:
+    try:
+        (
+            kind,
+            reserved,
+            record_length,
+            path_length,
+            content_length,
+            uid,
+            gid,
+            mode,
+            link_count,
+            device,
+            inode,
+            content_sha256,
+            reserved_tail,
+        ) = _TUI_ATTACH_PIN_RECORD.unpack_from(frame, base)
+    except struct.error as cause:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff pin is invalid",
+        ) from cause
+    if (
+        reserved != 0
+        or record_length != _TUI_ATTACH_PIN_RECORD_BYTES
+        or path_length != len(path)
+        or any(reserved_tail)
+    ):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff pin is non-canonical",
+        )
+    pin = _TuiAttachBootstrapPinV1(
+        kind=kind,
+        path=path,
+        content_length=content_length,
+        content_sha256=content_sha256,
+        uid=uid,
+        gid=gid,
+        mode=mode,
+        link_count=link_count,
+        device=device,
+        inode=inode,
+    )
+    _validate_tui_attach_pin(
+        pin,
+        expected_kind,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    return pin
+
+
+def _decode_tui_attach_handoff_v1(
+    frame: bytes,
+    *,
+    expected_uid: int | None = None,
+    expected_gid: int | None = None,
+) -> _TuiAttachHandoffV1:
+    if not isinstance(frame, bytes) or not (
+        _TUI_ATTACH_HEADER_BYTES <= len(frame) <= _MAX_TUI_ATTACH_FRAME_BYTES
+    ):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff length is invalid",
+        )
+    uid = os.geteuid() if expected_uid is None else expected_uid
+    gid = os.getegid() if expected_gid is None else expected_gid
+    if uid <= 0 or gid <= 0:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.PEER_CREDENTIALS_MISMATCH,
+            "DeveloperLocal TUI handoff owner identity mismatched",
+        )
+    try:
+        (
+            magic,
+            version,
+            action,
+            outcome,
+            header_length,
+            locator_count,
+            frame_length,
+            generation,
+            config_commitment,
+        ) = _TUI_ATTACH_PREFIX.unpack_from(frame)
+        conversation_path_length = int.from_bytes(frame[68:72], "big")
+        inspection_path_length = int.from_bytes(frame[164:168], "big")
+    except (struct.error, ValueError) as cause:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff header is invalid",
+        ) from cause
+    if (
+        magic != _TUI_ATTACH_HANDOFF_MAGIC
+        or version != _TUI_ATTACH_VERSION
+        or action != _TUI_ATTACH_ACTION
+        or outcome != _TUI_ATTACH_READY_OUTCOME
+        or header_length != _TUI_ATTACH_HEADER_BYTES
+        or locator_count != _TUI_ATTACH_LOCATOR_COUNT
+        or frame_length != len(frame)
+        or len(generation) != 16
+        or not any(generation)
+        or len(config_commitment) != 32
+        or not any(config_commitment)
+        or not 1 <= conversation_path_length <= _MAX_TUI_ATTACH_PATH_BYTES
+        or not 1 <= inspection_path_length <= _MAX_TUI_ATTACH_PATH_BYTES
+        or _TUI_ATTACH_HEADER_BYTES + conversation_path_length + inspection_path_length
+        != len(frame)
+    ):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff header is invalid",
+        )
+    payload = frame[_TUI_ATTACH_HEADER_BYTES:]
+    conversation_path = payload[:conversation_path_length]
+    inspection_path = payload[conversation_path_length:]
+    conversation = _decode_tui_attach_pin_record(
+        frame,
+        64,
+        b"C",
+        conversation_path,
+        expected_uid=uid,
+        expected_gid=gid,
+    )
+    inspection = _decode_tui_attach_pin_record(
+        frame,
+        160,
+        b"I",
+        inspection_path,
+        expected_uid=uid,
+        expected_gid=gid,
+    )
+    if conversation.path == inspection.path:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff paths conflict",
+        )
+    digest = hashlib.sha256()
+    digest.update(_TUI_ATTACH_HANDOFF_DIGEST_DOMAIN)
+    digest.update(frame[:256])
+    digest.update(payload)
+    if not hmac.compare_digest(frame[256:_TUI_ATTACH_HEADER_BYTES], digest.digest()):
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff digest mismatched",
+        )
+    handoff = _TuiAttachHandoffV1(
+        generation=generation,
+        config_commitment=config_commitment,
+        conversation=conversation,
+        inspection=inspection,
+    )
+    if _encode_tui_attach_handoff_v1(handoff) != frame:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff is non-canonical",
+        )
+    return handoff
+
+
+def _receive_exact(stream_socket: socket.socket, length: int) -> bytes:
+    received = bytearray()
+    while len(received) < length:
+        try:
+            chunk = stream_socket.recv(length - len(received))
+        except (OSError, TimeoutError) as cause:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.IO,
+                "DeveloperLocal TUI handoff read failed",
+            ) from cause
+        if not chunk:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+                "DeveloperLocal TUI handoff read was incomplete",
+            )
+        received.extend(chunk)
+    return bytes(received)
+
+
+def _read_tui_attach_handoff_fd(fd: int) -> _TuiAttachHandoffV1:
+    if os.name != "posix" or not isinstance(fd, int) or fd < 0:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff descriptor is invalid",
+        )
+    try:
+        stream_socket = socket.socket(fileno=fd)
+    except OSError as cause:
+        raise _tui_attach_error(
+            _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+            "DeveloperLocal TUI handoff descriptor is invalid",
+        ) from cause
+    try:
+        try:
+            socket_type = stream_socket.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        except OSError as cause:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+                "DeveloperLocal TUI handoff descriptor is invalid",
+            ) from cause
+        if stream_socket.family != socket.AF_UNIX or socket_type != socket.SOCK_STREAM:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+                "DeveloperLocal TUI handoff descriptor is invalid",
+            )
+        try:
+            peer = _peer_credentials(stream_socket)
+        except RuntimeAgentConversationClientError as cause:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.PEER_CREDENTIALS_MISMATCH,
+                "DeveloperLocal TUI handoff peer identity is unavailable",
+            ) from cause
+        if peer != (os.geteuid(), os.getegid()):
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.PEER_CREDENTIALS_MISMATCH,
+                "DeveloperLocal TUI handoff peer identity mismatched",
+            )
+        try:
+            stream_socket.settimeout(_TUI_ATTACH_READ_TIMEOUT_SECONDS)
+        except OSError as cause:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.IO,
+                "DeveloperLocal TUI handoff timeout setup failed",
+            ) from cause
+        header = _receive_exact(stream_socket, _TUI_ATTACH_HEADER_BYTES)
+        frame_length = int.from_bytes(header[12:16], "big")
+        if not _TUI_ATTACH_HEADER_BYTES <= frame_length <= _MAX_TUI_ATTACH_FRAME_BYTES:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+                "DeveloperLocal TUI handoff length is invalid",
+            )
+        frame = header + _receive_exact(
+            stream_socket,
+            frame_length - _TUI_ATTACH_HEADER_BYTES,
+        )
+        try:
+            trailing = stream_socket.recv(1)
+        except (OSError, TimeoutError) as cause:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.IO,
+                "DeveloperLocal TUI handoff did not reach EOF",
+            ) from cause
+        if trailing:
+            raise _tui_attach_error(
+                _TuiAttachHandoffErrorCode.INVALID_HANDOFF,
+                "DeveloperLocal TUI handoff has trailing bytes",
+            )
+        return _decode_tui_attach_handoff_v1(frame)
+    finally:
+        stream_socket.close()
 
 
 def _bootstrap_digest(
@@ -304,7 +793,7 @@ def _lexical_absolute_path(
             "DeveloperLocal Agent endpoint path is invalid",
         )
     components = raw.split(b"/")[1:]
-    if any(component in {b".", b".."} for component in components):
+    if any(component in {b"", b".", b".."} for component in components):
         raise _error(
             RuntimeAgentConversationClientErrorCode.INVALID_PATH,
             "DeveloperLocal Agent endpoint path is invalid",
@@ -339,7 +828,11 @@ def _validate_existing_path_chain(path: bytes) -> None:
             )
 
 
-def _validate_private_parent(parent: bytes, expected_uid: int, expected_gid: int) -> None:
+def _validate_private_parent(
+    parent: bytes,
+    expected_uid: int,
+    expected_gid: int,
+) -> _FileIdentity:
     _validate_existing_path_chain(parent)
     metadata = _lstat(parent)
     mode = metadata.st_mode & 0o7777
@@ -354,6 +847,7 @@ def _validate_private_parent(parent: bytes, expected_uid: int, expected_gid: int
             RuntimeAgentConversationClientErrorCode.INSECURE_PERMISSIONS,
             "DeveloperLocal Agent endpoint directory is not owner-private",
         )
+    return _FileIdentity.from_stat(metadata)
 
 
 def _validate_private_bootstrap(
@@ -375,6 +869,23 @@ def _validate_private_bootstrap(
         )
 
 
+def _metadata_matches_tui_attach_pin(
+    metadata: os.stat_result,
+    pin: _TuiAttachBootstrapPinV1,
+) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == pin.uid
+        and metadata.st_gid == pin.gid
+        and metadata.st_mode & 0o7777 == pin.mode
+        and metadata.st_nlink == pin.link_count
+        and metadata.st_dev == pin.device
+        and metadata.st_ino == pin.inode
+        and metadata.st_size == pin.content_length
+    )
+
+
 def _validate_socket_path(bootstrap: _BootstrapV1) -> _FileIdentity:
     parent = posixpath.dirname(bootstrap.socket_path)
     _validate_private_parent(parent, bootstrap.server_uid, bootstrap.server_gid)
@@ -391,6 +902,13 @@ def _validate_socket_path(bootstrap: _BootstrapV1) -> _FileIdentity:
             "DeveloperLocal Agent socket is not owner-private",
         )
     return _FileIdentity.from_stat(metadata)
+
+
+def _validate_agent_socket_for_client(bootstrap: _BootstrapV1) -> _FileIdentity:
+    try:
+        return _validate_socket_path(bootstrap)
+    except RuntimeAgentConversationClientError as cause:
+        raise _TuiAttachAgentSocketError(cause.code, str(cause)) from cause
 
 
 def _decode_bootstrap(wire: bytes) -> _BootstrapV1:
@@ -488,19 +1006,42 @@ def _decode_bootstrap(wire: bytes) -> _BootstrapV1:
 
 def _read_private_bootstrap_file(
     path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    expected_pin: _TuiAttachBootstrapPinV1 | None = None,
 ) -> _BootstrapV1:
     if os.name != "posix":  # pragma: no cover - protocol is Unix-only
         raise _error(
             RuntimeAgentConversationClientErrorCode.INVALID_PATH,
             "DeveloperLocal Agent IPC requires a Unix host",
         )
-    raw_path = _lexical_absolute_path(path, _MAX_BOOTSTRAP_PATH_BYTES)
+    if expected_pin is None:
+        raw_path = _lexical_absolute_path(path, _MAX_BOOTSTRAP_PATH_BYTES)
+    else:
+        try:
+            _validate_tui_attach_pin(
+                expected_pin,
+                b"C",
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            raw_path = _tui_attach_path(os.fsencode(os.fspath(path)))
+        except (_TuiAttachHandoffError, TypeError, ValueError, UnicodeError) as cause:
+            raise _error(
+                RuntimeAgentConversationClientErrorCode.INVALID_PATH,
+                "DeveloperLocal Agent bootstrap path is invalid",
+            ) from cause
+        if raw_path != expected_pin.path:
+            raise _agent_bootstrap_identity_error(expected_pin)
     parent = posixpath.dirname(raw_path)
     uid = os.geteuid()
     gid = os.getegid()
-    _validate_private_parent(parent, uid, gid)
+    parent_identity = _validate_private_parent(parent, uid, gid)
     named_before = _lstat(raw_path)
     _validate_private_bootstrap(named_before, uid, gid)
+    if expected_pin is not None and not _metadata_matches_tui_attach_pin(
+        named_before,
+        expected_pin,
+    ):
+        raise _agent_bootstrap_identity_error(expected_pin)
     expected_identity = _FileIdentity.from_stat(named_before)
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:  # pragma: no cover - supported Unix hosts expose it
@@ -519,19 +1060,27 @@ def _read_private_bootstrap_file(
     try:
         opened = os.fstat(descriptor)
         _validate_private_bootstrap(opened, uid, gid)
+        if expected_pin is not None and not _metadata_matches_tui_attach_pin(
+            opened,
+            expected_pin,
+        ):
+            raise _agent_bootstrap_identity_error(expected_pin)
         length = opened.st_size
         if (
             expected_identity != _FileIdentity.from_stat(opened)
             or not _PXAB_HEADER_BYTES <= length <= _MAX_BOOTSTRAP_FRAME_BYTES
         ):
-            raise _error(
-                RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
-                "DeveloperLocal Agent bootstrap identity changed",
-            )
+            raise _agent_bootstrap_identity_error(expected_pin)
         chunks: list[bytes] = []
         remaining = length
         while remaining:
-            chunk = os.read(descriptor, remaining)
+            try:
+                chunk = os.read(descriptor, remaining)
+            except OSError as cause:
+                raise _error(
+                    RuntimeAgentConversationClientErrorCode.IO,
+                    "DeveloperLocal Agent bootstrap read failed",
+                ) from cause
             if not chunk:
                 raise _error(
                     RuntimeAgentConversationClientErrorCode.IO,
@@ -541,20 +1090,34 @@ def _read_private_bootstrap_file(
             remaining -= len(chunk)
     finally:
         os.close(descriptor)
+    if _validate_private_parent(parent, uid, gid) != parent_identity:
+        raise _agent_bootstrap_identity_error(expected_pin)
     named_after = _lstat(raw_path)
     _validate_private_bootstrap(named_after, uid, gid)
-    if expected_identity != _FileIdentity.from_stat(named_after):
+    if expected_identity != _FileIdentity.from_stat(named_after) or (
+        expected_pin is not None and not _metadata_matches_tui_attach_pin(named_after, expected_pin)
+    ):
+        raise _agent_bootstrap_identity_error(expected_pin)
+    wire = b"".join(chunks)
+    if expected_pin is not None and not hmac.compare_digest(
+        hashlib.sha256(wire).digest(),
+        expected_pin.content_sha256,
+    ):
         raise _error(
-            RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
-            "DeveloperLocal Agent bootstrap identity changed",
+            RuntimeAgentConversationClientErrorCode.DIGEST_MISMATCH,
+            "DeveloperLocal Agent bootstrap content digest mismatched",
         )
-    bootstrap = _decode_bootstrap(b"".join(chunks))
-    if posixpath.dirname(bootstrap.socket_path) != parent:
-        raise _error(
-            RuntimeAgentConversationClientErrorCode.INVALID_BOOTSTRAP,
-            "DeveloperLocal Agent bootstrap scope is invalid",
-        )
-    _validate_socket_path(bootstrap)
+    bootstrap = _decode_bootstrap(wire)
+    try:
+        if posixpath.dirname(bootstrap.socket_path) != parent:
+            raise _error(
+                RuntimeAgentConversationClientErrorCode.INVALID_BOOTSTRAP,
+                "DeveloperLocal Agent bootstrap scope is invalid",
+            )
+        _validate_agent_socket_for_client(bootstrap)
+    except Exception:
+        bootstrap.generation_token[:] = bytes(32)
+        raise
     return bootstrap
 
 
@@ -784,7 +1347,29 @@ class RuntimeAgentConversationClientV1:
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | Path,
     ) -> RuntimeAgentConversationClientV1:
         bootstrap = _read_private_bootstrap_file(path)
-        nonce = secrets.token_bytes(32)
+        return cls._from_bootstrap(bootstrap)
+
+    @classmethod
+    def _from_tui_attach_pin(
+        cls,
+        pin: _TuiAttachBootstrapPinV1,
+    ) -> RuntimeAgentConversationClientV1:
+        bootstrap = _read_private_bootstrap_file(pin.path, pin)
+        return cls._from_bootstrap(bootstrap)
+
+    @classmethod
+    def _from_bootstrap(
+        cls,
+        bootstrap: _BootstrapV1,
+    ) -> RuntimeAgentConversationClientV1:
+        try:
+            nonce = secrets.token_bytes(32)
+        except (OSError, NotImplementedError) as cause:
+            bootstrap.generation_token[:] = bytes(32)
+            raise _error(
+                RuntimeAgentConversationClientErrorCode.ENTROPY_UNAVAILABLE,
+                "DeveloperLocal Agent client entropy is unavailable",
+            ) from cause
         if not any(nonce):  # pragma: no cover - cryptographically negligible
             bootstrap.generation_token[:] = bytes(32)
             raise _error(
@@ -1041,7 +1626,7 @@ class RuntimeAgentConversationClientV1:
             body=body,
         )
         wire = _encode_ipc_frame(_PXAI_REQUEST_MAGIC, request)
-        socket_identity = _validate_socket_path(self._bootstrap)
+        socket_identity = _validate_agent_socket_for_client(self._bootstrap)
 
         async def exchange_once() -> _IpcFrame:
             writer: asyncio.StreamWriter | None = None
@@ -1058,7 +1643,7 @@ class RuntimeAgentConversationClientV1:
                         RuntimeAgentConversationClientErrorCode.PEER_CREDENTIALS_MISMATCH,
                         "DeveloperLocal Agent peer identity mismatched",
                     )
-                if _validate_socket_path(self._bootstrap) != socket_identity:
+                if _validate_agent_socket_for_client(self._bootstrap) != socket_identity:
                     raise _error(
                         RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
                         "DeveloperLocal Agent socket identity changed",
@@ -1071,7 +1656,13 @@ class RuntimeAgentConversationClientV1:
                         "DeveloperLocal Agent IPC cannot complete request framing",
                     )
                 writer.write_eof()
-                return await _read_ipc_frame(reader, _PXAI_RESPONSE_MAGIC)
+                response = await _read_ipc_frame(reader, _PXAI_RESPONSE_MAGIC)
+                if _validate_agent_socket_for_client(self._bootstrap) != socket_identity:
+                    raise _error(
+                        RuntimeAgentConversationClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+                        "DeveloperLocal Agent socket identity changed",
+                    )
+                return response
             finally:
                 if writer is not None:
                     writer.close()
@@ -1132,6 +1723,9 @@ class DeveloperLocalInspectionClientErrorCode(IntEnum):
     OPERATION_TIMED_OUT = 15
     PROTOCOL = 16
     IO = 17
+    REQUEST_PENDING = 18
+    LATEST_REQUIRED = 19
+    SEQUENCE_EXHAUSTED = 20
 
 
 class DeveloperLocalInspectionClientError(RuntimeError):
@@ -1142,11 +1736,33 @@ class DeveloperLocalInspectionClientError(RuntimeError):
         self.code = code
 
 
+class _TuiAttachInspectionBootstrapIdentityError(DeveloperLocalInspectionClientError):
+    """Private stage marker for a pinned PXIB identity race."""
+
+
+class _TuiAttachInspectionSocketError(DeveloperLocalInspectionClientError):
+    """Private stage marker for an Inspection socket identity failure."""
+
+
 def _inspection_error(
     code: DeveloperLocalInspectionClientErrorCode,
     message: str,
 ) -> DeveloperLocalInspectionClientError:
     return DeveloperLocalInspectionClientError(code, message)
+
+
+def _inspection_bootstrap_identity_error(
+    expected_pin: _TuiAttachBootstrapPinV1 | None,
+) -> DeveloperLocalInspectionClientError:
+    error_type = (
+        _TuiAttachInspectionBootstrapIdentityError
+        if expected_pin is not None
+        else DeveloperLocalInspectionClientError
+    )
+    return error_type(
+        DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+        "DeveloperLocal Inspection v2 bootstrap identity changed",
+    )
 
 
 class InspectionSourceOwnerV1(IntEnum):
@@ -1314,8 +1930,15 @@ class _InspectionBootstrapV2:
 class _InspectionRequestV2:
     request_id: bytes
     projection_id: bytes
+    kind: _InspectionRequestKindV2
+    after_revision: int
     request_digest: bytes
     canonical_wire: bytes = field(repr=False)
+
+
+class _InspectionRequestKindV2(IntEnum):
+    LATEST = 1
+    WATCH = 2
 
 
 class _InspectionResponseOutcomeV2(IntEnum):
@@ -1355,20 +1978,23 @@ def _inspection_bootstrap_digest(bootstrap: _InspectionBootstrapV2) -> bytes:
 
 def _encode_inspection_bootstrap_v2(bootstrap: _InspectionBootstrapV2) -> bytes:
     path_length = len(bootstrap.socket_path)
-    return _PXIB_HEADER.pack(
-        _PXIB_MAGIC,
-        _INSPECTION_VERSION,
-        _PXIB_HEADER_BYTES,
-        _PXIB_HEADER_BYTES + path_length,
-        path_length,
-        bootstrap.projection_id,
-        bytes(bootstrap.generation_token),
-        bootstrap.server_uid,
-        bootstrap.server_gid,
-        bootstrap.operation_timeout_nanos,
-        bytes(bootstrap.request_seed),
-        _inspection_bootstrap_digest(bootstrap),
-    ) + bootstrap.socket_path
+    return (
+        _PXIB_HEADER.pack(
+            _PXIB_MAGIC,
+            _INSPECTION_VERSION,
+            _PXIB_HEADER_BYTES,
+            _PXIB_HEADER_BYTES + path_length,
+            path_length,
+            bootstrap.projection_id,
+            bytes(bootstrap.generation_token),
+            bootstrap.server_uid,
+            bootstrap.server_gid,
+            bootstrap.operation_timeout_nanos,
+            bytes(bootstrap.request_seed),
+            _inspection_bootstrap_digest(bootstrap),
+        )
+        + bootstrap.socket_path
+    )
 
 
 def _decode_inspection_bootstrap_v2(wire: bytes) -> _InspectionBootstrapV2:
@@ -1498,31 +2124,218 @@ def _map_inspection_path_error(
     return _inspection_error(code, message)
 
 
-def _validate_inspection_socket_path(bootstrap: _InspectionBootstrapV2) -> _FileIdentity:
+def _validate_inspection_socket_metadata(
+    metadata: os.stat_result,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or metadata.st_mode & 0o7777 != _SOCKET_MODE
+        or metadata.st_nlink != 2
+    ):
+        raise _inspection_error(
+            DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET,
+            "DeveloperLocal Inspection v2 socket generation is invalid",
+        )
+
+
+def _is_canonical_inspection_socket_pin_name(name: bytes) -> bool:
+    expected_length = (
+        len(_INSPECTION_SOCKET_PIN_PREFIX)
+        + _INSPECTION_SOCKET_PIN_NONCE_HEX_BYTES
+        + len(_INSPECTION_SOCKET_PIN_SUFFIX)
+    )
+    nonce_end = len(_INSPECTION_SOCKET_PIN_PREFIX) + _INSPECTION_SOCKET_PIN_NONCE_HEX_BYTES
+    return (
+        len(name) == expected_length
+        and name.startswith(_INSPECTION_SOCKET_PIN_PREFIX)
+        and name.endswith(_INSPECTION_SOCKET_PIN_SUFFIX)
+        and all(
+            byte in b"0123456789abcdef"
+            for byte in name[len(_INSPECTION_SOCKET_PIN_PREFIX) : nonce_end]
+        )
+    )
+
+
+def _locate_inspection_socket_pin(parent: bytes) -> bytes:
+    scanned_entries = 0
+    scanned_name_bytes = 0
+    pin_path: bytes | None = None
     try:
-        return _validate_socket_path(bootstrap)
+        entries = os.scandir(parent)
+    except OSError as cause:
+        raise _inspection_error(
+            DeveloperLocalInspectionClientErrorCode.IO,
+            "DeveloperLocal Inspection v2 endpoint directory is unavailable",
+        ) from cause
+    try:
+        for entry in entries:
+            name = entry.name
+            if not isinstance(name, bytes):  # pragma: no cover - bytes path fixes this on POSIX
+                try:
+                    name = os.fsencode(name)
+                except UnicodeError as cause:
+                    raise _inspection_error(
+                        DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET,
+                        "DeveloperLocal Inspection v2 socket pin is invalid",
+                    ) from cause
+            scanned_entries += 1
+            scanned_name_bytes += len(name)
+            if (
+                scanned_entries > _MAX_ENDPOINT_DIRECTORY_SCAN_ENTRIES
+                or scanned_name_bytes > _MAX_ENDPOINT_DIRECTORY_SCAN_NAME_BYTES
+            ):
+                raise _inspection_error(
+                    DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET,
+                    "DeveloperLocal Inspection v2 endpoint directory is oversized",
+                )
+            if not name.startswith(_INSPECTION_SOCKET_PIN_PREFIX):
+                continue
+            if not _is_canonical_inspection_socket_pin_name(name) or pin_path is not None:
+                raise _inspection_error(
+                    DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET,
+                    "DeveloperLocal Inspection v2 socket pin is invalid",
+                )
+            pin_path = posixpath.join(parent, name)
+    except OSError as cause:
+        raise _inspection_error(
+            DeveloperLocalInspectionClientErrorCode.IO,
+            "DeveloperLocal Inspection v2 endpoint directory is unavailable",
+        ) from cause
+    finally:
+        entries.close()
+    if pin_path is None:
+        raise _inspection_error(
+            DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET,
+            "DeveloperLocal Inspection v2 socket pin is missing",
+        )
+    return pin_path
+
+
+def _validate_inspection_socket_path(bootstrap: _InspectionBootstrapV2) -> _FileIdentity:
+    parent = posixpath.dirname(bootstrap.socket_path)
+    try:
+        parent_identity = _validate_private_parent(
+            parent,
+            bootstrap.server_uid,
+            bootstrap.server_gid,
+        )
+        before = _lstat(bootstrap.socket_path)
     except RuntimeAgentConversationClientError as cause:
         raise _map_inspection_path_error(cause) from cause
+    _validate_inspection_socket_metadata(
+        before,
+        bootstrap.server_uid,
+        bootstrap.server_gid,
+    )
+    identity = _FileIdentity.from_stat(before)
+    pin_path = _locate_inspection_socket_pin(parent)
+    try:
+        pin_before = _lstat(pin_path)
+    except RuntimeAgentConversationClientError as cause:
+        raise _map_inspection_path_error(cause) from cause
+    _validate_inspection_socket_metadata(
+        pin_before,
+        bootstrap.server_uid,
+        bootstrap.server_gid,
+    )
+    if _FileIdentity.from_stat(pin_before) != identity:
+        raise _inspection_error(
+            DeveloperLocalInspectionClientErrorCode.INVALID_SOCKET,
+            "DeveloperLocal Inspection v2 socket pin identity mismatched",
+        )
+    try:
+        if (
+            _validate_private_parent(
+                parent,
+                bootstrap.server_uid,
+                bootstrap.server_gid,
+            )
+            != parent_identity
+        ):
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+                "DeveloperLocal Inspection v2 endpoint directory identity changed",
+            )
+        pin_after = _lstat(pin_path)
+        after = _lstat(bootstrap.socket_path)
+    except RuntimeAgentConversationClientError as cause:
+        raise _map_inspection_path_error(cause) from cause
+    _validate_inspection_socket_metadata(
+        pin_after,
+        bootstrap.server_uid,
+        bootstrap.server_gid,
+    )
+    _validate_inspection_socket_metadata(
+        after,
+        bootstrap.server_uid,
+        bootstrap.server_gid,
+    )
+    if _FileIdentity.from_stat(pin_after) != identity or _FileIdentity.from_stat(after) != identity:
+        raise _inspection_error(
+            DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+            "DeveloperLocal Inspection v2 socket generation identity changed",
+        )
+    return identity
+
+
+def _validate_inspection_socket_for_client(
+    bootstrap: _InspectionBootstrapV2,
+) -> _FileIdentity:
+    try:
+        return _validate_inspection_socket_path(bootstrap)
+    except DeveloperLocalInspectionClientError as cause:
+        raise _TuiAttachInspectionSocketError(cause.code, str(cause)) from cause
 
 
 def _read_private_inspection_bootstrap_file_v2(
     path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | Path,
+    expected_pin: _TuiAttachBootstrapPinV1 | None = None,
 ) -> _InspectionBootstrapV2:
     if os.name != "posix":
         raise _inspection_error(
             DeveloperLocalInspectionClientErrorCode.INVALID_PATH,
             "DeveloperLocal Inspection v2 requires a Unix host",
         )
+    uid = os.geteuid()
+    gid = os.getegid()
+    if expected_pin is None:
+        try:
+            raw_path = _lexical_absolute_path(path, _MAX_BOOTSTRAP_PATH_BYTES)
+        except RuntimeAgentConversationClientError as cause:
+            raise _map_inspection_path_error(cause) from cause
+    else:
+        try:
+            _validate_tui_attach_pin(
+                expected_pin,
+                b"I",
+                expected_uid=uid,
+                expected_gid=gid,
+            )
+            raw_path = _tui_attach_path(os.fsencode(os.fspath(path)))
+        except (_TuiAttachHandoffError, TypeError, ValueError, UnicodeError) as cause:
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.INVALID_PATH,
+                "DeveloperLocal Inspection v2 bootstrap path is invalid",
+            ) from cause
+        if raw_path != expected_pin.path:
+            raise _inspection_bootstrap_identity_error(expected_pin)
+    parent = posixpath.dirname(raw_path)
     try:
-        raw_path = _lexical_absolute_path(path, _MAX_BOOTSTRAP_PATH_BYTES)
-        parent = posixpath.dirname(raw_path)
-        uid = os.geteuid()
-        gid = os.getegid()
-        _validate_private_parent(parent, uid, gid)
+        parent_identity = _validate_private_parent(parent, uid, gid)
         named_before = _lstat(raw_path)
         _validate_private_bootstrap(named_before, uid, gid)
     except RuntimeAgentConversationClientError as cause:
         raise _map_inspection_path_error(cause) from cause
+    if expected_pin is not None and not _metadata_matches_tui_attach_pin(
+        named_before,
+        expected_pin,
+    ):
+        raise _inspection_bootstrap_identity_error(expected_pin)
     expected_identity = _FileIdentity.from_stat(named_before)
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
@@ -1544,15 +2357,17 @@ def _read_private_inspection_bootstrap_file_v2(
             _validate_private_bootstrap(opened, uid, gid)
         except RuntimeAgentConversationClientError as cause:
             raise _map_inspection_path_error(cause) from cause
+        if expected_pin is not None and not _metadata_matches_tui_attach_pin(
+            opened,
+            expected_pin,
+        ):
+            raise _inspection_bootstrap_identity_error(expected_pin)
         length = opened.st_size
         if (
             expected_identity != _FileIdentity.from_stat(opened)
             or not _PXIB_HEADER_BYTES <= length <= _MAX_INSPECTION_BOOTSTRAP_BYTES
         ):
-            raise _inspection_error(
-                DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
-                "DeveloperLocal Inspection v2 bootstrap identity changed",
-            )
+            raise _inspection_bootstrap_identity_error(expected_pin)
         chunks: list[bytes] = []
         remaining = length
         while remaining:
@@ -1573,16 +2388,26 @@ def _read_private_inspection_bootstrap_file_v2(
     finally:
         os.close(descriptor)
     try:
+        if _validate_private_parent(parent, uid, gid) != parent_identity:
+            raise _inspection_bootstrap_identity_error(expected_pin)
         named_after = _lstat(raw_path)
         _validate_private_bootstrap(named_after, uid, gid)
     except RuntimeAgentConversationClientError as cause:
         raise _map_inspection_path_error(cause) from cause
-    if expected_identity != _FileIdentity.from_stat(named_after):
+    if expected_identity != _FileIdentity.from_stat(named_after) or (
+        expected_pin is not None and not _metadata_matches_tui_attach_pin(named_after, expected_pin)
+    ):
+        raise _inspection_bootstrap_identity_error(expected_pin)
+    wire = b"".join(chunks)
+    if expected_pin is not None and not hmac.compare_digest(
+        hashlib.sha256(wire).digest(),
+        expected_pin.content_sha256,
+    ):
         raise _inspection_error(
-            DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
-            "DeveloperLocal Inspection v2 bootstrap identity changed",
+            DeveloperLocalInspectionClientErrorCode.DIGEST_MISMATCH,
+            "DeveloperLocal Inspection v2 bootstrap content digest mismatched",
         )
-    bootstrap = _decode_inspection_bootstrap_v2(b"".join(chunks))
+    bootstrap = _decode_inspection_bootstrap_v2(wire)
     if posixpath.dirname(bootstrap.socket_path) != parent:
         bootstrap.generation_token[:] = bytes(32)
         bootstrap.request_seed[:] = bytes(16)
@@ -1591,7 +2416,7 @@ def _read_private_inspection_bootstrap_file_v2(
             "DeveloperLocal Inspection v2 bootstrap scope is invalid",
         )
     try:
-        _validate_inspection_socket_path(bootstrap)
+        _validate_inspection_socket_for_client(bootstrap)
     except DeveloperLocalInspectionClientError:
         bootstrap.generation_token[:] = bytes(32)
         bootstrap.request_seed[:] = bytes(16)
@@ -1621,25 +2446,38 @@ def _inspection_request_id_v2(bootstrap: _InspectionBootstrapV2, sequence: int) 
     return request_id
 
 
-def _encode_inspection_latest_request_v2(
+def _encode_inspection_request_v2(
     request_id: bytes,
     projection_id: bytes,
+    kind: _InspectionRequestKindV2,
+    after_revision: int,
 ) -> _InspectionRequestV2:
-    if len(request_id) != 16 or not any(request_id) or len(projection_id) != 16 or not any(
-        projection_id
+    if (
+        len(request_id) != 16
+        or not any(request_id)
+        or len(projection_id) != 16
+        or not any(projection_id)
+        or not isinstance(kind, _InspectionRequestKindV2)
+        or not isinstance(after_revision, int)
+        or isinstance(after_revision, bool)
+        or kind is _InspectionRequestKindV2.LATEST
+        and after_revision != 0
+        or kind is _InspectionRequestKindV2.WATCH
+        and not 1 <= after_revision <= (1 << 64) - 1
     ):
         raise _inspection_error(
-            DeveloperLocalInspectionClientErrorCode.PROTOCOL,
-            "DeveloperLocal Inspection v2 request identity is invalid",
+            DeveloperLocalInspectionClientErrorCode.INVALID_FRAME,
+            "DeveloperLocal Inspection v2 request is invalid",
         )
     wire = bytearray(_PXIQ_BYTES)
     wire[:4] = _PXIQ_MAGIC
     wire[4:6] = _INSPECTION_VERSION.to_bytes(2, "big")
     wire[6:8] = _PXIQ_BYTES.to_bytes(2, "big")
     wire[8:12] = _PXIQ_BYTES.to_bytes(4, "big")
-    wire[12] = 1
+    wire[12] = int(kind)
     wire[16:32] = request_id
     wire[32:48] = projection_id
+    wire[48:56] = after_revision.to_bytes(8, "big")
     request_digest = _canonical_digest(
         _INSPECTION_REQUEST_DIGEST_DOMAIN,
         (bytes(wire[:64]),),
@@ -1648,8 +2486,35 @@ def _encode_inspection_latest_request_v2(
     return _InspectionRequestV2(
         request_id=request_id,
         projection_id=projection_id,
+        kind=kind,
+        after_revision=after_revision,
         request_digest=request_digest,
         canonical_wire=bytes(wire),
+    )
+
+
+def _encode_inspection_latest_request_v2(
+    request_id: bytes,
+    projection_id: bytes,
+) -> _InspectionRequestV2:
+    return _encode_inspection_request_v2(
+        request_id,
+        projection_id,
+        _InspectionRequestKindV2.LATEST,
+        0,
+    )
+
+
+def _encode_inspection_watch_request_v2(
+    request_id: bytes,
+    projection_id: bytes,
+    after_revision: int,
+) -> _InspectionRequestV2:
+    return _encode_inspection_request_v2(
+        request_id,
+        projection_id,
+        _InspectionRequestKindV2.WATCH,
+        after_revision,
     )
 
 
@@ -1877,8 +2742,7 @@ def _derive_inspection_overall_v1(
     ):
         return LocalInspectionOverallV1.UNKNOWN
     if any(
-        record.liveness
-        in {InspectionLivenessV1.BOOTSTRAPPING, InspectionLivenessV1.UNRESPONSIVE}
+        record.liveness in {InspectionLivenessV1.BOOTSTRAPPING, InspectionLivenessV1.UNRESPONSIVE}
         or record.readiness is InspectionReadinessV1.DEGRADED
         or record.health is InspectionHealthV1.DEGRADED
         for record in records
@@ -1892,9 +2756,11 @@ def _decode_local_inspection_snapshot_v1(wire: bytes) -> LocalInspectionSnapshot
         raise _inspection_protocol_failure(
             "DeveloperLocal Inspection v2 nested PXIS-v1 length is invalid"
         )
-    if wire[:4] != b"PXIS" or int.from_bytes(wire[4:6], "big") != 1 or int.from_bytes(
-        wire[6:8], "big"
-    ) != _PXIS_HEADER_BYTES:
+    if (
+        wire[:4] != b"PXIS"
+        or int.from_bytes(wire[4:6], "big") != 1
+        or int.from_bytes(wire[6:8], "big") != _PXIS_HEADER_BYTES
+    ):
         raise _inspection_protocol_failure(
             "DeveloperLocal Inspection v2 nested PXIS-v1 version is invalid"
         )
@@ -1938,8 +2804,7 @@ def _decode_local_inspection_snapshot_v1(wire: bytes) -> LocalInspectionSnapshot
     decoded = tuple(
         _decode_inspection_owner_record_v1(
             wire[
-                _PXIS_HEADER_BYTES
-                + index * _PXIS_OWNER_RECORD_BYTES : _PXIS_HEADER_BYTES
+                _PXIS_HEADER_BYTES + index * _PXIS_OWNER_RECORD_BYTES : _PXIS_HEADER_BYTES
                 + (index + 1) * _PXIS_OWNER_RECORD_BYTES
             ],
             projected_at_nanos,
@@ -1973,11 +2838,7 @@ def _decode_inspection_node_record_v2(
     wire: bytes,
     projected_at_nanos: int,
 ) -> NodeInspectionRecordV2:
-    if (
-        len(wire) != _PXIS_NODE_RECORD_BYTES
-        or any(wire[6:8])
-        or any(wire[104:])
-    ):
+    if len(wire) != _PXIS_NODE_RECORD_BYTES or any(wire[6:8]) or any(wire[104:]):
         raise _inspection_protocol_failure(
             "DeveloperLocal Inspection v2 NodeDaemon record is non-canonical"
         )
@@ -2128,8 +2989,7 @@ def _derive_inspection_overall_v2(
         return LocalInspectionOverallV1.UNKNOWN
     if (
         base is LocalInspectionOverallV1.DEGRADED
-        or node.liveness
-        in {InspectionLivenessV1.BOOTSTRAPPING, InspectionLivenessV1.UNRESPONSIVE}
+        or node.liveness in {InspectionLivenessV1.BOOTSTRAPPING, InspectionLivenessV1.UNRESPONSIVE}
         or node.readiness is InspectionReadinessV1.DEGRADED
         or node.health is InspectionHealthV1.DEGRADED
     ):
@@ -2152,8 +3012,7 @@ def _decode_local_inspection_snapshot_v2(wire: bytes) -> LocalInspectionSnapshot
         )
     if (
         int.from_bytes(wire[8:12], "big") != _PXIS_V2_BYTES
-        or int.from_bytes(wire[12:16], "big")
-        != _PXIS_V1_BYTES + _PXIS_NODE_RECORD_BYTES
+        or int.from_bytes(wire[12:16], "big") != _PXIS_V1_BYTES + _PXIS_NODE_RECORD_BYTES
         or int.from_bytes(wire[64:68], "big") != _PXIS_V1_BYTES
         or int.from_bytes(wire[68:70], "big") != _PXIS_NODE_RECORD_BYTES
         or any(wire[71:80])
@@ -2264,8 +3123,8 @@ def _decode_inspection_response_v2(
     current_revision = int.from_bytes(wire[64:72], "big")
     request_digest = wire[72:104]
     if (
-        request_kind != 1
-        or after_revision != 0
+        request_kind != int(request.kind)
+        or after_revision != request.after_revision
         or request_id != request.request_id
         or projection_id != request.projection_id
         or not hmac.compare_digest(request_digest, request.request_digest)
@@ -2275,7 +3134,12 @@ def _decode_inspection_response_v2(
             "DeveloperLocal Inspection v2 response correlation mismatched",
         )
     if outcome is _InspectionResponseOutcomeV2.SNAPSHOT:
-        if payload_length != _PXIS_V2_BYTES or current_revision == 0:
+        if (
+            payload_length != _PXIS_V2_BYTES
+            or current_revision == 0
+            or request.kind is _InspectionRequestKindV2.WATCH
+            and current_revision <= request.after_revision
+        ):
             raise _inspection_error(
                 DeveloperLocalInspectionClientErrorCode.INVALID_FRAME,
                 "DeveloperLocal Inspection v2 snapshot response shape is invalid",
@@ -2290,25 +3154,43 @@ def _decode_inspection_response_v2(
                 "DeveloperLocal Inspection v2 snapshot response correlation mismatched",
             )
         return snapshot
+    if outcome is _InspectionResponseOutcomeV2.NOT_MODIFIED:
+        if (
+            payload_length != 0
+            or request.kind is not _InspectionRequestKindV2.WATCH
+            or current_revision == 0
+            or current_revision > request.after_revision
+        ):
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.INVALID_FRAME,
+                "DeveloperLocal Inspection v2 not-modified response shape is invalid",
+            )
+        return None
     if outcome is _InspectionResponseOutcomeV2.NOT_FOUND:
         if payload_length != 0 or current_revision != 0:
             raise _inspection_error(
                 DeveloperLocalInspectionClientErrorCode.INVALID_FRAME,
                 "DeveloperLocal Inspection v2 not-found response shape is invalid",
             )
-        return None
+        raise _inspection_error(
+            DeveloperLocalInspectionClientErrorCode.SNAPSHOT_UNAVAILABLE,
+            "DeveloperLocal Inspection v2 snapshot is unavailable",
+        )
     raise _inspection_error(
         DeveloperLocalInspectionClientErrorCode.INVALID_FRAME,
-        "DeveloperLocal Inspection v2 Latest response outcome is invalid",
+        "DeveloperLocal Inspection v2 response outcome is invalid",
     )
 
 
 class DeveloperLocalInspectionClientV2:
-    """Generation-scoped, single-use PXIQ-v2 Latest client over private UDS."""
+    """Generation-scoped, no-retry PXIQ-v2 Latest/one-shot Watch client."""
 
     def __init__(self, bootstrap: _InspectionBootstrapV2) -> None:
         self._bootstrap = bootstrap
-        self._used = False
+        self._latest_attempted = False
+        self._cursor_revision: int | None = None
+        self._next_request_sequence = 1
+        self._request_in_flight = False
         self._closed = False
 
     @classmethod
@@ -2318,28 +3200,96 @@ class DeveloperLocalInspectionClientV2:
     ) -> DeveloperLocalInspectionClientV2:
         return cls(_read_private_inspection_bootstrap_file_v2(path))
 
+    @classmethod
+    def _from_tui_attach_pin(
+        cls,
+        pin: _TuiAttachBootstrapPinV1,
+    ) -> DeveloperLocalInspectionClientV2:
+        return cls(_read_private_inspection_bootstrap_file_v2(pin.path, pin))
+
     async def latest(self) -> LocalInspectionSnapshotV2:
-        if self._closed:
+        self._ensure_open()
+        if self._request_in_flight:
             raise _inspection_error(
-                DeveloperLocalInspectionClientErrorCode.CLOSED,
-                "DeveloperLocal Inspection v2 client is closed",
+                DeveloperLocalInspectionClientErrorCode.REQUEST_PENDING,
+                "DeveloperLocal Inspection v2 request is already pending",
             )
-        if self._used:
+        if self._latest_attempted:
             raise _inspection_error(
                 DeveloperLocalInspectionClientErrorCode.ALREADY_USED,
                 "DeveloperLocal Inspection v2 startup read was already attempted",
             )
-        self._used = True
+        self._latest_attempted = True
         request = _encode_inspection_latest_request_v2(
-            _inspection_request_id_v2(self._bootstrap, 1),
+            _inspection_request_id_v2(self._bootstrap, self._take_request_sequence()),
             self._bootstrap.projection_id,
         )
+        snapshot = await self._send_request(request)
+        if snapshot is None:  # Latest cannot canonically return NotModified.
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.PROTOCOL,
+                "DeveloperLocal Inspection v2 startup response is invalid",
+            )
+        self._cursor_revision = snapshot.projection_revision
+        return snapshot
+
+    async def watch(self, after_revision: int) -> LocalInspectionSnapshotV2 | None:
+        self._ensure_open()
+        if self._request_in_flight:
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.REQUEST_PENDING,
+                "DeveloperLocal Inspection v2 request is already pending",
+            )
+        if self._cursor_revision is None:
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.LATEST_REQUIRED,
+                "DeveloperLocal Inspection v2 startup read is required",
+            )
+        if (
+            not isinstance(after_revision, int)
+            or isinstance(after_revision, bool)
+            or after_revision != self._cursor_revision
+        ):
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.CORRELATION_MISMATCH,
+                "DeveloperLocal Inspection v2 watch cursor mismatched",
+            )
+        request = _encode_inspection_watch_request_v2(
+            _inspection_request_id_v2(self._bootstrap, self._take_request_sequence()),
+            self._bootstrap.projection_id,
+            after_revision,
+        )
+        snapshot = await self._send_request(request)
+        if snapshot is not None:
+            self._cursor_revision = snapshot.projection_revision
+        return snapshot
+
+    def _take_request_sequence(self) -> int:
+        sequence = self._next_request_sequence
+        if sequence > (1 << 64) - 1:
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.SEQUENCE_EXHAUSTED,
+                "DeveloperLocal Inspection v2 request sequence is exhausted",
+            )
+        self._next_request_sequence += 1
+        return sequence
+
+    async def _send_request(
+        self,
+        request: _InspectionRequestV2,
+    ) -> LocalInspectionSnapshotV2 | None:
+        if self._request_in_flight:
+            raise _inspection_error(
+                DeveloperLocalInspectionClientErrorCode.REQUEST_PENDING,
+                "DeveloperLocal Inspection v2 request is already pending",
+            )
+        self._request_in_flight = True
         authenticated_request = bytearray(self._bootstrap.generation_token)
         authenticated_request.extend(request.canonical_wire)
-        socket_identity = _validate_inspection_socket_path(self._bootstrap)
 
         async def exchange_once() -> bytes:
             writer: asyncio.StreamWriter | None = None
+            socket_identity = _validate_inspection_socket_for_client(self._bootstrap)
             try:
                 reader, writer = await asyncio.open_unix_connection(
                     path=self._bootstrap.socket_path
@@ -2357,7 +3307,7 @@ class DeveloperLocalInspectionClientV2:
                         DeveloperLocalInspectionClientErrorCode.PEER_CREDENTIALS_MISMATCH,
                         "DeveloperLocal Inspection v2 peer identity mismatched",
                     )
-                if _validate_inspection_socket_path(self._bootstrap) != socket_identity:
+                if _validate_inspection_socket_for_client(self._bootstrap) != socket_identity:
                     raise _inspection_error(
                         DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
                         "DeveloperLocal Inspection v2 socket identity changed",
@@ -2382,6 +3332,11 @@ class DeveloperLocalInspectionClientV2:
                         DeveloperLocalInspectionClientErrorCode.INVALID_FRAME,
                         "DeveloperLocal Inspection v2 response has trailing bytes",
                     )
+                if _validate_inspection_socket_for_client(self._bootstrap) != socket_identity:
+                    raise _inspection_error(
+                        DeveloperLocalInspectionClientErrorCode.ENDPOINT_IDENTITY_CHANGED,
+                        "DeveloperLocal Inspection v2 socket identity changed",
+                    )
                 return response
             finally:
                 if writer is not None:
@@ -2395,7 +3350,7 @@ class DeveloperLocalInspectionClientV2:
         except TimeoutError as cause:
             raise _inspection_error(
                 DeveloperLocalInspectionClientErrorCode.OPERATION_TIMED_OUT,
-                "DeveloperLocal Inspection v2 startup read timed out",
+                "DeveloperLocal Inspection v2 exchange timed out",
             ) from cause
         except DeveloperLocalInspectionClientError:
             raise
@@ -2406,13 +3361,15 @@ class DeveloperLocalInspectionClientV2:
             ) from cause
         finally:
             authenticated_request[:] = bytes(len(authenticated_request))
-        snapshot = _decode_inspection_response_v2(response_wire, request)
-        if snapshot is None:
+            self._request_in_flight = False
+        return _decode_inspection_response_v2(response_wire, request)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
             raise _inspection_error(
-                DeveloperLocalInspectionClientErrorCode.SNAPSHOT_UNAVAILABLE,
-                "DeveloperLocal Inspection v2 startup snapshot is unavailable",
+                DeveloperLocalInspectionClientErrorCode.CLOSED,
+                "DeveloperLocal Inspection v2 client is closed",
             )
-        return snapshot
 
     def close(self) -> None:
         if self._closed:

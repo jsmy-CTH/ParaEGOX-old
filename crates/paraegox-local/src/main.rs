@@ -15,7 +15,7 @@ use config::{
 #[cfg(unix)]
 use config::{
     LocalDeployCommandV1, LocalInspectionSnapshotCommandV1, LocalLifecycleCommandV1,
-    LocalManagedChatConfigV1,
+    LocalManagedChatConfigV1, LocalTuiAttachCommandV1,
 };
 use error::LocalProcessError;
 use serde::Serialize;
@@ -132,6 +132,19 @@ struct LocalChatSupervisorInvocationV1 {
 
 fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if config::tui_attach_intent(&arguments) {
+        return match dispatch_tui_attach(&arguments) {
+            Ok(outcome) => outcome.exit_code(),
+            Err(error) => {
+                eprintln!(
+                    "paraegox: code={} message={}",
+                    error.code(),
+                    error.message()
+                );
+                ExitCode::from(error.exit_code())
+            }
+        };
+    }
     if config::init_json_intent(&arguments) {
         return dispatch_init_to(&mut io::stdout().lock(), &arguments).exit_code();
     }
@@ -170,6 +183,28 @@ fn main() -> ExitCode {
             }
         },
     }
+}
+
+fn dispatch_tui_attach(arguments: &[OsString]) -> Result<DispatchOutcome, LocalProcessError> {
+    let command = config::parse_tui_attach(arguments)?;
+    #[cfg(unix)]
+    {
+        run_tui_attach_command(command)?;
+        Ok(DispatchOutcome::Success)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        unreachable!("local TUI parser rejects the unsupported non-Unix platform")
+    }
+}
+
+#[cfg(unix)]
+fn run_tui_attach_command(command: LocalTuiAttachCommandV1) -> Result<(), LocalProcessError> {
+    let config = command.into_config();
+    let locator = lifecycle::locate_local_tui_attach(&config)?;
+    let handoff = lifecycle::encode_local_tui_handoff(&locator)?;
+    composition::run_attached_tui(&handoff)
 }
 
 fn dispatch_inspection_snapshot_to(
@@ -1193,6 +1228,7 @@ fn usage() -> &'static str {
        paraegox down --config <absolute-paraegox.toml> --json
        paraegox deploy --local --config <absolute-paraegox.toml> --json
        paraegox inspection snapshot --config <absolute-paraegox.toml> --json
+       paraegox tui --config <absolute-paraegox.toml>
        paraegox node --config <absolute-paraegox-node.toml>
        paraegox deployment --config <absolute-paraegox-deployment.toml>
        paraegox version --json
@@ -1227,6 +1263,11 @@ inspection snapshot performs one generation-bound read-only PXIQ-v2 Latest
 exchange against the existing managed-local Inspection endpoint. It does not
 start, stop, recover, or mutate an owner; retry, watch, and health inference
 are outside this command.
+
+tui performs one generation-bound atomic attachment to the existing managed-
+local conversation and Inspection endpoints. It never starts, stops, recovers,
+retries, reconnects, or infers current health; exiting it leaves the owner and
+its Running generation intact.
 
 chat starts the configured ParaEGOX conversation owner chain and Textual console.
 The absolute versioned configuration is the sole public input for provider and
@@ -2093,10 +2134,31 @@ mod tests {
     }
 
     #[test]
+    fn recognized_tui_help_and_extended_grammar_fail_before_lifecycle_or_child() {
+        for arguments in [
+            vec![OsString::from("tui"), OsString::from("--help")],
+            vec![
+                OsString::from("tui"),
+                OsString::from("--config"),
+                OsString::from("/private/tmp/must-not-open.toml"),
+                OsString::from("--retry"),
+            ],
+        ] {
+            assert!(config::tui_attach_intent(&arguments));
+            assert_eq!(
+                dispatch_tui_attach(&arguments),
+                Err(LocalProcessError::Configuration(
+                    config::ConfigError::InvalidTuiGrammar
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn usage_exposes_runtime_and_offline_commands_without_internal_modes() {
         let text = usage();
         assert_eq!(
-            text.lines().take(13).collect::<Vec<_>>(),
+            text.lines().take(14).collect::<Vec<_>>(),
             [
                 "Usage: paraegox chat --config <absolute-paraegox.toml>",
                 "       paraegox init --directory <absolute-directory> --json",
@@ -2105,6 +2167,7 @@ mod tests {
                 "       paraegox down --config <absolute-paraegox.toml> --json",
                 "       paraegox deploy --local --config <absolute-paraegox.toml> --json",
                 "       paraegox inspection snapshot --config <absolute-paraegox.toml> --json",
+                "       paraegox tui --config <absolute-paraegox.toml>",
                 "       paraegox node --config <absolute-paraegox-node.toml>",
                 "       paraegox deployment --config <absolute-paraegox-deployment.toml>",
                 "       paraegox version --json",
@@ -2123,6 +2186,7 @@ mod tests {
         assert!(
             text.contains("paraegox inspection snapshot --config <absolute-paraegox.toml> --json")
         );
+        assert!(text.contains("paraegox tui --config <absolute-paraegox.toml>"));
         assert!(text.contains("reports only the authenticated local lifecycle state"));
         assert!(text.contains("never use a PID as control authority"));
         assert!(text.contains("restart and crash recovery are not part"));
@@ -2130,6 +2194,8 @@ mod tests {
         assert!(text.contains("does not install Artifact\nbytes"));
         assert!(text.contains("one generation-bound read-only PXIQ-v2 Latest"));
         assert!(text.contains("retry, watch, and health inference\nare outside"));
+        assert!(text.contains("never starts, stops, recovers,\nretries, reconnects"));
+        assert!(text.contains("leaves the owner and\nits Running generation intact"));
         assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));
         assert!(text.contains("paraegox deployment --config <absolute-paraegox-deployment.toml>"));
         assert!(text.contains("paraegox version --json"));
