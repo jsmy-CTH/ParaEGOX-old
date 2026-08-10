@@ -1920,6 +1920,21 @@ pub(crate) mod tests {
         RuntimeAgentControlMtlsExchangeSuccessV1, RuntimeAgentControlTransportErrorV1,
     };
 
+    #[cfg(unix)]
+    const LARGE_REMOTE_AGENT_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    #[cfg(unix)]
+    fn run_large_remote_agent_test(thread_name: &str, test: impl FnOnce() + Send + 'static) {
+        let worker = std::thread::Builder::new()
+            .name(thread_name.into())
+            .stack_size(LARGE_REMOTE_AGENT_TEST_STACK_BYTES)
+            .spawn(test)
+            .expect("spawn large-stack Remote Agent test thread");
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     fn lifecycle_budgets(values: [u64; 5]) -> ManagedServiceLifecycleBudgetsV1 {
         ManagedServiceLifecycleBudgetsV1::try_new(
             BoundedDuration::from_nanos(values[0]),
@@ -2211,8 +2226,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn remote_agent_and_descriptor_pxag_actions_are_spent_once_and_restart_verified() {
+    async fn remote_agent_and_descriptor_pxag_actions_are_spent_once_and_restart_verified_inner() {
         let controller = fabric_tests::controller_signer();
         let runtime = fabric_tests::runtime_signer();
         let (fabric, remote, ingress) =
@@ -2598,6 +2612,21 @@ pub(crate) mod tests {
             .expect("descriptor terminal exists");
         assert!(replay.replayed_from_journal());
         assert_eq!(replay.receipt(), descriptor.receipt());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_and_descriptor_pxag_actions_are_spent_once_and_restart_verified() {
+        run_large_remote_agent_test("px-remote-agent-actions", || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread Remote Agent test runtime");
+            runtime.block_on(
+                remote_agent_and_descriptor_pxag_actions_are_spent_once_and_restart_verified_inner(
+                ),
+            );
+        });
     }
 
     #[test]
