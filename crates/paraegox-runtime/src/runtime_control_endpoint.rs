@@ -6580,6 +6580,35 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    const LARGE_RUNTIME_CONTROL_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    fn run_large_runtime_control_test(thread_name: &str, test: impl FnOnce() + Send + 'static) {
+        let result = std::thread::Builder::new()
+            .name(thread_name.to_owned())
+            .stack_size(LARGE_RUNTIME_CONTROL_TEST_STACK_BYTES)
+            .spawn(test)
+            .unwrap_or_else(|error| panic!("large Runtime control test spawn failed: {error}"))
+            .join();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn run_large_runtime_control_async_test<Test, TestFuture>(thread_name: &str, test: Test)
+    where
+        Test: FnOnce() -> TestFuture + Send + 'static,
+        TestFuture: std::future::Future<Output = ()> + 'static,
+    {
+        run_large_runtime_control_test(thread_name, move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("large Runtime control runtime failed: {error}"))
+                .block_on(test());
+        });
+    }
+
     fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let start_offset = source
             .find(start)
@@ -9688,8 +9717,8 @@ mod tests {
         .unwrap_or_else(|error| panic!("live-lower rejection cleanup failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn live_lower_genesis_is_exact_post_readback_and_second_initialize_is_unavailable() {
+    async fn live_lower_genesis_is_exact_post_readback_and_second_initialize_is_unavailable_inner()
+    {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut control, dependencies, intended_client, _stack_request) =
             managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
@@ -9841,8 +9870,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("sealed genesis cleanup failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn current_final_genesis_binder_retains_exact_pxap_fixed_facts_and_sole_lease() {
+    #[test]
+    fn live_lower_genesis_is_exact_post_readback_and_second_initialize_is_unavailable() {
+        run_large_runtime_control_async_test(
+            "px-live-lower-genesis",
+            live_lower_genesis_is_exact_post_readback_and_second_initialize_is_unavailable_inner,
+        );
+    }
+
+    async fn current_final_genesis_binder_retains_exact_pxap_fixed_facts_and_sole_lease_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (_state_directory, mut control, dependencies, intended_client, _stack_request) =
             managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
@@ -9913,8 +9949,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("CurrentFinal genesis cleanup failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn current_final_fresh_and_observed_successor_keep_joint_and_journal_exact() {
+    #[test]
+    fn current_final_genesis_binder_retains_exact_pxap_fixed_facts_and_sole_lease() {
+        run_large_runtime_control_async_test(
+            "px-current-final-genesis",
+            current_final_genesis_binder_retains_exact_pxap_fixed_facts_and_sole_lease_inner,
+        );
+    }
+
+    async fn current_final_fresh_and_observed_successor_keep_joint_and_journal_exact_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (
             state_directory,
@@ -10080,8 +10123,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("fresh joint commit cleanup failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn observed_successor_uncertainty_matrix_keeps_pxrj_exact_and_returns_no_joint() {
+    #[test]
+    fn current_final_fresh_and_observed_successor_keep_joint_and_journal_exact() {
+        run_large_runtime_control_async_test(
+            "px-current-final-joint",
+            current_final_fresh_and_observed_successor_keep_joint_and_journal_exact_inner,
+        );
+    }
+
+    async fn observed_successor_uncertainty_matrix_keeps_pxrj_exact_and_returns_no_joint_inner() {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum Stage {
             BeforeTempSync,
@@ -10260,8 +10310,15 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn current_final_three_axis_replays_are_pure_and_reconstruct_every_authority() {
+    #[test]
+    fn observed_successor_uncertainty_matrix_keeps_pxrj_exact_and_returns_no_joint() {
+        run_large_runtime_control_async_test(
+            "px-observed-successor-uncertainty",
+            observed_successor_uncertainty_matrix_keeps_pxrj_exact_and_returns_no_joint_inner,
+        );
+    }
+
+    async fn current_final_three_axis_replays_are_pure_and_reconstruct_every_authority_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut control, dependencies, intended_client, stack_request, current) =
             managed_control_with_current_final_v2(socket_directory.socket_path.clone()).await;
@@ -10424,8 +10481,15 @@ mod tests {
         .unwrap_or_else(|error| panic!("three-axis replay cleanup failed: {error}"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fresh_publish_or_joint_readback_uncertainty_returns_no_authority_and_drops_pin() {
+    #[test]
+    fn current_final_three_axis_replays_are_pure_and_reconstruct_every_authority() {
+        run_large_runtime_control_async_test(
+            "px-current-final-replays",
+            current_final_three_axis_replays_are_pure_and_reconstruct_every_authority_inner,
+        );
+    }
+
+    async fn fresh_publish_or_joint_readback_uncertainty_returns_no_authority_and_drops_pin_inner() {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum Stage {
             PendingJournal,
@@ -10704,8 +10768,15 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn current_final_binder_same_bytes_new_inode_is_fail_stop_without_current_final() {
+    #[test]
+    fn fresh_publish_or_joint_readback_uncertainty_returns_no_authority_and_drops_pin() {
+        run_large_runtime_control_async_test(
+            "px-current-final-uncertainty",
+            fresh_publish_or_joint_readback_uncertainty_returns_no_authority_and_drops_pin_inner,
+        );
+    }
+
+    async fn current_final_binder_same_bytes_new_inode_is_fail_stop_without_current_final_inner() {
         let socket_directory = TestSocketDirectory::create();
         let (state_directory, mut control, dependencies, _intended_client, _stack_request) =
             managed_control_with_descriptor_evidence_v2(socket_directory.socket_path.clone()).await;
@@ -10756,6 +10827,21 @@ mod tests {
         assert!(control.core.remote_agent_access_s0_mutation_frozen_v2());
         drop(error);
         drop(control);
+    }
+
+    #[test]
+    fn current_final_binder_same_bytes_new_inode_is_fail_stop_without_current_final() {
+        run_large_runtime_control_test("px-current-final-binder", || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("current-final binder runtime failed: {error}"))
+                .block_on(
+                    current_final_binder_same_bytes_new_inode_is_fail_stop_without_current_final_inner(
+                    ),
+                );
+        });
     }
 
     #[test]
@@ -15649,8 +15735,7 @@ mod tests {
         assert!(source.contains(".latch_remote_agent_access_s0_mutation_freeze_v2();"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn active_pxds_bridge_claims_only_exact_published_inner_and_registered_outer() {
+    async fn active_pxds_bridge_claims_only_exact_published_inner_and_registered_outer_inner() {
         // The endpoint's remote-mTLS fixture remains intentionally fail-closed,
         // so this test begins at the signed PXDS1 terminal boundary. It proves
         // endpoint correlation and handle gating, not a live two-host session.
@@ -16012,6 +16097,21 @@ mod tests {
                 .is_none(),
             "ordered shutdown must revoke the inner handle and every registered alias"
         );
+    }
+
+    #[test]
+    fn active_pxds_bridge_claims_only_exact_published_inner_and_registered_outer() {
+        run_large_runtime_control_test("px-restricted-bridge", || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("restricted bridge runtime failed: {error}"))
+                .block_on(
+                    active_pxds_bridge_claims_only_exact_published_inner_and_registered_outer_inner(
+                    ),
+                );
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

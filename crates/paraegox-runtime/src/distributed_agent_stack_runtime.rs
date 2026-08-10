@@ -3156,6 +3156,25 @@ mod tests {
     };
     use crate::task_registry::CancellationSource;
 
+    const LARGE_DISTRIBUTED_ACTIVATION_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    fn run_large_distributed_activation_test(
+        thread_name: &str,
+        test: impl FnOnce() + Send + 'static,
+    ) {
+        let result = std::thread::Builder::new()
+            .name(thread_name.to_owned())
+            .stack_size(LARGE_DISTRIBUTED_ACTIVATION_TEST_STACK_BYTES)
+            .spawn(test)
+            .unwrap_or_else(|error| {
+                panic!("large distributed activation test spawn failed: {error}")
+            })
+            .join();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     const DISTRIBUTED_FIXTURE: &str = include_str!(
         "../../paraegox-runtime-contracts/tests/fixtures/distributed_agent_stack_v1.hex"
     );
@@ -4056,8 +4075,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn activation_vertical_after_validated_snapshot_commits_ready_and_serves_echo() {
+    async fn activation_vertical_after_validated_snapshot_commits_ready_and_serves_echo_inner() {
         let projection = fixture_projection();
         let request = fixture_request();
         let channel = response_channel(&projection);
@@ -4339,6 +4357,20 @@ mod tests {
                 .is_none()
         );
         assert!(fabric_assembly.shutdown().await.exact_zero());
+    }
+
+    #[test]
+    fn activation_vertical_after_validated_snapshot_commits_ready_and_serves_echo() {
+        run_large_distributed_activation_test("px-distributed-activation", || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("distributed activation runtime failed: {error}"))
+                .block_on(
+                    activation_vertical_after_validated_snapshot_commits_ready_and_serves_echo_inner(),
+                );
+        });
     }
 
     #[test]

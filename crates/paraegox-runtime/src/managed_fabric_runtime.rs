@@ -4549,8 +4549,9 @@ mod tests {
             .expect("missing endpoint genesis error-map boundary");
         let endpoint_map = &endpoint_map_tail[..endpoint_map_end];
         assert!(
-            endpoint_map
-                .contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)")
+            endpoint_map.contains(
+                "RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(cause)"
+            )
         );
         assert!(
             endpoint_map.contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)")
