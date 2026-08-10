@@ -24,6 +24,17 @@ const INITIALIZATION_RECEIPT_VERSION: u16 = 1;
 const INITIALIZATION_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"paraegox.deployment.tenure-authority.initialization-receipt.sha256.v1";
 
+struct InitializerLockGuard(File);
+
+impl Drop for InitializerLockGuard {
+    fn drop(&mut self) {
+        // A concurrent fork can temporarily duplicate the open-file
+        // description. Explicitly unlocking releases the initializer lock
+        // without waiting for an unrelated CLOEXEC child to reach exec.
+        let _ = self.0.unlock();
+    }
+}
+
 pub(super) fn initialize(
     directory: &Path,
     provisioning: AuthorityProvisioning,
@@ -94,7 +105,7 @@ fn initialize_with(
     let encoded = encode_snapshot(&snapshot)?;
     let receipt = InitializationReceipt::from_snapshot(&snapshot, &encoded)?;
 
-    let _lock = create_and_lock_initializer_lock(&directory)?;
+    let _lock = InitializerLockGuard(create_and_lock_initializer_lock(&directory)?);
     publish_initial_snapshot(&directory, &encoded, temp_token, failpoint)?;
     let read_back = read_active_snapshot(&directory)?;
     if read_back != snapshot {
@@ -350,7 +361,7 @@ impl std::error::Error for InitializationError {}
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -365,7 +376,8 @@ mod tests {
     use crate::plan::DeploymentScopeId;
 
     use super::{
-        InitializationEntropy, InitializationEntropyError, InitializationError, initialize_with,
+        InitializationEntropy, InitializationEntropyError, InitializationError,
+        InitializerLockGuard, initialize_with,
     };
     use crate::tenure_authority::model::{
         AcquireAuthorization, AuthorityFingerprints, AuthorityProvisioning,
@@ -376,6 +388,36 @@ mod tests {
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn initializer_lock_guard_unlocks_while_a_cloned_descriptor_remains_open() {
+        let directory = TestDirectory::new();
+        let lock_path = directory.path().join(LOCK_FILE_NAME);
+        let locked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap_or_else(|error| panic!("initializer lock create failed: {error}"));
+        locked
+            .try_lock()
+            .unwrap_or_else(|error| panic!("initializer lock acquisition failed: {error}"));
+        let inherited = locked
+            .try_clone()
+            .unwrap_or_else(|error| panic!("initializer lock clone failed: {error}"));
+
+        drop(InitializerLockGuard(locked));
+
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap_or_else(|error| panic!("initializer lock reopen failed: {error}"));
+        contender.try_lock().unwrap_or_else(|error| {
+            panic!("initializer lock remained held by cloned descriptor: {error}")
+        });
+        drop(inherited);
+    }
 
     struct TestDirectory(PathBuf);
 
