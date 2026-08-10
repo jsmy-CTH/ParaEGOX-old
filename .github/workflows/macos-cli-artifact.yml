@@ -1120,7 +1120,6 @@ jobs:
               process: subprocess.Popen[bytes] | None = None
               owner_running = False
               master_fd = -1
-              observer_fd = -1
               try:
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
                       probe.bind(("127.0.0.1", 7447))
@@ -1163,8 +1162,11 @@ jobs:
                       termios.TIOCSWINSZ,
                       struct.pack("HHHH", 34, 120, 0, 0),
                   )
-                  observer_fd = os.dup(slave_fd)
-                  original_terminal = termios.tcgetattr(observer_fd)
+                  # macOS revokes the slave side when the controlling session
+                  # leader exits, so a retained slave dup returns ENOTTY after
+                  # a clean detach. The master remains queryable and exposes
+                  # the same terminal attributes before and after the session.
+                  original_terminal = termios.tcgetattr(master_fd)
                   process = subprocess.Popen(
                       [
                           os.fspath(binary),
@@ -1206,7 +1208,7 @@ jobs:
                   )
                   os.write(master_fd, b"\x1b")
                   wait_for_exit(master_fd, process, capture)
-                  if termios.tcgetattr(observer_fd) != original_terminal:
+                  if termios.tcgetattr(master_fd) != original_terminal:
                       raise RuntimeError("artifact TUI did not restore terminal attributes")
                   if TEXTUAL_TERMINAL_RESTORE not in capture:
                       raise RuntimeError("artifact TUI did not restore the alternate screen")
@@ -1250,8 +1252,6 @@ jobs:
                           process.wait(timeout=5.0)
                   if master_fd >= 0:
                       os.close(master_fd)
-                  if observer_fd >= 0:
-                      os.close(observer_fd)
                   if owner_running:
                       with suppress(Exception):
                           run_json(
