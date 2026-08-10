@@ -4321,7 +4321,10 @@ mod tests {
                 && uncertain < drop_pxap
         );
         assert!(!seam.contains("RemoteAgentAuthorizedTransitionV2"));
-        assert!(!seam.contains("RemoteAgentAccessJointSuccessorCandidateV2"));
+        let public_end = seam
+            .find("\n    fn commit_remote_agent_access_observed_successor_v2_with<Commit>(")
+            .expect("missing private managed successor helper boundary");
+        assert!(!seam[..public_end].contains("RemoteAgentAccessJointSuccessorCandidateV2"));
         assert!(!seam.contains("same_epoch"));
         assert!(!seam[uncertain..].contains("joint_transition"));
         assert!(!seam[uncertain..].contains("observed:"));
