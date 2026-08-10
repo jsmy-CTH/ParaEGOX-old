@@ -5,28 +5,32 @@
 > 授权日期：2026-08-10
 > 最近重排：2026-08-10；先完成本地可见闭环，再进入远端 artifact 路线，OpsService 最后准入
 > 授权来源：当前工作区用户明确要求优先完成 CLI、部署查看、Inspection/Ops 路线与可验证 TUI，并冻结新的 Remote Agent 扩张
-> 当前 committed anchor：`4334a59af1656429f0401c0b780134c8871148e9`；工作区中的后续 r352 与其他候选改动必须原样保留，但未提交、未验证的内容不构成完成证据
-> 当前最近动作：M2a 三条生命周期 grammar、lifecycle JSON v1、single-owner headless 机制与 Ubuntu system-harness 候选已形成；2026-08-10 已在独立 r352 overlay 上通过 macOS focused check/clippy/lifecycle tests，并真实验证并发 `up` 同 generation、一项 `changed = true`、一项 `changed = false` 与 joined `down`。这不是 immutable candidate 或 Ubuntu 完成证据；candidate commit 与 exact-ref Ubuntu Rust/完整治理/真实进程通过证据仍未形成。I0 `init` 已获实现授权，但代码或测试存在本身不构成完成证据
+> 当前 committed anchor：`main` 仍为 `4334a59af1656429f0401c0b780134c8871148e9`；当前窄 immutable code ref 为 `build/mac-source-snapshot-20260810-r356-local-cli-ops-test-stack-fmt`（`2b3d055f194c03cf28dd5f91960c05d5013125a4`）。它沿 r353 functional candidate、r354 Ubuntu rustfmt 与 r355/r356 test-only stack fix 递进，精确包含 M0/M1/M2a/I0、治理、CI 与正式文档路径，并排除 7 个未完成 Runtime S1 路径
+> 当前最近动作：r356 已在固定 host-key 的 Ubuntu exact-ref worktree 通过 locked format/metadata、workspace all-targets check、Clippy `-D warnings`、workspace all-targets test compile、完整 governance 与 workspace doctest；`paraegox-local` 174/174 项在 non-root、默认线程栈下通过。相同 r356 binary 还以 non-root 真实进程执行了 `tests/system/test_m2_local_lifecycle_cli.py` 的 owner-contention 与完整 lifecycle 两个场景，均通过。M2a 因而已有 exact-ref Ubuntu candidate evidence；I0 的 sudo/ownership system matrix 与 macOS artifact workflow 仍未执行，因为当前 Ubuntu consumer 没有 non-root passwordless-sudo 身份，不能用 root 或跳过 fixture 冒充通过
+> 当前 M3 动作：M3a snapshot 的 public grammar 与 JSON v1 合同已获授权；这里只冻结合同，不声称 CLI 已实现或通过平台验证。连续 watch 拆为 M3b，仍未登记 public grammar
+> 当前 D0 动作：已将快速可见的 compiled-in deterministic deployment 拆为 D0a，并在本 Program 冻结 exact CLI/JSON 合同；它不依赖 external Artifact，不触发 ADR-0004 A0。external-artifact 路线拆为 A1/D0b，只有 [ADR-0011](../adr/ADR-0011-local-immutable-artifact-materialization-and-deployment-selection.md) 被用户显式接受后才可实现；其当前 `Proposed` 状态不是实现授权
 
 ## 一句话结果
 
-ParaEGOX 当前优先交付一条普通开发者可以初始化私有本地工作区、检查配置、构建并检查 immutable artifact、本地部署、启动、查看状态与证据、附着 TUI、替换、重启和回滚的 golden path；该本地闭环完成后，才进入显式 Node enrollment、只传输不激活的 `push` 与远端部署，最后才评审 OpsService 准入。Remote Agent 新能力在整个 Program 中继续冻结。
+ParaEGOX 当前先交付一条普通开发者能直接验证的本地路线：初始化私有工作区、检查配置、以 compiled-in `deterministic-echo-v1` 经真实 DeploymentController/Runtime 部署到 `ActiveReady`，再查看 Inspection、Evidence/日志与附着 TUI。只有 ADR-0011 显式 Accepted 后，才把 external Artifact build/inspect/materialize、external-artifact deploy、replace/restart 和 rollback 接入完整 golden path；之后再进入 Node enrollment、只传输不激活的 `push` 与远端部署，最后评审 OpsService。Remote Agent 新能力在整个 Program 中继续冻结。
 
 ## 为什么重排
 
 现有代码已经积累 Kernel、Runtime、Deployment、Node、Fabric、Model、Agent、Inspection 和本地组合机制，但交付顺序长期由底层 tranche 推动。用户最先需要的是“拿到东西后能初始化、能部署、能看见、出错能解释、失败能回退”，而不是继续扩张 remote contract、session、connector、proxy 或通用编排抽象。
 
-现有 TUI 入口只在 `chat` 启动链中做一次严格的 Inspection `Latest` 读取，再显示启动状态。这个 one-shot 切片的目的，是先证明 owner 边界、IPC、失败关闭和 UI 启动顺序，不是假装已经有持续运维控制台。当前路线以此为已有证据，但先补齐可重复的本地安装/部署闭环，再让 Inspection、Evidence/日志和 TUI 作为并行可见性分支汇入。
+现有 TUI 入口只在 `chat` 启动链中做一次严格的 Inspection `Latest` 读取，再显示启动状态。这个 one-shot 切片的目的，是先证明 owner 边界、IPC、失败关闭和 UI 启动顺序，不是假装已经有持续运维控制台。当前路线以此为已有证据，先用不需要 Artifact/Installation 新 owner 的 D0a 补齐可重复的本地部署可见基线，再让 Inspection、Evidence/日志和 TUI 汇入；external Artifact 安装语义留给显式决策后的 D0b。
 
 ## 权威与所有权边界
 
 - 本 Program 是当前交付优先级的权威，但只在 Accepted ADR 与 [`governance.toml`](../../governance.toml) 已登记边界内生效。
 - [ADR-0005](../adr/ADR-0005-typed-domain-graphs-and-runtime-assembly-boundary.md) 已 **Accepted**：保留 Deck、ServiceDependency 与 activation constraint 各自的 typed graph 及必要纯算法，不建设通用 Graph Engine、Graph Store、持久 Graph Schema 或中央 workflow runtime。本 Program 不能重新打开该决定。
 - [ADR-0003](../adr/ADR-0003-ops-service-operation-boundary.md) 继续保持 **Proposed**。本 Program 不接受它，也不授权提前实现完整 OpsService、federated Inspection、ConsoleGateway 或 Web Console；OpsService 只能位于本路线最后的 O0 准入门。
-- [ADR-0004](../adr/ADR-0004-deck-workload-and-application-admission-boundary.md) 的 A0 gate 约束本路线：稳定 Release/Installation identity、active pointer、升级/卸载或 installation-owned state 不能被塞进 DeploymentController、Deck、CLI 或 `paraegox-local` 私有目录。
+- [ADR-0004](../adr/ADR-0004-deck-workload-and-application-admission-boundary.md) 的 A0 是条件式 gate，只在出现以下真实 fixture 时触发：多个独立 DeckLock 需要统一 release/update/uninstall；installation-owned mutable state 需要跨 run/升级/重部署存续；或同一 release 需要多次隔离安装/多 Artifact 需要共同稳定安装 owner。在触发前不预建 Application、Installation、active pointer、uninstall 或 GC；触发后也不能把它们塞进 DeploymentController、Deck、CLI 或 `paraegox-local` 私有目录。
+- [ADR-0011](../adr/ADR-0011-local-immutable-artifact-materialization-and-deployment-selection.md) 当前是 **Proposed**：它提议单 external Artifact 的 immutable materialization 与 Deployment selection 边界，不创建 Installation active pointer。它可以作为 A1/D0b 的候选决策，但在用户显式接受前不授权实现、治理登记或 capability 声明。
 - 当前本地公共入口仍由 `DeveloperLocal composition root` 拥有。M1 离线 CLI 与 I0 本地初始化不创建新 owner，不取得 Secret、网络、服务生命周期或 domain durable-state mutation 权限；M2a 只在同一 composition root 内增加窄 lifecycle seam。
-- `init` 只生成开发者本地配置工作区，不是安装器、Installation owner、Deployment owner 或 state owner；它不触发 A0。`deploy --local` 对稳定 artifact、installation record、active release 与回滚的需求会触发 A0，且必须先完成最小决策。
-- Deployment desired state、Runtime apply、Node facts、Artifact/Release、Installation、Inspection projection、Evidence 和领域副作用继续由各自真实 owner 持有。CLI/TUI 只能调用公开 bounded seam，不能成为第二写者。
+- M3a 仍位于同一 composition root：Inspection owner 继续独占 projection，lifecycle owner 只提供 config-commitment-bound 的当前 Running generation rendezvous，CLI 只做一次只读 PXIB/PXIQ/PXIP v2 `Latest`；三者都不取得彼此的 state 或 action authority。
+- `init` 只生成开发者本地配置工作区；D0a 只确保一个 compiled-in、无 external bytes、无 installation-owned state 的 deterministic fixture 经现有 Controller/Runtime 到达 `ActiveReady`。两者都不是安装器、Installation owner 或 active-pointer owner，也都不触发 A0。
+- Deployment desired state、Runtime apply、Node facts、Inspection projection、Evidence 和领域副作用继续由各自真实 owner 持有。未来 external Artifact bytes/materialization 只能在 ADR-0011 Accepted 后由其准入的 owner 持有；若真实 fixture 触发 A0，还必须先准入对应的最小 Application/Installation 或更窄 owner。CLI/TUI 只能调用 bounded seam，不能成为第二写者。
 - “Ops”在本 Program 中先表示用户可操作、可诊断的产品路线，不等于 ADR-0003 所描述的持久化 OpsService 已经实现或被接受。
 
 ## 明确冻结与非目标
@@ -76,7 +80,7 @@ I0 合同固定为：
 - `state` 只作为配置中的未来 domain state path；I0 不创建该目录，不初始化 identity、owner、lifecycle record、socket、Deployment/Runtime/Node state 或任何其他 domain state。
 - I0 完全离线，不读取 Secret，不启动 owner/service/child process，不打开 network socket，也不执行 artifact 安装、激活、迁移或权限授予。
 - 新建 workspace 和 mode-0600 配置必须 private、原子发布且失败关闭。目标内容与固定模板 byte-identical 时成功返回 `changed = false`；任何文件、hardlink、类型、所有者、权限、symlink、发布临时对象或内容冲突都不得覆盖、合并、删除或“修复”既有数据。
-- I0 不是 Installation owner，也不产生 Release、Installation、Deployment 或 Ops Receipt；因此它不触发 A0。首次 `deploy --local` 的稳定安装需求才触发 A0。
+- I0 不是 Installation owner，也不产生 Release、Installation、Deployment 或 Ops Receipt；因此它不触发 A0。D0a 同样不产生稳定安装身份或 active pointer；只有出现 ADR-0004 的真实触发 fixture 时才进入 A0。
 
 I0 JSON v1 的 top-level 字段严格且仅有：
 
@@ -96,39 +100,110 @@ diagnostics
 - 错误时三个字符串字段均为 JSON null，且 `diagnostics` 恰有一项；该项只有稳定 `code` 与 public-safe `message`，不得泄露 workspace 绝对路径、Secret 或底层未审计错误文本。`changed` 必须如实表示返回时已知可观察或不确定的持久变化：grammar/path/既有对象拒绝为 `false`；留下新 workspace、已链接最终配置，或清理/耐久性不确定时为 `true`；既有 workspace 中只创建过临时文件且已完成身份核验、删除与目录 fsync 时仍为 `false`。
 - 对该 `--json` grammar，stdout 在可写时严格为一个 compact JSON object 加一个 LF，stderr 为空。成功为 exit 0；已识别 `init` 的 grammar/path/既有对象或发布冲突为 exit 2；I/O 或发布结果不确定为 exit 1。所有错误均为 `ok = false`，stdout failure 仍失败关闭。
 
-除上述 M1、I0 与下文 M2a grammar 外，artifact、deploy、replace/restart、rollback、Inspection、Evidence/logs、TUI、push 和 remote deploy 的 exact command name、参数顺序与 JSON schema 尚未冻结。每个 Step 开始前必须登记 producer、consumer、owner、权限、失败语义、兼容规则和测试入口。
+### D0a — compiled-in local deploy
+
+首个且仅有的 D0a exact public grammar 冻结为：
+
+```text
+paraegox deploy --local --config <absolute-paraegox.toml> --json
+```
+
+参数顺序固定，不接受默认/相对配置路径、artifact/release/installation/path/digest、target、provider/model/Secret、replace/restart/rollback、retry 或额外参数。它仅复用现有严格 DeveloperLocal chat schema v1，且只接受配置已选择的 `deterministic-echo-v1`；provisioned 或任何其他 profile 在 deployment/lifecycle/domain mutation 前以 exit 2 失败关闭。
+
+D0a 是“确保 compiled-in deterministic profile 已经运行并返回一次可验证的 deployment 结果”，不是 Artifact 安装。实现内部必须复用唯一 M2a `run_up()` 与同一 hidden supervisor；首次起动继续由现有 composition 执行真实 Authority/Runtime/Node owner 链、`RunningStack::activate()`、真实 DeploymentController commit/apply 与 Runtime authenticated apply，并且只有 Fabric/Model/Agent Runtime terminal 均为 `ActiveReady` 才可形成成功结果。不得启动第二个 Controller、重新 apply 已终结的同一请求，或让并发 follower 创建新 revision/apply。
+
+supervisor 只能在上述真实 owner 链完成且对 receipt/revision/digest 做严格关联后，缓存一份窄的 verified deployment projection，并经现有 lifecycle UDS 提供 owner-private、只读、config/generation-bound `DeployQuery`。每个 query 必须携带并严格匹配该请求从 `run_up()` 得到的 expected generation；mismatch、非当前 Running generation 或 down race 都以 exit 1 失败且不 retry，不能把旧请求的 mutation 归给新 generation。该 action 不是公共 Ops API，lifecycle 不成为 DeploymentController proxy 或第二份 desired-state 权威；CLI 只读取这份投影。D0a 不创建 external Artifact bytes/store/manifest、ReleaseId、产品/Application Installation identity、record、owner、active/current pointer、uninstall/GC，也不授权 replace、restart、rollback、持续 reconcile 或当前健康检查。现有 RuntimeHost/DeveloperFixture-local legacy `installation_id` 保持原有内部 build/store identity 语义，不得公开、删除或重解释成产品安装身份。
+
+D0a JSON v1 的 top-level 字段严格且仅有：
+
+```text
+schema_version
+command
+mode
+ok
+profile
+changed
+generation
+deployment_revision
+controller_snapshot_sequence
+runtime_apply_request_digest
+runtime_terminal_receipt_digest
+terminal_outcome
+current_health_checked
+diagnostics
+```
+
+- `schema_version` 固定为 JSON number `1`；`command = "deploy"`；`mode = "local"`；`ok`、`changed` 与 `current_health_checked` 是 JSON boolean。`current_health_checked` 始终为 `false`：成功只是 owner Receipt 关联的 point-in-time terminal outcome，不是当前 Inspection health。
+- 成功时 `ok = true`、`profile = "deterministic-echo-v1"`、`terminal_outcome = "active_ready"`、`diagnostics = []`，其他结果字段均为非 null；`generation` 是 16-byte lifecycle identity 的精确 32 字符 lower-case hex JSON string且无 `0x` 前缀，`deployment_revision` 与 `controller_snapshot_sequence` 是无前导零的 canonical 十进制 JSON string，绝不编码为 JSON number。两个 digest 必须是精确 64 字符 lower-case hex JSON string。`runtime_apply_request_digest` 精确投影现有 PXMT `model_agent_request_digest`，不能命名或解释为另一个 DeploymentController operation/commit Receipt。
+- `changed` 的唯一公式是 `run_up.changed && !model_agent_replayed`，并且 DeployQuery 已匹配同一个 expected generation、projection 为完整可验证的 `ActiveReady`。`fabric_replayed` 仍可作为内部关联校验但不改变此 public boolean。已运行实例、并发 follower、相同请求或 model/agent durable replay 均为 `changed = false`，不得借共享 generation、旧 query 或历史 Receipt 声称是本请求的新变化。
+- 错误时 `ok = false`，`profile`、`generation`、`deployment_revision`、`controller_snapshot_sequence`、`runtime_apply_request_digest`、`runtime_terminal_receipt_digest` 与 `terminal_outcome` 均为 JSON null，`changed = false`，且 `diagnostics` 恰有一项；该项仅含稳定 `code` 与 public-safe `message`。不得输出 config/state/bootstrap/socket 路径、uid/gid、PID/PGID、capability/token、Secret/SecretRef、credential/seed/key、endpoint/route、raw receipt 或未审计底层错误。
+- 对该 `--json` grammar，stdout 在可写时严格为一个 compact JSON object 加一个 LF，stderr 为空。成功为 exit 0；已识别 `deploy` 的 grammar、absolute/config safety/config-authority 或 unsupported profile 错误为 exit 2；lifecycle/owner/activation/evidence/query/I/O 与输出失败为 exit 1。stdout failure 仍失败关闭，不得从进程、文件、transport ACK 或日志合成成功。
+
+### M3a — 本地 Inspection snapshot
+
+首个且仅有的 M3a exact public grammar 冻结为：
+
+```text
+paraegox inspection snapshot --config <absolute-paraegox.toml> --json
+```
+
+参数顺序固定，不接受默认配置、相对路径、`--bootstrap`、socket/token/state-root、cursor、retry、watch 或额外参数。它复用现有严格 DeveloperLocal chat schema v1 与 config commitment，只读取当前 Running generation 的 owner-private Inspection projection；不解析 Secret value，不启动、停止、恢复或重启 owner，不创建 lifecycle/domain state，也不写 desired state。
+
+M3a JSON v1 的 top-level 字段严格且仅有：
+
+```text
+schema_version
+command
+ok
+changed
+snapshot
+diagnostics
+```
+
+- `schema_version` 固定为 JSON number `1`，`command` 固定为 `"inspection.snapshot"`，`changed` 始终为 `false`。成功为 `ok = true`、`diagnostics = []`；`snapshot` 恰含 `snapshot_version`、`projection_id`、`observation_clock_ref`、`projection_revision`、`projected_at_nanos`、`overall`、`projection_digest`、`sources` 和 `node`，其中 `snapshot_version = 2`。除这两个 schema/version 字段外，PXIS v2 的全部 `u64` revision、epoch、sequence 与 nanoseconds 都编码为无前导零的 canonical 十进制 JSON string，避免常见自动化在 `2^53 - 1` 以上丢失身份或 cursor 精度。
+- `sources` 是固定 Authority、DeploymentController、RuntimeHost、FabricService、AgentService 顺序的五项数组。每项严格含 `owner`、`freshness`、`subject_ref`、`coordinate`、`observed_at_nanos`、`valid_until_nanos`、`liveness`、`readiness`、`health`、`feature_support`、`reason`、`owner_fact_digest`；`coordinate` 只能为 null，或严格的 `{kind: authority_tenure, tenure_epoch, fact_sequence}`、`{kind: deployment_revision, revision, fact_sequence}`、`{kind: runtime_host_epoch, runtime_host_epoch, snapshot_sequence}`、`{kind: fabric_service_generation, service_generation, observation_sequence}`、`{kind: agent_service_generation, service_generation, observation_sequence}` 之一，不能压成一个可互换 revision。
+- `node` 严格含 `freshness`、`node_ref`、`node_incarnation_ref`、`registration_epoch`、`status_sequence`、`observed_at_nanos`、`valid_until_nanos`、`liveness`、`readiness`、`health`、`feature_support`、`reason`、`node_status_digest`。16-byte identity/ref 与 32-byte digest 分别编码为 32/64 字符 lower-case hex；所有 enum 严格采用现有 PXIS v2 variant 的 lower-case snake-case 名称；全部 PXIS `u64` 使用上述 canonical 十进制 string，缺失 option 字段保留为 JSON null，不接受 wall-clock 替换 owner-local nanoseconds。
+- `Fresh`/`Stale`/`Partitioned`/`Missing`、各维度 `Unknown` 与 conservative `overall` 都是 Inspection owner 已投影的事实。CLI 不按进程存在、连接成功或本机 wall clock 重算 freshness，不把 stale/unknown 变成命令失败或健康；完整且严格解码的 stale/unknown snapshot 仍为 exit 0。
+- 错误时 `snapshot = null` 且 `diagnostics` 恰有一项，只有稳定 `code` 与 public-safe `message`。已识别 inspection namespace 的 grammar、absolute/config 安全或 config-authority drift 为 exit 2；locator/bootstrap/socket/peer/token、PXIQ/PXIP/PXIS correlation/protocol、NotFound、timeout/I/O 与输出失败为 exit 1；成功仅为 exit 0。stdout 可写时严格为一个 compact JSON object 加一个 LF，stderr 为空。
+- 输出不得包含 config/state/bootstrap/socket 路径、uid/gid、PID/PGID、capability/token、Secret/SecretRef、credential、seed、private/signing key、endpoint/route 或未审计底层错误。M3a 不声明当前健康、Deployment 收敛、Agent 可对话、Evidence、history、stream/watch、retry/reconnect、OpsService、federation、Remote Agent 或生产支持。
+
+除上述 M1、I0、D0a、M3a snapshot 与下文 M2a grammar 外，external Artifact build/inspect/materialize、D0b、replace/restart、rollback、Inspection watch、Evidence/logs、TUI、push 和 remote deploy 的 exact command name、参数顺序与 JSON schema 尚未冻结。Program 可以先冻结合同；尚未实现的 public API/CLI 不得预登记到 `governance.toml`，必须在实现、真实 consumer 与 system test 同一批次内同步登记 producer、consumer、owner、权限、失败语义与兼容规则。
 
 ## Step DAG 与当前进度图
 
 ```text
-                         ┌──────────────> I0 本地 init ───────────────────────┐
-M0 文档/治理 ─> M1 离线 CLI ─> M2a headless 生命周期 ─> A0 最小决策 ─> A1 artifact ─> D0 local deploy ─> R0 replace/restart ─> D1 rollback ─┐
-                                      └──────────────> M3 Inspection ───────────────┐                                                │
-                                                               D0 ──────────────────┴─> M4 Evidence/日志 ─> M5 attach TUI ─────────┤
-                                                                                                                                      ▼
-G0 本地 golden path ─> N0 Node enroll/transfer ─> N1 push-only ─> N2 remote deploy ─> O0 OpsService 最后准入
+M0 文档/治理 ─> M1 离线 CLI ─┬─> I0 本地 init ───────────┐
+                         └─> M2a headless 生命周期 ─┬─> D0a compiled-in local deploy ─┐
+                                                    └─> M3a snapshot ─> M3b watch ─┤
+D0a + M3a ─> M4 Evidence/日志；M3b + M4 ─> M5 attach TUI
+ADR-0011 Proposed ──用户显式 Accepted──> A1 external Artifact ─> D0b external-artifact deploy ─> R0 replace/restart ─> D1 rollback
+ADR-0004 真实触发 fixture ─> A0 条件 gate ─> 最小 owner ADR Accepted 或稳定拒绝（当前 D0a 不触发）
+D1 + M5 ─> G0 本地 golden path ─> N0 Node enroll/transfer ─> N1 push-only ─> N2 remote deploy ─> O0 OpsService 最后准入
 ```
 
-依赖说明：I0 可在 M0/M1 收口后与 M2a exact-ref 收口并行，但 D0 必须同时等待 I0、M2a 与 A1；A0 是由 D0 的稳定安装需求触发，不是由 I0 触发。M3 可在 M2a 后与 A0–D1 分支并行；M4 同时等待真实 D0 Receipt surface 与 M3 read-only projection，M5 再消费二者。只有 D1 与 M5 都完成，G0 本地 golden path 才成立。N0–N2 不得越过 G0，O0 永远最后。
+依赖说明：I0 可在 M0/M1 收口后与 M2a exact-ref 收口并行，D0a 只等待 I0 + M2a，不等待 A0、ADR-0011 或 A1。M3a 合同可以先冻结，但实现与完成证据必须等待 M2a 的 immutable exact-ref gate；M3b 再消费已验证的 M3a。M4 同时等待真实 D0a point-in-time Receipt projection 与 M3a read-only projection，M5 同时等待 M3b 与 M4。A1 与 D0b 必须等待 ADR-0011 由用户显式 Accepted，D0b 再消费 D0a 已验证的本地路径与 A1；R0/D1 不得越过 D0b。A0 不是正常链的预置层，只在 ADR-0004 的真实 fixture 出现时截断相关副作用。只有 D1 与 M5 都完成，G0 完整本地 golden path 才成立。N0–N2 不得越过 G0，O0 永远最后。
 
 | Step | 当前状态 | 依赖 | 用户可见结果 | 完成证据 |
 | --- | --- | --- | --- | --- |
-| M0 文档与治理权威 | Active | 无 | 正式 docs 可版本化，只有 `docs/workbench` 保持本地；本 Program 成为当前路线 | candidate commit 追踪全部正式 docs；治理检查拒绝未追踪正式 docs 和已追踪 workbench；文档链接/状态检查通过 |
-| M1 离线 CLI 首切片 | Active（候选实现已出现，尚未形成验收证据） | M0 | 用户能查询版本、严格检查配置、离线诊断静态前置条件 | exact grammar 正负测试、稳定 JSON/exit code、Secret/network/state 零副作用测试；对应 public API 登记 |
-| M2a 本地 headless 生命周期 | Active（源码/测试候选与 macOS focused evidence 已形成，尚无 exact-ref Ubuntu 验收证据） | M1 | 用一份现有严格 chat 配置执行 `up/status/down`，三条操作共享一个 headless whole-local composition owner | exact grammar/JSON 正负测试；pre-state Secret 失败零副作用；并发同 generation 且 `changed` 与请求相关；private lock/record/same-user UDS、signal/joined shutdown、owned-socket 清理与 terminal record；同一 exact Ubuntu ref 的完整证据 |
-| I0 本地 init | Authorized（实现切片已开始；尚无完成证据） | M1；可与 M2a 收口并行 | 一条离线命令生成 private deterministic-echo config workspace，不创建 domain state | exact grammar/JSON 正负测试；byte-identical 幂等 `changed = false`；文件/权限/symlink/内容冲突不覆盖；Secret/owner/network/state 零副作用；public API 登记与 exact-ref 平台证据 |
-| A0 最小 Release/Installation 决策 | Planned | M2a；由 D0 需求触发 | 明确 artifact、release、installation、active pointer、DeploymentRevision 与 Receipt 分别由谁拥有 | 按 ADR-0004 形成并接受最小后继决策，或以稳定 diagnostic 拒绝 D0；不得用 plan 或代码存在代替 Accepted decision |
-| A1 artifact build/inspect | Planned | A0 Accepted | 用户能构建 immutable artifact，并在无安装副作用时读取版本、digest、manifest 与目标兼容性 | reproducible bytes/digest、tamper/unsupported-target fail-closed、inspect 零安装副作用、producer/consumer 与兼容证据 |
-| D0 local deploy | Planned | I0 + M2a + A1 | 本地执行 verify → install → activate → wait Ready → owner Receipt，而不是只复制文件或启动进程 | crash/partial failure、同请求幂等、old/new active 唯一性、Ready/Uncertain、失败不破坏旧实例、owner-issued Receipt |
-| R0 replace/restart | Planned | D0 | 显式替换新 artifact；或在同 artifact/state 上安全停止后重启，不透明自动 retry | generation fencing、joined stop、SIGKILL/owner loss、stale generation、same-state restart、replace partial failure 与 no-double-active 证据 |
-| D1 rollback | Planned | R0 | 指定已知 release/digest 回滚为新的前向 revision，并重新验证 Ready | target identity/compatibility、旧 artifact/state、rollback partial failure、Ready/Uncertain 与 Receipt correlation |
-| M3 本地 Inspection | Planned | M2a | 用户读取带 source/revision/freshness 的 snapshot，并在授权后持续 watch | 只读协议与 owner 边界；断连、stale/unknown、backpressure、重连和 cursor 证据；不得写 desired state |
-| M4 Evidence 与日志诊断 | Planned | D0 + M3 | 用户从失败定位到 owner、Receipt/Evidence 和有界日志，而不是只看“启动失败” | Secret-free 输出、bounded retention/query、owner-issued Receipt correlation、缺证据时 Unknown/Uncertain |
-| M5 可附着 TUI | Planned | M3 + M4 | TUI attach 已运行实例并展示状态、原因与证据；detach 后服务继续 | attach/detach、断连/恢复、慢消费者、终端恢复、无隐藏写操作的人工与自动化证据 |
+| M0 文档与治理权威 | Validated candidate（r356 Ubuntu complete-governance PASS） | 无 | 正式 docs 可版本化，只有 `docs/workbench` 保持本地；本 Program 成为当前路线 | candidate commit 追踪全部正式 docs；治理检查拒绝未追踪正式 docs 和已追踪 workbench；文档链接/状态检查通过 |
+| M1 离线 CLI 首切片 | Active（r356 Ubuntu Rust/unit PASS；artifact/process smoke 待验） | M0 | 用户能查询版本、严格检查配置、离线诊断静态前置条件 | exact grammar 正负测试、稳定 JSON/exit code、Secret/network/state 零副作用测试；对应 public API 登记 |
+| M2a 本地 headless 生命周期 | Validated candidate（r356 Ubuntu Rust、174/174 local 与 2/2 real-process 场景 PASS） | M1 | 用一份现有严格 chat 配置执行 `up/status/down`，三条操作共享一个 headless whole-local composition owner | exact grammar/JSON 正负测试；pre-state Secret 失败零副作用；并发同 generation 且 `changed` 与请求相关；private lock/record/same-user UDS、signal/joined shutdown、owned-socket 清理与 terminal record；同一 exact Ubuntu ref 的完整证据 |
+| I0 本地 init | Active（r356 Ubuntu Rust/unit PASS；sudo ownership matrix 与 macOS artifact 待验） | M1；可与 M2a 收口并行 | 一条离线命令生成 private deterministic-echo config workspace，不创建 domain state | exact grammar/JSON 正负测试；byte-identical 幂等 `changed = false`；文件/权限/symlink/内容冲突不覆盖；Secret/owner/network/state 零副作用；public API 登记与 exact-ref 平台证据 |
+| A0 条件式 Application/Installation gate | Not triggered（当前 D0a） | ADR-0004 真实触发 fixture | 只在 multi-Deck 统一发布/更新/卸载、installation-owned mutable state、多隔离安装或多 Artifact 稳定 owner 出现时准入最小 owner | 与触发条件对应的真实 fixture、owner/consumer/failure evidence，以及最小后继 ADR Accepted 或稳定拒绝；不预建 Application/Installation |
+| ADR-0011 external-Artifact 边界 | Proposed（未授权实现） | 用户显式决策 | 决定单 external Artifact 的 immutable materialization、Deployment selection 与 Runtime reopen 边界 | 用户显式 Accepted 与有效决策记录；文档/代码存在不得替代决策 |
+| A1 external Artifact build/inspect/materialize | Planned/Blocked | ADR-0011 用户显式 Accepted；若触发 A0 还需其最小 ADR Accepted | 用户能构建、只读 inspect 并由真实 owner 物化单个 immutable Artifact，不创建 Installation active pointer | reproducible bytes/digest、strict canonical manifest、tamper/unsupported-target pre-effect fail-closed、crash/idempotency/Receipt 与 zero-install inspect 证据 |
+| D0a compiled-in local deploy | Authorized（contract only；未实现、未验证） | I0 + M2a | 用 exact CLI 把唯一 deterministic fixture 经现有 Controller/Runtime 到达 point-in-time `ActiveReady`；重复/并发 follower 不新增 revision/apply | exact grammar/strict JSON、真实 owner/receipt correlation、same-request/replay/concurrency、unsupported profile pre-effect reject、down race/supervisor crash/output failure/tamper/no-leak 的 focused/system/exact-ref 证据 |
+| D0b external-artifact local deploy | Planned/Blocked（未登记 public grammar） | D0a + A1 + ADR-0011 用户显式 Accepted | 本地消费 exact immutable Artifact owner Receipt，由 Controller 选择 desired revision、Runtime 复验并到达 Ready，无 Installation active pointer | materialized/committed/activated/ready 不混同；crash/partial failure、同 operation 幂等、Uncertain query/reconcile、owner Receipt 关联与失败不破坏旧实例 |
+| R0 replace/restart | Planned/Blocked | D0b | 显式替换新 Artifact；或在同 Artifact/state 上安全停止后重启，不透明自动 retry | forward DeploymentRevision、generation fencing、joined stop、SIGKILL/owner loss、stale generation、same-state restart、partial failure 与 no-double-active 证据 |
+| D1 rollback | Planned/Blocked | D0b + R0 | 选择已知 `ArtifactObjectRefV1` 为新的前向 DeploymentRevision，并重新验证 Ready | target identity/compatibility、历史 Artifact 完整对象复验、rollback partial failure、Ready/Uncertain 与 Receipt correlation；不切 active pointer |
+| M3a 本地 Inspection snapshot | Authorized（contract only；未实现、未验证） | M2a | 用户通过一条 exact read-only CLI 读取带 typed source/revision/freshness 的 PXIS v2 snapshot | exact grammar/JSON/exit/channel；安全 locator；一次 Latest、无 retry/mutation；fresh→stale 与 no-leak 的 focused/system/exact-ref 证据 |
+| M3b 本地 Inspection watch | Planned/Deferred（未登记 public grammar） | M3a | 在另行授权后持续观察 projection 变化 | projection-aware cursor、NotModified/gap/reset、断连、backpressure、bounded reconnect 与 restart 证据；不得写 desired state |
+| M4 Evidence 与日志诊断 | Planned | D0a + M3a | 用户从失败定位到 owner、Receipt/Evidence 和有界日志，而不是只看“启动失败” | Secret-free 输出、bounded retention/query、owner-issued Receipt correlation、缺证据时 Unknown/Uncertain |
+| M5 可附着 TUI | Planned | M3b + M4 | TUI attach 已运行实例并展示状态、原因与证据；detach 后服务继续 | attach/detach、断连/恢复、慢消费者、终端恢复、无隐藏写操作的人工与自动化证据 |
 | G0 本地 golden path | Derived gate，未满足 | D1 + M5 | 新用户可复现 init 到 rollback 的完整本地路线 | immutable exact-ref Mac/Linux guide run、claim-to-evidence、已知限制；不是独立实现 Step |
 | N0 Node enroll/transfer contract | Planned | G0 | 显式登记目标、信任、传输身份和暂存边界；不依赖 Remote Agent | target identity/host-key/trust pin、Secret-safe credential reference、transport interruption/resume/cleanup 与 staging integrity 证据 |
 | N1 push-only | Planned | N0 | 只把一个 exact artifact 传到 target staging，不安装、不激活、不重启 | source/target digest 相等；重复传输幂等；中断无半成品；证明零 install/activate/restart/domain mutation |
-| N2 remote deploy | Planned | N1 | 远端复用与 D0 等价的 verify/install/activate/Ready/Receipt 语义 | transport 与 operation identity 分离；断连/timeout 为 Uncertain；远端 rollback、两平台/两主机 exact-ref smoke 与无 SSH hidden fallback |
+| N2 remote deploy | Planned | N1；复用已验证 D0b/D1 | 远端复用 external Artifact materialize、Controller commit、Runtime activate/Ready 与 owner Receipt 语义，不引入 Installation active pointer | transport 与 operation identity 分离；断连/timeout 为 Uncertain；远端 rollback、两平台/两主机 exact-ref smoke 与无 SSH hidden fallback |
 | O0 OpsService 最后准入 | Planned/Blocked | N2 + ADR-0003 Accepted 或后继决策 | 多客户端共享 durable ControlRequest/Receipt；真实 owner 继续执行副作用 | 至少两个独立真实客户端/operation consumer、crash-consistent journal、idempotency、Uncertain query/reconcile、owner Receipt；若准入条件不足则保持 deferred |
 
 状态只表示已授权范围与当前验收证据，不使用百分比掩盖依赖或平台缺口。
@@ -180,35 +255,51 @@ diagnostics
 - `diagnostics` 始终是 bounded JSON array；每项严格包含稳定 `code` 与 public-safe `message`，成功时为空。任何 envelope 都不得包含绝对/相对路径、state root、PID/PGID、Secret、SecretRef、credential、seed、private/signing key 或其内容。
 - 对这三条 `--json` grammar，stdout 在可写时严格为一个 compact JSON object 加一个 LF，stderr 为空。Exit 0 与 `ok = true` 表示请求成功或 `status` 成功分类到非 `failed`/`unknown` 状态；exit 1 与 `ok = false` 表示 lifecycle/start/owner/join/output failure，或 `failed`/`unknown`；exit 2 与 `ok = false` 表示已识别 lifecycle 命令的 grammar、绝对配置路径、严格 chat 配置或 config-authority validation failure。不能交付 JSON 的 stdout failure 仍以 exit 1 失败关闭。
 
-此处只冻结 contract 并授权 M2a 候选实现，不构成 milestone 完成或平台验证证据。验收必须把同一个 immutable exact Ubuntu ref 绑定到 locked Rust format/metadata/check/clippy/test、完整治理检查和 `tests/system/test_m2_local_lifecycle_cli.py` 的真实进程结果，并至少证明 pre-state Secret 失败零 lifecycle/domain state 副作用、并发 same-config 只有一个 generation 且 `changed` 正确关联、只读 status、joined down 后 owned-socket unlink/fsync 与 durable terminal record，以及 config drift/no-leak 边界。当前尚无这组 exact-ref Ubuntu 通过证据。2026-08-10 的本机 focused run 已在不合入未完成 Runtime S1 候选的独立 r352 overlay 上通过 `paraegox-local` all-targets check、Clippy `-D warnings`、19 项 lifecycle focused tests，并以真实进程证明并发 `up` 与 `down`；它没有 immutable candidate ref，也没有运行 Linux-only system harness，因此只作为开发诊断证据。macOS artifact workflow 对 lifecycle 仍只验证 help 可见性，不验证 `up/status/down` envelope、owner 或进程语义。
+此处冻结 contract 并授权 M2a 候选实现；milestone 是否完成仍由可复现 evidence 决定。r356 immutable exact ref 已在 Ubuntu 绑定 locked Rust format/metadata/workspace check/Clippy/test compile、完整治理、workspace doctest、non-root 默认栈下的 `paraegox-local` 174/174，以及 `tests/system/test_m2_local_lifecycle_cli.py` 中 owner-contention 和完整 lifecycle 两个真实进程场景。后两项覆盖 pre-state Secret 失败零 lifecycle/domain state 副作用、并发 same-config 单 generation 与请求相关 `changed`、只读 status、joined down/terminal record、config drift 和 no-leak；由于 consumer 未安装 pytest，测试函数由 Python 3.11 直接加载执行，而不是经 pytest runner。macOS artifact workflow 仍只验证 help 可见性，不验证 `up/status/down` envelope、owner 或进程语义。
 
 ### I0 — 本地 init
 
-生产者是 `paraegox-local` 的窄 filesystem adapter 与既有严格 chat decoder，消费者是新用户、开发自动化和 D0 guide。I0 只拥有“按固定模板原子创建 private config workspace”的一次性动作，不拥有其配置指向的 state，也不持有常驻 lifecycle。恢复只允许重新运行 exact 请求：byte-identical 完成态返回 `changed = false`；任何 uncertain 临时状态必须在发布前可安全清理或在下次请求中 fail-closed，不得覆盖既有对象。实现与测试必须同时冻结上述 grammar、JSON、mode/symlink/owner 检查和零副作用边界。
+生产者是 `paraegox-local` 的窄 filesystem adapter 与既有严格 chat decoder，消费者是新用户、开发自动化和 D0a guide。I0 只拥有“按固定模板原子创建 private config workspace”的一次性动作，不拥有其配置指向的 state，也不持有常驻 lifecycle。恢复只允许重新运行 exact 请求：byte-identical 完成态返回 `changed = false`；任何 uncertain 临时状态必须在发布前可安全清理或在下次请求中 fail-closed，不得覆盖既有对象。实现与测试必须同时冻结上述 grammar、JSON、mode/symlink/owner 检查和零副作用边界。
 
-### A0 — 最小 Release/Installation 决策
+### A0 — 条件式 Application/Installation gate
 
-A0 不是“创建完整 Application 平台”，而是按 ADR-0004 对 D0 的真实触发条件做最小准入。决策至少要分清 immutable Artifact bytes/digest、ProductRelease 或更窄 release identity、Installation identity/record/active pointer、DeploymentRevision、Runtime apply、owner Receipt 与 EvidenceRef；明确谁是唯一 writer、崩溃点、重复请求、partial install、兼容检查、卸载/retain 和 rollback authority。合法出口只有接受一份最小后继 ADR，或以稳定 diagnostic 拒绝 D0。I0、目录名或 CLI 命令名不能被当成 owner 证据。
+A0 不是 D0a 的固定前置层，也不是“创建完整 Application 平台”。它只在 ADR-0004 的三类真实 fixture 出现时触发：多个独立 DeckLock 需要统一 release/update/uninstall；installation-owned mutable state 需要跨 DeckRun、升级或重部署存续；或同一 release 需要多次隔离安装/多 Artifact 需要共同稳定安装 owner。当前单个 compiled-in deterministic fixture 无 external bytes、无 installation-owned state、无多隔离安装，因此 I0 和 D0a 都不触发 A0。
 
-### A1 — artifact build/inspect
+一旦触发，必须在相关 build/materialization/deployment/data mutation 前提交与真实条件对应的 fixture、identity producer、独立 consumer、唯一 writer、crash/partial failure 与 retain/delete/GC 边界。合法出口只有接受一份定义实际最小 owner 的后继 ADR，或以稳定 diagnostic 拒绝该能力。不得用 CLI 命令名、目录、自由字符串 scope、plan 或预建 Application/Installation/active pointer 冒充 owner 证据。
 
-build 只从 exact source/build inputs 产生 immutable、可重复验证的 artifact 与 manifest；inspect 只读 bytes 和 metadata，不创建 Installation、Deployment desired state 或 Runtime state。目标平台、build identity、digest、兼容范围与 canonical manifest 必须可机器读取。篡改、未知字段、unsupported target 或 digest mismatch 在任何安装副作用前失败关闭。
+### A1 — external Artifact build/inspect/materialize
 
-### D0 — local deploy
+A1 只能在 ADR-0011 被用户显式 Accepted 后开始；`Proposed` 文本不授权代码、public contract、package/store 或 `governance.toml` 登记。获准后，build 只从 exact source/build inputs 产生 immutable、可重复验证的 Artifact 与 canonical manifest；inspect 只读 bytes/metadata 且零物化/部署副作用；materialize 由决策准入的 owner 以 immutable object 和 owner Receipt 发布，不创建 Installation、active/current pointer、Deployment desired state 或 Runtime generation。篡改、未知字段、unsupported target、digest/pair mismatch 必须在任何 store/deployment/runtime 副作用前失败关闭。
 
-D0 是第一个真正触发 A0 的产品动作。其 owner-specific 状态机至少分离 `Verified → Installed → Activated → Ready`，失败时显式为 `Failed` 或 `Uncertain`；Transferred、Installed、Activated 与 Ready 永不互相推导。Artifact/Release owner 验证 bytes，Installation owner 管 installation record/active pointer，DeploymentController 管 committed desired revision，RuntimeHost 管本地副作用，各自签发自己的 Receipt。CLI 只汇总引用，不写这些 store。实现不得把这些步骤降低成通用 graph node 或让 graph scheduler成为恢复权威。
+### D0a — compiled-in local deploy
+
+D0a 按上文 exact grammar 确保唯一 compiled-in `deterministic-echo-v1` 走过现有 DeveloperLocal composition、唯一 M2a supervisor、真实 DeploymentController 与 Runtime terminal `ActiveReady`。它不安装 bytes，不引入产品/Application Installation或Artifact owner，不依赖 ADR-0011，不触发 A0；既有 legacy `installation_id` 继续只是内部RuntimeHost/DeveloperFixture身份且不进入public JSON。成功输出只摘要 verified owner references/digests 与 point-in-time outcome，不是新的“总 Receipt”或当前健康声明。
+
+实现批次必须同时包含 exact CLI/serializer、expected-generation-bound owner-private `DeployQuery`、真实 consumer、`tests/system/test_d0a_compiled_local_deploy_cli.py`、相关 CI 与该已实现 public surface 的 `governance.toml` 登记；不在此 contract-only 批次预登记尚不存在的 API。focused/system 证据至少覆盖 init→deploy、重复 deploy、up→deploy、并发 follower、down→up generation mismatch、config drift、provisioned pre-effect reject、query failure/down race/supervisor crash/output failure/tamper、`changed = run_up.changed && !model_agent_replayed` 与 no-leak，并且绑定同一 immutable exact Ubuntu ref 的完整门禁。
+
+### D0b — external-artifact local deploy
+
+D0b 必须等待 ADR-0011 用户显式 Accepted、A1 与 D0a；当前不冻结 public grammar/JSON，不授权实现。它未来只能消费严格验证的 immutable Artifact projection 与 materialization Receipt reference，由 DeploymentController 独占 desired Artifact 选择/DeploymentRevision，Runtime 经只读 port 重开并复验 exact object 后拥有 live generation。Materialized、Committed、Activated 与 Ready 不得互相推导；CLI 只聚合 owner references，不写 store、不创建 active pointer、不合成第二份 desired state 或 Receipt。若具体 fixture 出现 ADR-0004 触发条件，D0b 在副作用前还必须通过 A0。
 
 ### R0 — replace/restart
 
-R0 吸收原 M2b 的 restart/异常恢复，并在 D0 后增加真实 release replace。same-state restart 只有在前一 generation 已证明 joined stop 后才产生新 generation；replace 必须明确 old/new artifact、active pointer、DeploymentRevision、state compatibility 与 no-double-active。owner 丢失、SIGKILL、陈旧 generation、超时或证据缺失不能以 PID 消失合成 stopped，也不能自动透明 replay；应返回 Failed/Unknown/Uncertain 并提供 bounded recover/reconcile 路径。
+R0 吸收原 M2b 的 restart/异常恢复，并在 D0b 后增加真实 external Artifact replace；它不从 D0a 的 compiled-in fixture 抢跑。same-state restart 只有在前一 generation 已证明 joined/retired terminal 后才产生新 generation；replace 必须明确 old/new Artifact commitment、forward DeploymentRevision、state compatibility 与 no-double-active，不创建 Installation active pointer。owner 丢失、SIGKILL、陈旧 generation、超时或证据缺失不能以 PID 消失合成 stopped，也不能自动透明 replay；应返回 Failed/Unknown/Uncertain 并提供 bounded recover/reconcile 路径。
 
 ### D1 — rollback
 
-rollback 选择一个已知 release/digest，作为新的前向 Installation/Deployment revision 执行完整 verify、compatibility、activate 和 Ready 检查，不倒退 revision counter，也不以目录/Git 指针切换冒充成功。旧 artifact 或旧 state 不兼容、partial activation 或失联必须保留可查询 Receipt 并报告 Failed/Uncertain；只有新 revision Ready 才报告 RolledBack。
+rollback 依赖 D0b/R0，选择一个已知、仍物化且重新验证兼容的历史 `ArtifactObjectRefV1`，作为新的 forward DeploymentRevision 执行完整 commit/apply/Ready 流程，不倒退 revision/generation high-water，不产生 Installation revision，也不以目录、Git、backup rename 或 symlink/active pointer 切换冒充成功。历史 payload/manifest/state 不兼容、partial activation 或失联必须保留可查询 Receipt 并报告 Failed/Uncertain；只有新 forward revision 取得 exact `ActiveReady` 才能摘要为 RolledBack。
 
-### M3 — Inspection
+### M3a — Inspection snapshot
 
-生产者是现有真实 owner 的 observed facts 与 Inspection projection，消费者是 CLI/TUI。snapshot/watch 只读，必须携带 source、revision/epoch、observed time、freshness 和 stale/unknown；网络或 producer 失效不能合成健康，也不能成为 desired-state 写者。
+生产者是现有真实 owner facts 经 `paraegox-local` 当前 RunningStack 交给现有 Inspection projection/PXIB/PXIQ/PXIP v2 owner 的 immutable cache，消费者是公共 CLI/operator automation。lifecycle control 只增加一个 config-commitment-bound、same-uid/gid、transient locator action：composition 必须等 lifecycle control 与 Inspection endpoint 都 Ready 后，才把 owner-private PXIB path 交给该 Running generation；locator 只在 exact config/current Running generation 返回它，不持久化、不进入公共 JSON，也不返回 token。CLI 严格加载 PXIB 后直连 Inspection 并只发一次 `Latest`；lifecycle 不是 Inspection proxy，Inspection 仍是 projection owner，CLI 不是 cache、freshness、health 或 mutation owner。命令不得隐式调用 `up`、orphan recovery、restart 或 retry。
+
+M3a 的后续实现写集限于本 Program，以及 `crates/paraegox-local/src/{config.rs,main.rs,error.rs,lifecycle.rs,composition.rs}`、一个新的 owner-coherent `inspection_client.rs`、`tests/system/test_m3_local_inspection_cli.py`、`.github/workflows/ci.yml`、仅用于 help/light-envelope smoke 的 `.github/workflows/macos-cli-artifact.yml`，以及与实现和真实 consumer 同批新增的 `governance.toml` public API 登记；不修改 `crates/paraegox-inspection/**`、ADR-0003、Python console/TUI、Ops/Remote Agent/Graph。focused tests 必须覆盖 exact grammar/serializer、typed coordinate 与 null/hex/enum、`2^53 - 1`、`2^53`、`u64::MAX` 的 canonical decimal string、Running/config/uid-gid locator、unsafe PXIB/file/socket/peer/token/correlation/trailing/timeout、一次 Latest/无 retry，以及 stale/unknown 不升级。exact-binary system evidence 必须覆盖真实 headless `up` 后 r1、真实 freshness 边界后的 stale r2、重复 r2 revision 不增长、provisioned Secret env 移除后读取、`down` 后无 cached success、path/config/root/extra-arg、Secret/path/token canary、stdout 一个 JSON+LF/stderr 空，并证明 lifecycle/domain 文件未被 snapshot 修改。Mac 不以 Rust/system smoke 替代 Ubuntu exact-ref gate。
+
+本 Program 合同只把 M3a 置为 Authorized/contract；在 Rust 实现、真实 consumer、focused/system 结果与同一 immutable exact Ubuntu ref 的完整门禁出现前，不把尚不存在的 surface 预登记为 `registry.public_apis`，也不得标 Implemented、Validated 或 Completed。ADR-0003 继续 Proposed，M3a 不需要也不构成其 acceptance。
+
+### M3b — Inspection watch
+
+连续 watch 后置且尚无 public grammar/JSONL schema。后续准入必须把 cursor 定义为至少 `(snapshot/protocol version, projection_id, projection_revision)`，不能只用 revision；同 projection 的 NotModified、gap/cursor-ahead 必须显式 resync，新 projection_id 表示 restart reset。一个外层 coordinator 可以循环既有 one-shot Watch，但每次仍只有一个 in-flight exchange，stdout flush 前不得取下一项，不得建无界 queue；poll floor、backpressure、bounded reconnect budget、断连与 down/up 后的 projection reset 都必须有证据。endpoint 断连不等于 source `Partitioned`，restart 不得比较旧 clock/revision，也不得自动调用 `up`、restart 或 orphan recovery。现有 producer 目前只足以证明 initial snapshot 与一次 freshness 变 stale；在真实 refresh/recovery producer 与上述测试存在前，不冻结 watch command，也不声称持续运维能力。
 
 ### M4 — Evidence 与日志
 
@@ -228,7 +319,7 @@ N0 只建立 operator 部署 target 的显式身份、信任、credential refere
 
 ### N2 — remote deploy
 
-remote deploy 只消费 N1 已验证 staging artifact，并复用 D0/D1 的 owner、状态和 Receipt 语义。传输成功与部署成功是两次独立 operation；SSH 可作为明确受限的 bootstrap/rescue 研究对象，不能成为 hidden production fallback 或任意 executor。控制端断连不证明远端未发生副作用，必须进入 Uncertain 并向真实 owner query/reconcile。
+remote deploy 只消费 N1 已验证 staging Artifact，并复用已验证 D0b/D1 的 Artifact/DeploymentController/Runtime owner、状态和 Receipt 语义，不创建 Installation active pointer。传输成功与部署成功是两次独立 operation；SSH 可作为明确受限的 bootstrap/rescue 研究对象，不能成为 hidden production fallback 或任意 executor。控制端断连不证明远端未发生副作用，必须进入 Uncertain 并向真实 owner query/reconcile。
 
 ### O0 — OpsService 最后准入
 
@@ -240,7 +331,7 @@ O0 只有在 N2 后、ADR-0003 被 Accepted 或由后继决策替代、且至少
 
 1. DeckTopology/DataLink、ServiceDependency 与 activation constraint 保持不可互换的 typed graph，各自由领域 owner 定义 validator、错误、生命周期与证据。
 2. 只有两个独立真实生产消费者已经证明相同 pure algorithm 需求后，才允许按实际交集抽取 internal Graph Foundation；它不得包含 I/O、持久状态、async scheduler、retry、approval、Receipt、compensation 或 rollback。
-3. D0–D1 与 N1–N2 使用 owner-specific、Receipt-backed 状态机。实现可以使用局部拓扑排序或确定性步骤表，但不能把部署正确性、恢复或权限委托给通用 graph executor。
+3. D0a、D0b、R0/D1 与 N1–N2 使用 owner-specific、Receipt-backed 状态机。实现可以使用局部拓扑排序或确定性步骤表，但不能把部署正确性、恢复或权限委托给通用 graph executor。
 4. O0 也不得隐藏 workflow/saga engine。未来若至少两个独立、持久、跨 owner workflow 证明共享语义，必须以新的证据和后继 ADR 重新准入；“步骤很多”或“UI 想画图”都不构成反例。
 
 ## Golden path 验收场景
@@ -249,26 +340,27 @@ O0 只有在 N2 后、ADR-0003 被 Accepted 或由后继决策替代、且至少
 
 1. `paraegox init --directory <absolute-directory> --json` 生成 private `paraegox.toml`，但不创建 `state`；再次运行 byte-identical 请求返回 `changed = false`，冲突不覆盖。
 2. 对生成配置执行 M1 `config check` 与 `doctor --offline`，全程无 Secret、网络和 state mutation。
-3. 构建一个 immutable ParaEGOX artifact，并用只读 inspect 获得 version、digest、manifest 与 target compatibility。
-4. local deploy 明确完成 verify、install、activate、Ready 与 owner Receipt；任何缺失证据只能是 Failed/Uncertain。
-5. 读取 M2a lifecycle status，再由 M3 Inspection snapshot/watch 解释 freshness、stale、unknown、partial 或 reconcile-required，不能把两者混成一份“健康”状态。
-6. 查询 bounded、无 Secret 的日志/Evidence，并 attach TUI 查看 owner、状态、原因与 EvidenceRef；detach 后服务继续运行。
-7. 完成 same-state restart 与 new-artifact replace，证明 joined stop、generation fencing 与 no-double-active。
-8. 指定已知旧 release/digest rollback 为新 revision，并重新验证 Ready。
+3. 执行 `paraegox deploy --local --config <absolute-paraegox.toml> --json`：唯一 compiled-in deterministic fixture 通过真实 Controller/Runtime 返回 point-in-time `active_ready`；相同请求、重复执行与并发 follower 不创建新 revision/apply，且 `changed = false`。这一 D0a 基线不等待 Artifact/Installation 路线。
+4. 读取 M2a lifecycle status，再由 M3a Inspection snapshot 与另行验收后的 M3b watch 解释 freshness、stale、unknown、partial 或 reconcile-required，不能把 lifecycle、历史 deployment outcome 与当前健康混成一份状态。
+5. 查询 bounded、无 Secret 的日志/Evidence，并 attach TUI 查看 owner、状态、原因与 EvidenceRef；detach 后服务继续运行。至此形成快速可见本地基线，但不声称 external Artifact、replace 或 rollback。
+6. ADR-0011 经用户显式 Accepted 后，构建一个 immutable ParaEGOX Artifact，以只读 inspect 获取 version/digest/manifest/target compatibility，再由 Artifact owner 物化；任何 tamper/unsupported 在 store/deployment/runtime 副作用前拒绝。
+7. D0b 消费 exact immutable Artifact reference，由 DeploymentController 提交 forward revision、Runtime 复验并到达 `ActiveReady`；Materialized/Committed/Activated/Ready 各自只由 owner evidence 证明，任何缺失证据只能是 Failed/Uncertain。
+8. 完成 same-state restart 与 new-Artifact replace，证明 joined stop、generation fencing、forward revision 与 no-double-active；再选择已知历史 `ArtifactObjectRefV1` 作为新 forward revision rollback 并重新验证 Ready，不使用 Installation active pointer。
 
 ### 远端闭环
 
 1. 显式 enroll 一个部署 target，固定信任与 staging boundary，不创建 Remote Agent session。
-2. push exact artifact，只获得 TransferReceipt；服务状态、active release 与 DeploymentRevision 均不改变。
-3. remote deploy 消费 staging artifact并获得独立 Deployment/Installation/Runtime Receipts；控制端失联时报告 Uncertain，再 query/reconcile。
+2. push exact Artifact，只获得 TransferReceipt；服务状态、DeploymentController desired Artifact selection 与 DeploymentRevision 均不改变。
+3. remote deploy 消费 staging Artifact 并获得独立 Artifact materialization、Deployment 与 Runtime owner Receipt references；它不创建 Installation active pointer。控制端失联时报告 Uncertain，再 query/reconcile。
 4. 在真实两主机 exact-ref 场景执行远端 status、Evidence 与 rollback；不能用单机 mock、`--no-run`、一次 marker 或截图代替。
 
 ## 决策与变更规则
 
 - 本 Program 可重排 Draft `kernel-foundation.md` 中的候选顺序，但不能覆盖 Accepted ADR。
-- I0 不触发 A0；任何 local/remote deploy、stable Installation identity、active pointer、升级、卸载或 installation-owned state 都必须先通过 A0。
-- 如 M3–M5 或 N0–N2 需要完整 OpsService 语义，不能把 O0 前移；必须继续使用窄 typed owner seam，或先单独评审并接受 ADR-0003 后再修改本 Program。
-- 新增公共命令、JSON 字段、persistent format、state mutation、Secret access 或网络行为必须先更新 `governance.toml` 与本 Program 的对应 Step。
+- I0 与 D0a 都不触发 A0。A0 只由 ADR-0004 的真实 fixture 触发：多 DeckLock 统一发布/更新/卸载、installation-owned mutable state、或多隔离安装/多 Artifact 共同稳定 owner。一旦触发，相关副作用必须在最小后继 ADR Accepted 前以稳定 diagnostic 失败关闭。
+- ADR-0011 的 `Proposed` 状态不授权 A1/D0b。只有用户显式 Accepted 并留下有效决策记录后，才能实现 external Artifact build/inspect/materialize 与 external-artifact deploy；R0/D1 继续依赖 D0b。
+- 如 M3a–M5 或 N0–N2 需要完整 OpsService 语义，不能把 O0 前移；必须继续使用窄 typed owner seam，或先单独评审并接受 ADR-0003 后再修改本 Program。
+- 新增公共命令、JSON 字段、persistent format、state mutation、Secret access 或网络行为必须先在本 Program 冻结对应 Step。尚未实现的 public surface 不得预登记；实现、真实 consumer、system test 与 `governance.toml` 登记必须在同一批次内提交。
 - milestone 只有在列出的 evidence 可由评审者对 immutable exact ref 复现后才能标 Completed；代码存在、工作树存在、文档存在或某个下游模块引用它都不够。
 - Mac 是唯一 writable source authority；本机不得运行 Cargo/rustc/rustfmt。Rust、完整治理与真实 system evidence 必须在 admitted Ubuntu/CI host 对同一 exact ref 执行，且不能把 Mac focused evidence升级为平台验收。
 - Program 结束后，把稳定命令写入 guides/reference，把故障恢复写入 runbooks，把 claim-to-evidence 写入 testing；本文件保留交付历史、O0 准入结论与 Remote Agent 冻结/解冻结论。
