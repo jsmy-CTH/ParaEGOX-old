@@ -135,8 +135,7 @@ const FABRIC_CONNECT_PRIVATE_KEY_FILE_B_OPTION: &str = "--fabric-connect-private
 const LOOPBACK_TCP_PREFIX: &str = "tcp/127.0.0.1:";
 const MAX_STATE_ROOT_BYTES: usize = 4_096;
 const INIT_CONFIG_FILE_NAME: &str = "paraegox.toml";
-const MAX_INIT_DIRECTORY_BYTES: usize =
-    MAX_STATE_ROOT_BYTES - INIT_CONFIG_FILE_NAME.len() - 1;
+const MAX_INIT_DIRECTORY_BYTES: usize = MAX_STATE_ROOT_BYTES - INIT_CONFIG_FILE_NAME.len() - 1;
 const MAX_TLS_FILE_PATH_BYTES: usize = 4_096;
 const MAX_EXPERIMENTAL_PEER_COMMON_NAME_BYTES: usize = 253;
 
@@ -5290,7 +5289,10 @@ client_private_key_file = "{root}/node/controller-key.pem"
             OsString::from(too_long),
             OsString::from(JSON_OPTION),
         ];
-        assert_eq!(parse_init(&arguments), Err(ConfigError::InvalidInitDirectory));
+        assert_eq!(
+            parse_init(&arguments),
+            Err(ConfigError::InvalidInitDirectory)
+        );
     }
 
     #[test]

@@ -74,17 +74,15 @@ pub(crate) fn initialize(directory: &Path) -> Result<InitOutcomeV1, InitFailureV
             false,
         ));
     }
-    let expected = expected_config_wire(directory)
-        .map_err(|error| InitFailureV1::new(error, false))?;
+    let expected =
+        expected_config_wire(directory).map_err(|error| InitFailureV1::new(error, false))?;
     let workspace = open_or_create_workspace(directory, uid.as_raw(), gid.as_raw())?;
     let config_changed = publish_or_verify_config(&workspace, &expected)
         .map_err(|failure| failure.with_prior_change(workspace.created))?;
     let changed = workspace.created || config_changed;
     validate_final_workspace(&workspace, &expected, changed)
         .map_err(|error| InitFailureV1::new(error, changed))?;
-    Ok(InitOutcomeV1 {
-        changed,
-    })
+    Ok(InitOutcomeV1 { changed })
 }
 
 fn validate_final_workspace(
@@ -136,7 +134,10 @@ impl WorkspaceV1 {
     fn validate_named_identity(&self) -> Result<(), LocalProcessError> {
         validate_existing_path_chain(&self.parent_path)?;
         let parent_named = fs::symlink_metadata(&self.parent_path).map_err(classify_path_io)?;
-        let parent_opened = self.parent.metadata().map_err(|_| LocalProcessError::InitIo)?;
+        let parent_opened = self
+            .parent
+            .metadata()
+            .map_err(|_| LocalProcessError::InitIo)?;
         if !parent_named.is_dir()
             || !parent_opened.is_dir()
             || !same_std_file(&parent_named, &parent_opened)
@@ -183,8 +184,8 @@ fn open_or_create_workspace(
             false,
         ))?
         .to_os_string();
-    let parent = open_existing_parent(parent_path)
-        .map_err(|error| InitFailureV1::new(error, false))?;
+    let parent =
+        open_existing_parent(parent_path).map_err(|error| InitFailureV1::new(error, false))?;
     let mut created = false;
     match read_named_metadata(&parent, &directory_name)
         .map_err(|error| InitFailureV1::new(error, false))?
@@ -216,7 +217,10 @@ fn open_or_create_workspace(
         Mode::empty(),
     )
     .map_err(|error| {
-        InitFailureV1::new(classify_named_open(error, VerifyContextV1::Existing), created)
+        InitFailureV1::new(
+            classify_named_open(error, VerifyContextV1::Existing),
+            created,
+        )
     })?;
     let directory_file = File::from(owned);
     if created {
@@ -227,11 +231,8 @@ fn open_or_create_workspace(
             fchown(&directory_file, None, Some(Gid::from_raw(gid)))
                 .map_err(|_| InitFailureV1::new(LocalProcessError::InitIo, true))?;
         }
-        fchmod(
-            &directory_file,
-            Mode::from_bits_truncate(0o700),
-        )
-        .map_err(|_| InitFailureV1::new(LocalProcessError::InitIo, true))?;
+        fchmod(&directory_file, Mode::from_bits_truncate(0o700))
+            .map_err(|_| InitFailureV1::new(LocalProcessError::InitIo, true))?;
     }
     let workspace = WorkspaceV1 {
         parent,
@@ -311,9 +312,8 @@ fn publish_or_verify_config(
     workspace: &WorkspaceV1,
     expected: &[u8],
 ) -> Result<bool, InitFailureV1> {
-    let expected_length = u64::try_from(expected.len()).map_err(|_| {
-        InitFailureV1::new(LocalProcessError::InitWorkspaceConflict, false)
-    })?;
+    let expected_length = u64::try_from(expected.len())
+        .map_err(|_| InitFailureV1::new(LocalProcessError::InitWorkspaceConflict, false))?;
     workspace
         .validate_named_identity()
         .map_err(|error| InitFailureV1::new(error, false))?;
@@ -326,28 +326,14 @@ fn publish_or_verify_config(
             false,
         ));
     }
-    match read_named_metadata(
-        &workspace.directory,
-        OsStr::new(INIT_CONFIG_RELATIVE_PATH),
-    )
-    .map_err(|error| InitFailureV1::new(error, false))?
+    match read_named_metadata(&workspace.directory, OsStr::new(INIT_CONFIG_RELATIVE_PATH))
+        .map_err(|error| InitFailureV1::new(error, false))?
     {
         Some(metadata) => {
-            validate_private_file(
-                &metadata,
-                workspace.uid,
-                workspace.gid,
-                1,
-                expected_length,
-            )
-            .map_err(|error| InitFailureV1::new(error, false))?;
-            verify_config(
-                workspace,
-                expected,
-                1,
-                VerifyContextV1::Existing,
-            )
-            .map_err(|error| InitFailureV1::new(error, false))?;
+            validate_private_file(&metadata, workspace.uid, workspace.gid, 1, expected_length)
+                .map_err(|error| InitFailureV1::new(error, false))?;
+            verify_config(workspace, expected, 1, VerifyContextV1::Existing)
+                .map_err(|error| InitFailureV1::new(error, false))?;
             Ok(false)
         }
         None => {
@@ -357,10 +343,7 @@ fn publish_or_verify_config(
     }
 }
 
-fn publish_new_config(
-    workspace: &WorkspaceV1,
-    expected: &[u8],
-) -> Result<(), InitFailureV1> {
+fn publish_new_config(workspace: &WorkspaceV1, expected: &[u8]) -> Result<(), InitFailureV1> {
     let owned = openat(
         &workspace.directory,
         INIT_CONFIG_TEMP_FILE,
@@ -403,8 +386,7 @@ fn publish_new_config_inner(
     temporary: &mut File,
     linked: &mut bool,
 ) -> Result<(), LocalProcessError> {
-    fchmod(&*temporary, Mode::from_bits_truncate(0o600))
-        .map_err(|_| LocalProcessError::InitIo)?;
+    fchmod(&*temporary, Mode::from_bits_truncate(0o600)).map_err(|_| LocalProcessError::InitIo)?;
     validate_open_named_file(
         &workspace.directory,
         OsStr::new(INIT_CONFIG_TEMP_FILE),
@@ -434,12 +416,7 @@ fn publish_new_config_inner(
         },
     )?;
     workspace.validate_named_identity()?;
-    if read_named_metadata(
-        &workspace.directory,
-        OsStr::new(INIT_CONFIG_RELATIVE_PATH),
-    )?
-    .is_some()
-    {
+    if read_named_metadata(&workspace.directory, OsStr::new(INIT_CONFIG_RELATIVE_PATH))?.is_some() {
         return Err(LocalProcessError::InitWorkspaceConflict);
     }
     linkat(
@@ -495,15 +472,10 @@ fn publish_new_config_inner(
         .directory
         .sync_all()
         .map_err(|_| LocalProcessError::InitPublicationUncertain)?;
-    verify_config(
-        workspace,
-        expected,
-        1,
-        VerifyContextV1::Published,
-    )?;
-    workspace.validate_named_identity().map_err(|_| {
-        LocalProcessError::InitPublicationUncertain
-    })
+    verify_config(workspace, expected, 1, VerifyContextV1::Published)?;
+    workspace
+        .validate_named_identity()
+        .map_err(|_| LocalProcessError::InitPublicationUncertain)
 }
 
 fn cleanup_owned_temporary(
@@ -511,10 +483,7 @@ fn cleanup_owned_temporary(
     temporary: &File,
     linked: bool,
 ) -> Result<(), LocalProcessError> {
-    let Some(named) = read_named_metadata(
-        &workspace.directory,
-        OsStr::new(INIT_CONFIG_TEMP_FILE),
-    )?
+    let Some(named) = read_named_metadata(&workspace.directory, OsStr::new(INIT_CONFIG_TEMP_FILE))?
     else {
         return Ok(());
     };
@@ -644,8 +613,7 @@ fn validate_open_named_file(
     let before = read_named_metadata(directory, name)?.ok_or(expected.context.invalid())?;
     let opened = file.metadata().map_err(|_| expected.context.io())?;
     let after = read_named_metadata(directory, name)?.ok_or(expected.context.invalid())?;
-    let expected_length =
-        u64::try_from(expected.length).map_err(|_| expected.context.invalid())?;
+    let expected_length = u64::try_from(expected.length).map_err(|_| expected.context.invalid())?;
     for metadata in [&before, &after] {
         validate_private_file(
             metadata,
@@ -848,7 +816,10 @@ mod tests {
         let config_path = workspace.join(INIT_CONFIG_RELATIVE_PATH);
         let config_metadata = fs::symlink_metadata(&config_path).expect("config metadata");
         let workspace_metadata = fs::symlink_metadata(&workspace).expect("workspace metadata");
-        assert_eq!(workspace_metadata.mode() & MODE_MASK, PRIVATE_DIRECTORY_MODE);
+        assert_eq!(
+            workspace_metadata.mode() & MODE_MASK,
+            PRIVATE_DIRECTORY_MODE
+        );
         assert_eq!(config_metadata.mode() & MODE_MASK, PRIVATE_FILE_MODE);
         assert_eq!(config_metadata.nlink(), 1);
         assert!(!workspace.join(INIT_STATE_RELATIVE_PATH).exists());
@@ -857,7 +828,10 @@ mod tests {
         let text = fs::read_to_string(&config_path).expect("read generated config");
         match parse_chat_config_toml_for_test(&text).expect("strict generated chat config") {
             Command::DeveloperFixtureV1(config) => {
-                assert_eq!(config.state_root(), workspace.join(INIT_STATE_RELATIVE_PATH));
+                assert_eq!(
+                    config.state_root(),
+                    workspace.join(INIT_STATE_RELATIVE_PATH)
+                );
                 assert_eq!(config.fabric_listen(), INIT_FABRIC_LISTEN);
             }
             _ => panic!("generated config must select deterministic fixture"),
@@ -873,8 +847,11 @@ mod tests {
         let fixture = InitFixtureV1::new("conflicts");
         let workspace = fixture.workspace();
         fs::create_dir(&workspace).expect("create workspace");
-        fs::set_permissions(&workspace, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .expect("private workspace");
+        fs::set_permissions(
+            &workspace,
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private workspace");
         let config_path = workspace.join(INIT_CONFIG_RELATIVE_PATH);
         fs::write(&config_path, b"different\n").expect("write conflicting config");
         fs::set_permissions(&config_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
@@ -883,7 +860,10 @@ mod tests {
         let failure = initialize(&workspace).expect_err("different content conflicts");
         assert_eq!(failure.error(), LocalProcessError::InitWorkspaceConflict);
         assert!(!failure.changed());
-        assert_eq!(fs::read(&config_path).expect("conflict preserved"), b"different\n");
+        assert_eq!(
+            fs::read(&config_path).expect("conflict preserved"),
+            b"different\n"
+        );
 
         fs::remove_file(&config_path).expect("remove first conflict");
         fs::write(workspace.join(INIT_CONFIG_TEMP_FILE), b"stale").expect("extra temp");
@@ -898,25 +878,35 @@ mod tests {
         let fixture = InitFixtureV1::new("metadata-conflicts");
         let workspace = fixture.workspace();
         fs::create_dir(&workspace).expect("create workspace");
-        fs::set_permissions(&workspace, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .expect("private workspace");
+        fs::set_permissions(
+            &workspace,
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("private workspace");
         let config_path = workspace.join(INIT_CONFIG_RELATIVE_PATH);
         let outside = fixture.root.join("outside");
-        fs::write(&outside, expected_config_wire(&workspace).expect("expected config"))
-            .expect("outside config");
+        fs::write(
+            &outside,
+            expected_config_wire(&workspace).expect("expected config"),
+        )
+        .expect("outside config");
         fs::set_permissions(&outside, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
             .expect("private outside config");
 
         symlink(&outside, &config_path).expect("symlink config");
         assert_eq!(
-            initialize(&workspace).expect_err("symlink conflicts").error(),
+            initialize(&workspace)
+                .expect_err("symlink conflicts")
+                .error(),
             LocalProcessError::InitWorkspaceConflict
         );
         fs::remove_file(&config_path).expect("remove symlink");
 
         fs::hard_link(&outside, &config_path).expect("hardlink config");
         assert_eq!(
-            initialize(&workspace).expect_err("hardlink conflicts").error(),
+            initialize(&workspace)
+                .expect_err("hardlink conflicts")
+                .error(),
             LocalProcessError::InitWorkspaceConflict
         );
         fs::remove_file(&config_path).expect("remove hardlink");

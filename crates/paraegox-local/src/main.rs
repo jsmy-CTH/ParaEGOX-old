@@ -146,9 +146,7 @@ fn dispatch_init_to(output: &mut impl Write, arguments: &[OsString]) -> Dispatch
                     DispatchOutcome::DiagnosticFailure
                 }
             }
-            Err(failure) => {
-                finish_init_result(output, failure.changed(), failure.error())
-            }
+            Err(failure) => finish_init_result(output, failure.changed(), failure.error()),
         }
     }
     #[cfg(not(unix))]
@@ -1099,7 +1097,10 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&output).expect("init path failure JSON");
         assert_eq!(parsed["ok"], false);
         assert_eq!(parsed["changed"], false);
-        assert_eq!(parsed["diagnostics"][0]["code"], "PXLC-INIT-DIRECTORY-INVALID");
+        assert_eq!(
+            parsed["diagnostics"][0]["code"],
+            "PXLC-INIT-DIRECTORY-INVALID"
+        );
     }
 
     #[test]

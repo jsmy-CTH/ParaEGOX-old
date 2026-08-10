@@ -118,9 +118,7 @@ impl LocalProcessError {
         match self {
             Self::Configuration(error) => error.message(),
             Self::OfflineJsonOutput => "offline machine-readable output failed",
-            Self::InitUnsafeExecutionIdentity => {
-                "init requires a non-root Unix user and group"
-            }
+            Self::InitUnsafeExecutionIdentity => "init requires a non-root Unix user and group",
             Self::InitWorkspaceConflict => {
                 "init workspace or configuration conflicts with the strict private layout"
             }
