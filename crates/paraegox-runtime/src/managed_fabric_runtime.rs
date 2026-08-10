@@ -58,10 +58,9 @@ use crate::managed_service_assembly::{
 };
 use crate::remote_agent_access_state::{
     RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessGenesisCandidateV2,
-    RemoteAgentAccessObservedProgressV2,
-    RemoteAgentAccessSnapshotIdentityPinsV2, RemoteAgentAccessSnapshotV2,
-    RemoteAgentAccessStateErrorV2, RemoteAgentAccessStaticIdentityPinsV2,
-    RemoteAgentCurrentFinalAccessSnapshotV2,
+    RemoteAgentAccessObservedProgressV2, RemoteAgentAccessSnapshotIdentityPinsV2,
+    RemoteAgentAccessSnapshotV2, RemoteAgentAccessStateErrorV2,
+    RemoteAgentAccessStaticIdentityPinsV2, RemoteAgentCurrentFinalAccessSnapshotV2,
 };
 use crate::remote_agent_descriptor_evidence::{
     RemoteAgentDescriptorEvidenceError, RemoteAgentDescriptorEvidenceV1,
@@ -76,8 +75,8 @@ use crate::runtime_store::{
     RemoteAgentAccessFreshCommitErrorV2, RemoteAgentAccessGenesisInitializeCommitErrorV2,
     RemoteAgentAccessJointSuccessorCandidateV2, RemoteAgentAccessJointTransitionV2,
     RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2,
-    RemoteAgentAccessSuccessorCommitErrorV2,
-    RemoteAgentReplayJournalAbsentLeaseV2, RemoteAgentReplayJournalStartupSlotV2, RuntimeStore,
+    RemoteAgentAccessSuccessorCommitErrorV2, RemoteAgentReplayJournalAbsentLeaseV2,
+    RemoteAgentReplayJournalStartupSlotV2, RuntimeStore,
 };
 #[cfg(test)]
 use crate::runtime_store::{
@@ -1845,7 +1844,10 @@ impl ManagedFabricRuntimeCore {
         Commit: FnOnce(
             &mut ManagedFabricStore,
             RemoteAgentAccessJointSuccessorCandidateV2,
-        ) -> Result<RemoteAgentAccessJointTransitionV2, RemoteAgentAccessSuccessorCommitErrorV2>,
+        ) -> Result<
+            RemoteAgentAccessJointTransitionV2,
+            RemoteAgentAccessSuccessorCommitErrorV2,
+        >,
     {
         let RemoteAgentAccessJointTransitionBundleV2 {
             joint_transition,
@@ -1872,15 +1874,15 @@ impl ManagedFabricRuntimeCore {
                 joint_transition,
                 exact_pxap,
             }),
-            Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected { cause, joint }) => {
-                Err(RemoteAgentAccessManagedSuccessorCommitErrorV2::StoreRejected(
-                    Box::new(RemoteAgentAccessManagedSuccessorRetryV2 {
+            Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected { cause, joint }) => Err(
+                RemoteAgentAccessManagedSuccessorCommitErrorV2::StoreRejected(Box::new(
+                    RemoteAgentAccessManagedSuccessorRetryV2 {
                         cause,
                         joint: *joint,
                         exact_pxap,
-                    }),
-                ))
-            }
+                    },
+                )),
+            ),
             Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause)) => {
                 drop(exact_pxap);
                 Err(RemoteAgentAccessManagedSuccessorCommitErrorV2::OutcomeUncertain(cause))
@@ -4177,9 +4179,7 @@ mod tests {
             .find("\n/// Pure state rejection recovers the complete current joint authority")
             .expect("missing fresh success wrapper boundary");
         let success_wrapper = &success_tail[..success_end];
-        assert!(
-            success_wrapper.contains("joint_transition: RemoteAgentAccessJointTransitionV2")
-        );
+        assert!(success_wrapper.contains("joint_transition: RemoteAgentAccessJointTransitionV2"));
         assert!(success_wrapper.contains("exact_pxap: Box<[u8]>"));
         assert!(!success_wrapper.contains("Pending"));
         assert!(!success_wrapper.contains("verified_ingress"));
@@ -4228,12 +4228,14 @@ mod tests {
         assert!(
             test_forwarding.contains("store.commit_remote_agent_access_fresh_v2_at_failpoints(")
         );
-        assert!(test_forwarding.contains(
-            "store.commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint("
-        ));
-        assert!(test_forwarding.contains(
-            "store.commit_remote_agent_access_successor_v2_at_failpoints("
-        ));
+        assert!(
+            test_forwarding
+                .contains("store.commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint(")
+        );
+        assert!(
+            test_forwarding
+                .contains("store.commit_remote_agent_access_successor_v2_at_failpoints(")
+        );
         assert!(test_forwarding.contains(
             ".seed_remote_agent_replay_unapplied_stable_for_test(&same_epoch, &preflight)"
         ));
@@ -4254,12 +4256,12 @@ mod tests {
         assert!(!dispatch.contains("seed_remote_agent_replay_unapplied_stable_for_test"));
         assert!(!dispatch.contains("commit_remote_agent_access_fresh_v2_at_failpoints"));
         assert!(!dispatch.contains("commit_remote_agent_access_observed_successor_v2"));
-        assert!(!dispatch.contains(
-            "commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint"
-        ));
-        assert!(!dispatch.contains(
-            "commit_remote_agent_access_observed_successor_v2_at_failpoints"
-        ));
+        assert!(
+            !dispatch.contains("commit_remote_agent_access_fresh_v2_at_joint_readback_failpoint")
+        );
+        assert!(
+            !dispatch.contains("commit_remote_agent_access_observed_successor_v2_at_failpoints")
+        );
     }
 
     #[test]
@@ -4340,9 +4342,9 @@ mod tests {
 
         let endpoint = include_str!("runtime_control_endpoint.rs");
         assert!(!endpoint.contains("RemoteAgentAccessObservedProgressV2 {"));
-        assert!(endpoint.contains(
-            "RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test("
-        ));
+        assert!(
+            endpoint.contains("RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test(")
+        );
     }
 
     #[test]

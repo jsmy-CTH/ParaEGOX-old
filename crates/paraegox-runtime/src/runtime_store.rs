@@ -3579,8 +3579,7 @@ impl ManagedFabricStore {
         };
         if &destination != preflight.pending_snapshot_for_store_precommit()
             || destination.sequence() != expected_destination_sequence
-            || destination.previous_snapshot_digest()
-                != Some(current.snapshot.snapshot_digest())
+            || destination.previous_snapshot_digest() != Some(current.snapshot.snapshot_digest())
             || destination.writer_runtime_host_epoch() != current.current_runtime_host_epoch
             || destination.snapshot_digest() != preflight.pending_candidate_snapshot_digest()
         {
@@ -3630,7 +3629,8 @@ impl ManagedFabricStore {
                     ));
                 }
             };
-        let journal_identity = RemoteAgentReplayJournalIdentityPinsV2::from(current.static_identity);
+        let journal_identity =
+            RemoteAgentReplayJournalIdentityPinsV2::from(current.static_identity);
         let planned_stable = match Self::validate_remote_agent_replay_journal_candidate(
             planned_stable_encoded.as_ref(),
             journal_identity,
@@ -3644,8 +3644,7 @@ impl ManagedFabricStore {
             }
         };
         if planned_stable.phase() != RemoteAgentReplayJournalPhaseV2::Stable
-            || planned_stable.writer_runtime_host_epoch()
-                != current.current_runtime_host_epoch
+            || planned_stable.writer_runtime_host_epoch() != current.current_runtime_host_epoch
             || classify_remote_agent_replay_startup_pair_v2(
                 Some(&current.snapshot),
                 Some(&planned_stable),
@@ -3703,12 +3702,7 @@ impl ManagedFabricStore {
             {
                 return Err(ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch);
             }
-            Ok((
-                expected_pending,
-                expected_stable,
-                pending_wire,
-                stable_wire,
-            ))
+            Ok((expected_pending, expected_stable, pending_wire, stable_wire))
         })();
         if let Err(cause) = self.revalidate_remote_agent_access_same_epoch_v2(&current) {
             self.stopped = true;
@@ -3955,7 +3949,9 @@ impl ManagedFabricStore {
     ) -> Result<RemoteAgentAccessJointTransitionV2, RemoteAgentAccessSuccessorCommitErrorV2> {
         if let Err(cause) = self.ensure_operational() {
             drop(joint);
-            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                cause,
+            ));
         }
 
         // This block is deliberately pure: these are the only failures that
@@ -3974,26 +3970,22 @@ impl ManagedFabricStore {
                 });
             }
         };
-        let expected_destination_sequence = match joint.same_epoch.snapshot.sequence().checked_add(1)
-        {
-            Some(sequence) => sequence,
-            None => {
-                return Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected {
-                    cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
-                    joint: Box::new(joint),
-                });
-            }
-        };
+        let expected_destination_sequence =
+            match joint.same_epoch.snapshot.sequence().checked_add(1) {
+                Some(sequence) => sequence,
+                None => {
+                    return Err(RemoteAgentAccessSuccessorCommitErrorV2::Rejected {
+                        cause: ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
+                        joint: Box::new(joint),
+                    });
+                }
+            };
         if joint.candidate.source_snapshot_sequence() != joint.same_epoch.snapshot.sequence()
             || joint.candidate.source_snapshot_digest()
                 != joint.same_epoch.snapshot.snapshot_digest()
             || joint.candidate.source_phase() != joint.same_epoch.snapshot.phase()
-            || destination
-                != *joint
-                    .candidate
-                    .destination_snapshot_for_store_precommit()
-            || joint.candidate.destination_snapshot_sequence()
-                != expected_destination_sequence
+            || destination != *joint.candidate.destination_snapshot_for_store_precommit()
+            || joint.candidate.destination_snapshot_sequence() != expected_destination_sequence
             || destination.sequence() != expected_destination_sequence
             || destination.previous_snapshot_digest()
                 != Some(joint.same_epoch.snapshot.snapshot_digest())
@@ -4040,7 +4032,9 @@ impl ManagedFabricStore {
             self.stopped = true;
             drop(current);
             drop(candidate);
-            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+            return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                cause,
+            ));
         }
         let stable_before = match self.exact_remote_agent_replay_journal_stable_for_pxrs(
             &current.snapshot,
@@ -4052,7 +4046,9 @@ impl ManagedFabricStore {
                 self.stopped = true;
                 drop(current);
                 drop(candidate);
-                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                    cause,
+                ));
             }
         };
 
@@ -4071,7 +4067,9 @@ impl ManagedFabricStore {
                 self.stopped = true;
                 drop(current);
                 drop(candidate);
-                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                    cause,
+                ));
             }
         };
         if committed.snapshot != destination {
@@ -4095,7 +4093,9 @@ impl ManagedFabricStore {
                 drop(current);
                 drop(candidate);
                 drop(committed);
-                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(cause));
+                return Err(RemoteAgentAccessSuccessorCommitErrorV2::OutcomeUncertain(
+                    cause,
+                ));
             }
         };
         let transition = match candidate.try_authorize_committed_successor_v2(authority) {
@@ -5252,8 +5252,7 @@ impl ManagedFabricStore {
             || source.current_runtime_host_epoch != destination.current_runtime_host_epoch
             || expected_stable.journal_identity
                 != RemoteAgentReplayJournalIdentityPinsV2::from(destination.static_identity)
-            || expected_stable.current_runtime_host_epoch
-                != destination.current_runtime_host_epoch
+            || expected_stable.current_runtime_host_epoch != destination.current_runtime_host_epoch
             || destination.snapshot.sequence() != expected_destination_sequence
             || destination.snapshot.previous_snapshot_digest()
                 != Some(source.snapshot.snapshot_digest())
@@ -11745,7 +11744,9 @@ pub(crate) mod tests {
             .find("Ok(RemoteAgentAccessJointTransitionV2 {")
             .expect("successor must return only inseparable joint authority");
         assert!(pure_reject < fs_currentness);
-        assert!(!body[fs_currentness..].contains("RemoteAgentAccessSuccessorCommitErrorV2::Rejected"));
+        assert!(
+            !body[fs_currentness..].contains("RemoteAgentAccessSuccessorCommitErrorV2::Rejected")
+        );
         assert!(fs_currentness < stable_before);
         assert!(stable_before < publish);
         assert!(publish < post_joint);
@@ -11771,16 +11772,15 @@ pub(crate) mod tests {
             .and_then(|(_, tail)| tail.split_once('}').map(|(candidate, _)| candidate))
             .expect("joint successor candidate must remain bounded");
         assert!(candidate_definition.contains("same_epoch: RemoteAgentAccessSameEpochLeaseV2"));
-        assert!(candidate_definition.contains("candidate: RemoteAgentAuthorizedSuccessorCandidateV2"));
+        assert!(
+            candidate_definition.contains("candidate: RemoteAgentAuthorizedSuccessorCandidateV2")
+        );
     }
 
     #[test]
     fn transition_commit_seal_has_one_production_exact_joint_mint_path() {
         let source = include_str!("runtime_store.rs");
-        let mint_seam = concat!(
-            "Ok(RemoteAgentAccessTransitionCommit",
-            "AuthorityV2 {"
-        );
+        let mint_seam = concat!("Ok(RemoteAgentAccessTransitionCommit", "AuthorityV2 {");
         assert_eq!(
             source.matches(mint_seam).count(),
             1,

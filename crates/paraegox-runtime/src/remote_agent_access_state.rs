@@ -67,8 +67,7 @@ use crate::{
     },
     runtime_control_endpoint::RemoteAgentLiveLowerProjectionV2,
     runtime_store::{
-        RemoteAgentAccessTransitionCommitAuthorityV2,
-        RemoteAgentReplayJournalPendingAuthorityV2,
+        RemoteAgentAccessTransitionCommitAuthorityV2, RemoteAgentReplayJournalPendingAuthorityV2,
     },
 };
 
@@ -3352,8 +3351,7 @@ impl RemoteAgentAuthorizedSuccessorCandidateV2 {
         self,
         authority: RemoteAgentAccessTransitionCommitAuthorityV2,
     ) -> Result<RemoteAgentAuthorizedTransitionV2, RemoteAgentAccessStateErrorV2> {
-        let source_matches = authority.source_snapshot_sequence()
-                == self.source_snapshot_sequence
+        let source_matches = authority.source_snapshot_sequence() == self.source_snapshot_sequence
             && authority.source_snapshot_digest() == self.source_snapshot_digest
             && authority.source_phase() == self.source_phase;
         if !source_matches
@@ -10614,9 +10612,7 @@ mod tests {
                     Some(clock_for_request_v2(&request, 13)),
                 );
                 assert!(matches!(
-                    observed_successor_error_cause_v2(
-                        prepared.try_observed_successor(observation)
-                    ),
+                    observed_successor_error_cause_v2(prepared.try_observed_successor(observation)),
                     RemoteAgentAccessStateErrorV2::InvalidGenerationSuccessor
                 ));
             }
@@ -10625,9 +10621,7 @@ mod tests {
             let observation =
                 active_open_observation_v2(prepared.snapshot(), Some(proxy_epoch), None);
             assert!(matches!(
-                observed_successor_error_cause_v2(
-                    prepared.try_observed_successor(observation)
-                ),
+                observed_successor_error_cause_v2(prepared.try_observed_successor(observation)),
                 RemoteAgentAccessStateErrorV2::InvalidFreshClockMarker
             ));
 
@@ -10643,9 +10637,7 @@ mod tests {
                 Some(clock_for_request_v2(&request, deadline)),
             );
             assert!(matches!(
-                observed_successor_error_cause_v2(
-                    prepared.try_observed_successor(observation)
-                ),
+                observed_successor_error_cause_v2(prepared.try_observed_successor(observation)),
                 RemoteAgentAccessStateErrorV2::DeadlineExpired
             ));
         }
@@ -10680,10 +10672,11 @@ mod tests {
                 verified_ingress,
                 pending,
             };
-            let prepared_seal = RemoteAgentAccessTransitionCommitAuthorityV2::from_exact_edge_for_test(
-                &source,
-                &prepared_destination,
-            );
+            let prepared_seal =
+                RemoteAgentAccessTransitionCommitAuthorityV2::from_exact_edge_for_test(
+                    &source,
+                    &prepared_destination,
+                );
             let prepared = authorized_fresh
                 .try_authorize_committed_prepared_v2(prepared_seal)
                 .unwrap_or_else(|error| panic!("exact Prepared readback rejected: {error}"));
@@ -10705,8 +10698,14 @@ mod tests {
             let candidate = prepared
                 .try_observed_successor(observed)
                 .unwrap_or_else(|error| panic!("S1OpenIntent candidate rejected: {error}"));
-            assert_eq!(candidate.source_snapshot_sequence(), prepared_source.sequence());
-            assert_eq!(candidate.source_snapshot_digest(), prepared_source.snapshot_digest());
+            assert_eq!(
+                candidate.source_snapshot_sequence(),
+                prepared_source.sequence()
+            );
+            assert_eq!(
+                candidate.source_snapshot_digest(),
+                prepared_source.snapshot_digest()
+            );
             assert_eq!(candidate.source_phase(), prepared_source.phase());
             assert_eq!(
                 candidate.destination_phase(),
@@ -10722,9 +10721,7 @@ mod tests {
                     .destination_snapshot_for_store_precommit()
                     .canonical_wire()
             );
-            let destination = candidate
-                .destination_snapshot_for_store_precommit()
-                .clone();
+            let destination = candidate.destination_snapshot_for_store_precommit().clone();
             let successor_seal =
                 RemoteAgentAccessTransitionCommitAuthorityV2::from_exact_edge_for_test(
                     &prepared_source,
@@ -11691,9 +11688,7 @@ mod tests {
             let (_, prepared) = prepared_local_v2();
             let mismatched = local_fence_observation_v2(prepared.snapshot(), 1_001, 1_002);
             assert!(matches!(
-                observed_successor_error_cause_v2(
-                    prepared.try_observed_successor(mismatched)
-                ),
+                observed_successor_error_cause_v2(prepared.try_observed_successor(mismatched)),
                 RemoteAgentAccessStateErrorV2::InvalidFreshClockMarker
             ));
 
@@ -11705,9 +11700,7 @@ mod tests {
                 .absolute_deadline_nanos;
             let at_deadline = local_fence_observation_v2(prepared.snapshot(), deadline, deadline);
             assert!(matches!(
-                observed_successor_error_cause_v2(
-                    prepared.try_observed_successor(at_deadline)
-                ),
+                observed_successor_error_cause_v2(prepared.try_observed_successor(at_deadline)),
                 RemoteAgentAccessStateErrorV2::DeadlineExpired
             ));
 
@@ -11720,9 +11713,7 @@ mod tests {
             let after_deadline =
                 local_fence_observation_v2(prepared.snapshot(), deadline + 1, deadline + 1);
             assert!(matches!(
-                observed_successor_error_cause_v2(
-                    prepared.try_observed_successor(after_deadline)
-                ),
+                observed_successor_error_cause_v2(prepared.try_observed_successor(after_deadline)),
                 RemoteAgentAccessStateErrorV2::DeadlineExpired
             ));
 
@@ -12336,7 +12327,9 @@ mod tests {
             assert!(observed_fixture.contains("PreparedNoEffects"));
             assert!(observed_fixture.contains("RemoteAccessActive"));
             assert!(observed_fixture.contains("bytes_are_zero_v2"));
-            assert!(observed_fixture.contains("validate_progress_successor_v2(prepared, &observed)?"));
+            assert!(
+                observed_fixture.contains("validate_progress_successor_v2(prepared, &observed)?")
+            );
 
             let candidate = source
                 .split_once("pub(crate) struct RemoteAgentAuthorizedSuccessorCandidateV2 {")
@@ -12379,7 +12372,10 @@ mod tests {
                 "destination_snapshot_digest",
                 "destination_phase",
             ] {
-                assert!(candidate_impl.contains(getter), "candidate getter missing: {getter}");
+                assert!(
+                    candidate_impl.contains(getter),
+                    "candidate getter missing: {getter}"
+                );
             }
             assert!(candidate_impl.contains("try_authorize_committed_successor_v2"));
             assert!(candidate_impl.contains("InvalidTransitionCommitAuthority"));
@@ -12412,8 +12408,12 @@ mod tests {
             assert!(rejected.contains("authorized_transition"));
             assert!(rejected.contains("observed"));
 
-            assert!(!source.contains("impl From<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"));
-            assert!(!source.contains("impl TryFrom<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"));
+            assert!(!source.contains(
+                "impl From<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"
+            ));
+            assert!(!source.contains(
+                "impl TryFrom<RemoteAgentAccessSnapshotV2> for RemoteAgentAuthorizedTransitionV2"
+            ));
         }
 
         fn reseal_replay_journal_v2(wire: &mut [u8]) {

@@ -6692,8 +6692,7 @@ mod tests {
     };
     use crate::managed_fabric_runtime::{
         RemoteAgentAccessFreshCommitRejectCauseV2, RemoteAgentAccessJointTransitionBundleV2,
-        RemoteAgentAccessManagedFreshCommitErrorV2,
-        RemoteAgentAccessManagedSuccessorCommitErrorV2,
+        RemoteAgentAccessManagedFreshCommitErrorV2, RemoteAgentAccessManagedSuccessorCommitErrorV2,
     };
     use crate::managed_model_runtime::{
         RuntimeModelBackendResolveError, RuntimeResolvedModelBackendV1,
@@ -6724,8 +6723,7 @@ mod tests {
     use crate::runtime_provisioning::RuntimeProvisioningInputV1;
     use crate::runtime_store::{
         ManagedFabricStore, RemoteAgentAccessCommitFailpointV2,
-        RemoteAgentAccessJointReadbackFailpointV2,
-        RemoteAgentReplayJournalCommitFailpointV2,
+        RemoteAgentAccessJointReadbackFailpointV2, RemoteAgentReplayJournalCommitFailpointV2,
         tests::{TestDirectory, managed_fabric_store_fixture_from_snapshot},
     };
 
@@ -10058,7 +10056,10 @@ mod tests {
         assert_eq!(successor.exact_pxap_for_test(), expected_pxap.as_slice());
         let successor_pxrs = fs::read(&pxrs_path)
             .unwrap_or_else(|error| panic!("successor PXRS readback failed: {error}"));
-        assert_eq!(successor_pxrs.as_slice(), successor_snapshot.canonical_wire());
+        assert_eq!(
+            successor_pxrs.as_slice(),
+            successor_snapshot.canonical_wire()
+        );
         let successor_pxrj = fs::read(&pxrj_path)
             .unwrap_or_else(|error| panic!("successor PXRJ readback failed: {error}"));
         let successor_pxrj_inode = fs::metadata(&pxrj_path)
@@ -10226,10 +10227,7 @@ mod tests {
             if published {
                 assert_ne!(disk_pxrs, prepared_pxrs);
                 assert_ne!(disk_pxrs_inode, prepared_pxrs_inode);
-                assert_eq!(
-                    exact.phase(),
-                    RemoteAgentAccessDurablePhaseV2::S1OpenIntent,
-                );
+                assert_eq!(exact.phase(), RemoteAgentAccessDurablePhaseV2::S1OpenIntent,);
                 assert_eq!(
                     exact.sequence(),
                     prepared_sequence
@@ -10679,7 +10677,7 @@ mod tests {
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
                     assert_eq!(pxrj.revision(), 2);
                     assert_eq!(pxrj.applied_burn_ordinal(), 0);
-                    assert_eq!(pxrj.burn_count(), 0);
+                    assert_eq!(pxrj.burn_count(), 1);
                     assert_eq!(pxrj.pending_source_snapshot_sequence(), Some(1));
                 }
                 JournalExpectation::CommittedStable => {
@@ -10761,11 +10759,11 @@ mod tests {
         );
         assert!(matches!(
             mapped,
-            RuntimeControlRequestError::Internal(
-                RuntimeBootstrapEndpointError::ManagedFabric(ManagedFabricRuntimeError::Store(
+            RuntimeControlRequestError::Internal(RuntimeBootstrapEndpointError::ManagedFabric(
+                ManagedFabricRuntimeError::Store(
                     ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
-                )),
-            )
+                )
+            ),)
         ));
 
         let source = include_str!("runtime_control_endpoint.rs");
