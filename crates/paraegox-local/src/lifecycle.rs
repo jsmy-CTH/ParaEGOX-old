@@ -2771,10 +2771,8 @@ mod tests {
     fn client_transport_accepts_only_peer_closed_write_half_shutdown() {
         assert!(accept_client_write_half_shutdown(Ok(())).is_ok());
         assert!(
-            accept_client_write_half_shutdown(Err(io::Error::from(
-                io::ErrorKind::NotConnected
-            )))
-            .is_ok()
+            accept_client_write_half_shutdown(Err(io::Error::from(io::ErrorKind::NotConnected)))
+                .is_ok()
         );
 
         for kind in [
@@ -2844,9 +2842,8 @@ mod tests {
             let request = encode_internal_request(InternalActionV1::Status, commitment);
             let (mut client, mut server) =
                 UnixStream::pair().expect("connected EOF transport pair");
-            let mut reader = tokio::spawn(async move {
-                read_internal_request(&mut server, commitment).await
-            });
+            let mut reader =
+                tokio::spawn(async move { read_internal_request(&mut server, commitment).await });
             client
                 .write_all(&request)
                 .await
