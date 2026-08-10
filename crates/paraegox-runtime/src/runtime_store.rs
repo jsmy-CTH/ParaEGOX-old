@@ -11713,7 +11713,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remote_agent_access_v2_replacement_postpublish_failure_reopens_pair_for_reconcile_without_candidate()
-    {
+     {
         let (directory, mut store, initial, pending, static_identity, runtime_host_epoch) =
             remote_agent_access_prepared_store_fixture_v2();
         let absent = remote_agent_access_absent_lease_v2(
