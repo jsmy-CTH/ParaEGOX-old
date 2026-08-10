@@ -941,7 +941,7 @@ pub(crate) fn locate_local_tui_attach(
     config: &LocalManagedChatConfigV1,
 ) -> Result<LocalTuiAttachLocatorV1, LocalProcessError> {
     validate_execution_identity()?;
-    let status = observe(config)?;
+    let status = observe(config).map_err(classify_tui_status_observation_error)?;
     if status.diagnostic().is_some_and(|diagnostic| {
         diagnostic.code() == LocalProcessError::LifecycleConfiguration.code()
     }) {
@@ -967,6 +967,14 @@ pub(crate) fn locate_local_tui_attach(
             }
             Ok(None) | Err(_) => Err(LocalProcessError::LocalTuiLocator),
         },
+    }
+}
+
+fn classify_tui_status_observation_error(error: LocalProcessError) -> LocalProcessError {
+    if error == LocalProcessError::LifecycleConfiguration {
+        LocalProcessError::LifecycleConfiguration
+    } else {
+        LocalProcessError::LocalTuiLocator
     }
 }
 
@@ -3915,11 +3923,35 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) fn encode_local_tui_handoff(").next())
             .expect("bounded TUI locator read source");
-        assert_eq!(locator_read.matches("observe(config)?").count(), 1);
+        assert_eq!(
+            locator_read
+                .matches("observe(config).map_err(classify_tui_status_observation_error)?")
+                .count(),
+            1
+        );
         assert_eq!(locator_read.matches("query_local_tui_attach(").count(), 1);
         assert!(!locator_read.contains("run_up("));
         assert!(!locator_read.contains("run_down("));
         assert!(!locator_read.contains("loop {"));
+    }
+
+    #[test]
+    fn tui_status_observation_errors_use_only_the_admitted_public_taxonomy() {
+        assert_eq!(
+            classify_tui_status_observation_error(LocalProcessError::LifecycleConfiguration),
+            LocalProcessError::LifecycleConfiguration
+        );
+        for error in [
+            LocalProcessError::LifecycleState,
+            LocalProcessError::LifecycleControl,
+            LocalProcessError::LifecycleUnavailable,
+            LocalProcessError::LifecycleReconcileRequired,
+        ] {
+            assert_eq!(
+                classify_tui_status_observation_error(error),
+                LocalProcessError::LocalTuiLocator
+            );
+        }
     }
 
     #[test]

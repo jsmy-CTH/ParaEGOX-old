@@ -205,10 +205,11 @@ mod platform {
         MAX_REFERENCE_QUERY_RESPONSE_BYTES, ReferenceAdmissionPolicyInputV1,
         ReferenceApplyTerminalHeadV1, ReferenceApplyTerminalLifecycleEffectV1,
         ReferenceApplyTerminalOutcomeV1, ReferenceBootstrapChannelPolicyInputV1,
-        ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1, ReferenceQueryIdV1,
-        ReferenceQueryRequestDraftV1, ReferenceQueryRequestV1, ReferenceQueryResponseV1,
-        ReferenceQuerySelectorV1, ValidatedReferenceLifecycleBudgetsV1,
-        ed25519_control_key_fingerprint, reference_admission_policy_fingerprint_v1,
+        ReferenceBootstrapResponseV1, ReferenceBootstrapServingIdentityV1,
+        ReferenceBootstrapStateV1, ReferenceQueryIdV1, ReferenceQueryRequestDraftV1,
+        ReferenceQueryRequestV1, ReferenceQueryResponseV1, ReferenceQuerySelectorV1,
+        ValidatedReferenceLifecycleBudgetsV1, ed25519_control_key_fingerprint,
+        reference_admission_policy_fingerprint_v1,
         reference_bootstrap_channel_policy_fingerprint_v1,
     };
     use paraegox_runtime_contracts::wire::{
@@ -3969,6 +3970,7 @@ mod platform {
             ProcessCommand::CommitReferenceLoop(arguments) => commit_reference_loop(arguments),
             ProcessCommand::CommitReferenceEmpty(arguments) => commit_reference_empty(arguments),
             ProcessCommand::AcquireTenure(arguments) => acquire_tenure(arguments),
+            ProcessCommand::TurnoverTenure(arguments) => turnover_tenure(arguments),
             ProcessCommand::BootstrapRuntime(arguments) => bootstrap_runtime(arguments),
             ProcessCommand::ObserveManagedServing(arguments) => observe_managed_serving(arguments),
             ProcessCommand::CommitAgentStack(arguments) => commit_agent_stack(*arguments),
@@ -4440,6 +4442,37 @@ mod platform {
         // This S7-E command is deliberately ensure-once, not a writer-turnover
         // surface. It replays only the globally current matching transaction;
         // another writer's later committed epoch fences this invocation.
+        acquire_tenure_with_mode(arguments, TenureAcquisitionMode::EnsureOnce)
+    }
+
+    fn turnover_tenure(arguments: TurnoverTenureArguments) -> Result<(), DeploymentdProcessError> {
+        acquire_tenure_with_mode(
+            arguments.acquire,
+            TenureAcquisitionMode::Turnover(AcquireTenureOperationId::from_bytes(
+                arguments.operation_id,
+            )),
+        )
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TenureAcquisitionMode {
+        EnsureOnce,
+        Turnover(AcquireTenureOperationId),
+    }
+
+    impl TenureAcquisitionMode {
+        const fn receipt_header(self) -> &'static str {
+            match self {
+                Self::EnsureOnce => "controller_acquire_tenure_v1",
+                Self::Turnover(_) => "controller_turnover_tenure_v1",
+            }
+        }
+    }
+
+    fn acquire_tenure_with_mode(
+        arguments: AcquireTenureArguments,
+        mode: TenureAcquisitionMode,
+    ) -> Result<(), DeploymentdProcessError> {
         validate_service_identity(arguments.common.expected_uid, arguments.common.expected_gid)?;
         validate_tenure_separation(&arguments)?;
 
@@ -4536,30 +4569,76 @@ mod platform {
             let snapshot = store
                 .snapshot()
                 .map_err(|_| process_error(ProcessErrorKind::Store))?;
-            let unresolved = snapshot
-                .state()
-                .current_unresolved_tenure_transaction()
-                .map_err(|_| process_error(ProcessErrorKind::Tenure))?;
-            let global_latest_committed = if unresolved.is_none() {
-                snapshot
-                    .state()
-                    .global_latest_committed_tenure_transaction()
-                    .map_err(|_| process_error(ProcessErrorKind::Tenure))?
-            } else {
-                None
-            };
-            match select_durable_tenure_request(
-                unresolved.map(DurableTenureRequest::from),
-                global_latest_committed.map(DurableTenureRequest::from),
-                profile.writer,
-                authority_domain_fingerprint,
-            )? {
-                Some(canonical_request) => {
-                    recover_tenure_request(canonical_request, &profile, &controller_verifying_key)?
+            match mode {
+                TenureAcquisitionMode::EnsureOnce => {
+                    let unresolved = snapshot
+                        .state()
+                        .current_unresolved_tenure_transaction()
+                        .map_err(|_| process_error(ProcessErrorKind::Tenure))?;
+                    let global_latest_committed = if unresolved.is_none() {
+                        snapshot
+                            .state()
+                            .global_latest_committed_tenure_transaction()
+                            .map_err(|_| process_error(ProcessErrorKind::Tenure))?
+                    } else {
+                        None
+                    };
+                    match select_durable_tenure_request(
+                        unresolved.map(DurableTenureRequest::from),
+                        global_latest_committed.map(DurableTenureRequest::from),
+                        profile.writer,
+                        authority_domain_fingerprint,
+                    )? {
+                        Some(canonical_request) => recover_tenure_request(
+                            canonical_request,
+                            &profile,
+                            &controller_verifying_key,
+                        )?,
+                        None => {
+                            validate_fresh_tenure_plan(&arguments, snapshot.state())?;
+                            fresh_tenure_request(&profile, &controller_signer)?
+                        }
+                    }
                 }
-                None => {
-                    validate_fresh_tenure_plan(&arguments, snapshot.state())?;
-                    fresh_tenure_request(&profile, &controller_signer)?
+                TenureAcquisitionMode::Turnover(operation_id) => {
+                    let exact = snapshot
+                        .state()
+                        .tenure_transaction(operation_id)
+                        .map(DurableTenureRequest::from);
+                    let unresolved = snapshot
+                        .state()
+                        .current_unresolved_tenure_transaction()
+                        .map_err(|_| process_error(ProcessErrorKind::Tenure))?
+                        .map(DurableTenureRequest::from);
+                    let global_latest_committed = snapshot
+                        .state()
+                        .global_latest_committed_tenure_transaction()
+                        .map_err(|_| process_error(ProcessErrorKind::Tenure))?
+                        .map(DurableTenureRequest::from);
+                    match select_turnover_tenure_request(
+                        exact,
+                        unresolved,
+                        global_latest_committed,
+                        operation_id,
+                        profile.writer,
+                        authority_domain_fingerprint,
+                    )? {
+                        TurnoverTenureSelection::Recover(canonical_request) => {
+                            recover_tenure_request(
+                                canonical_request,
+                                &profile,
+                                &controller_verifying_key,
+                            )?
+                        }
+                        TurnoverTenureSelection::Fresh(operation_id) => {
+                            validate_turnover_tenure_state(&arguments, snapshot.state())?;
+                            fresh_tenure_request_for_operation(
+                                &profile,
+                                &controller_signer,
+                                operation_id,
+                            )?
+                        }
+                    }
                 }
             }
         };
@@ -4578,6 +4657,7 @@ mod platform {
                 .map_err(|_| process_error(ProcessErrorKind::Store))?,
             operation,
             &acquired,
+            mode.receipt_header(),
         )
     }
 
@@ -4624,6 +4704,48 @@ mod platform {
             return Err(process_error(ProcessErrorKind::Tenure));
         }
         Ok(Some(selected.canonical_request))
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TurnoverTenureSelection<'a> {
+        Recover(&'a [u8]),
+        Fresh(AcquireTenureOperationId),
+    }
+
+    fn select_turnover_tenure_request<'a>(
+        exact_operation: Option<DurableTenureRequest<'a>>,
+        unresolved: Option<DurableTenureRequest<'a>>,
+        global_latest_committed: Option<DurableTenureRequest<'a>>,
+        requested_operation: AcquireTenureOperationId,
+        requested_writer: DeploymentWriterRef,
+        authority_domain_fingerprint: ControllerTenureAuthorityDomainFingerprint,
+    ) -> Result<TurnoverTenureSelection<'a>, DeploymentdProcessError> {
+        if let Some(exact) = exact_operation {
+            validate_durable_tenure_request(exact, requested_writer, authority_domain_fingerprint)?;
+            return Ok(TurnoverTenureSelection::Recover(exact.canonical_request));
+        }
+        if unresolved.is_some() {
+            // A different caller operation cannot replace an already-durable
+            // Prepared/Uncertain request. The caller must resume that exact ID.
+            return Err(process_error(ProcessErrorKind::Tenure));
+        }
+        let latest =
+            global_latest_committed.ok_or_else(|| process_error(ProcessErrorKind::Tenure))?;
+        validate_durable_tenure_request(latest, requested_writer, authority_domain_fingerprint)?;
+        Ok(TurnoverTenureSelection::Fresh(requested_operation))
+    }
+
+    fn validate_durable_tenure_request(
+        request: DurableTenureRequest<'_>,
+        requested_writer: DeploymentWriterRef,
+        authority_domain_fingerprint: ControllerTenureAuthorityDomainFingerprint,
+    ) -> Result<(), DeploymentdProcessError> {
+        if request.writer != requested_writer
+            || request.authority_domain_fingerprint != authority_domain_fingerprint
+        {
+            return Err(process_error(ProcessErrorKind::Tenure));
+        }
+        Ok(())
     }
 
     fn tenure_request_profile(
@@ -4678,6 +4800,46 @@ mod platform {
         Ok(())
     }
 
+    fn validate_turnover_tenure_state(
+        arguments: &AcquireTenureArguments,
+        state: &crate::controller_journal::ControllerJournalState,
+    ) -> Result<(), DeploymentdProcessError> {
+        let scope = DeploymentScopeId::from_bytes(arguments.common.scope);
+        let plan = DeploymentId::from_bytes(arguments.common.plan);
+        let committed = state
+            .committed_plan()
+            .ok_or_else(|| process_error(ProcessErrorKind::Tenure))?;
+        let binding = state
+            .target_binding()
+            .ok_or_else(|| process_error(ProcessErrorKind::Tenure))?;
+        let response = ReferenceBootstrapResponseV1::decode(binding.bootstrap_response())
+            .map_err(|_| process_error(ProcessErrorKind::Tenure))?;
+        let facts = response.facts();
+        if state.scope() != scope
+            || state.plan_lineage() != plan
+            || committed.scope() != scope
+            || committed.plan() != plan
+            || committed.revision().value() != state.current_revision()
+            || committed.target() != state.installed_manifest().target()
+            || committed.content().target() != state.installed_manifest().target()
+            || committed.content().shape() != TargetIntent::OneSourceLoop
+            || committed.content().manifest_digest().value()
+                != state.installed_manifest().manifest_digest()
+            || binding.target() != committed.target()
+            || binding.manifest_digest() != committed.content().manifest_digest()
+            || response.canonical_wire() != binding.bootstrap_response()
+            || response.response_digest() != binding.bootstrap_response_digest().value()
+            || facts.target() != binding.target()
+            || facts.runtime_store_instance_id() != binding.runtime_store_instance_id()
+            || facts.runtime_host_epoch() != binding.last_runtime_host_epoch()
+            || facts.manifest_digest() != binding.manifest_digest().value()
+            || facts.state() != ReferenceBootstrapStateV1::ReadyForApply
+        {
+            return Err(process_error(ProcessErrorKind::Tenure));
+        }
+        Ok(())
+    }
+
     fn recover_tenure_request(
         canonical_request: &[u8],
         profile: &TenureRequestProfile,
@@ -4720,6 +4882,16 @@ mod platform {
         controller_signer: &SigningKey,
     ) -> Result<PreparedAcquireTenureRequest, DeploymentdProcessError> {
         let entropy = read_tenure_entropy()?;
+        fresh_tenure_request_from_entropy(profile, controller_signer, &entropy)
+    }
+
+    fn fresh_tenure_request_for_operation(
+        profile: &TenureRequestProfile,
+        controller_signer: &SigningKey,
+        operation_id: AcquireTenureOperationId,
+    ) -> Result<PreparedAcquireTenureRequest, DeploymentdProcessError> {
+        let mut entropy = read_tenure_entropy()?;
+        entropy[..16].copy_from_slice(operation_id.as_bytes());
         fresh_tenure_request_from_entropy(profile, controller_signer, &entropy)
     }
 
@@ -8522,6 +8694,7 @@ mod platform {
         snapshot: &ControllerJournalSnapshot,
         operation: AcquireTenureOperationId,
         acquired: &ControllerAcquiredTenure,
+        receipt_header: &'static str,
     ) -> Result<(), DeploymentdProcessError> {
         let transaction = snapshot
             .state()
@@ -8542,7 +8715,7 @@ mod platform {
 
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
-        writeln!(output, "controller_acquire_tenure_v1")
+        writeln!(output, "{receipt_header}")
             .map_err(|_| process_error(ProcessErrorKind::Output))?;
         write_labeled_hex(
             &mut output,
@@ -9583,6 +9756,7 @@ mod platform {
         CommitReferenceLoop(CommitArguments),
         CommitReferenceEmpty(CommitEmptyArguments),
         AcquireTenure(AcquireTenureArguments),
+        TurnoverTenure(TurnoverTenureArguments),
         BootstrapRuntime(BootstrapArguments),
         ObserveManagedServing(ManagedServingArguments),
         CommitAgentStack(Box<AgentStackCommitArguments>),
@@ -9655,6 +9829,12 @@ mod platform {
         authority_socket_path: PathBuf,
         authority_uid: u32,
         authority_gid: u32,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TurnoverTenureArguments {
+        acquire: AcquireTenureArguments,
+        operation_id: [u8; 16],
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9802,27 +9982,13 @@ mod platform {
                     operation_id: parse_nonzero_hex(&arguments[9])?,
                 }))
             }
-            "acquire-tenure-v1" if arguments.len() == 18 => {
-                Ok(ProcessCommand::AcquireTenure(AcquireTenureArguments {
-                    common: CommonArguments {
-                        state_directory: parse_absolute_path(&arguments[1])?,
-                        scope: parse_nonzero_hex(&arguments[3])?,
-                        plan: parse_nonzero_hex(&arguments[4])?,
-                        request_auth_key: parse_nonzero_hex(&arguments[5])?,
-                        public_key_path: parse_absolute_file_path(&arguments[6])?,
-                        expected_uid: parse_nonzero_u32(&arguments[8])?,
-                        expected_gid: parse_nonzero_u32(&arguments[9])?,
-                    },
-                    expected_store_id: parse_nonzero_hex(&arguments[2])?,
-                    controller_private_seed_path: parse_absolute_file_path(&arguments[7])?,
-                    controller_principal: parse_nonzero_hex(&arguments[10])?,
-                    writer_ref: parse_nonzero_hex(&arguments[11])?,
-                    tenure_authority_ref: parse_nonzero_hex(&arguments[12])?,
-                    tenure_key_ref: parse_nonzero_hex(&arguments[13])?,
-                    authority_public_key_path: parse_absolute_file_path(&arguments[14])?,
-                    authority_socket_path: parse_absolute_file_path(&arguments[15])?,
-                    authority_uid: parse_nonzero_u32(&arguments[16])?,
-                    authority_gid: parse_nonzero_u32(&arguments[17])?,
+            "acquire-tenure-v1" if arguments.len() == 18 => Ok(ProcessCommand::AcquireTenure(
+                parse_acquire_tenure_arguments(&arguments)?,
+            )),
+            "turnover-tenure-v1" if arguments.len() == 19 => {
+                Ok(ProcessCommand::TurnoverTenure(TurnoverTenureArguments {
+                    acquire: parse_acquire_tenure_arguments(&arguments)?,
+                    operation_id: parse_nonzero_hex(&arguments[18])?,
                 }))
             }
             command @ ("bootstrap-runtime-v1"
@@ -9881,6 +10047,32 @@ mod platform {
             }
             _ => Err(process_error(ProcessErrorKind::Arguments)),
         }
+    }
+
+    fn parse_acquire_tenure_arguments(
+        arguments: &[OsString],
+    ) -> Result<AcquireTenureArguments, DeploymentdProcessError> {
+        Ok(AcquireTenureArguments {
+            common: CommonArguments {
+                state_directory: parse_absolute_path(&arguments[1])?,
+                scope: parse_nonzero_hex(&arguments[3])?,
+                plan: parse_nonzero_hex(&arguments[4])?,
+                request_auth_key: parse_nonzero_hex(&arguments[5])?,
+                public_key_path: parse_absolute_file_path(&arguments[6])?,
+                expected_uid: parse_nonzero_u32(&arguments[8])?,
+                expected_gid: parse_nonzero_u32(&arguments[9])?,
+            },
+            expected_store_id: parse_nonzero_hex(&arguments[2])?,
+            controller_private_seed_path: parse_absolute_file_path(&arguments[7])?,
+            controller_principal: parse_nonzero_hex(&arguments[10])?,
+            writer_ref: parse_nonzero_hex(&arguments[11])?,
+            tenure_authority_ref: parse_nonzero_hex(&arguments[12])?,
+            tenure_key_ref: parse_nonzero_hex(&arguments[13])?,
+            authority_public_key_path: parse_absolute_file_path(&arguments[14])?,
+            authority_socket_path: parse_absolute_file_path(&arguments[15])?,
+            authority_uid: parse_nonzero_u32(&arguments[16])?,
+            authority_gid: parse_nonzero_u32(&arguments[17])?,
+        })
     }
 
     fn parse_managed_serving_arguments(
@@ -10290,14 +10482,14 @@ mod platform {
             DistributedRestrictedControllerConnectorCapabilityV1, DurableTenureRequest,
             FileLengthPolicy, FileRole, FreshControllerApplyRequestV1, ManagedServingArguments,
             ProcessCommand, ProcessErrorKind, TENURE_ENTROPY_BYTES, TenureRequestProfile,
-            acquire_developer_tenure_once, build_empty_commit_receipt, build_reference_candidate,
-            build_reference_empty_candidate, commit_reference_empty_in_store,
-            developer_agent_bootstrap_service_plan,
+            TurnoverTenureSelection, acquire_developer_tenure_once, build_empty_commit_receipt,
+            build_reference_candidate, build_reference_empty_candidate,
+            commit_reference_empty_in_store, developer_agent_bootstrap_service_plan,
             distributed_owner_terminal_runtime_observation_is_admissible,
             fresh_apply_request_from_entropy, fresh_tenure_request_from_entropy, parse_arguments,
             parse_nonzero_hex, read_pinned_file, recover_tenure_request,
-            select_durable_tenure_request, validate_committed_empty_state,
-            validate_developer_agent_bootstrap_desired,
+            select_durable_tenure_request, select_turnover_tenure_request,
+            validate_committed_empty_state, validate_developer_agent_bootstrap_desired,
         };
         use crate::controller_initializer::{
             ControllerInitializationInput, initialize_controller_store_developer_local,
@@ -10320,7 +10512,7 @@ mod platform {
         use crate::plan::{DeploymentId, DeploymentScopeId, DeploymentWriterRef};
         use crate::planner::StableAllocationSnapshot;
         use crate::tenure_protocol::{
-            ControllerAcquireKeyRef, ControllerPublicKeyFingerprint,
+            AcquireTenureOperationId, ControllerAcquireKeyRef, ControllerPublicKeyFingerprint,
             MAX_ACQUIRE_TENURE_RESPONSE_PAYLOAD_BYTES,
         };
 
@@ -10508,6 +10700,13 @@ mod platform {
                 "502".into(),
                 "21".into(),
             ]
+        }
+
+        fn turnover_tenure_arguments(operation: u8) -> Vec<OsString> {
+            let mut arguments = tenure_arguments();
+            arguments[0] = "turnover-tenure-v1".into();
+            arguments.push(hex(operation, 16));
+            arguments
         }
 
         fn migration_arguments() -> Vec<OsString> {
@@ -10912,6 +11111,23 @@ mod platform {
                 ProcessErrorKind::Arguments
             );
 
+            let turnover = turnover_tenure_arguments(0x5a);
+            let parsed_turnover = parse_arguments(turnover.clone())
+                .expect("turnover must accept one caller-stable operation ID");
+            let ProcessCommand::TurnoverTenure(parsed_turnover) = parsed_turnover else {
+                panic!("turnover parsed as a different command");
+            };
+            assert_eq!(parsed_turnover.operation_id, [0x5a; 16]);
+            let mut missing_turnover_operation = turnover.clone();
+            missing_turnover_operation.pop();
+            assert!(parse_arguments(missing_turnover_operation).is_err());
+            let mut extra_turnover = turnover;
+            extra_turnover.push(hex(0x5b, 16));
+            assert!(parse_arguments(extra_turnover).is_err());
+            let mut zero_turnover_operation = turnover_tenure_arguments(0x5a);
+            zero_turnover_operation[18] = hex(0, 16);
+            assert!(parse_arguments(zero_turnover_operation).is_err());
+
             let mut missing = initialize_arguments();
             missing.pop();
             assert!(parse_arguments(missing).is_err());
@@ -11115,6 +11331,115 @@ mod platform {
                     .kind,
                 ProcessErrorKind::Tenure
             );
+        }
+
+        #[test]
+        fn tenure_turnover_selection_replays_exact_id_and_admits_only_resolved_successor() {
+            let writer_a = DeploymentWriterRef::from_bytes([0x81; 16]);
+            let writer_b = DeploymentWriterRef::from_bytes([0x82; 16]);
+            let domain_a = ControllerTenureAuthorityDomainFingerprint::from_stored(
+                Digest32::from_bytes([0x83; 32]),
+            );
+            let domain_b = ControllerTenureAuthorityDomainFingerprint::from_stored(
+                Digest32::from_bytes([0x84; 32]),
+            );
+            let committed = DurableTenureRequest {
+                canonical_request: b"writer-a-epoch-1",
+                writer: writer_a,
+                authority_domain_fingerprint: domain_a,
+            };
+            let unresolved = DurableTenureRequest {
+                canonical_request: b"writer-a-epoch-2-unresolved",
+                writer: writer_a,
+                authority_domain_fingerprint: domain_a,
+            };
+            let other_writer = DurableTenureRequest {
+                canonical_request: b"writer-b-epoch-2",
+                writer: writer_b,
+                authority_domain_fingerprint: domain_a,
+            };
+            let operation = AcquireTenureOperationId::from_bytes([0x85; 16]);
+
+            assert_eq!(
+                select_turnover_tenure_request(
+                    Some(unresolved),
+                    Some(unresolved),
+                    Some(committed),
+                    operation,
+                    writer_a,
+                    domain_a,
+                ),
+                Ok(TurnoverTenureSelection::Recover(
+                    unresolved.canonical_request
+                )),
+                "an exact caller ID resumes its byte-identical unresolved request"
+            );
+            assert_eq!(
+                select_turnover_tenure_request(
+                    Some(committed),
+                    None,
+                    Some(committed),
+                    operation,
+                    writer_a,
+                    domain_a,
+                ),
+                Ok(TurnoverTenureSelection::Recover(
+                    committed.canonical_request
+                )),
+                "an exact committed caller ID replays without allocating a successor"
+            );
+            assert_eq!(
+                select_turnover_tenure_request(
+                    None,
+                    None,
+                    Some(committed),
+                    operation,
+                    writer_a,
+                    domain_a,
+                ),
+                Ok(TurnoverTenureSelection::Fresh(operation)),
+                "a different ID may create one successor only after prior work resolves"
+            );
+            assert_eq!(
+                select_turnover_tenure_request(
+                    None,
+                    Some(unresolved),
+                    Some(committed),
+                    operation,
+                    writer_a,
+                    domain_a,
+                )
+                .expect_err("a different ID cannot replace unresolved authority")
+                .kind,
+                ProcessErrorKind::Tenure
+            );
+            assert_eq!(
+                select_turnover_tenure_request(None, None, None, operation, writer_a, domain_a,)
+                    .expect_err("turnover requires an existing committed tenure")
+                    .kind,
+                ProcessErrorKind::Tenure
+            );
+            for latest in [
+                DurableTenureRequest {
+                    authority_domain_fingerprint: domain_b,
+                    ..committed
+                },
+                other_writer,
+            ] {
+                assert_eq!(
+                    select_turnover_tenure_request(
+                        None,
+                        None,
+                        Some(latest),
+                        operation,
+                        writer_a,
+                        domain_a,
+                    )
+                    .expect_err("writer or Authority-domain drift must fail closed")
+                    .kind,
+                    ProcessErrorKind::Tenure
+                );
+            }
         }
 
         #[test]

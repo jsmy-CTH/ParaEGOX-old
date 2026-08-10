@@ -88,13 +88,14 @@ jobs:
           grep -Fqx '       paraegox down --config <absolute-paraegox.toml> --json' "$help_output"
           grep -Fqx '       paraegox deploy --local --config <absolute-paraegox.toml> --json' "$help_output"
           grep -Fqx '       paraegox inspection snapshot --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox tui --config <absolute-paraegox.toml>' "$help_output"
           grep -Fqx '       paraegox node --config <absolute-paraegox-node.toml>' "$help_output"
           grep -Fqx '       paraegox deployment --config <absolute-paraegox-deployment.toml>' "$help_output"
           grep -Fqx '       paraegox version --json' "$help_output"
           grep -Fqx '       paraegox config check <chat|node|deployment> --config <absolute-config.toml> --json' "$help_output"
           grep -Fqx '       paraegox doctor <chat|node|deployment> --config <absolute-config.toml> --offline --json' "$help_output"
           grep -Fqx '       paraegox --help' "$help_output"
-          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 13
+          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 14
 
           version_json="$RUNNER_TEMP/paraegox-version.json"
           init_first_json="$RUNNER_TEMP/paraegox-init-first.json"
@@ -104,6 +105,8 @@ jobs:
           deploy_grammar_json="$RUNNER_TEMP/paraegox-deploy-grammar.json"
           inspection_not_running_json="$RUNNER_TEMP/paraegox-inspection-not-running.json"
           inspection_grammar_json="$RUNNER_TEMP/paraegox-inspection-grammar.json"
+          tui_not_running_stdout="$RUNNER_TEMP/paraegox-tui-not-running.stdout"
+          tui_grammar_stdout="$RUNNER_TEMP/paraegox-tui-grammar.stdout"
           config_json="$RUNNER_TEMP/paraegox-config-check.json"
           doctor_json="$RUNNER_TEMP/paraegox-doctor.json"
           invalid_json="$RUNNER_TEMP/paraegox-invalid-config.json"
@@ -113,6 +116,8 @@ jobs:
           deploy_grammar_stderr="$RUNNER_TEMP/paraegox-deploy-grammar.stderr"
           inspection_not_running_stderr="$RUNNER_TEMP/paraegox-inspection-not-running.stderr"
           inspection_grammar_stderr="$RUNNER_TEMP/paraegox-inspection-grammar.stderr"
+          tui_not_running_stderr="$RUNNER_TEMP/paraegox-tui-not-running.stderr"
+          tui_grammar_stderr="$RUNNER_TEMP/paraegox-tui-grammar.stderr"
           config_stderr="$RUNNER_TEMP/paraegox-config-check.stderr"
           doctor_stderr="$RUNNER_TEMP/paraegox-doctor.stderr"
           invalid_stderr="$RUNNER_TEMP/paraegox-invalid-config.stderr"
@@ -216,6 +221,43 @@ jobs:
           set -e
           test "$inspection_grammar_status" -eq 2
           test ! -s "$inspection_grammar_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='tui poison Secret value' \
+            DEEPSEEK_API_KEY='tui poison Secret value' \
+            PARAEGOX_M5A_UNLISTED_CANARY='tui environment canary value' \
+            "$binary" tui --help \
+              > "$tui_grammar_stdout" 2> "$tui_grammar_stderr"
+          tui_grammar_status=$?
+          set -e
+          test "$tui_grammar_status" -eq 2
+          test ! -s "$tui_grammar_stdout"
+          test "$(wc -l < "$tui_grammar_stderr" | tr -d ' ')" -eq 1
+          grep -Fqx \
+            'paraegox: code=PXLC-TUI-GRAMMAR message=tui requires exactly --config <absolute-paraegox.toml>' \
+            "$tui_grammar_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='tui poison Secret value' \
+            DEEPSEEK_API_KEY='tui poison Secret value' \
+            PARAEGOX_M5A_UNLISTED_CANARY='tui environment canary value' \
+            "$binary" tui --config "$offline_config" \
+              > "$tui_not_running_stdout" 2> "$tui_not_running_stderr"
+          tui_not_running_status=$?
+          set -e
+          test "$tui_not_running_status" -eq 1
+          test ! -s "$tui_not_running_stdout"
+          test "$(wc -l < "$tui_not_running_stderr" | tr -d ' ')" -eq 1
+          grep -Fqx \
+            'paraegox: code=PXLC-TUI-NOT-RUNNING message=local TUI requires the current owner generation to be running' \
+            "$tui_not_running_stderr"
+          if grep -Fq \
+            -e 'tui poison Secret value' \
+            -e 'tui environment canary value' \
+            "$tui_grammar_stderr" "$tui_not_running_stderr"; then
+            printf 'TUI pre-effect diagnostic leaked a Secret or environment canary\n' >&2
+            exit 1
+          fi
           test ! -e "$offline_state_root"
           OPENAI_API_KEY='offline poison Secret value' \
             DEEPSEEK_API_KEY='offline poison Secret value' \
@@ -504,7 +546,7 @@ jobs:
             exit 1
           fi
 
-          if grep -Eq 'paraegox-local|developer-|fixture-v1|openai-v1|deepseek-v1|__node-daemon-child-v1|--node-bootstrap-file|--node-observation-bootstrap-file' "$help_output"; then
+          if grep -Eq 'paraegox-local|developer-|fixture-v1|openai-v1|deepseek-v1|__node-daemon-child-v1|--node-bootstrap-file|--node-observation-bootstrap-file|--tui-attach-fd' "$help_output"; then
             printf 'hidden or legacy CLI surface is still exposed\n' >&2
             exit 1
           fi
@@ -864,6 +906,362 @@ jobs:
           PATH="$smoke_python_prefix/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
             "$smoke_python" scripts/smoke_macos_textual_chat.py \
               --bundle-dir "$relocated_bundle"
+
+      - name: Smoke bounded macOS artifact TUI attachment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          M5A_BUNDLE="$PWD/artifact" \
+            uv run --frozen python - <<'PY'
+          from __future__ import annotations
+
+          import errno
+          import fcntl
+          import json
+          import os
+          import select
+          import signal
+          import socket
+          import stat
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          import termios
+          import time
+          from contextlib import suppress
+          from pathlib import Path
+
+          START_TIMEOUT_SECONDS = 45.0
+          REPLY_TIMEOUT_SECONDS = 45.0
+          EXIT_TIMEOUT_SECONDS = 20.0
+          COMMAND_TIMEOUT_SECONDS = 180.0
+          MAX_CAPTURE_BYTES = 2 * 1024 * 1024
+          TEXTUAL_TERMINAL_RESTORE = b"\x1b[?1049l"
+          MESSAGE = "m5a-artifact-attach-echo"
+          OPENAI_CANARY = "m5a macOS OPENAI Secret canary"
+          DEEPSEEK_CANARY = "m5a macOS DEEPSEEK Secret canary"
+          ENVIRONMENT_CANARY = "m5a macOS unlisted environment canary"
+
+
+          def require_bundle() -> tuple[Path, Path]:
+              root = Path(os.environ["M5A_BUNDLE"]).resolve(strict=True)
+              binary = root / "paraegox"
+              launcher = root / "paraegox-console"
+              for path in (binary, launcher):
+                  metadata = path.lstat()
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or path.is_symlink()
+                      or metadata.st_mode & 0o111 == 0
+                  ):
+                      raise RuntimeError("artifact TUI executable identity is unsafe")
+              if not (root / "python" / "paraegox_sdk").is_dir():
+                  raise RuntimeError("artifact TUI Python payload is incomplete")
+              return root, binary
+
+
+          def exact_json_line(raw: bytes) -> dict[str, object]:
+              if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+                  raise RuntimeError("lifecycle output was not one JSON line")
+              value = json.loads(raw)
+              if not isinstance(value, dict):
+                  raise RuntimeError("lifecycle output was not a JSON object")
+              canonical = json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ).encode() + b"\n"
+              if raw != canonical:
+                  raise RuntimeError("lifecycle output was not canonical JSON")
+              return value
+
+
+          def run_json(
+              binary: Path,
+              environment: dict[str, str],
+              *arguments: str,
+          ) -> dict[str, object]:
+              completed = subprocess.run(
+                  [os.fspath(binary), *arguments],
+                  cwd=binary.parent,
+                  env=environment,
+                  stdin=subprocess.DEVNULL,
+                  capture_output=True,
+                  timeout=COMMAND_TIMEOUT_SECONDS,
+                  check=False,
+              )
+              output = completed.stdout + completed.stderr
+              if any(
+                  value.encode() in output
+                  for value in (OPENAI_CANARY, DEEPSEEK_CANARY, ENVIRONMENT_CANARY)
+              ):
+                  raise RuntimeError("artifact lifecycle output exposed a canary")
+              if completed.returncode != 0 or completed.stderr:
+                  raise RuntimeError("artifact lifecycle command failed closed")
+              return exact_json_line(completed.stdout)
+
+
+          def bounded_append(capture: bytearray, chunk: bytes) -> None:
+              capture.extend(chunk)
+              if len(capture) > MAX_CAPTURE_BYTES:
+                  del capture[: len(capture) - MAX_CAPTURE_BYTES]
+
+
+          def read_once(master_fd: int, capture: bytearray, timeout: float) -> bool:
+              ready, _, _ = select.select([master_fd], [], [], timeout)
+              if not ready:
+                  return False
+              try:
+                  chunk = os.read(master_fd, 65_536)
+              except OSError as error:
+                  if error.errno == errno.EIO:
+                      return False
+                  raise
+              if not chunk:
+                  return False
+              bounded_append(capture, chunk)
+              return True
+
+
+          def read_until(
+              master_fd: int,
+              process: subprocess.Popen[bytes],
+              capture: bytearray,
+              marker: bytes,
+              timeout_seconds: float,
+          ) -> None:
+              deadline = time.monotonic() + timeout_seconds
+              while marker not in capture:
+                  if process.poll() is not None:
+                      raise RuntimeError("artifact TUI exited before its expected marker")
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("artifact TUI marker deadline expired")
+                  read_once(master_fd, capture, 0.2)
+
+
+          def wait_for_exit(
+              master_fd: int,
+              process: subprocess.Popen[bytes],
+              capture: bytearray,
+          ) -> None:
+              deadline = time.monotonic() + EXIT_TIMEOUT_SECONDS
+              while process.poll() is None:
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("artifact TUI exit deadline expired")
+                  read_once(master_fd, capture, 0.2)
+              while read_once(master_fd, capture, 0):
+                  pass
+              if process.returncode != 0:
+                  raise RuntimeError("artifact TUI did not detach successfully")
+
+
+          def child_terminal_setup() -> None:
+              os.setsid()
+              fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+          def assert_no_canary_or_private_path(
+              capture: bytes,
+              config: Path,
+              state_root: Path,
+          ) -> None:
+              forbidden = (
+                  os.fsencode(config),
+                  os.fsencode(state_root),
+                  OPENAI_CANARY.encode(),
+                  DEEPSEEK_CANARY.encode(),
+                  ENVIRONMENT_CANARY.encode(),
+                  b"OPENAI_API_KEY",
+                  b"DEEPSEEK_API_KEY",
+                  b"SecretRef",
+                  b"Traceback",
+              )
+              if any(value in capture for value in forbidden):
+                  raise RuntimeError("artifact TUI output exposed private input")
+
+
+          bundle, binary = require_bundle()
+          base_python = Path(sys.base_prefix) / "bin" / "python3"
+          if not base_python.is_file():
+              raise RuntimeError("Python 3.11 base interpreter is unavailable")
+          environment = os.environ.copy()
+          environment.pop("PYTHONPATH", None)
+          environment.pop("VIRTUAL_ENV", None)
+          environment["PATH"] = os.pathsep.join(
+              (
+                  os.fspath(base_python.parent),
+                  "/usr/bin",
+                  "/bin",
+                  "/usr/sbin",
+                  "/sbin",
+              )
+          )
+          environment["TERM"] = "xterm-256color"
+          environment["COLUMNS"] = "120"
+          environment["LINES"] = "34"
+          environment["OPENAI_API_KEY"] = OPENAI_CANARY
+          environment["DEEPSEEK_API_KEY"] = DEEPSEEK_CANARY
+          environment["PARAEGOX_M5A_UNLISTED_CANARY"] = ENVIRONMENT_CANARY
+
+          temporary_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+          with tempfile.TemporaryDirectory(
+              prefix="pxm5a-",
+              dir=temporary_parent,
+          ) as temporary:
+              root = Path(temporary).resolve(strict=True)
+              workspace = root / "w"
+              config = workspace / "paraegox.toml"
+              state_root = workspace / "state"
+              process: subprocess.Popen[bytes] | None = None
+              owner_running = False
+              master_fd = -1
+              observer_fd = -1
+              try:
+                  with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                      probe.bind(("127.0.0.1", 7447))
+                  initialized = run_json(
+                      binary,
+                      environment,
+                      "init",
+                      "--directory",
+                      os.fspath(workspace),
+                      "--json",
+                  )
+                  if initialized.get("ok") is not True or state_root.exists():
+                      raise RuntimeError("artifact init did not remain pre-state")
+                  started = run_json(
+                      binary,
+                      environment,
+                      "up",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  owner_running = True
+                  generation = started.get("generation")
+                  if started.get("state") != "running" or not isinstance(generation, str):
+                      raise RuntimeError("artifact owner did not reach Running")
+                  before = run_json(
+                      binary,
+                      environment,
+                      "status",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  if before.get("state") != "running" or before.get("generation") != generation:
+                      raise RuntimeError("artifact owner generation was not stable")
+
+                  master_fd, slave_fd = os.openpty()
+                  fcntl.ioctl(
+                      slave_fd,
+                      termios.TIOCSWINSZ,
+                      struct.pack("HHHH", 34, 120, 0, 0),
+                  )
+                  observer_fd = os.dup(slave_fd)
+                  original_terminal = termios.tcgetattr(observer_fd)
+                  process = subprocess.Popen(
+                      [
+                          os.fspath(binary),
+                          "tui",
+                          "--config",
+                          os.fspath(config),
+                      ],
+                      cwd=bundle,
+                      env=environment,
+                      stdin=slave_fd,
+                      stdout=slave_fd,
+                      stderr=slave_fd,
+                      preexec_fn=child_terminal_setup,
+                  )
+                  os.close(slave_fd)
+                  capture = bytearray()
+                  read_until(
+                      master_fd,
+                      process,
+                      capture,
+                      b"System: connected",
+                      START_TIMEOUT_SECONDS,
+                  )
+                  for marker in (b"Inspection cache", b"NodeDaemon", b"r1"):
+                      read_until(
+                          master_fd,
+                          process,
+                          capture,
+                          marker,
+                          START_TIMEOUT_SECONDS,
+                      )
+                  os.write(master_fd, f"{MESSAGE}\r".encode())
+                  read_until(
+                      master_fd,
+                      process,
+                      capture,
+                      f"echo: {MESSAGE}".encode(),
+                      REPLY_TIMEOUT_SECONDS,
+                  )
+                  os.write(master_fd, b"\x1b")
+                  wait_for_exit(master_fd, process, capture)
+                  if termios.tcgetattr(observer_fd) != original_terminal:
+                      raise RuntimeError("artifact TUI did not restore terminal attributes")
+                  if TEXTUAL_TERMINAL_RESTORE not in capture:
+                      raise RuntimeError("artifact TUI did not restore the alternate screen")
+                  assert_no_canary_or_private_path(bytes(capture), config, state_root)
+
+                  after = run_json(
+                      binary,
+                      environment,
+                      "status",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  if after.get("state") != "running" or after.get("generation") != generation:
+                      raise RuntimeError("artifact TUI detach changed owner generation")
+                  stopped = run_json(
+                      binary,
+                      environment,
+                      "down",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  owner_running = False
+                  if stopped.get("state") != "stopped":
+                      raise RuntimeError("artifact owner did not join after down")
+                  if any(
+                      stat.S_ISSOCK(path.lstat().st_mode)
+                      for path in state_root.rglob("*")
+                  ):
+                      raise RuntimeError("artifact owner down retained a Unix socket")
+              finally:
+                  if process is not None and process.poll() is None:
+                      with suppress(ProcessLookupError):
+                          os.killpg(process.pid, signal.SIGTERM)
+                      with suppress(subprocess.TimeoutExpired):
+                          process.wait(timeout=5.0)
+                      if process.poll() is None:
+                          with suppress(ProcessLookupError):
+                              os.killpg(process.pid, signal.SIGKILL)
+                          process.wait(timeout=5.0)
+                  if master_fd >= 0:
+                      os.close(master_fd)
+                  if observer_fd >= 0:
+                      os.close(observer_fd)
+                  if owner_running:
+                      with suppress(Exception):
+                          run_json(
+                              binary,
+                              environment,
+                              "down",
+                              "--config",
+                              os.fspath(config),
+                              "--json",
+                          )
+
+          print("macOS artifact TUI light smoke completed")
+          PY
 
       - name: Checksum the complete bundle
         shell: bash

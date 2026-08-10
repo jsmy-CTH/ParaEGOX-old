@@ -193,6 +193,29 @@ def test_only_the_two_real_process_facades_are_promoted() -> None:
     assert symbols == PUBLIC_DEPLOYMENTD_SYMBOLS
 
 
+def test_turnover_tenure_is_an_exact_owned_replay_surface() -> None:
+    process_source = _read_required(DEPLOYMENT_SRC / "deployment_process.rs")
+    production_source = process_source.split("#[cfg(test)]", maxsplit=1)[0]
+    tenure_surface = production_source.split("fn acquire_tenure(", maxsplit=1)[1].split(
+        "fn bootstrap_runtime(", maxsplit=1
+    )[0]
+
+    assert '"acquire-tenure-v1" if arguments.len() == 18' in production_source
+    assert '"turnover-tenure-v1" if arguments.len() == 19' in production_source
+    assert "operation_id: parse_nonzero_hex(&arguments[18])?" in production_source
+    assert "TenureAcquisitionMode::EnsureOnce" in tenure_surface
+    assert "TenureAcquisitionMode::Turnover" in tenure_surface
+    assert "UnixTenureAuthorityClient::try_new" in tenure_surface
+    assert "ControllerStore::open" in tenure_surface
+    assert ".tenure_transaction(operation_id)" in tenure_surface
+    assert "if let Some(exact) = exact_operation" in tenure_surface
+    assert "if unresolved.is_some()" in tenure_surface
+    assert "global_latest_committed" in tenure_surface
+    assert "validate_durable_tenure_request" in tenure_surface
+    assert "validate_turnover_tenure_state" in tenure_surface
+    assert "ReferenceBootstrapStateV1::ReadyForApply" in tenure_surface
+
+
 def test_governance_claims_exact_one_shot_controller_vertical_without_second_restart_owner(
 ) -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
@@ -209,7 +232,8 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "paraegox_deployment::run_deploymentd_process",
         (
             "paraegox-deploymentd initialize-reference-v1/commit-reference-loop-v1/"
-            "commit-reference-empty-v1/acquire-tenure-v1/bootstrap-runtime-v1/"
+            "commit-reference-empty-v1/acquire-tenure-v1/turnover-tenure-v1/"
+            "bootstrap-runtime-v1/"
             "apply-reference-v1/reconcile-reference-once-v1/"
             "migrate-controller-journal-v7-to-v8-v1/"
             "initialize-distributed-agent-stack-v1/"
@@ -231,6 +255,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "commit-reference-loop-v1",
         "commit-reference-empty-v1",
         "acquire-tenure-v1",
+        "turnover-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
         "reconcile-reference-once-v1",
@@ -248,6 +273,13 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
     assert "bootstrap refresh may legitimately pin a newer Runtime epoch" in package[
         "responsibility"
     ]
+    assert "It remains ensure-once after a committed tenure" in package["responsibility"]
+    assert "one caller-stable nonzero 16-byte operation ID" in package["responsibility"]
+    assert "a different ID cannot overtake unresolved work" in package["responsibility"]
+    assert "fully cross-pinned durable Runtime bootstrap binding" in package["responsibility"]
+    assert "not a fresh Runtime liveness probe" in package["responsibility"]
+    assert "automatic restart detector" in package["responsibility"]
+    assert "second restart/reassembly authority" in package["responsibility"]
     assert "committed at 1ed704c" in package["responsibility"]
     assert "verified by Ubuntu CI run 30748840399" in package["responsibility"]
     assert "owner-private exact PXQR/PXQS" in package["responsibility"]
@@ -290,6 +322,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "commit-reference-loop-v1",
         "commit-reference-empty-v1",
         "acquire-tenure-v1",
+        "turnover-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
         "reconcile-reference-once-v1",
@@ -310,6 +343,15 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         in compatibility
     )
     assert "communicate over real strict versioned wires" in compatibility
+    assert "`acquire-tenure-v1` remains ensure-once" in compatibility
+    assert "Relative to that exact acquire grammar" in compatibility
+    assert "adds exactly one trailing nonzero 16-byte caller-stable operation ID" in compatibility
+    assert "durable transaction replay key, not caller nonce entropy" in compatibility
+    assert "a different ID cannot replace unresolved work" in compatibility
+    assert "fully cross-pinned durable Runtime bootstrap binding" in compatibility
+    assert "does not prove fresh Runtime liveness" in compatibility
+    assert "detect restart automatically" in compatibility
+    assert "create a second restart/reassembly authority" in compatibility
 
     developer_compatibility = public_rows_by_symbols[
         frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS)
