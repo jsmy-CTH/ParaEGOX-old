@@ -1,13 +1,14 @@
 //! Zenoh-native Fabric ownership for ParaEGOX.
 //!
 //! [`FabricService`] owns its general typed-binding Zenoh session. The narrow
-//! restricted Runtime-apply/Runtime-control and Unix Node-control clients and
-//! endpoints own separate role-scoped query-only sessions; every raw transport
-//! value remains private. Callers use versioned envelopes, owner-issued
-//! [`PortBinding`] tokens, request-only [`ClientPortBindingV1`] routes, and a
-//! bounded typed request receiver. The v1 binary encoding is an experimental,
-//! Fabric-owned contract until a separately governed cross-language consumer
-//! adopts it; this crate does not claim a stable polyglot ABI.
+//! restricted Runtime-apply/Runtime-control, Unix Node-control, and independent
+//! remote-Agent proxy listener lifecycles own separate role-scoped sessions;
+//! every raw transport value remains private. Callers use versioned envelopes,
+//! owner-issued [`PortBinding`] tokens, request-only [`ClientPortBindingV1`]
+//! routes, and a bounded typed request receiver. The v1 binary encoding is an
+//! experimental, Fabric-owned contract until a separately governed
+//! cross-language consumer adopts it; this crate does not claim a stable
+//! polyglot ABI.
 
 #![forbid(unsafe_code)]
 
@@ -52,8 +53,8 @@ pub use service::{
     ExperimentalRemoteMtlsLinkSnapshotV1, ExperimentalRemoteMtlsObservationErrorV1,
     ExperimentalRemoteMtlsPeerBindingV1, ExperimentalRemoteMtlsPeerLinkObservationV1,
     FabricConfigError, FabricError, FabricService, FabricServiceConfig, HandlerResponse,
-    InboundRequest, InstalledBinding, PortBinding, RemoteTlsEndpoint, RequestReceiver,
-    RequestResponseBindingSpec, ResolvedRemoteMtlsConnectorCredentialFilesV1,
-    ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles,
-    ResolvedRemoteMtlsListenerCredentialFilesV1, SessionEndpoint,
+    InboundRequest, InstalledBinding, PortBinding, PreparedRemoteAgentProxyListenerV2,
+    RemoteAgentProxyListenerV2, RemoteTlsEndpoint, RequestReceiver, RequestResponseBindingSpec,
+    ResolvedRemoteMtlsConnectorCredentialFilesV1, ResolvedRemoteMtlsCredentialFiles,
+    ResolvedRemoteMtlsIdentityFiles, ResolvedRemoteMtlsListenerCredentialFilesV1, SessionEndpoint,
 };

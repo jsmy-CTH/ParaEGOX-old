@@ -1,6 +1,6 @@
 //! The single-session FabricService and its owned request-binding workers.
 
-use core::{fmt, num::NonZeroU64, time::Duration};
+use core::{fmt, future::Future, num::NonZeroU64, time::Duration};
 use std::{
     collections::BTreeMap,
     io::Read,
@@ -415,6 +415,12 @@ enum FabricTransportConfig {
         expected_mac_agent_client_principal: PrincipalRef,
         routes: RemoteAgentDataPlaneRoutesV1,
     },
+    RemoteAgentProxyListenerMtlsV2 {
+        remote_tls_listen_endpoint: RemoteTlsEndpoint,
+        credentials: ResolvedRemoteMtlsListenerCredentialFilesV1,
+        expected_mac_agent_client_principal: PrincipalRef,
+        routes: RemoteAgentDataPlaneRoutesV1,
+    },
     RemoteAgentConnectorMtlsV1 {
         remote_tls_connect_endpoint: RemoteTlsEndpoint,
         credentials: ResolvedRemoteMtlsConnectorCredentialFilesV1,
@@ -487,6 +493,61 @@ impl FabricServiceConfig {
         Ok(Self {
             transport: FabricTransportConfig::RemoteAgentListenerMtlsV1 {
                 loopback_listen_endpoint,
+                remote_tls_listen_endpoint,
+                credentials,
+                expected_mac_agent_client_principal,
+                routes: RemoteAgentDataPlaneRoutesV1::try_new(
+                    submit_key_expression,
+                    control_key_expression,
+                )?,
+            },
+        })
+    }
+
+    /// Creates one independent Ubuntu remote-Agent proxy listener.
+    ///
+    /// Unlike [`Self::try_remote_agent_listener_v1`], this successor neither
+    /// retains nor creates a plaintext loopback listener. It admits exactly
+    /// one TLS listener, no connector, one expected Mac certificate principal,
+    /// and the two concrete Agent routes. Preparing and opening this config
+    /// requires the role-specific [`PreparedRemoteAgentProxyListenerV2`]
+    /// lifecycle; [`FabricService::start`] rejects this profile.
+    ///
+    /// A connector credential cannot be substituted for the listener role:
+    ///
+    /// ```compile_fail
+    /// use paraegox_fabric::{
+    ///     FabricServiceConfig, RemoteTlsEndpoint,
+    ///     ResolvedRemoteMtlsConnectorCredentialFilesV1,
+    /// };
+    /// use paraegox_kernel::identity::PrincipalRef;
+    ///
+    /// fn wrong_credential_role(
+    ///     endpoint: RemoteTlsEndpoint,
+    ///     connector: ResolvedRemoteMtlsConnectorCredentialFilesV1,
+    ///     expected_mac: PrincipalRef,
+    /// ) {
+    ///     let _ = FabricServiceConfig::try_remote_agent_proxy_listener_v2(
+    ///         endpoint,
+    ///         connector,
+    ///         expected_mac,
+    ///         "paraegox/agent/submit",
+    ///         "paraegox/agent/control",
+    ///     );
+    /// }
+    /// ```
+    pub fn try_remote_agent_proxy_listener_v2(
+        remote_tls_listen_endpoint: RemoteTlsEndpoint,
+        credentials: ResolvedRemoteMtlsListenerCredentialFilesV1,
+        expected_mac_agent_client_principal: PrincipalRef,
+        submit_key_expression: impl Into<String>,
+        control_key_expression: impl Into<String>,
+    ) -> Result<Self, FabricConfigError> {
+        if principal_is_zero(expected_mac_agent_client_principal) {
+            return Err(FabricConfigError::ZeroExpectedRemoteAgentPrincipal);
+        }
+        Ok(Self {
+            transport: FabricTransportConfig::RemoteAgentProxyListenerMtlsV2 {
                 remote_tls_listen_endpoint,
                 credentials,
                 expected_mac_agent_client_principal,
@@ -618,6 +679,7 @@ impl FabricServiceConfig {
             } => experimental_peer_bindings.clone(),
             FabricTransportConfig::LoopbackTcp { .. }
             | FabricTransportConfig::RemoteAgentListenerMtlsV1 { .. }
+            | FabricTransportConfig::RemoteAgentProxyListenerMtlsV2 { .. }
             | FabricTransportConfig::RemoteAgentConnectorMtlsV1 { .. } => None,
         }
     }
@@ -704,6 +766,32 @@ impl FabricServiceConfig {
                     *expected_mac_agent_client_principal,
                 )?;
             }
+            FabricTransportConfig::RemoteAgentProxyListenerMtlsV2 {
+                remote_tls_listen_endpoint,
+                credentials,
+                expected_mac_agent_client_principal,
+                routes,
+            } => {
+                configure_remote_agent_session(&mut config)?;
+                set_protocols(&mut config, r#"["tls"]"#)?;
+                set_endpoints(
+                    &mut config,
+                    endpoint_array_json(core::iter::once(remote_tls_listen_endpoint.as_str())),
+                    endpoint_array_json(core::iter::empty()),
+                )?;
+                configure_remote_agent_mtls_role(
+                    &mut config,
+                    credentials.root_ca_certificate_file.as_ref(),
+                    &credentials.listen_identity,
+                    RemoteMtlsRole::Listener,
+                )?;
+                configure_remote_agent_acl(
+                    &mut config,
+                    routes,
+                    RemoteAgentSessionRoleV1::Listener,
+                    *expected_mac_agent_client_principal,
+                )?;
+            }
             FabricTransportConfig::RemoteAgentConnectorMtlsV1 {
                 remote_tls_connect_endpoint,
                 credentials,
@@ -749,6 +837,9 @@ impl fmt::Debug for FabricServiceConfig {
             } => "secured-hybrid-mtls",
             FabricTransportConfig::RemoteAgentListenerMtlsV1 { .. } => {
                 "remote-agent-listener-mtls-v1"
+            }
+            FabricTransportConfig::RemoteAgentProxyListenerMtlsV2 { .. } => {
+                "remote-agent-proxy-listener-mtls-v2"
             }
             FabricTransportConfig::RemoteAgentConnectorMtlsV1 { .. } => {
                 "remote-agent-connector-mtls-v1"
@@ -1185,6 +1276,152 @@ impl ExperimentalRemoteMtlsLinkSnapshotV1 {
     }
 }
 
+/// A fully validated, effect-free plan for one independent TLS-only S1.
+///
+/// Preparation builds the exact private Zenoh configuration and reserves one
+/// fresh nonzero session epoch, but performs no file read, socket open, route
+/// declaration, or background task spawn. The caller may therefore persist an
+/// S1-open intent containing [`Self::session_epoch`] before consuming
+/// [`Self::start`]. The exact two routes remain private and move into the live
+/// listener for the later role-specific PXAP binding slice.
+///
+/// This plan is intentionally neither `Clone` nor `Copy`:
+///
+/// ```compile_fail
+/// use paraegox_fabric::PreparedRemoteAgentProxyListenerV2;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<PreparedRemoteAgentProxyListenerV2>();
+/// ```
+///
+/// ```compile_fail
+/// use paraegox_fabric::PreparedRemoteAgentProxyListenerV2;
+///
+/// fn require_copy<T: Copy>() {}
+/// require_copy::<PreparedRemoteAgentProxyListenerV2>();
+/// ```
+pub struct PreparedRemoteAgentProxyListenerV2 {
+    zenoh_config: zenoh::Config,
+    session_epoch: DistributedFabricSessionEpochV1,
+    routes: RemoteAgentDataPlaneRoutesV1,
+}
+
+impl PreparedRemoteAgentProxyListenerV2 {
+    /// Builds an effect-free start plan for exactly the S1 proxy-listener role.
+    ///
+    /// Any other [`FabricServiceConfig`] profile fails before entropy is read.
+    /// Entropy is sampled exactly once and is never caller supplied.
+    pub fn try_prepare(config: FabricServiceConfig) -> Result<Self, FabricError> {
+        Self::try_prepare_with(config, |destination| {
+            getrandom::fill(destination).map_err(|_| ())
+        })
+    }
+
+    fn try_prepare_with(
+        config: FabricServiceConfig,
+        fill: impl FnOnce(&mut [u8; 16]) -> Result<(), ()>,
+    ) -> Result<Self, FabricError> {
+        let routes = match &config.transport {
+            FabricTransportConfig::RemoteAgentProxyListenerMtlsV2 { routes, .. } => routes.clone(),
+            _ => return Err(FabricError::RemoteAgentProxyListenerProfileRequired),
+        };
+        let zenoh_config = config.build_zenoh_config()?;
+        let session_epoch = try_fabric_session_epoch_with(fill)?;
+        Ok(Self {
+            zenoh_config,
+            session_epoch,
+            routes,
+        })
+    }
+
+    /// Returns the reserved nonzero epoch without exposing transport authority.
+    #[must_use]
+    pub const fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {
+        self.session_epoch
+    }
+
+    /// Consumes this plan and performs the first transport effect: Session open.
+    ///
+    /// A failure returns no live listener token and the consumed plan cannot be
+    /// reused for an implicit retry. The caller remains responsible for mapping
+    /// a failure after its durable open intent to outcome-uncertain state.
+    pub async fn start(self) -> Result<RemoteAgentProxyListenerV2, FabricError> {
+        self.start_with(
+            |zenoh_config| async move { zenoh::open(zenoh_config).await.map_err(|_| ()) },
+        )
+        .await
+    }
+
+    async fn start_with<Open, OpenFuture>(
+        self,
+        open: Open,
+    ) -> Result<RemoteAgentProxyListenerV2, FabricError>
+    where
+        Open: FnOnce(zenoh::Config) -> OpenFuture,
+        OpenFuture: Future<Output = Result<zenoh::Session, ()>>,
+    {
+        let Self {
+            zenoh_config,
+            session_epoch,
+            routes,
+        } = self;
+        let session = open(zenoh_config)
+            .await
+            .map_err(|()| FabricError::SessionOpenFailed)?;
+        Ok(RemoteAgentProxyListenerV2 {
+            session,
+            session_epoch,
+            routes,
+        })
+    }
+}
+
+/// The sole live owner token for one independent TLS-only remote-Agent S1.
+///
+/// The raw Zenoh Session, exact routes, and general [`FabricService`] mutation
+/// surface remain private. This initial slice exposes only epoch correlation
+/// and consuming shutdown; exact PXAP lane installation is added separately.
+///
+/// ```compile_fail
+/// use paraegox_fabric::RemoteAgentProxyListenerV2;
+///
+/// fn cannot_borrow_raw_session(listener: &RemoteAgentProxyListenerV2) {
+///     let _ = &listener.session;
+/// }
+/// ```
+pub struct RemoteAgentProxyListenerV2 {
+    session: zenoh::Session,
+    session_epoch: DistributedFabricSessionEpochV1,
+    routes: RemoteAgentDataPlaneRoutesV1,
+}
+
+impl RemoteAgentProxyListenerV2 {
+    /// Returns the exact epoch reserved by the consumed prepared plan.
+    #[must_use]
+    pub const fn session_epoch(&self) -> DistributedFabricSessionEpochV1 {
+        self.session_epoch
+    }
+
+    /// Consumes the owner token and closes its sole Session.
+    ///
+    /// This slice owns no queryables or workers yet. Later binding slices must
+    /// preserve the ordered fence, drain, join, then close lifecycle here.
+    /// [`FabricError::SessionCloseFailed`] is outcome-uncertain: the consuming
+    /// call returns no reusable live token and cannot prove that close had no
+    /// effect.
+    pub async fn shutdown(self) -> Result<(), FabricError> {
+        let Self {
+            session,
+            session_epoch: _,
+            routes: _routes,
+        } = self;
+        session
+            .close()
+            .await
+            .map_err(|_| FabricError::SessionCloseFailed)
+    }
+}
+
 /// Owns exactly one private Zenoh session and all entities declared on it.
 pub struct FabricService {
     session: zenoh::Session,
@@ -1197,6 +1434,12 @@ pub struct FabricService {
 impl FabricService {
     /// Generates a fresh nonzero epoch, then opens the sole Zenoh Session.
     pub async fn start(config: FabricServiceConfig) -> Result<Self, FabricError> {
+        if matches!(
+            &config.transport,
+            FabricTransportConfig::RemoteAgentProxyListenerMtlsV2 { .. }
+        ) {
+            return Err(FabricError::RemoteAgentProxyListenerProfileRequired);
+        }
         let experimental_peer_bindings = config.experimental_peer_bindings();
         let zenoh_config = config.build_zenoh_config()?;
         let session_epoch = try_fabric_session_epoch_with(|destination| {
@@ -2435,6 +2678,7 @@ impl From<FabricConfigError> for ExperimentalRemoteMtlsConfigErrorV1 {
 pub enum FabricError {
     SessionConfigurationFailed,
     SessionEpochUnavailable,
+    RemoteAgentProxyListenerProfileRequired,
     SessionOpenFailed,
     SessionCloseFailed,
     BindingDeclarationFailed,
@@ -2463,6 +2707,9 @@ impl fmt::Display for FabricError {
                 Self::SessionConfigurationFailed => "Zenoh session configuration failed",
                 Self::SessionEpochUnavailable => {
                     "Fabric session epoch entropy is unavailable or invalid"
+                }
+                Self::RemoteAgentProxyListenerProfileRequired => {
+                    "operation requires the dedicated remote-Agent proxy listener v2 profile"
                 }
                 Self::SessionOpenFailed => "Zenoh session failed to open",
                 Self::SessionCloseFailed => "Zenoh session failed to close",
@@ -2552,10 +2799,11 @@ mod tests {
         ExperimentalRemoteMtlsConfigErrorV1, ExperimentalRemoteMtlsObservationErrorV1,
         ExperimentalRemoteMtlsPeerBindingV1, FabricConfigError, FabricError, FabricService,
         FabricServiceConfig, MAX_EXPERIMENTAL_OBSERVED_LINKS, MAX_KEY_EXPRESSION_BYTES,
-        PrincipalRef, REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES, RemoteTlsEndpoint,
-        ResolvedRemoteMtlsConnectorCredentialFilesV1, ResolvedRemoteMtlsCredentialFiles,
-        ResolvedRemoteMtlsIdentityFiles, ResolvedRemoteMtlsListenerCredentialFilesV1,
-        SessionEndpoint, classify_and_advance_experimental_remote_mtls_links,
+        PreparedRemoteAgentProxyListenerV2, PrincipalRef, REMOTE_AGENT_TRANSPORT_MAX_MESSAGE_BYTES,
+        RemoteTlsEndpoint, ResolvedRemoteMtlsConnectorCredentialFilesV1,
+        ResolvedRemoteMtlsCredentialFiles, ResolvedRemoteMtlsIdentityFiles,
+        ResolvedRemoteMtlsListenerCredentialFilesV1, SessionEndpoint,
+        classify_and_advance_experimental_remote_mtls_links,
         classify_experimental_remote_mtls_links, try_fabric_session_epoch_with,
     };
     use crate::restricted_runtime_apply_peer_certificate_common_name_v1;
@@ -2619,6 +2867,28 @@ mod tests {
 
     const fn principal(marker: u8) -> PrincipalRef {
         PrincipalRef::from_bytes([marker; 16])
+    }
+
+    fn proxy_listener_config() -> FabricServiceConfig {
+        FabricServiceConfig::try_remote_agent_proxy_listener_v2(
+            RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
+            listener_credentials(),
+            principal(0x51),
+            "paraegox/agent/submit",
+            "paraegox/agent/control",
+        )
+        .unwrap()
+    }
+
+    fn prepared_proxy_listener(seed: u8) -> PreparedRemoteAgentProxyListenerV2 {
+        PreparedRemoteAgentProxyListenerV2::try_prepare_with(
+            proxy_listener_config(),
+            |destination| {
+                destination.copy_from_slice(&[seed; 16]);
+                Ok(())
+            },
+        )
+        .unwrap()
     }
 
     fn json_config(config: &zenoh::Config, key: &str) -> Value {
@@ -2875,6 +3145,85 @@ mod tests {
     }
 
     #[test]
+    fn remote_agent_proxy_listener_v2_is_tls_only_with_exact_hardening_and_acl() {
+        let mac_principal = principal(0x51);
+        let config = proxy_listener_config();
+        assert_eq!(
+            format!("{config:?}"),
+            "FabricServiceConfig { transport_profile: \"remote-agent-proxy-listener-mtls-v2\", .. }"
+        );
+
+        let zenoh = config.build_zenoh_config().unwrap();
+        assert_remote_agent_session_hardening(&zenoh);
+        assert_eq!(zenoh.get_json("mode").unwrap(), "\"peer\"");
+        assert_eq!(
+            zenoh.get_json("listen/endpoints").unwrap(),
+            "[\"tls/192.0.2.10:7447\"]"
+        );
+        assert_eq!(zenoh.get_json("connect/endpoints").unwrap(), "[]");
+        assert_eq!(
+            zenoh.get_json("transport/link/protocols").unwrap(),
+            "[\"tls\"]"
+        );
+        assert_eq!(
+            zenoh
+                .get_json("transport/link/tls/root_ca_certificate")
+                .unwrap(),
+            "\"/run/paraegox/tls/root-ca.pem\""
+        );
+        assert_eq!(
+            zenoh
+                .get_json("transport/link/tls/listen_certificate")
+                .unwrap(),
+            "\"/run/paraegox/tls/listen-certificate.pem\""
+        );
+        assert_eq!(
+            zenoh
+                .get_json("transport/link/tls/listen_private_key")
+                .unwrap(),
+            "\"/run/paraegox/tls/listen-private-key.pem\""
+        );
+        assert_eq!(
+            zenoh
+                .get_json("transport/link/tls/connect_certificate")
+                .unwrap(),
+            "null"
+        );
+        assert_eq!(
+            zenoh
+                .get_json("transport/link/tls/connect_private_key")
+                .unwrap(),
+            "null"
+        );
+        assert_remote_agent_acl(
+            &zenoh,
+            &restricted_runtime_apply_peer_certificate_common_name_v1(mac_principal),
+            json!(["reply", "declare_queryable"]),
+            json!(["query"]),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_listener_profile_is_confined_to_its_prepared_lifecycle() {
+        let connector = FabricServiceConfig::try_remote_agent_connector_v1(
+            RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
+            connector_credentials(),
+            principal(0x52),
+            "paraegox/agent/submit",
+            "paraegox/agent/control",
+        )
+        .unwrap();
+        assert!(matches!(
+            PreparedRemoteAgentProxyListenerV2::try_prepare(connector),
+            Err(FabricError::RemoteAgentProxyListenerProfileRequired)
+        ));
+        assert!(matches!(
+            FabricService::start(proxy_listener_config()).await,
+            Err(FabricError::RemoteAgentProxyListenerProfileRequired)
+        ));
+    }
+
+    #[test]
     fn remote_agent_routes_and_principals_fail_closed_before_session_open() {
         let build = |peer_principal, submit: String, control: String| {
             FabricServiceConfig::try_remote_agent_listener_v1(
@@ -2898,6 +3247,16 @@ mod tests {
             FabricServiceConfig::try_remote_agent_connector_v1(
                 RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
                 connector_credentials(),
+                PrincipalRef::from_bytes([0; 16]),
+                "paraegox/agent/submit",
+                "paraegox/agent/control",
+            ),
+            Err(FabricConfigError::ZeroExpectedRemoteAgentPrincipal)
+        );
+        assert_eq!(
+            FabricServiceConfig::try_remote_agent_proxy_listener_v2(
+                RemoteTlsEndpoint::try_new("tls/192.0.2.10:7447").unwrap(),
+                listener_credentials(),
                 PrincipalRef::from_bytes([0; 16]),
                 "paraegox/agent/submit",
                 "paraegox/agent/control",
@@ -3280,6 +3639,126 @@ mod tests {
             ));
             assert_eq!(calls, 1, "session epoch generation must not retry");
         }
+    }
+
+    #[test]
+    fn proxy_listener_prepare_builds_without_open_and_entropy_fails_closed_once() {
+        let mut calls = 0;
+        let prepared = PreparedRemoteAgentProxyListenerV2::try_prepare_with(
+            proxy_listener_config(),
+            |destination| {
+                calls += 1;
+                destination.copy_from_slice(&[0xa5; 16]);
+                Ok(())
+            },
+        )
+        .expect("prepare must not open the nonlocal endpoint or read nonexistent TLS files");
+        assert_eq!(calls, 1);
+        assert_eq!(prepared.session_epoch(), session_epoch(0xa5));
+        assert_eq!(
+            prepared.zenoh_config.get_json("listen/endpoints").unwrap(),
+            "[\"tls/192.0.2.10:7447\"]"
+        );
+        assert_eq!(
+            prepared.zenoh_config.get_json("connect/endpoints").unwrap(),
+            "[]"
+        );
+
+        for outcome in [Err(()), Ok([0_u8; 16])] {
+            let mut entropy_calls = 0;
+            assert!(matches!(
+                PreparedRemoteAgentProxyListenerV2::try_prepare_with(
+                    proxy_listener_config(),
+                    |destination| {
+                        entropy_calls += 1;
+                        let bytes = outcome?;
+                        destination.copy_from_slice(&bytes);
+                        Ok(())
+                    },
+                ),
+                Err(FabricError::SessionEpochUnavailable)
+            ));
+            assert_eq!(entropy_calls, 1, "prepare entropy must not retry");
+        }
+
+        let mut wrong_profile_entropy_calls = 0;
+        let wrong_profile = FabricServiceConfig::try_peer(
+            vec![SessionEndpoint::try_new("tcp/127.0.0.1:7447").unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            PreparedRemoteAgentProxyListenerV2::try_prepare_with(wrong_profile, |destination| {
+                wrong_profile_entropy_calls += 1;
+                destination.copy_from_slice(&[0xa6; 16]);
+                Ok(())
+            },),
+            Err(FabricError::RemoteAgentProxyListenerProfileRequired)
+        ));
+        assert_eq!(
+            wrong_profile_entropy_calls, 0,
+            "wrong transport role must fail before entropy is consumed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_listener_start_failure_returns_no_live_owner_token() {
+        let prepared = prepared_proxy_listener(0xa7);
+        let mut open_calls = 0;
+        let result = prepared
+            .start_with(|_zenoh_config| {
+                open_calls += 1;
+                async { Err::<zenoh::Session, ()>(()) }
+            })
+            .await;
+
+        assert!(matches!(result, Err(FabricError::SessionOpenFailed)));
+        assert_eq!(
+            open_calls, 1,
+            "a consumed prepared plan must not retry open"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_proxy_epoch_becomes_live_and_shutdown_releases_its_session() {
+        let loopback_endpoint = available_tcp_endpoint();
+        let loopback_address = loopback_endpoint
+            .as_str()
+            .strip_prefix("tcp/")
+            .unwrap()
+            .to_owned();
+        let loopback_config = FabricServiceConfig::try_peer(vec![loopback_endpoint], Vec::new())
+            .unwrap()
+            .build_zenoh_config()
+            .unwrap();
+        let prepared = prepared_proxy_listener(0xa8);
+        let reserved_epoch = prepared.session_epoch();
+
+        let live = prepared
+            .start_with(move |proxy_config| async move {
+                assert_eq!(
+                    proxy_config.get_json("transport/link/protocols").unwrap(),
+                    "[\"tls\"]"
+                );
+                zenoh::open(loopback_config).await.map_err(|_| ())
+            })
+            .await
+            .expect("test opener must create one live private Session");
+        assert_eq!(live.session_epoch(), reserved_epoch);
+        assert_eq!(
+            live.routes.as_array(),
+            ["paraegox/agent/submit", "paraegox/agent/control"]
+        );
+        let bind_error = TcpListener::bind(&loopback_address)
+            .expect_err("live wrapper must retain ownership of its private Session");
+        assert_eq!(bind_error.kind(), std::io::ErrorKind::AddrInUse);
+
+        live.shutdown()
+            .await
+            .expect("consuming shutdown must close the private Session");
+        let rebound = TcpListener::bind(&loopback_address)
+            .expect("shutdown must release the private Session listener");
+        drop(rebound);
     }
 
     #[test]
