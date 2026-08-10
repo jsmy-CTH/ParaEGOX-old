@@ -38,6 +38,12 @@ use crate::lifecycle::LocalInspectionBootstrapLocatorV1;
 
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const SOCKET_DIRECTORY_MODE: u32 = 0o2750;
+const SOCKET_LINK_COUNT_WITH_GENERATION_PIN: u64 = 2;
+const SOCKET_PIN_PREFIX: &[u8] = b".pxi-";
+const SOCKET_PIN_SUFFIX: &[u8] = b"-socket.pin";
+const SOCKET_PIN_NONCE_HEX_BYTES: usize = 32;
+const MAX_ENDPOINT_DIRECTORY_SCAN_ENTRIES: usize = 256;
+const MAX_ENDPOINT_DIRECTORY_SCAN_NAME_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentityV1 {
@@ -194,11 +200,8 @@ fn load_bootstrap(
     {
         return Err(LocalProcessError::LocalInspectionBootstrap);
     }
-    validate_private_parent(bootstrap.socket_path(), expected_uid, expected_gid)?;
-    let socket = fs::symlink_metadata(bootstrap.socket_path())
-        .map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
-    validate_socket_metadata(&socket, expected_uid, expected_gid)?;
-    let socket_identity = FileIdentityV1::from_metadata(&socket);
+    let socket_identity =
+        validate_socket_generation(bootstrap.socket_path(), expected_uid, expected_gid)?;
 
     let final_metadata =
         fs::symlink_metadata(path).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
@@ -327,11 +330,89 @@ fn validate_socket_metadata(
         || metadata.uid() != expected_uid
         || metadata.gid() != expected_gid
         || metadata.permissions().mode() & 0o7777 != PRIVATE_FILE_MODE
-        || metadata.nlink() != 1
+        || metadata.nlink() != SOCKET_LINK_COUNT_WITH_GENERATION_PIN
     {
         return Err(LocalProcessError::LocalInspectionBootstrap);
     }
     Ok(())
+}
+
+fn validate_socket_generation(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<FileIdentityV1, LocalProcessError> {
+    validate_private_parent(path, expected_uid, expected_gid)?;
+    let before =
+        fs::symlink_metadata(path).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+    validate_socket_metadata(&before, expected_uid, expected_gid)?;
+    let identity = FileIdentityV1::from_metadata(&before);
+    let parent = path
+        .parent()
+        .ok_or(LocalProcessError::LocalInspectionBootstrap)?;
+    let pin_path = locate_socket_generation_pin(parent)?;
+    let pin_before = fs::symlink_metadata(&pin_path)
+        .map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+    validate_socket_metadata(&pin_before, expected_uid, expected_gid)?;
+    if FileIdentityV1::from_metadata(&pin_before) != identity {
+        return Err(LocalProcessError::LocalInspectionBootstrap);
+    }
+
+    validate_private_parent(path, expected_uid, expected_gid)?;
+    let pin_after = fs::symlink_metadata(&pin_path)
+        .map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+    let after =
+        fs::symlink_metadata(path).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+    validate_socket_metadata(&pin_after, expected_uid, expected_gid)?;
+    validate_socket_metadata(&after, expected_uid, expected_gid)?;
+    if FileIdentityV1::from_metadata(&pin_after) != identity
+        || FileIdentityV1::from_metadata(&after) != identity
+    {
+        return Err(LocalProcessError::LocalInspectionBootstrap);
+    }
+    Ok(identity)
+}
+
+fn locate_socket_generation_pin(parent: &Path) -> Result<PathBuf, LocalProcessError> {
+    let mut scanned_entries = 0_usize;
+    let mut scanned_name_bytes = 0_usize;
+    let mut pin_path = None;
+    let entries = fs::read_dir(parent).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+        let name = entry.file_name();
+        let name_bytes = name.as_os_str().as_bytes();
+        scanned_entries = scanned_entries
+            .checked_add(1)
+            .ok_or(LocalProcessError::LocalInspectionBootstrap)?;
+        scanned_name_bytes = scanned_name_bytes
+            .checked_add(name_bytes.len())
+            .ok_or(LocalProcessError::LocalInspectionBootstrap)?;
+        if scanned_entries > MAX_ENDPOINT_DIRECTORY_SCAN_ENTRIES
+            || scanned_name_bytes > MAX_ENDPOINT_DIRECTORY_SCAN_NAME_BYTES
+        {
+            return Err(LocalProcessError::LocalInspectionBootstrap);
+        }
+        if !name_bytes.starts_with(SOCKET_PIN_PREFIX) {
+            continue;
+        }
+        if !is_canonical_socket_pin_name(name_bytes) || pin_path.is_some() {
+            return Err(LocalProcessError::LocalInspectionBootstrap);
+        }
+        pin_path = Some(parent.join(name));
+    }
+    pin_path.ok_or(LocalProcessError::LocalInspectionBootstrap)
+}
+
+fn is_canonical_socket_pin_name(name: &[u8]) -> bool {
+    let expected_length =
+        SOCKET_PIN_PREFIX.len() + SOCKET_PIN_NONCE_HEX_BYTES + SOCKET_PIN_SUFFIX.len();
+    name.len() == expected_length
+        && name.starts_with(SOCKET_PIN_PREFIX)
+        && name.ends_with(SOCKET_PIN_SUFFIX)
+        && name[SOCKET_PIN_PREFIX.len()..SOCKET_PIN_PREFIX.len() + SOCKET_PIN_NONCE_HEX_BYTES]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 async fn exchange_once(
@@ -399,14 +480,12 @@ fn validate_socket_path_identity(
     path: &Path,
     expected: FileIdentityV1,
 ) -> Result<(), LocalProcessError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
-    validate_socket_metadata(
-        &metadata,
+    let observed = validate_socket_generation(
+        path,
         Uid::effective().as_raw(),
         Gid::effective().as_raw(),
     )?;
-    if FileIdentityV1::from_metadata(&metadata) != expected {
+    if observed != expected {
         return Err(LocalProcessError::LocalInspectionBootstrap);
     }
     Ok(())
@@ -744,6 +823,7 @@ mod tests {
         directory: PathBuf,
         bootstrap_path: PathBuf,
         socket_path: PathBuf,
+        socket_pin_path: PathBuf,
         locator: LocalInspectionBootstrapLocatorV1,
     }
 
@@ -773,6 +853,12 @@ mod tests {
             let listener = StdUnixListener::bind(&socket_path).expect("Inspection test listener");
             fs::set_permissions(&socket_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
                 .expect("private Inspection socket mode");
+            let socket_pin_path = directory.join(format!(
+                ".pxi-{}-socket.pin",
+                "0".repeat(SOCKET_PIN_NONCE_HEX_BYTES)
+            ));
+            fs::hard_link(&socket_path, &socket_pin_path)
+                .expect("Inspection owner socket generation pin");
 
             let projection_id = [0x31; 16];
             let generation_token = [0x42; 32];
@@ -800,6 +886,7 @@ mod tests {
                     directory,
                     bootstrap_path,
                     socket_path,
+                    socket_pin_path,
                     locator,
                 },
                 listener,
@@ -812,6 +899,7 @@ mod tests {
     impl Drop for ClientFixture {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.bootstrap_path);
+            let _ = fs::remove_file(&self.socket_pin_path);
             let _ = fs::remove_file(&self.socket_path);
             let _ = fs::remove_dir(&self.directory);
         }
@@ -1087,6 +1175,39 @@ mod tests {
         ));
         fs::remove_file(&bootstrap_hardlink).expect("remove PXIB hardlink fixture");
 
+        fs::remove_file(&fixture.socket_pin_path).expect("remove owner socket generation pin");
+        assert!(matches!(
+            load_bootstrap(&restored_locator),
+            Err(LocalProcessError::LocalInspectionBootstrap)
+        ));
+        fs::hard_link(&fixture.socket_path, &fixture.socket_pin_path)
+            .expect("restore owner socket generation pin");
+        assert!(load_bootstrap(&restored_locator).is_ok());
+
+        let noncanonical_pin = fixture.directory.join(".pxi-not-canonical-socket.pin");
+        fs::rename(&fixture.socket_pin_path, &noncanonical_pin)
+            .expect("replace canonical owner pin name");
+        assert!(matches!(
+            load_bootstrap(&restored_locator),
+            Err(LocalProcessError::LocalInspectionBootstrap)
+        ));
+        fs::rename(&noncanonical_pin, &fixture.socket_pin_path)
+            .expect("restore canonical owner pin name");
+        assert!(load_bootstrap(&restored_locator).is_ok());
+
+        let second_canonical_pin = fixture.directory.join(format!(
+            ".pxi-{}-socket.pin",
+            "1".repeat(SOCKET_PIN_NONCE_HEX_BYTES)
+        ));
+        fs::hard_link(&fixture.socket_path, &second_canonical_pin)
+            .expect("second canonical socket generation pin");
+        assert!(matches!(
+            load_bootstrap(&restored_locator),
+            Err(LocalProcessError::LocalInspectionBootstrap)
+        ));
+        fs::remove_file(&second_canonical_pin).expect("remove second canonical socket pin");
+        assert!(load_bootstrap(&restored_locator).is_ok());
+
         let socket_hardlink = fixture.directory.join("i-hardlink.sock");
         fs::hard_link(&fixture.socket_path, &socket_hardlink)
             .expect("Inspection socket hardlink fixture");
@@ -1102,6 +1223,30 @@ mod tests {
             load_bootstrap(&restored_locator),
             Err(LocalProcessError::LocalInspectionBootstrap)
         ));
+        fs::set_permissions(
+            &fixture.socket_path,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+        )
+        .expect("restore Inspection socket mode");
+
+        let (_, original_socket_identity) =
+            load_bootstrap(&restored_locator).expect("capture original socket generation");
+        fs::remove_file(&fixture.socket_pin_path).expect("remove original socket pin");
+        fs::remove_file(&fixture.socket_path).expect("remove original public socket name");
+        let replacement_listener =
+            StdUnixListener::bind(&fixture.socket_path).expect("bind replacement socket generation");
+        fs::set_permissions(
+            &fixture.socket_path,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+        )
+        .expect("private replacement socket mode");
+        fs::hard_link(&fixture.socket_path, &fixture.socket_pin_path)
+            .expect("pin replacement socket generation");
+        assert!(matches!(
+            validate_socket_path_identity(&fixture.socket_path, original_socket_identity),
+            Err(LocalProcessError::LocalInspectionBootstrap)
+        ));
+        drop(replacement_listener);
         drop(listener);
     }
 
