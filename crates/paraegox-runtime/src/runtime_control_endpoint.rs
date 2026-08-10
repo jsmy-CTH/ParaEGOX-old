@@ -11837,10 +11837,7 @@ mod tests {
             },
         );
         let revoked_owner = control
-            .handle_restricted_runtime_control_frame_v1(
-                broken_invariant.canonical_wire(),
-                &carrier,
-            )
+            .handle_restricted_runtime_control_frame_v1(broken_invariant.canonical_wire(), &carrier)
             .await
             .unwrap_err();
         assert!(
