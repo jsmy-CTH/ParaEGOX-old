@@ -29,6 +29,14 @@ pub(crate) enum LocalProcessError {
     LocalInspectionNotFound,
     LocalInspectionIo,
     LocalInspectionJsonOutput,
+    LocalReceiptNotRunning,
+    LocalReceiptLocator,
+    LocalReceiptBootstrap,
+    LocalReceiptPeer,
+    LocalReceiptProtocol,
+    LocalReceiptNotFound,
+    LocalReceiptIo,
+    LocalReceiptJsonOutput,
     LocalTuiNotRunning,
     LocalTuiTerminal,
     LocalTuiLocator,
@@ -107,6 +115,14 @@ impl LocalProcessError {
             Self::LocalInspectionNotFound => "PXLC-INSPECTION-NOT-FOUND",
             Self::LocalInspectionIo => "PXLC-INSPECTION-IO",
             Self::LocalInspectionJsonOutput => "PXLC-INSPECTION-JSON-OUTPUT",
+            Self::LocalReceiptNotRunning => "PXLC-RECEIPT-NOT-RUNNING",
+            Self::LocalReceiptLocator => "PXLC-RECEIPT-LOCATOR",
+            Self::LocalReceiptBootstrap => "PXLC-RECEIPT-BOOTSTRAP",
+            Self::LocalReceiptPeer => "PXLC-RECEIPT-PEER",
+            Self::LocalReceiptProtocol => "PXLC-RECEIPT-PROTOCOL",
+            Self::LocalReceiptNotFound => "PXLC-RECEIPT-NOT-FOUND",
+            Self::LocalReceiptIo => "PXLC-RECEIPT-IO",
+            Self::LocalReceiptJsonOutput => "PXLC-RECEIPT-JSON-OUTPUT",
             Self::LocalTuiNotRunning => "PXLC-TUI-NOT-RUNNING",
             Self::LocalTuiTerminal => "PXLC-TUI-TERMINAL",
             Self::LocalTuiLocator => "PXLC-TUI-LOCATOR",
@@ -207,6 +223,20 @@ impl LocalProcessError {
             }
             Self::LocalInspectionIo => "local Inspection one-shot exchange failed closed",
             Self::LocalInspectionJsonOutput => "local Inspection machine-readable output failed",
+            Self::LocalReceiptNotRunning => {
+                "local Receipt snapshot requires the current owner generation to be running"
+            }
+            Self::LocalReceiptLocator => "local Receipt owner locator query failed closed",
+            Self::LocalReceiptBootstrap => "local Receipt bootstrap failed strict validation",
+            Self::LocalReceiptPeer => "local Receipt endpoint identity failed strict validation",
+            Self::LocalReceiptProtocol => {
+                "local Receipt response failed strict protocol validation"
+            }
+            Self::LocalReceiptNotFound => {
+                "local Receipt is retiring and unavailable for this generation"
+            }
+            Self::LocalReceiptIo => "local Receipt one-shot exchange failed closed",
+            Self::LocalReceiptJsonOutput => "local Receipt machine-readable output failed",
             Self::LocalTuiNotRunning => {
                 "local TUI requires the current owner generation to be running"
             }
@@ -395,6 +425,40 @@ mod tests {
 
         for (failure, code) in [
             (
+                LocalProcessError::LocalReceiptNotRunning,
+                "PXLC-RECEIPT-NOT-RUNNING",
+            ),
+            (
+                LocalProcessError::LocalReceiptLocator,
+                "PXLC-RECEIPT-LOCATOR",
+            ),
+            (
+                LocalProcessError::LocalReceiptBootstrap,
+                "PXLC-RECEIPT-BOOTSTRAP",
+            ),
+            (LocalProcessError::LocalReceiptPeer, "PXLC-RECEIPT-PEER"),
+            (
+                LocalProcessError::LocalReceiptProtocol,
+                "PXLC-RECEIPT-PROTOCOL",
+            ),
+            (
+                LocalProcessError::LocalReceiptNotFound,
+                "PXLC-RECEIPT-NOT-FOUND",
+            ),
+            (LocalProcessError::LocalReceiptIo, "PXLC-RECEIPT-IO"),
+            (
+                LocalProcessError::LocalReceiptJsonOutput,
+                "PXLC-RECEIPT-JSON-OUTPUT",
+            ),
+        ] {
+            assert_eq!(failure.exit_code(), 1);
+            assert_eq!(failure.code(), code);
+            assert!(!failure.message().is_empty());
+            assert!(!failure.message().contains('/'));
+        }
+
+        for (failure, code) in [
+            (
                 LocalProcessError::LocalTuiNotRunning,
                 "PXLC-TUI-NOT-RUNNING",
             ),
@@ -417,6 +481,7 @@ mod tests {
             ConfigError::InvalidLocalDeployGrammar,
             ConfigError::UnsupportedLocalDeployProfile,
             ConfigError::InvalidInspectionSnapshotGrammar,
+            ConfigError::InvalidReceiptSnapshotGrammar,
             ConfigError::InvalidTuiGrammar,
         ] {
             let failure = LocalProcessError::Configuration(failure);
@@ -424,6 +489,7 @@ mod tests {
             assert!(
                 failure.code().starts_with("PXLC-DEPLOY-")
                     || failure.code() == "PXLC-INSPECTION-GRAMMAR"
+                    || failure.code() == "PXLC-RECEIPT-GRAMMAR"
                     || failure.code() == "PXLC-TUI-GRAMMAR"
             );
         }

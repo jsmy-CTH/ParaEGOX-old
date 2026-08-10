@@ -3,23 +3,25 @@
 > 状态：Active
 > Program ID：`local-operator-cli-ops`
 > 授权日期：2026-08-10
-> 最近重排：2026-08-10；先完成本地可见闭环，再进入远端 artifact 路线，OpsService 最后准入
+> 最近重排：2026-08-11；在保留 M4a/M4b 拆分、ADR-0003 Proposed 与 OpsService 最后准入的前提下，根据已 Accepted 的 ADR-0011 同步 Artifact F0：A1→D0b 只作为同一 admission candidate 的内部实现顺序，二者必须在同一 exact ref 由真实 Controller/Runtime/TUI consumer 共同过门，A1 不独立登记、合并或发布
 > 授权来源：当前工作区用户明确要求优先完成 CLI、部署查看、Inspection/Ops 路线与可验证 TUI，并冻结新的 Remote Agent 扩张
 > 当前 committed anchor：`main` 仍为 `4334a59af1656429f0401c0b780134c8871148e9`；当前 D0a exact-ref 验证锚点为 `build/mac-source-snapshot-20260810-r363-d0a-compiled-local-deploy`（`20ef3f281501e3399d83c7e42e0150f208f4e8cd`）。它在 r356 M0/M1/M2a/I0 基线上递进包含 D0a 合同修正、compiled-in local deploy 实现、focused/system evidence、治理登记与 CI 接线，不包含 external Artifact、replace/restart、rollback 或 Remote Agent 能力扩张
 > 当前最近动作：r363 已在固定 host-key 的 Ubuntu exact-ref worktree 通过 `cargo fmt --all --check`、locked metadata、workspace all-targets check、Clippy `-D warnings`、workspace all-targets `test --no-run`、完整 governance 与 workspace doctest；`paraegox-local` 在 non-root、默认线程栈下原样短 `TMPDIR` 重跑 182/182 通过，同一 exact-ref 真实 D0a binary 的 `tests/system/test_d0a_compiled_local_deploy_cli.py` 3/3 函数通过。首次 182 项运行使用过长 `TMPDIR`，其中 3 项只因 Unix-domain socket `sun_path` 超长失败；改用短 `TMPDIR` 后对原样代码和测试全量重跑即 182/182，因此这 3 项是验证环境路径限制，不是产品失败。GitHub macOS run `31382789910` 也已在同一 commit 成功完成原生 CLI 编译、public CLI/light init/deploy smoke、relocated bundle、Textual child + Rust Agent IPC smoke、checksum/archive/upload；commit-addressed artifact `9060699090` 于 `2026-08-17T11:23:46Z` 过期。该 Mac run 不替代 Ubuntu D0a ActiveReady system evidence，`init` 的 non-root/passwordless-sudo ownership matrix仍未闭合
 > 当前 M3 动作：M3a snapshot 的 public grammar 与 JSON v1 合同已获授权，候选实现与 evidence 正在中央 immutable CI 收口；在该 gate 完成前仍不标 `Validated` 或 `Completed`。连续 watch 保持 M3b 独立后续，仍未登记 public grammar
-> 当前 M5 动作：M5 已拆为 M5a attach TUI 与 M5b logs integration；M5a 的 exact grammar、只附着已 Running generation、双 locator、ADR-0009 Python direct typed-client边界、实现、真实 consumer、治理登记与 focused/Linux/macOS evidence 已形成 `Implemented candidate` 并接入 exact CI，但同一 immutable exact ref 的完整门禁与下列未覆盖矩阵尚未收口，因此不是 `Validated` 或 `Completed`。M5b 继续等待 M5a + M4
-> 当前 D0 动作：D0a 的 exact CLI/JSON、compiled-in deterministic deployment 与真实 binary system evidence 已在 r363 达到 exact-ref `Validated`；它不依赖 external Artifact，不触发 ADR-0004 A0。external-artifact 路线仍是 A1/D0b，只有 [ADR-0011](../adr/ADR-0011-local-immutable-artifact-materialization-and-deployment-selection.md) 被用户显式接受后才可实现；其当前 `Proposed` 状态不是 Artifact、replace/restart 或 rollback 实现授权
+> 当前 M5 动作：M5 已拆为 M5a attach TUI 与 M5b logs integration；M5a 的 exact grammar、只附着已 Running generation、双 locator、ADR-0009 Python direct typed-client边界、实现、真实 consumer、治理登记与 focused/Linux/macOS evidence 已形成 `Implemented candidate` 并接入 exact CI，但同一 immutable exact ref 的完整门禁与下列未覆盖矩阵尚未收口，因此不是 `Validated` 或 `Completed`。M5b 继续等待 M5a + M4b
+> 当前 M4 动作：原 M4 已拆为 M4a/M4b。M4a 当前 Running generation 的 verified PXMT Receipt one-shot snapshot 已形成实现、真实 consumer、治理登记、focused 与 Linux exact-binary system harness 的 `Implemented candidate`；Ubuntu immutable exact-ref 完整门禁尚在收口，因此不是 `Validated` 或 `Completed`。M4b 才拥有 durable PXEV、失败后可查与 bounded structured logs 的原 M4 完成条件；M4a 不完成 M4，不解锁 M5b
+> 当前 D0 动作：D0a 的 exact CLI/JSON、compiled-in deterministic deployment 与真实 binary system evidence 已在 r363 达到 exact-ref `Validated`；它不依赖 external Artifact，不触发 ADR-0004 A0。ADR-0011 及其 authorization receipt 已 Accepted，本 Program 现冻结 A1/D0b Artifact F0 合同；二者仍未实现、未登记或发布，且A1没有独立public/admission状态，R0/D1继续后置到joint D0b gate之后
+> 当前 Artifact F0 动作：首个且唯一的 profile 是 `developer-local-echo-prefix-v1`；候选内部先建立 bounded non-executable model-data 的 reproducible build、zero-mutation inspect 和 immutable materialization，再由 D0b 在独立 fresh lifecycle/deployment state 真实消费。本次只是六条 intended-public grammar 与 owner contract 的冻结，不是代码、`governance.toml` 预登记、独立 A1 admission 或 capability 完成声明
 
 ## 一句话结果
 
-ParaEGOX 当前先交付一条普通开发者能直接验证的本地路线：初始化私有工作区、检查配置、以 compiled-in `deterministic-echo-v1` 经真实 DeploymentController/Runtime 部署到 `ActiveReady`，读取 Inspection，并用独立 TUI 附着该已运行 generation；Evidence/日志完成后再汇入同一 TUI。只有 ADR-0011 显式 Accepted 后，才把 external Artifact build/inspect/materialize、external-artifact deploy、replace/restart 和 rollback 接入完整 golden path；之后再进入 Node enrollment、只传输不激活的 `push` 与远端部署，最后评审 OpsService。Remote Agent 新能力在整个 Program 中继续冻结。
+ParaEGOX 当前先交付一条普通开发者能直接验证的本地路线：初始化私有工作区、检查配置、以 compiled-in `deterministic-echo-v1` 经真实 DeploymentController/Runtime 部署到 `ActiveReady`，读取 Inspection，并用独立 TUI 附着该已运行 generation。M4a 先只读取该 generation 的 verified PXMT Receipt；只有 M4b 完成 durable PXEV、失败后可查与 bounded structured logs 后，M5b 才把这些诊断数据汇入同一 TUI。ADR-0011 已 Accepted，因此下一条路线是在同一 Artifact F0 candidate 内先实现 `developer-local-echo-prefix-v1` 的 build/inspect/materialize 机制证据，再让 D0b 在 fresh workspace 经 DeploymentController/Runtime/TUI 真实消费 external bytes；只有整条链在同一 exact ref 通过 admission/governance/merge gate 后才成为用户可用 surface。R0 replace/restart 与 D1 rollback 仍等待该 D0b gate。之后再进入 Node enrollment、只传输不激活的 `push` 与远端部署，最后评审 OpsService。Remote Agent 新能力在整个 Program 中继续冻结。
 
 ## 为什么重排
 
 现有代码已经积累 Kernel、Runtime、Deployment、Node、Fabric、Model、Agent、Inspection 和本地组合机制，但交付顺序长期由底层 tranche 推动。用户最先需要的是“拿到东西后能初始化、能部署、能看见、出错能解释、失败能回退”，而不是继续扩张 remote contract、session、connector、proxy 或通用编排抽象。
 
-现有 TUI 入口只在 `chat` 启动链中做一次严格的 Inspection `Latest` 读取，再显示启动状态；Textual child 的退出也会让该 `chat` composition 进入 joined shutdown。这个 one-shot 切片证明了 owner 边界、IPC、失败关闭和 UI 启动顺序，但不能冒充“附着一个已经由 `up`/`deploy` 持有的实例”。当前路线已用不需要 Artifact/Installation 新 owner 的 D0a 建立可重复的本地部署可见基线，因此先用 M5a 把 TUI 变成真正的非 owning attach client；Evidence/日志随后由 M5b 汇入，external Artifact 安装语义仍留给显式决策后的 D0b。
+现有 TUI 入口只在 `chat` 启动链中做一次严格的 Inspection `Latest` 读取，再显示启动状态；Textual child 的退出也会让该 `chat` composition 进入 joined shutdown。这个 one-shot 切片证明了 owner 边界、IPC、失败关闭和 UI 启动顺序，但不能冒充“附着一个已经由 `up`/`deploy` 持有的实例”。当前路线已用不需要 Artifact/Installation 新 owner 的 D0a 建立可重复的本地部署可见基线，因此先用 M5a 把 TUI 变成真正的非 owning attach client；M4a 只增加当前 Running generation 的 Receipt 可见性，它不代替 M4b 的 Evidence/日志生产者与失败后查询。只有 M4b 完成后 M5b 才汇入这些诊断数据。external Artifact 的 owner 决策现已生效，但 ArtifactStore materialization、Deployment desired selection、Runtime live generation与TUI/Agent external-prefix observation必须在一个 admission candidate 内按 A1-internal→D0b 顺序共同证明；不得独立合并 A1，也不得用文档或 compiled-in D0a 代替真实 consumer。
 
 ## 权威与所有权边界
 
@@ -28,12 +30,13 @@ ParaEGOX 当前先交付一条普通开发者能直接验证的本地路线：�
 - [ADR-0009](../adr/ADR-0009-agent-conversation-and-client-boundary.md) 已 **Accepted**：本地 Python Textual 直接消费版本化 `AgentConversationClient` 与独立 Inspection typed client，typed client 自己负责 authenticated/no-retry owner IPC；TUI 不持 raw Zenoh Session，Rust local parent也不得演变成 replacement `ConsoleBridge` 或 domain-traffic proxy。本 Program 只能为 attach 增加 generation-bound bootstrap pin/handoff，不能静默 supersede 这条依赖方向。
 - [ADR-0003](../adr/ADR-0003-ops-service-operation-boundary.md) 继续保持 **Proposed**。本 Program 不接受它，也不授权提前实现完整 OpsService、federated Inspection、ConsoleGateway 或 Web Console；OpsService 只能位于本路线最后的 O0 准入门。
 - [ADR-0004](../adr/ADR-0004-deck-workload-and-application-admission-boundary.md) 的 A0 是条件式 gate，只在出现以下真实 fixture 时触发：多个独立 DeckLock 需要统一 release/update/uninstall；installation-owned mutable state 需要跨 run/升级/重部署存续；或同一 release 需要多次隔离安装/多 Artifact 需要共同稳定安装 owner。在触发前不预建 Application、Installation、active pointer、uninstall 或 GC；触发后也不能把它们塞进 DeploymentController、Deck、CLI 或 `paraegox-local` 私有目录。
-- [ADR-0011](../adr/ADR-0011-local-immutable-artifact-materialization-and-deployment-selection.md) 当前是 **Proposed**：它提议单 external Artifact 的 immutable materialization 与 Deployment selection 边界，不创建 Installation active pointer。它可以作为 A1/D0b 的候选决策，但在用户显式接受前不授权实现、治理登记或 capability 声明。
+- [ADR-0011](../adr/ADR-0011-local-immutable-artifact-materialization-and-deployment-selection.md) 已 **Accepted**，唯一生效证据是 [`local-artifact-baseline-v1.authorization-receipt`](local-artifact-baseline-v1.authorization-receipt)。本 Program 冻结的决策三元组为 ADR SHA-256 `fc4309f87f1770409a941d4d4ecd0694c302820ebfeeca599b9326c7bca27779`、ADR index SHA-256 `93ebf6b87a1f369916538b4bc56bf343a8e22fc3b20bcbe7a59e91fae5c0fc0d` 与 receipt SHA-256 `e491156e32cbd6d61ca84a3aa1d328950f29248d348d66eccd10729c4ccbaa0e`。它授权本 Program 准入单个 bounded non-executable model-data Artifact 的 A1/D0b 合同，但 ADR/receipt 本身不是实现、治理登记或 capability 完成证据。
 - 当前本地公共入口仍由 `DeveloperLocal composition root` 拥有。M1 离线 CLI 与 I0 本地初始化不创建新 owner，不取得 Secret、网络、服务生命周期或 domain durable-state mutation 权限；M2a 只在同一 composition root 内增加窄 lifecycle seam。
 - M3a 仍位于同一 composition root：Inspection owner 继续独占 projection，lifecycle owner 只提供 config-commitment-bound 的当前 Running generation rendezvous，CLI 只做一次只读 PXIB/PXIQ/PXIP v2 `Latest`；三者都不取得彼此的 state 或 action authority。
+- M4a 不创建 Evidence 或日志 owner。RuntimeHost 继续是 PXMT 事实、签名与 terminal outcome 的唯一 owner；DeveloperLocal composition 内的 owner-private Receipt adapter 只在现有真实激活输出上独立验证并一次性供应同一 canonical PXMT bytes，不签名、改写、持久化或升级 outcome。lifecycle 只定位 exact config/current Running generation 的 pinned adapter bootstrap，不返回 Receipt 内容、不代理 typed query；CLI typed client 只做一次读取并重新验证 canonical bytes、digest、request/target/store/key correlation 与 Runtime Ed25519 签名。
 - M5a 仍不创建新的 lifecycle、Session、Inspection 或 durable TUI state owner。lifecycle supervisor 只原子返回同一 config/current Running generation 的 conversation PXAB 与 Inspection PXIB verified pins；Rust local parent 只做 lifecycle query、token-free child handoff 与 child supervision，不读取 bootstrap/token，也不代理 domain traffic。按 Accepted [ADR-0009](../adr/ADR-0009-agent-conversation-and-client-boundary.md)，Python Textual child 继续直接消费版本化 `AgentConversationClient` 与独立 `DeveloperLocalInspectionClientV2`；raw token 不进入 Textual App/widget字段、child argv/env、日志或持久文件，Python 也不创建或持有 raw Zenoh Session。typed client对自己拥有的 mutable token buffers在错误与 close路径 best-effort 清零，但合同不虚构 CPython 对运算中 immutable `bytes` 临时副本的强制内存擦除。AgentService 继续独占 Session/Turn/cancel mutation，Inspection 继续独占 snapshot/freshness，TUI detach 不触发 `down` 或任何 owner shutdown。
 - `init` 只生成开发者本地配置工作区；D0a 只确保一个 compiled-in、无 external bytes、无 installation-owned state 的 deterministic fixture 经现有 Controller/Runtime 到达 `ActiveReady`。两者都不是安装器、Installation owner 或 active-pointer owner，也都不触发 A0。
-- Deployment desired state、Runtime apply、Node facts、Inspection projection、Evidence 和领域副作用继续由各自真实 owner 持有。未来 external Artifact bytes/materialization 只能在 ADR-0011 Accepted 后由其准入的 owner 持有；若真实 fixture 触发 A0，还必须先准入对应的最小 Application/Installation 或更窄 owner。CLI/TUI 只能调用 bounded seam，不能成为第二写者。
+- Deployment desired state、Runtime apply、Node facts、Inspection projection、Evidence 和领域副作用继续由各自真实 owner 持有。Artifact F0 中，build/inspect contract owner 独占 canonical manifest/payload strict decode 与可重现 object ref，`inspect` 零持久变化；ArtifactStore 是 exact pair、materialization journal 和 owner Receipt 的唯一写者；DeploymentController 独占 desired object ref、DeploymentRevision、deployment operation 与 Deployment Receipt；RuntimeHost 只经 read-only access port 重开并复验 Slice 绑定的 pair，仍是 live generation/PXMT 唯一 owner。lifecycle 只为 fresh D0b 启动唯一 supervisor，不得用 D0a `run_up` 或旧 desired state 冒充 external deployment。CLI/TUI 只能调用 bounded seam，不能成为第二写者或总 Receipt 签发者。若真实 fixture 触发 A0，相关 mutation 在最小后继 ADR Accepted 前必须以 `A0_APPLICATION_ADMISSION_REQUIRED` 失败关闭。
 - “Ops”在本 Program 中先表示用户可操作、可诊断的产品路线，不等于 ADR-0003 所描述的持久化 OpsService 已经实现或被接受。
 
 ## 明确冻结与非目标
@@ -142,6 +145,520 @@ diagnostics
 - 错误时 `ok = false`，`profile`、`generation`、`deployment_revision`、`controller_snapshot_sequence`、`runtime_apply_request_digest`、`runtime_terminal_receipt_digest` 与 `terminal_outcome` 均为 JSON null，且 `diagnostics` 恰有一项；该项仅含稳定 `code` 与 public-safe `message`。grammar/config/unsupported-profile 等在 `run_up` 前失败、或已有 Running generation 且本请求可证明没有接受 mutation 时，`changed = false`；一旦本请求已接受新的 lifecycle generation，或 owner/query/I/O failure 使零变化无法被证明，`changed = null`，不得用 `false` 掩盖可能已经运行的实例，也不得用 `true` 猜测尚未取回的 deployment projection。不得输出 config/state/bootstrap/socket 路径、uid/gid、PID/PGID、capability/token、Secret/SecretRef、credential/seed/key、endpoint/route、raw receipt 或未审计底层错误。
 - 对该 `--json` grammar，stdout 在可写时严格为一个 compact JSON object 加一个 LF，stderr 为空。成功为 exit 0；已识别 `deploy` 的 grammar、absolute/config safety/config-authority 或 unsupported profile 错误为 exit 2；lifecycle/owner/activation/evidence/query/I/O 与输出失败为 exit 1。stdout failure 仍失败关闭，不得从进程、文件、transport ACK 或日志合成成功。
 
+### Artifact F0 — A1 build/inspect/materialize 与 D0b fresh deploy
+
+Artifact F0 首批且仅有以下六条 intended-public exact grammar；命令、选项与参数顺序逐 token 固定。它们当前只冻结 compatibility candidate，并未登记、合并或发布；前四条即使在候选内部可执行，也必须保持 implementation-internal，直到后两条的真实 Controller/Runtime/TUI consumer 在同一 exact ref 完成 admission gate：
+
+```text
+paraegox artifact build --profile developer-local-echo-prefix-v1 --source <ABS> --output <ABS> --json
+paraegox artifact inspect --manifest <ABS> --payload <ABS> --json
+paraegox artifact materialize --config <ABS> --manifest <ABS> --payload <ABS> --operation-id <32hex> --json
+paraegox artifact materialization query --config <ABS> --operation-id <32hex> --json
+paraegox deploy --local --config <ABS> --artifact-object-ref <REF> --materialization-receipt-ref <REF> --operation-id <32hex> --json
+paraegox deployment operation query --config <ABS> --operation-id <32hex> --json
+```
+
+- `<ABS>` 必须是 lexical-canonical absolute path；六条命令均不接受默认路径、相对路径、选项换序、重复选项、额外参数、隐藏 fallback 或透明 retry。每个 `<32hex>` 是非零 16-byte operation identity 的精确 32 字符 lower-case hex，无 `0x` 前缀。
+- D0a 的 `deploy --local --config <ABS> --json` 仍是原样五 token grammar。dispatcher 必须先按完整 argv 的 exact length/order 区分 D0a 与 D0b，再进入各自 strict parser；不得用可选 artifact flags 把两条合同合并，也不得改变 D0a JSON/行为。
+- `artifact build` 与 `artifact inspect` 完全离线且零 domain mutation；`inspect` 还必须零 filesystem mutation。`artifact materialize`/`artifact materialization query` 只进入 ArtifactStore seam；D0b deploy/query 只进入下文 owner seam。没有一条命令创建 Installation、active/current pointer、Graph operation 或通用 Ops operation。
+
+首个 profile 的 immutable execution contract 固定为：
+
+- `profile = "developer-local-echo-prefix-v1"`，`runtime_kind = "managed_model_data_v1"`。payload 长度严格为 1..64 bytes，必须是 UTF-8 且每个 byte 都是 printable ASCII `0x20..0x7e`；因此 CR、LF、NUL 与其他 control 全部非法，最后一个 byte 还必须精确为 ASCII space `0x20`。
+- canonical manifest 绑定 payload length/digest、上述 profile/runtime kind、`adapter_abi = "bounded-text-model-data-v1"`、`target_profile = "developer-local-managed-model-v1"` 与 `entrypoint = "literal-prefix-v1"`。四个 execution 值都由 profile 固定，不是 CLI/config/manifest 可自由 override 的输入或可选 default；build 必须逐字写入 canonical manifest，inspect/ArtifactStore/Controller/Runtime 必须逐字匹配，且实现批的跨语言 golden 必须冻结其 exact bytes。`entrypoint` 不新增 public JSON top-level 字段。不兼容变化只能创建显式 successor profile/contract，不能扩宽 v1 decoder。
+- RuntimeHost 必须从 Slice 绑定的 terminal ArtifactStore object 通过 read-only access port exact reopen canonical manifest 与 payload，再重算并复验 pair、profile/runtime kind、length、ABI、target 与 entrypoint；只有全部通过后，仓库内编译 adapter 才可接受 0..16384-byte 的既有 prompt并产生精确 `payload || prompt` bytes。这份 external payload 必须真实改变 Agent/TUI 可见结果，不能回退到 D0a compiled-in fixture。
+- payload 不是 executable、dynamic library、ProcessDomain program、script 或 eval 输入，不能创建 subprocess、读取路径/环境、访问网络或取得其他 ambient OS authority；本合同不作 sandbox/containment 声明，也不构成 Installation/A0。出现 ADR-0004 的真实触发 fixture时才在任何 Artifact/deployment/runtime mutation 前返回 `A0_APPLICATION_ADMISSION_REQUIRED`。
+
+canonical manifest 是 big-endian、fixed-size、精确 206-byte 的 `PXAM` v1；header 精确 80 bytes，布局严格为：
+
+```text
+0..4      magic = PXAM
+4..6      version = u16_be(1)
+6..8      header_len = u16_be(80)
+8..12     frame_len = u32_be(206)
+12..14    profile_len = u16_be(30)
+14..16    runtime_kind_len = u16_be(21)
+16..18    adapter_abi_len = u16_be(26)
+18..20    target_profile_len = u16_be(32)
+20..22    entrypoint_len = u16_be(17)
+22..24    reserved = u16_be(0)
+24..32    payload_len = u64_be(1..64)
+32..64    payload_digest[32]
+64..68    max_prompt_bytes = u32_be(16384)
+68..72    max_output_bytes = u32_be(32768)
+72..76    effect_flags = u32_be(0)
+76..80    reserved = u32_be(0)
+80..110   ASCII "developer-local-echo-prefix-v1"
+110..131  ASCII "managed_model_data_v1"
+131..157  ASCII "bounded-text-model-data-v1"
+157..189  ASCII "developer-local-managed-model-v1"
+189..206  ASCII "literal-prefix-v1"
+```
+
+payload 与 manifest digest domain 固定为：
+
+```text
+payload_digest  = SHA-256("paraegox.artifact.payload.sha256.v1" || exact_payload_bytes)
+manifest_digest = SHA-256("paraegox.artifact.manifest.sha256.v1" || exact_206_byte_PXAM)
+```
+
+binary `ArtifactObjectRefV1` 是 big-endian、精确 72-byte 的 `PXAK` v1：
+
+```text
+0..4    magic = PXAK
+4..6    version = u16_be(1)
+6..8    frame_len = u16_be(72)
+8..40   payload_digest[32]
+40..72  manifest_digest[32]
+```
+
+所有 decoder 必须拒绝错误 magic/version/header/frame/string length、reserved、literal、limit、effect flags、digest、trailing 或 oversize，strict decode 后 canonical re-encode 必须逐 byte 等于输入。`max_prompt_bytes` 与 `max_output_bytes` 是固定 contract limits而非自由 metadata；本 profile 的最大输出实际为 `64 + 16384 = 16448` bytes，不得截断、补零或利用 32768 上限扩宽 payload/prompt。
+
+`artifact build --output <ABS>` 的 `<ABS>` 是 non-root、lexical-canonical absolute artifact directory；整条既有父链必须无 symlink并由当前 uid/gid安全控制。首次 build 原子创建 mode-0700目录，成功后严格只有 `manifest.pxam`（精确206 bytes、mode0600、regular、single-link）与逐byte等于accepted source的 `payload.bin`（1..64 bytes、mode0600、regular、single-link），不得设置executable bit、跟随/发布symlink/hardlink或覆盖既有对象。新pair必须经同父目录temp、fsync、identity recheck与原子no-overwrite发布后才返回 `changed = true`；同source、同exact bytes重跑必须返回 `changed = false` 且两个既有文件的inode/bytes不变。目录/文件/额外entry、owner/mode/link/content任一冲突都fail-closed且不覆盖；错误退出时，只有安全清理并证明零最终mutation才可 `changed = false`，留下任何可观察对象或durability不确定都必须为null。build不读写state root、ArtifactStore、Controller或Runtime。`artifact inspect` 只接受显式manifest/payload路径；无论成功或失败都不得创建、写入、rename、删除、chmod/chown任何对象，也不创建domain state。
+
+两类 public reference 的 canonical text wire 固定为：
+
+```text
+sha256:<64-lowerhex-payload-digest>:<64-lowerhex-manifest-digest>
+pxamr1:<64-lowerhex-store-instance>:<canonical-decimal-sequence>:<32-lowerhex-operation-id>:<64-lowerhex-receipt-digest>
+```
+
+- `ArtifactObjectRefV1` 的两个 digest 不可拆分、换序、截断或降格为 payload-only identity；相同 payload 加不同 manifest 是不同 object。`<canonical-decimal-sequence>` 是大于零、无前导零且不编码成 JSON number 的 owner sequence。
+- materialization Receipt ref 的 store instance、operation id、sequence 与 receipt digest 必须逐项关联 ArtifactStore terminal record；CLI、Controller、Runtime 或文件存在都不能另签、改写或从 ref 文本推导 terminal outcome。
+
+ArtifactStore v1 的 capacity 与 filesystem profile 同样固定：
+
+- 最多 64 个 terminal objects、最多 1024 个 materialization operations，owner-counted content + admission/journal + operation/Receipt总预算精确为 8 MiB（8388608 bytes）；所有计数与加法必须 checked/preflight。任一上限耗尽都返回稳定 pre-effect owner error，不接受新 admission、不覆盖旧 object/operation，也不把容量失败改写为 `uncertain`。
+- store root 与其所有 owner目录必须为当前 euid/egid拥有的 real directory、mode 0700；manifest、payload、operation与Receipt对象必须是当前 euid/egid拥有、mode 0600、regular、single-link文件。每次访问都 no-follow并在同一 descriptor复核 device/inode/owner/mode/nlink/length；发布只允许 identity-checked no-overwrite。
+- v1 没有 GC、delete、retain、evict、后台清理或目录扫描恢复 owner。已 terminal但未被Deployment引用的完整 object仍计入64-object/8-MiB上限；无法证明归属的temp/partial bytes进入quarantine/`uncertain`，CLI/Runtime不得为释放容量而删除或覆盖。
+
+ArtifactStore materialization 的 canonical owner bytes 同样属于 F0 v1，不得由语言对象、JSON、文件名或 serde 默认值代替。所有整数为 big-endian，所有 frame 都必须 exact EOF、strict decode 后 canonical re-encode 逐 byte 相等；16-byte operation id、32-byte commitment/digest/store instance 均不得全零。`operation_sequence` 是 ArtifactStore-global admission high-water：首份 PXAA 精确为 1，每个新 operation 的 durable PXAA 精确加一，绝不复用、倒退、跳号或按完成顺序重排；same operation/same PXAQ replay 必须沿用原 sequence。PXAA bytes 与 successor high-water 位于同一 durable owner commit并一起 fsync，不存在第二个 counter file/writer。`u64::MAX`、checked addition、1024-operation或8-MiB preflight失败必须发生在新 PXAA 前；若 publication 后无法证明 old 或 new完整 commit，先只按 exact operation/PXAQ 重开，能恢复 canonical PXAA才用其 sequence并终结原 operation为 U，否则 ArtifactStore owner整体失败关闭、`changed = null`，且绝不猜测/复用候选 sequence。
+
+`PXAQ` v1 是 fixed 176-byte canonical materialization request：
+
+```text
+0..4      magic = PXAQ
+4..6      version = u16_be(1)
+6         action = M
+7         reserved = 0
+8..10     header_len = u16_be(176)
+10..12    reserved = 0
+12..16    frame_len = u32_be(176)
+16..32    operation_id[16]
+32..64    config_commitment[32]
+64..136   exact PXAK v1[72]
+136..140  contract_flags = u32_be(0)
+140..144  reserved = 0
+144..176  request_digest[32]
+```
+
+`request_digest = SHA-256("paraegox.artifact.materialization-request.sha256.v1" || frame[0..144])`。manifest/payload path 不进入 request identity；producer 必须先通过同一 fd 的 strict pair 验证，再从 exact bytes 生成 PXAK/PXAQ，因此 path replacement 不能改变已 admitted request，也不能让 path 成为 object identity。
+
+`PXAA` v1 是 fixed 208-byte durable admission：
+
+```text
+0..4      magic = PXAA
+4..6      version = u16_be(1)
+6         action = M
+7         state = A
+8..10     header_len = u16_be(208)
+10..12    reserved = 0
+12..16    frame_len = u32_be(208)
+16..48    artifact_store_instance[32]
+48..56    operation_sequence = u64_be(nonzero)
+56..72    operation_id[16]
+72..104   PXAQ request_digest[32]
+104..176  exact PXAK v1[72]
+176..208  admission_digest[32]
+```
+
+`admission_digest = SHA-256("paraegox.artifact.materialization-admission.sha256.v1" || frame[0..176])`。capacity、A0、config、pair 与 compatibility preflight 必须先完成；`PXAA` 的 durable no-overwrite publication 是首次 materialization owner mutation。相同 operation/request 只能读取或推进这一 admission；不同 request/object/config commitment 必须在另一个 owner effect 前 conflict。
+
+`PXMU` v1 是 fixed 240-byte durable materializing record；它表示 owner 已在同一 operation 的唯一 mutation lease 下进入 pair publication，不是 transport ACK 或内存 flag：
+
+```text
+0..4      magic = PXMU
+4..6      version = u16_be(1)
+6         action = M
+7         state = P
+8..10     header_len = u16_be(240)
+10..12    reserved = 0
+12..16    frame_len = u32_be(240)
+16..48    artifact_store_instance[32]
+48..56    operation_sequence = u64_be(nonzero)
+56..72    operation_id[16]
+72..104   PXAQ request_digest[32]
+104..136  PXAA admission_digest[32]
+136..208  exact PXAK v1[72]
+208..240  materializing_digest[32]
+```
+
+`materializing_digest = SHA-256("paraegox.artifact.materializing.sha256.v1" || frame[0..208])`。同一 admission 最多发布一份 exact PXMU。restart 看到 PXMU 而没有 PXAW 时必须恢复同一 operation，不得先改写为U或生成新id/sequence：只从canonical PXAQ/PXAA中的exact PXAK与owner-derived fixed object location执行一次bounded no-follow reopen，不扫描目录、不接受path fallback、不重放temp write、不覆盖/rename/delete任何既有对象。若recovery开始时canonical final pair与exact PXAV已存在，且owner/mode/nlink/identity、bytes、object high-water与directory durability全部可证明，则必须复用该PXAV并以原operation/operation sequence终结为PXAW-E与PXAX-E；若recovery开始时不存在PXAV，但canonical final pair及其全部上述事实可证明，则必须在recovery中以原object high-water规则新发布exact PXAV，并终结为PXAW-M与PXAX-M。两种情况不得互换M/E，也不得根据creator operation id推断，因为PXAV不携带该字段。若只见partial pair、对象/identity不一致、durability或归属任何一项不明，才以保留全部verified facts的PXAW-U/PXAX终结原operation。recovery不能把PXAA/PXMU、文件存在或清理成功单独解释成completed object。
+
+`PXAV` v1 是 fixed 192-byte immutable object terminal；它只证明 ArtifactStore 已对完整 pair 做 final no-overwrite publish、directory sync 与 exact reopen，不代表 Deployment selection：
+
+```text
+0..4      magic = PXAV
+4..6      version = u16_be(1)
+6         action = M
+7         state = R
+8..10     header_len = u16_be(192)
+10..12    reserved = 0
+12..16    frame_len = u32_be(192)
+16..48    artifact_store_instance[32]
+48..56    object_sequence = u64_be(nonzero)
+56..128   exact PXAK v1[72]
+128..136  payload_len = u64_be(1..64)
+136..140  manifest_len = u32_be(206)
+140..160  reserved = 0
+160..192  object_terminal_digest[32]
+```
+
+`object_terminal_digest = SHA-256("paraegox.artifact.object-terminal.sha256.v1" || frame[0..160])`。`object_sequence` 是独立的 ArtifactStore-global terminal-object high-water：首个新 unique object精确为1，之后每个新 durable PXAV精确加一；相同 PXAK 只能 strict复验并复用原 PXAV/sequence，不得因新 operation或replay新造 object、跳号、复用 sequence或发布等价但 byte-different terminal。PXAV 与 object high-water successor必须在同一 durable owner commit一起fsync；64-object/8-MiB/`u64::MAX` 在 pair publication前 checked preflight。若 final pair/PXAV/high-water 的 identity或durability无法证明，原 operation只能进入PXAW-U，ArtifactStore在 exact bounded recovery完成前拒绝新object publication，绝不扫描目录、覆盖或猜测下一个sequence。
+
+`PXAW` v1 是 fixed 304-byte materialization operation terminal，state byte 严格为 `M`（本 operation 完成新物化）、`E`（exact object 已存在且完成关联）、`F`（owner-confirmed failed）或 `U`（effect/耐久性无法证明）：
+
+```text
+0..4      magic = PXAW
+4..6      version = u16_be(1)
+6         action = M
+7         state = M | E | F | U
+8..10     header_len = u16_be(304)
+10..12    reserved = 0
+12..16    frame_len = u32_be(304)
+16..48    artifact_store_instance[32]
+48..56    operation_sequence = u64_be(nonzero)
+56..72    operation_id[16]
+72..104   PXAQ request_digest[32]
+104..136  PXAA admission_digest[32]
+136..168  PXMU materializing_digest[32] or all-zero
+168..200  PXAV object_terminal_digest[32] or all-zero
+200..272  exact PXAK v1[72]
+272..304  operation_terminal_digest[32]
+```
+
+`operation_terminal_digest = SHA-256("paraegox.artifact.materialization-terminal.sha256.v1" || frame[0..272])`。`M|E` 要求 PXMU 与可 exact reopen 的 PXAV digest 都 nonzero；`M` 只能表示本 operation 的正常执行或 bounded recovery 从“没有PXAV”推进到新durable PXAV，`E` 只能表示该 operation 在正常执行或 bounded recovery开始时已经看到并strict复验既有exact PXAV。PXAV不携带creator operation id，M/E只由本 operation 开始或恢复开始时PXAV是否已durable存在决定，不得事后猜测。`F` 可以在进入 publication 前让两个 digest 全零，或保留已 durable PXMU但要求 PXAV全零并证明没有 terminal object 被本 operation 发布；`U` 必须分别保留已验证 PXMU/PXAV digest（若存在）或全零（若未知），不能猜测。`F|U` 不删除 admission、progress、partial/quarantine 或已验证 object evidence。
+
+`PXAX` v1 是 fixed 240-byte ArtifactStore owner Receipt；只有 durable PXAW 后才能签发，state 必须逐 byte 等于 PXAW：
+
+```text
+0..4      magic = PXAX
+4..6      version = u16_be(1)
+6         action = M
+7         state = M | E | F | U
+8..10     header_len = u16_be(240)
+10..12    reserved = 0
+12..16    frame_len = u32_be(240)
+16..48    artifact_store_instance[32]
+48..56    operation_sequence = u64_be(nonzero)
+56..72    operation_id[16]
+72..104   PXAQ request_digest[32]
+104..136  PXAW operation_terminal_digest[32]
+136..208  exact PXAK v1[72]
+208..240  receipt_digest[32]
+```
+
+`receipt_digest = SHA-256("paraegox.artifact.materialization-receipt.sha256.v1" || frame[0..208])`。`pxamr1` text ref 的四个变量必须分别来自该 PXAX 的 store instance、ArtifactStore-global operation sequence、operation id 与 receipt digest；消费 ref 必须经 ArtifactStore typed read 取得 exact PXAX/PXAW/PXMU/PXAV/PXAA/PXAQ/PXAM/payload 链并全部复验，ref 文本或文件存在本身不是 materialized 证明。PXAX 是本地 store-identity 与 durable-owner correlation Receipt，不声明跨主机签名或 remote trust。
+
+materialization hardcoded shared goldens 全部位于 `tests/fixtures/wire/`，文件名与内容边界冻结为：`artifact_f0_pxam_v1.hex`（206 bytes）、`artifact_f0_pxak_v1.hex`（72 bytes）、`artifact_f0_pxaq_v1.hex`（176 bytes）、`artifact_f0_pxaa_v1.hex`（208 bytes）、`artifact_f0_pxmu_v1.hex`（240 bytes）、`artifact_f0_pxav_v1.hex`（192 bytes）、`artifact_f0_pxaw_materialized_v1.hex`（304 bytes）、`artifact_f0_pxaw_already_materialized_v1.hex`（304 bytes）、`artifact_f0_pxaw_failed_v1.hex`（304 bytes）、`artifact_f0_pxaw_uncertain_v1.hex`（304 bytes）与对应四份 `artifact_f0_pxax_*_v1.hex`（各 240 bytes），另有 `artifact_f0_text_refs_v1.txt` 冻结 exact object/ref 行与单一 LF。PXAA/PXMU/PXAW/PXAX happy vector的ArtifactStore-global operation sequence固定为1，PXAV object sequence固定为1；bounded-recovery golden必须分别hardcode“recovery开始时PXAV已存在→E”与“recovery开始时PXAV不存在、由本次恢复新发布→M”，并拒绝交换后的terminal bytes；独立successor vector必须hardcode sequence 2、same-operation/same-object replay仍为1以及`u64::MAX` preflight reject。golden 必须由独立 Rust/Python decoder 消费且 expected bytes hardcoded，不能在测试中调用 production encoder 生成期望值。
+
+D0b 也不复用未锚定的既有 Deployment DTO 或 serde layout。它只复用已经 canonical 的 PXAK、PXAX、PlanContent/Slice、Runtime authenticated apply 与 PXMT；下列 external-deployment owner frames 是完整新增锚点。`execution_profile_commitment` 精确为 `SHA-256("paraegox.artifact.execution-profile.sha256.v1" || u16_be(30) || "developer-local-echo-prefix-v1" || u16_be(21) || "managed_model_data_v1" || u16_be(26) || "bounded-text-model-data-v1" || u16_be(32) || "developer-local-managed-model-v1" || u16_be(17) || "literal-prefix-v1" || u32_be(16384) || u32_be(32768) || u32_be(0))`；这些长度/limit/flag 是 bytes，不是自由字符串拼接。
+
+`PXDQ` v1 是 fixed 288-byte D0b canonical request：
+
+```text
+0..4      magic = PXDQ
+4..6      version = u16_be(1)
+6         action = D
+7         reserved = 0
+8..10     header_len = u16_be(288)
+10..12    reserved = 0
+12..16    frame_len = u32_be(288)
+16..32    deployment_operation_id[16]
+32..64    config_commitment[32]
+64..136   exact PXAK v1[72]
+136..168  materialization_store_instance[32]
+168..176  materialization_operation_sequence = u64_be(nonzero)
+176..192  materialization_operation_id[16]
+192..224  PXAX receipt_digest[32]
+224..256  execution_profile_commitment[32]
+256..288  deployment_request_digest[32]
+```
+
+`deployment_request_digest = SHA-256("paraegox.deployment.external-request.sha256.v1" || frame[0..256])`。四个 materialization locator 字段必须 canonical 重建用户给出的 `pxamr1` ref，并经 typed ArtifactStore read 验证一份 state `M|E` 的 exact PXAX；`F|U` Receipt 永不准入 D0b。request 不包含 mutable path、workspace A state 或 compiled-in fallback selector。
+
+`PXDK` v1 是 fixed 240-byte fresh-only DeploymentController admission：
+
+```text
+0..4      magic = PXDK
+4..6      version = u16_be(1)
+6         action = D
+7         state = A
+8..10     header_len = u16_be(240)
+10..12    reserved = 0
+12..16    frame_len = u32_be(240)
+16..48    controller_store_instance[32]
+48..56    admission_sequence = u64_be(nonzero)
+56..72    deployment_operation_id[16]
+72..104   PXDQ deployment_request_digest[32]
+104..176  exact PXAK v1[72]
+176..208  previous_desired_head_digest[32] = all-zero
+208..240  admission_digest[32]
+```
+
+`admission_digest = SHA-256("paraegox.deployment.external-admission.sha256.v1" || frame[0..208])`。`admission_sequence` 是 Controller-global deployment-admission high-water：首份 PXDK精确为1，每个后继新operation精确加一，绝不复用、倒退、跳号或按terminal顺序重排；same id/same PXDQ replay沿用原sequence。PXDK与high-water successor必须在同一durable Controller commit一起fsync；`u64::MAX`/checked addition与owner capacity在PXDK前失败关闭。若publication后无法证明old/new完整commit，只能按exact id/PXDQ bounded重开；恢复canonical PXDK后用同sequence终结原operation为U，否则Controller owner整体失败关闭、`changed = null`，不得猜测下一个sequence。F0 只接受 all-zero previous head；任何 lifecycle generation、Deployment operation 或 desired head 已存在时都必须在 PXDK 前返回 replace-required。PXDK durable publication 是 D0b 的首次 lifecycle/deployment mutation，且只能在唯一 supervisor 的 owner lock 下发生。因此 F0 workspace 最多 admission 一个 D0b operation；同 id/same PXDQ 只 replay/推进它，任何第二 id 即使第一项 failed也不建立 queue或第二 PXDK，只能等待 R0 的显式 replacement/recovery 合同。
+
+`PXDM` v1 是 fixed 496-byte append-only deployment operation record；state byte严格为 `C`（committed）、`P`（applying）、`R`（active_ready）、`F`（failed）、`U`（uncertain）或 `S`（superseded），outcome byte严格为 nonterminal `N` 或对应 terminal `R|F|U|S`：
+
+```text
+0..4      magic = PXDM
+4..6      version = u16_be(1)
+6         state = C | P | R | F | U | S
+7         outcome = N | R | F | U | S
+8..10     header_len = u16_be(496)
+10..12    reserved = 0
+12..16    frame_len = u32_be(496)
+16..48    controller_store_instance[32]
+48..56    record_sequence = u64_be(nonzero)
+56..72    deployment_operation_id[16]
+72..104   PXDQ deployment_request_digest[32]
+104..136  PXDK admission_digest[32]
+136..208  exact PXAK v1[72]
+208..240  PXAX receipt_digest[32]
+240..248  deployment_revision = u64_be or zero
+248..256  controller_snapshot_sequence = u64_be or zero
+256..288  desired_head_digest[32] or all-zero
+288..320  runtime_apply_request_digest[32] or all-zero
+320..352  runtime_terminal_receipt_digest[32] or all-zero
+352..368  lifecycle_generation[16] or all-zero
+368..400  execution_profile_commitment[32]
+400..432  previous_record_digest[32] or all-zero
+432..464  superseding_desired_head_digest[32] or all-zero
+464..496  operation_record_digest[32]
+```
+
+`operation_record_digest = SHA-256("paraegox.deployment.external-operation-record.sha256.v1" || frame[0..464])`。`record_sequence` 是该 operation 内从 1 开始、每个 successor 精确加一的局部序列，不是 Controller 全局 journal offset。首条 `C` 使用 all-zero previous record，要求 revision、snapshot、desired head nonzero，Runtime/generation/superseding字段全零，outcome `N`；`P` 要求前述 committed 字段与 runtime apply digest、generation nonzero，superseding 全零，outcome `N`；`R` 要求所有 committed/applying 字段与 Runtime terminal digest nonzero、superseding全零，outcome `R`。`F|U` 必须逐项保留前一 verified record 的所有 nonzero 字段，只允许把本次新获得且验证相关的后续字段从 zero推进到 nonzero，不得清空或改写；outcome分别为`F|U`。若 failure/uncertainty 发生在 PXDK 后、首条 `C` 前，第一份 PXDM 可以是 `F|U`，previous record与所有尚未产生的 progress 字段全零；这不是“未 admission”。`S` 要求 superseding desired head nonzero且不同于本 operation desired head，保留全部既有字段，outcome `S`。首份 PXDM 的 previous record全零，之后必须精确引用同 operation 的前一 canonical PXDM；任何 operation 都从自己的 sequence 1开始且不能串接另一 operation 的 digest。`F|U|S` 不再接受 successor；`R` 在 F0 中同样终结，只有后续 R0 以新 operation/new desired 获得显式 replacement authority 后，才可为旧 operation追加恰一份 `S` successor并签发新的 PXDO-S；旧 PXDO-R 继续是历史 point-in-time Receipt，latest query返回 S，不能改写旧 bytes。
+
+`PXDO` v1 是 fixed 432-byte terminal DeploymentController Receipt，只允许 `R|F|U|S`，并从 terminal PXDM逐字段复制 verified facts：
+
+```text
+0..4      magic = PXDO
+4..6      version = u16_be(1)
+6         action = D
+7         outcome = R | F | U | S
+8..10     header_len = u16_be(432)
+10..12    reserved = 0
+12..16    frame_len = u32_be(432)
+16..48    controller_store_instance[32]
+48..56    receipt_sequence = u64_be(nonzero)
+56..72    deployment_operation_id[16]
+72..104   PXDQ deployment_request_digest[32]
+104..136  terminal PXDM operation_record_digest[32]
+136..208  exact PXAK v1[72]
+208..240  PXAX receipt_digest[32]
+240..248  deployment_revision = u64_be or zero
+248..256  controller_snapshot_sequence = u64_be or zero
+256..288  desired_head_digest[32] or all-zero
+288..320  runtime_apply_request_digest[32] or all-zero
+320..352  runtime_terminal_receipt_digest[32] or all-zero
+352..368  lifecycle_generation[16] or all-zero
+368..400  superseding_desired_head_digest[32] or all-zero
+400..432  deployment_receipt_digest[32]
+```
+
+`deployment_receipt_digest = SHA-256("paraegox.deployment.external-receipt.sha256.v1" || frame[0..400])`。`receipt_sequence` 是 Controller owner 在 terminal PXDO durable publication时分配的大于零、全 store 单调递增且不复用的 Receipt 序列；它不是 PXDM 的 operation-local record sequence。PXDO 的 optional-zero字段必须与 terminal PXDM逐 byte一致，`R` 要求 revision/snapshot/desired/runtime request/runtime terminal/generation全 nonzero且 superseding全零；`F|U|S` 遵循 PXDM verified-prefix preservation。canonical text `DeploymentReceiptRefV1` 固定为 `pxdor1:<64-lowerhex-controller-store-instance>:<canonical-decimal-receipt-sequence>:<32-lowerhex-operation-id>:<64-lowerhex-deployment-receipt-digest>`；它必须 canonical reparse/re-encode并经 Controller typed query取得 exact PXDQ/PXDK/PXDM/PXDO，不能从 JSON、desired 文件或 Runtime PXMT 自行合成。
+
+D0b hardcoded shared goldens 同样位于 `tests/fixtures/wire/`，冻结为 `artifact_f0_pxdq_v1.hex`（288 bytes）、`artifact_f0_pxdk_v1.hex`（240 bytes）、`artifact_f0_pxdm_committed_v1.hex`、`artifact_f0_pxdm_applying_v1.hex`、`artifact_f0_pxdm_active_ready_v1.hex`、`artifact_f0_pxdm_failed_v1.hex`、`artifact_f0_pxdm_uncertain_v1.hex`、`artifact_f0_pxdm_superseded_v1.hex`（各496 bytes）、对应四个 terminal outcome 的 `artifact_f0_pxdo_{active_ready,failed,uncertain,superseded}_v1.hex`（各432 bytes）与加入 `artifact_f0_text_refs_v1.txt` 的 exact `pxdor1` 行。PXDK happy vector的Controller-global admission sequence固定为1；owner-private pure high-water successor vector（不构成F0第二个public admission）必须hardcode 2、same id replay仍为1与`u64::MAX` preflight reject。实现批还必须 hardcode `execution_profile_commitment` 与四个 D0b digest domain；golden、state transition与 frozen JSON expected value不能由同一 production encoder/mapper共同生成。
+
+`artifact build` 与 `artifact inspect` 的 JSON v1 top-level key 顺序严格且仅有：
+
+```text
+schema_version
+command
+ok
+changed
+profile
+artifact_object_ref
+payload_length
+runtime_kind
+adapter_abi
+target_profile
+diagnostics
+```
+
+`artifact materialize` 与 `artifact materialization query` 的 JSON v1 top-level key 顺序严格且仅有：
+
+```text
+schema_version
+command
+ok
+changed
+operation_id
+state
+artifact_object_ref
+materialization_receipt_ref
+diagnostics
+```
+
+其 `state` enum 严格为 `admitted|materializing|materialized|already_materialized|failed|uncertain`。D0b `deploy` 与 `deployment operation query` 的 JSON v1 top-level key 顺序严格且仅有：
+
+```text
+schema_version
+command
+mode
+ok
+changed
+operation_id
+state
+profile
+artifact_object_ref
+materialization_receipt_ref
+generation
+deployment_revision
+controller_snapshot_sequence
+deployment_receipt_ref
+runtime_apply_request_digest
+runtime_terminal_receipt_digest
+terminal_outcome
+current_health_checked
+diagnostics
+```
+
+其 `state` enum 严格为 `admitted|committed|applying|active_ready|failed|uncertain|superseded`。
+
+JSON scalar 类型不由值猜测：`schema_version` 与 `payload_length` 是 JSON number；`ok`、非 null `changed`、`current_health_checked` 是 JSON boolean；`diagnostics` 是 array；其余 non-null 字段全部是 JSON string。下表中的 `PF` 精确表示 profile string `"developer-local-echo-prefix-v1"`，`O` 表示 canonical object ref，`MR` 表示 canonical `pxamr1`，`DR` 表示 canonical `pxdor1`，`V` 表示必须从最后一份 owner-verified canonical record 原样保留的值；`—` 精确表示 JSON null，不允许省略 key、空字符串、零字符串、空 object/array 或错误类型代替。
+
+build/inspect 的逐 outcome envelope 固定为：
+
+| command / outcome | `ok` | `changed` | `profile` | `artifact_object_ref` | `payload_length` | `runtime_kind` / `adapter_abi` / `target_profile` | `diagnostics` | exit |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| build / first published pair | true | true | `developer-local-echo-prefix-v1` | O | 1..64 number | 三个固定字符串 | `[]` | 0 |
+| build / exact byte-identical replay | true | false | 同上 | O | 1..64 number | 三个固定字符串 | `[]` | 0 |
+| inspect / valid exact pair | true | false | 同上 | O | 1..64 number | 三个固定字符串 | `[]` | 0 |
+| build 或 inspect / applicable grammar、platform、path、profile、compatibility 或 A0 pre-effect reject | false | false | — | — | — | 三字段均 — | 恰一项对应 exit-2 stable diagnostic | 2 |
+| build 或 inspect / execution identity reject | false | false | — | — | — | 三字段均 — | `PXLC-EXECUTION-IDENTITY` 恰一项 | 1 |
+| build / owner effect 或 durability 无法证明 | false | — | — | — | — | 三字段均 — | `PXLC-ARTIFACT-UNCERTAIN` 恰一项 | 1 |
+| build 或 inspect / I/O failure 且已证明零 mutation | false | false | — | — | — | 三字段均 — | `PXLC-ARTIFACT-IO` 恰一项 | 1 |
+
+`inspect` 永远不能产生 `changed = true|null`；build 只有完整 pair final publish、directory sync与exact reopen全部归因于本 invocation 时为 true。stdout delivery failure 没有一份可声称“已交付”的 JSON envelope；实现仍必须尝试 `PXLC-ARTIFACT-JSON-OUTPUT`、exit 1，且不能因此改变或回滚已 durable 的 owner事实。
+
+materialization 的逐 state envelope 固定为：
+
+| command / owner outcome | `ok` | `changed` | `operation_id` | `state` | `artifact_object_ref` | `materialization_receipt_ref` | `diagnostics` | exit |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| materialize / `admitted` | true | true 或 replay 时 false | exact input 32hex | `admitted` | O | — | `[]` | 0 |
+| materialize / `materializing` | true | true 或 replay/readback时 false | exact input 32hex | `materializing` | O | — | `[]` | 0 |
+| materialize / `materialized` | true | true 或 terminal replay时 false | exact input 32hex | `materialized` | O | MR（PXAX state M） | `[]` | 0 |
+| materialize / `already_materialized` | true | 新 operation 完成关联时 true、terminal replay时 false | exact input 32hex | `already_materialized` | O | MR（PXAX state E） | `[]` | 0 |
+| materialize / `failed` | false | 已证明本调用推进时 true、纯 replay时 false | exact input 32hex | `failed` | O | MR（PXAX state F） | `PXLC-ARTIFACT-MATERIALIZATION-FAILED` 恰一项 | 1 |
+| materialize / `uncertain` | false | 无法证明 effect 时 —；已证明 terminal commit归因时 true；纯 replay时 false | exact input 32hex | `uncertain` | O | MR（PXAX state U） | `PXLC-ARTIFACT-UNCERTAIN` 恰一项 | 1 |
+| materialization query / 任一已存在 state | 与同 state 上述值相同 | false | exact input 32hex | 对应 exact state | 按同 state | 按同 state | 按同 state | 按同 state |
+| materialization query / NotFound | false | false | exact input 32hex | — | — | — | `PXLC-ARTIFACT-NOT-FOUND` 恰一项 | 1 |
+| 任一 materialization 命令 / 其逐命令 total order 所列的 exit-2 pre-effect reject | false | false | 仅当 32hex 已 strict parse 时保留，否则 — | — | — | — | 恰一项对应 exit-2 stable diagnostic | 2 |
+| 任一 materialization 命令 / execution identity reject | false | false | 仅当 32hex 已 strict parse 时保留，否则 — | — | — | — | `PXLC-EXECUTION-IDENTITY` 恰一项 | 1 |
+| 已可能 admission、但无法读取足够 owner record分类 | false | — | exact input 32hex | `uncertain` | 已由 PXAQ 验证时 O，否则 — | 已验证 PXAX 时 MR，否则 — | `PXLC-ARTIFACT-UNCERTAIN` 恰一项 | 1 |
+
+`admitted` 精确对应只有 PXAA、尚无 PXMU/PXAW；`materializing` 精确对应 PXMU 已 durable、尚无 PXAW。MR 对所有四种 PXAX terminal state 都必须保留；只有 state `M|E` 可供 D0b admission，不能因 `failed|uncertain` 的 Receipt 非 null 而升级为 materialized。
+
+D0b 的逐 state envelope 固定为：
+
+| command / owner outcome | `ok` | `changed` | `operation_id` / `state` / `profile` | object / MR | `generation` | revision / snapshot | DR | Runtime request / terminal digest | `terminal_outcome` | diagnostics / exit |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| deploy / `admitted` | true | true 或 replay时 false | exact id / `admitted` / PF | O / MR | — | — / — | — | — / — | — | `[]` / 0 |
+| deploy / `committed` | true | true 或 replay/readback时 false | exact id / `committed` / PF | O / MR | — | nonzero decimal / nonzero decimal | — | — / — | — | `[]` / 0 |
+| deploy / `applying` | true | true 或 replay/readback时 false | exact id / `applying` / PF | O / MR | 32hex | nonzero decimal / nonzero decimal | — | 64hex / — | — | `[]` / 0 |
+| deploy / `active_ready` | true | true 或 terminal replay时 false | exact id / `active_ready` / PF | O / MR | 32hex | nonzero decimal / nonzero decimal | DR | 64hex / 64hex | `active_ready` | `[]` / 0 |
+| deploy / `failed` | false | owner推进归因时 true、纯 replay时 false | exact id / `failed` / PF | O / MR | V 或 — | V 或 — / V 或 — | DR | V 或 — / V 或 — | `failed` | `PXLC-DEPLOY-FAILED` / 1 |
+| deploy / `uncertain` | false | effect无法证明时 —；terminal commit归因时 true；纯 replay时 false | exact id / `uncertain` / PF | O / MR | V 或 — | V 或 — / V 或 — | DR | V 或 — / V 或 — | `uncertain` | `PXLC-DEPLOY-UNCERTAIN` / 1 |
+| deploy / `superseded` | false | owner推进归因时 true、纯 replay时 false | exact id / `superseded` / PF | O / MR | V 或 — | V / V | DR | V 或 — / V 或 — | `superseded` | `PXLC-DEPLOY-SUPERSEDED` / 1 |
+| deployment operation query / 任一已存在 state | 与同 state 上述值相同 | false | 按同 state | 按同 state | 按同 state | 按同 state | 按同 state | 按同 state | 按同 state | 按同 state |
+| deployment operation query / NotFound | false | false | exact input id / — / — | — / — | — | — / — | — | — / — | — | `PXLC-DEPLOY-NOT-FOUND` / 1 |
+| 任一 D0b 命令 / 其逐命令 total order 所列的 exit-2 pre-effect reject | false | false | 仅当 id 已 strict parse时保留 / — / — | — / — | — | — / — | — | — / — | — | 恰一项对应 exit-2 stable diagnostic / 2 |
+| 任一 D0b 命令 / execution identity reject | false | false | 仅当 id 已 strict parse时保留 / — / — | — / — | — | — / — | — | — / — | — | `PXLC-EXECUTION-IDENTITY` / 1 |
+| admission 可能发生但 owner record不足以分类 | false | — | exact input id / `uncertain` / PF（若 PXDQ 已验证） | 验证到哪一项就原样保留，否则 — | V 或 — | V 或 — / V 或 — | 已验证 PXDO 时 DR，否则 — | V 或 — / V 或 — | `uncertain` | `PXLC-DEPLOY-UNCERTAIN` / 1 |
+
+D0b 两条命令的 `mode` 始终是 string `"local"`、`current_health_checked` 始终是 boolean `false`。terminal DR 对 `R|F|U|S` 都非 null；失败状态的 `V` 只允许来自 terminal PXDM/PXDO 的 nonzero verified prefix，不能从文件存在、进程状态或更后阶段的猜测补值。`superseded` 在 Artifact F0 fresh-only 路线不能由本批主动制造；它仅为后续 R0 的显式 successor 保留 strict read兼容性，F0 遇到任何既有 desired仍必须 pre-effect replace-required。
+
+Artifact F0 自有 diagnostic code、exact public-safe message 与 exit taxonomy 固定如下；除“严格 config decoder code”外不得透传底层 errno、path、owner identity、frame bytes 或自由文本：
+
+| code | exact `message` | exit |
+| --- | --- | --- |
+| `PXLC-ARTIFACT-GRAMMAR` | `artifact command grammar is invalid` | 2 |
+| `PXLC-ARTIFACT-PATH` | `artifact path is invalid or unsafe` | 2 |
+| `PXLC-ARTIFACT-PROFILE` | `artifact profile is unsupported` | 2 |
+| `PXLC-ARTIFACT-COMPATIBILITY` | `artifact bytes are invalid or incompatible` | 2 |
+| `PXLC-ARTIFACT-CONFLICT` | `artifact operation conflicts with its durable request` | 2 |
+| `PXLC-ARTIFACT-CAPACITY` | `artifact store capacity is exhausted` | 2 |
+| `A0_APPLICATION_ADMISSION_REQUIRED` | `application admission is required before this operation` | 2 |
+| `PXLC-ARTIFACT-NOT-FOUND` | `artifact operation was not found` | 1 |
+| `PXLC-ARTIFACT-MATERIALIZATION-FAILED` | `artifact materialization failed` | 1 |
+| `PXLC-ARTIFACT-UNCERTAIN` | `artifact operation outcome is uncertain` | 1 |
+| `PXLC-ARTIFACT-OWNER` | `artifact store owner state failed strict validation` | 1 |
+| `PXLC-ARTIFACT-IO` | `artifact operation could not complete` | 1 |
+| `PXLC-ARTIFACT-JSON-OUTPUT` | `artifact JSON output could not be written` | 1 |
+| `PXLC-DEPLOY-EXTERNAL-GRAMMAR` | `external deploy requires the exact artifact and operation arguments` | 2 |
+| `PXLC-DEPLOYMENT-QUERY-GRAMMAR` | `deployment operation query requires the exact config and operation arguments` | 2 |
+| `PXLC-ARG-NON-UTF8` | `arguments must be valid UTF-8` | 2 |
+| `PXLC-PLATFORM-UNSUPPORTED` | `DeveloperLocal modes require the Unix DeveloperLocal platform` | 2 |
+| `PXLC-CONFIG-PATH-INVALID` | `config path must name an absolute lexically canonical regular file` | 2 |
+| `PXLC-CONFIG-FILE-READ` | `config file could not be read` | 2 |
+| `PXLC-CONFIG-FILE-TOO-LARGE` | `config file exceeds the 64 KiB limit` | 2 |
+| `PXLC-CONFIG-DOCUMENT-INVALID` | `config file is not a strict ParaEGOX TOML document` | 2 |
+| `PXLC-CONFIG-SCHEMA-UNSUPPORTED` | `config schema_version is not supported` | 2 |
+| `PXLC-STATE-ROOT-TOO-LONG` | `state root exceeds the bounded DeveloperLocal limit` | 2 |
+| `PXLC-STATE-ROOT-INVALID` | `state root must be a non-root, lexically canonical absolute Unix path` | 2 |
+| `PXLC-FABRIC-LISTEN-INVALID` | `Fabric listen must be canonical tcp/127.0.0.1:PORT with PORT in 1..=65535` | 2 |
+| `PXLC-MODEL-MISSING` | `the selected provisioned chat profile requires model in config` | 2 |
+| `PXLC-CONFIG-PROVIDER-INVALID` | `config model fields do not match the selected provider` | 2 |
+| `PXLC-MODEL-INVALID` | `the model identifier is invalid for the selected provisioned chat profile` | 2 |
+| `PXLC-CONFIG-PROVIDER-UNKNOWN` | `config selects an unsupported model provider` | 2 |
+| `PXLC-LIFECYCLE-CONFIGURATION` | `managed-local lifecycle configuration authority changed` | 2 |
+| `PXLC-EXECUTION-IDENTITY` | `DeveloperLocal commands require a non-root user and group` | 1 |
+| `PXLC-DEPLOY-ARTIFACT` | `deployment artifact reference is invalid or incompatible` | 2 |
+| `PXLC-DEPLOY-MATERIALIZATION-RECEIPT` | `materialization receipt is invalid or not ready` | 2 |
+| `PXLC-DEPLOY-CONFLICT` | `deployment operation conflicts with its durable request` | 2 |
+| `PXLC-DEPLOY-REPLACE-REQUIRED` | `existing deployment state requires explicit replacement` | 2 |
+| `PXLC-DEPLOY-CAPACITY` | `deployment owner capacity is exhausted` | 2 |
+| `PXLC-DEPLOY-NOT-FOUND` | `deployment operation was not found` | 1 |
+| `PXLC-DEPLOY-FAILED` | `deployment operation failed` | 1 |
+| `PXLC-DEPLOY-UNCERTAIN` | `deployment operation outcome is uncertain` | 1 |
+| `PXLC-DEPLOY-SUPERSEDED` | `deployment operation was superseded` | 1 |
+| `PXLC-DEPLOY-OWNER` | `deployment owner could not complete the operation` | 1 |
+| `PXLC-DEPLOY-JSON-OUTPUT` | `deployment JSON output could not be written` | 1 |
+
+每个 failure envelope 的 `diagnostics` 恰一项且该 object 的 key 顺序严格为 `code,message`；所有 success/non-error progress 精确为 `[]`。同一 invocation 同时可观察多个 failure时，以下六行是逐 code、从左到右的完整 total order，不允许按实现层级、最后错误或自由文本改序：
+
+| exact command | diagnostic total order（左侧优先） |
+| --- | --- |
+| `artifact build` | `PXLC-ARTIFACT-GRAMMAR` → `PXLC-PLATFORM-UNSUPPORTED` → `PXLC-EXECUTION-IDENTITY` → `PXLC-ARTIFACT-PATH` → `PXLC-ARTIFACT-PROFILE` → `PXLC-ARTIFACT-COMPATIBILITY` → `A0_APPLICATION_ADMISSION_REQUIRED` → `PXLC-ARTIFACT-UNCERTAIN` → `PXLC-ARTIFACT-IO` → `PXLC-ARTIFACT-JSON-OUTPUT` |
+| `artifact inspect` | `PXLC-ARTIFACT-GRAMMAR` → `PXLC-PLATFORM-UNSUPPORTED` → `PXLC-EXECUTION-IDENTITY` → `PXLC-ARTIFACT-PATH` → `PXLC-ARTIFACT-COMPATIBILITY` → `PXLC-ARTIFACT-IO` → `PXLC-ARTIFACT-JSON-OUTPUT` |
+| `artifact materialize` | `PXLC-ARTIFACT-GRAMMAR` → `PXLC-ARG-NON-UTF8` → `PXLC-PLATFORM-UNSUPPORTED` → `PXLC-EXECUTION-IDENTITY` → `PXLC-CONFIG-PATH-INVALID` → `PXLC-CONFIG-FILE-READ` → `PXLC-CONFIG-FILE-TOO-LARGE` → `PXLC-CONFIG-DOCUMENT-INVALID` → `PXLC-CONFIG-SCHEMA-UNSUPPORTED` → `PXLC-STATE-ROOT-TOO-LONG` → `PXLC-STATE-ROOT-INVALID` → `PXLC-FABRIC-LISTEN-INVALID` → `PXLC-MODEL-MISSING` → `PXLC-CONFIG-PROVIDER-INVALID` → `PXLC-MODEL-INVALID` → `PXLC-CONFIG-PROVIDER-UNKNOWN` → `PXLC-LIFECYCLE-CONFIGURATION` → `PXLC-ARTIFACT-PATH` → `PXLC-ARTIFACT-PROFILE` → `PXLC-ARTIFACT-COMPATIBILITY` → `A0_APPLICATION_ADMISSION_REQUIRED` → `PXLC-ARTIFACT-CONFLICT` → `PXLC-ARTIFACT-CAPACITY` → `PXLC-ARTIFACT-MATERIALIZATION-FAILED` → `PXLC-ARTIFACT-UNCERTAIN` → `PXLC-ARTIFACT-OWNER` → `PXLC-ARTIFACT-IO` → `PXLC-ARTIFACT-JSON-OUTPUT` |
+| `artifact materialization query` | `PXLC-ARTIFACT-GRAMMAR` → `PXLC-ARG-NON-UTF8` → `PXLC-PLATFORM-UNSUPPORTED` → `PXLC-EXECUTION-IDENTITY` → `PXLC-CONFIG-PATH-INVALID` → `PXLC-CONFIG-FILE-READ` → `PXLC-CONFIG-FILE-TOO-LARGE` → `PXLC-CONFIG-DOCUMENT-INVALID` → `PXLC-CONFIG-SCHEMA-UNSUPPORTED` → `PXLC-STATE-ROOT-TOO-LONG` → `PXLC-STATE-ROOT-INVALID` → `PXLC-FABRIC-LISTEN-INVALID` → `PXLC-MODEL-MISSING` → `PXLC-CONFIG-PROVIDER-INVALID` → `PXLC-MODEL-INVALID` → `PXLC-CONFIG-PROVIDER-UNKNOWN` → `PXLC-LIFECYCLE-CONFIGURATION` → `PXLC-ARTIFACT-NOT-FOUND` → `PXLC-ARTIFACT-MATERIALIZATION-FAILED` → `PXLC-ARTIFACT-UNCERTAIN` → `PXLC-ARTIFACT-OWNER` → `PXLC-ARTIFACT-IO` → `PXLC-ARTIFACT-JSON-OUTPUT` |
+| D0b `deploy` | `PXLC-DEPLOY-EXTERNAL-GRAMMAR` → `PXLC-ARG-NON-UTF8` → `PXLC-PLATFORM-UNSUPPORTED` → `PXLC-EXECUTION-IDENTITY` → `PXLC-CONFIG-PATH-INVALID` → `PXLC-CONFIG-FILE-READ` → `PXLC-CONFIG-FILE-TOO-LARGE` → `PXLC-CONFIG-DOCUMENT-INVALID` → `PXLC-CONFIG-SCHEMA-UNSUPPORTED` → `PXLC-STATE-ROOT-TOO-LONG` → `PXLC-STATE-ROOT-INVALID` → `PXLC-FABRIC-LISTEN-INVALID` → `PXLC-MODEL-MISSING` → `PXLC-CONFIG-PROVIDER-INVALID` → `PXLC-MODEL-INVALID` → `PXLC-CONFIG-PROVIDER-UNKNOWN` → `PXLC-LIFECYCLE-CONFIGURATION` → `PXLC-DEPLOY-ARTIFACT` → `PXLC-DEPLOY-MATERIALIZATION-RECEIPT` → `A0_APPLICATION_ADMISSION_REQUIRED` → `PXLC-DEPLOY-CONFLICT` → `PXLC-DEPLOY-REPLACE-REQUIRED` → `PXLC-DEPLOY-CAPACITY` → `PXLC-DEPLOY-FAILED` → `PXLC-DEPLOY-UNCERTAIN` → `PXLC-DEPLOY-SUPERSEDED` → `PXLC-DEPLOY-OWNER` → `PXLC-DEPLOY-JSON-OUTPUT` |
+| `deployment operation query` | `PXLC-DEPLOYMENT-QUERY-GRAMMAR` → `PXLC-ARG-NON-UTF8` → `PXLC-PLATFORM-UNSUPPORTED` → `PXLC-EXECUTION-IDENTITY` → `PXLC-CONFIG-PATH-INVALID` → `PXLC-CONFIG-FILE-READ` → `PXLC-CONFIG-FILE-TOO-LARGE` → `PXLC-CONFIG-DOCUMENT-INVALID` → `PXLC-CONFIG-SCHEMA-UNSUPPORTED` → `PXLC-STATE-ROOT-TOO-LONG` → `PXLC-STATE-ROOT-INVALID` → `PXLC-FABRIC-LISTEN-INVALID` → `PXLC-MODEL-MISSING` → `PXLC-CONFIG-PROVIDER-INVALID` → `PXLC-MODEL-INVALID` → `PXLC-CONFIG-PROVIDER-UNKNOWN` → `PXLC-LIFECYCLE-CONFIGURATION` → `PXLC-DEPLOY-NOT-FOUND` → `PXLC-DEPLOY-FAILED` → `PXLC-DEPLOY-UNCERTAIN` → `PXLC-DEPLOY-SUPERSEDED` → `PXLC-DEPLOY-OWNER` → `PXLC-DEPLOY-JSON-OUTPUT` |
+
+该 total order 也冻结 parser 的 code collapse：任何缺少、额外、换序、重复或未知 option，以及固定 ASCII command/option/profile token不匹配，都只产生对应命令行首项 grammar code，不再泄漏通用 `MODE-*`、`OPTION-*` 或 `CONFIG-PATH-MISSING` code。build/inspect 的 non-UTF-8 `<ABS>` value 精确归为 `PXLC-ARTIFACT-PATH`，其他 non-UTF-8 value归为其 grammar；其余四条命令在 exact token shape 已成立后遇到任一 non-UTF-8 value，精确归为 `PXLC-ARG-NON-UTF8`。因此表中没有未排序的 generic parser分支。
+
+两条 query 在完成 grammar/identity/config-authority validation后只读既有 owner record：明确不执行 A0、profile/ref compatibility、capacity、conflict、replace或任何其他 mutation preflight，也不创建 recovery operation。一个 exact readback 的 terminal `failed|uncertain|superseded` 只能压过它右侧后来发生的 owner transport/I/O/JSON-output failure；它绝不能压过本次 query 左侧的 grammar、platform、identity、config或lifecycle-authority validation，也不能把 malformed request变成历史 terminal响应。mutating command同样先完成自己左侧全部 request/admission validation，再允许已有 exact terminal压过其右侧 delivery failure。
+
+共同 JSON/exit 语义固定为：
+
+- `schema_version` 是 JSON number `1`；`command` 分别为 `"artifact.build"`、`"artifact.inspect"`、`"artifact.materialize"`、`"artifact.materialization.query"`、`"deploy"`、`"deployment.operation.query"`，D0b 的 `mode = "local"`。build/inspect 成功逐字公开上述 profile、runtime kind、adapter ABI 与 target profile；`payload_length` 是 1..64 的 JSON number，`entrypoint` 只在 canonical manifest 内。
+- inspect 和两条 query 的 `changed` 始终为 `false`。mutating command 的 `changed = true` 只表示本次调用可证明新建或推进了其 owner state，byte-identical build/replay/already-terminal 为 `false`；一旦已经可能接受 mutation 而 exact effect 无法证明，必须为 JSON null。`changed`、文件存在、exit 0 与 transport ACK 都不升级 owner state。
+- 同一 operation id + 同一 canonical request 只查询、返回或推进同一 durable operation，也可重放该 operation 自己已提交的 exact desired；同一 id + 不同 request/ref 必须在 owner effect 前 conflict。任何不同 operation id，或该 D0b operation 首次 admission 前已有不属于它的 Deployment desired head（包括 D0a），都必须在 Controller/Runtime/lifecycle effect 前返回 `PXLC-DEPLOY-REPLACE-REQUIRED`；R0 才拥有 replacement。
+- mutating command 和 query 对 `admitted|materializing|materialized|already_materialized|committed|applying|active_ready` 的有效 owner-correlated响应使用 `ok = true`、exit 0；`failed|uncertain|superseded` 使用 `ok = false`、exit 1 并保留已验证的 operation/ref/Receipt/terminal 字段，不得将其清空后伪装成“未发生”。query 找不到 operation、owner/receipt/correlation/timeout/I/O/output failure同样 exit 1；只有已识别 namespace 的 grammar、path/config/ref/profile/compatibility 或 pre-effect conflict 为 exit 2。stdout 可写时严格为一个 compact JSON object 加一个 LF，stderr 为空；不能完整交付 JSON 时仍 exit 1。
+- 输入或查询失败且没有 durable operation identity 时，nullable state/ref/Receipt/result 字段按上述逐命令矩阵为 null；strict parse成功的 query `operation_id` 只是回显 request identity，不声称 durable admission。query 只读 owner journal，绝不因 NotFound、output-loss recovery或 readback创建/推进 operation。成功 `active_ready` 只是关联 Controller committed revision 与 Runtime PXMT terminal 的 point-in-time deployment outcome，不是 Inspection health。
+- D0b 的 `generation`、`operation_id` 与 digest 分别严格为 32/32/64 lower-case hex string；revision/sequence 使用无前导零 canonical decimal string而非 JSON number。所有非 null object/Receipt ref 都必须 canonical reparse/re-encode且和请求、operation、PlanContent/Slice、Controller revision、Runtime apply/PXMT terminal 逐项关联；CLI 不签发总 Receipt。
+
+Owner 与 fresh-only seam 冻结为：
+
+- build/inspect contract producer 是 canonical manifest/payload 与 strict decoder 的唯一权威；build 可重复产生 byte-identical pair，inspect 必须严格 reparse/re-encode、重算 digest/compatibility 且零 mutation。ArtifactStore 是 exact manifest/payload pair、durable materialization admission/journal/terminal record 与 materialization Receipt 的唯一写者；它不选择 desired object、不创建 Runtime generation，也没有 GC/active pointer。
+- DeploymentController 只消费 strict manifest projection、完整 object ref 与关联 materialization Receipt，独占 desired ref、PlanContent、受影响 target Slice、DeploymentRevision、deployment operation 与 Deployment Receipt；完整 pair、profile/ABI/target/entrypoint commitment 必须同时进入 PlanContentDigest 和 Slice digest。它不读取 payload、不扫描 ArtifactStore、不接受 mutable path。
+- RuntimeHost 只能经 Runtime-owned read-only Artifact access port exact reopen terminal pair，在任何 Model/Agent 或其他 workload effect 前复验 canonical bytes、pair、Slice、profile/ABI/target/entrypoint、operation/revision/fence；它独占 live generation 与 PXMT terminal Receipt，不得发布 pair、写 ArtifactStore 或签发第二份 materialization/deployment Receipt。
+- D0b 只允许独立 fresh workspace：该 workspace 可先完成 A1 materialization，但不得已有 lifecycle generation、Deployment desired head 或 deployment operation；D0b 必须是该 workspace 的第一次 lifecycle/deployment mutation，直接启动唯一 supervisor 并走 external-artifact Controller/Runtime path，不能先调用 D0a `run_up()`、不能复用 workspace A 的 D0a state，也不能以 compiled-in fallback完成。workspace A 继续保留 D0a/M3/M5；workspace B 才执行 materialize→D0b。replace/restart 只由后续 R0 授权。
+- CLI/TUI、lifecycle、ArtifactStore、Controller 与 Runtime 都不得成为另一 owner 的第二 writer；任何 failure、timeout、output loss 或 missing evidence 必须保留 `Failed`/`Uncertain` 并用原 operation id query，不透明生成新 id或 retry。A1/D0b 当前均只有 `Contract frozen`：未实现、未验证、未登记或发布。Artifact crate/store与前四条 CLI 在内部实现序列中也不得独立取得 governance/public authority、进入 main branch 或声称可用；只有六条命令、真实 Artifact producer、D0b Controller/Runtime/TUI consumer、两个 system harness 与 `governance.toml` 在同一 immutable candidate ref 出现并共同过 admission/review/merge gate后，整条 Artifact F0 surface才能发布。
+- profile literals/limits、PXAM/PXAK/PXAQ/PXAA/PXMU/PXAV/PXAW/PXAX 与 PXDQ/PXDK/PXDM/PXDO bytes、全部 digest domains、两个 text refs、build filenames、六条 grammar、JSON key order/type/null/preserve matrix、diagnostic/exit taxonomy、operation replay/conflict、owner/fresh seam共同构成 Artifact F0 v1兼容单元；decoder不做version negotiation、content sniffing、unknown-field容忍或旧格式fallback。任何不兼容变化必须先回到Program并使用显式successor version/profile/command/schema与新goldens，不得静默改写v1。
+
 ### M3a — 本地 Inspection snapshot
 
 首个且仅有的 M3a exact public grammar 冻结为：
@@ -169,6 +686,177 @@ diagnostics
 - `Fresh`/`Stale`/`Partitioned`/`Missing`、各维度 `Unknown` 与 conservative `overall` 都是 Inspection owner 已投影的事实。CLI 不按进程存在、连接成功或本机 wall clock 重算 freshness，不把 stale/unknown 变成命令失败或健康；完整且严格解码的 stale/unknown snapshot 仍为 exit 0。
 - 错误时 `snapshot = null` 且 `diagnostics` 恰有一项，只有稳定 `code` 与 public-safe `message`。已识别 inspection namespace 的 grammar、absolute/config 安全或 config-authority drift 为 exit 2；locator/bootstrap/socket/peer/token、PXIQ/PXIP/PXIS correlation/protocol、NotFound、timeout/I/O 与输出失败为 exit 1；成功仅为 exit 0。stdout 可写时严格为一个 compact JSON object 加一个 LF，stderr 为空。
 - 输出不得包含 config/state/bootstrap/socket 路径、uid/gid、PID/PGID、capability/token、Secret/SecretRef、credential、seed、private/signing key、endpoint/route 或未审计底层错误。M3a 不声明当前健康、Deployment 收敛、Agent 可对话、Evidence、history、stream/watch、retry/reconnect、OpsService、federation、Remote Agent 或生产支持。
+
+### M4a — 当前 Running generation 的 Receipt snapshot
+
+首个且仅有的 M4a exact public grammar 冻结为：
+
+```text
+paraegox receipt snapshot --config <absolute-paraegox.toml> --json
+```
+
+参数顺序固定，不接受默认/相对配置、`--bootstrap`、socket/token/state-root/store/evidence path、generation、cursor/list/since/follow/watch、retry/reconnect、raw/export、provider/model/Secret 或额外参数。它复用现有严格 DeveloperLocal chat schema v1 与 config commitment，只读取 lifecycle 已分类为 `Running` 且 `owner_readiness_observed = true` 的当前 generation；never-started、starting/stopping/stopped、failed/unknown 或 config drift 都失败关闭。它不解析 Secret value，不隐式调用 `up`、`deploy`、`down`、restart、orphan recovery 或 reconcile；已 Running 的 provisioned profile 在移除启动时 Secret 环境后仍必须可读。
+
+CLI 只执行一次同配置 lifecycle `Status`，得到 expected generation 后只再执行一次 Receipt locator 和一次 typed `Latest`，三段都不 retry、reconnect 或 fallback。Receipt locator 复用现有 exact 54-byte `PXLO` v1 request shape：`0..4 = PXLO`、`4 = version 1`、`5 = action R`、`6..38 = config commitment`、`38..54 = expected generation`，之后必须 exact EOF。lifecycle 仅在记录仍为同一 config/current Running/ready generation、未 stopping，且 Receipt adapter bootstrap 已在 Ready event 前完成安全 pin 时返回 `PXRL` v1；否则不返回旧 generation 或 cached success。
+
+`PXRL` v1 是 lifecycle 到 CLI 的 owner-locator，不是 Receipt 响应；所有整数为 big-endian，header 固定 160 bytes，path 为 1..4096 bytes，frame 最大 4256 bytes：
+
+```text
+0..4      magic = PXRL
+4..6      u16 version = 1
+6         action = R
+7         outcome = R
+8..10     u16 header_len = 160
+10..12    reserved = 0
+12..16    u32 frame_len
+16..20    u32 bootstrap_path_len
+20..24    u32 bootstrap_content_len
+24..40    lifecycle generation[16]
+40..72    config commitment[32]
+72..104   SHA-256(bootstrap content)
+104..112  u64 bootstrap device
+112..120  u64 bootstrap inode
+120..128  reserved = 0
+128..160  SHA-256 locator frame digest
+160..     bootstrap path bytes
+```
+
+locator digest 严格为 `SHA-256("paraegox.local.receipt-locator-response.v1" || frame[0..128] || path)`。decoder 必须拒绝错误 magic/version/action/outcome/header/frame/path/content length、reserved、zero generation/config/content/frame digest、UTF-8/NUL/relative/非 lexical-canonical path、expected generation/config mismatch、trailing/oversize 和非 canonical re-encode。locator 不携带 bootstrap bytes、capability token、PXMT bytes 或 public JSON 字段；lifecycle 不打开 Receipt endpoint、不验证 PXMT、不返回 Receipt projection。
+
+locator 所 pin 的 owner-private `PXRB` v1 bootstrap 也使用 big-endian canonical frame，header 固定 320 bytes，socket path 为 1..512 bytes，因此 `bootstrap_content_len` 必须为 321..832：
+
+```text
+0..4      magic = PXRB
+4..6      u16 version = 1
+6..8      u16 header_len = 320
+8..12     u32 frame_len
+12..16    u32 socket_path_len
+16..32    lifecycle generation[16]
+32..64    config commitment[32]
+64..96    generation token[32]
+96..100   u32 server uid
+100..104  u32 server gid
+104..112  u64 operation timeout nanos = 5000000000
+112..128  request-id seed[16]
+128..144  RuntimeHost target[16]
+144..176  Runtime store instance[32]
+176..192  Runtime response key ref[16]
+192..224  Runtime response Ed25519 public key[32]
+224..256  expected PXMT request digest[32]
+256..288  expected PXMT Receipt digest[32]
+288..320  SHA-256 bootstrap digest
+320..     socket path bytes
+```
+
+bootstrap digest 严格为 `SHA-256("paraegox.local.receipt-bootstrap.v1" || frame[0..288] || socket_path)`。decoder 必须拒绝 zero identity/token/seed/key/digest、root/uid-gid mismatch、错误 fixed timeout、长度/path/canonical re-encode，且 PXRB 中的 generation/config/request/receipt 必须分别与 PXRL 和本次取回的 PXMT 精确一致。
+
+owner-private Receipt adapter 的版本化 bootstrap 必须精确绑定 lifecycle generation、config commitment、socket path/identity、32-byte generation token、server uid/gid、固定 5-second operation timeout、request-id seed、RuntimeHost target、Runtime store instance、Runtime response key ref/public key、expected PXMT request digest 与 expected Receipt digest；私有 token/seed 使用 zeroizing 存储且 Debug 脱敏。CLI 对 bootstrap 的整条现存 path chain 执行 no-symlink/owner/private-mode 检查，以 `O_NOFOLLOW|O_CLOEXEC` 在同一 fd 上交叉验证 regular、uid/gid、mode 0600、link-count 1、device/inode/content length/SHA-256 与 canonical bootstrap digest。
+
+本 one-shot client 只生成 sequence `1`，其 16-byte request id 精确为 `first16(SHA-256("paraegox.local.receipt-request-id.v1" || request-id seed || u64_be(1)))`；结果全零即失败，不能改用随机值、wall clock、PID 或第二个 sequence。CLI 只向 mode-0600 的 same-uid/gid owner socket 发一次 token-authenticated `Latest`：request transport 恰为 208 bytes，即 bootstrap 的 raw generation token 32 bytes，随后是不带 outer length prefix 的 fixed 176-byte `PXRQ` v1。`PXRQ` 所有整数使用 big-endian，布局严格为：
+
+```text
+0..4      magic = PXRQ
+4..6      u16 version = 1
+6         action = L
+7         reserved = 0
+8..10     u16 header_len = 176
+10..12    reserved = 0
+12..16    u32 frame_len = 176
+16..32    request_id[16]
+32..48    lifecycle generation[16]
+48..80    config commitment[32]
+80..112   expected PXMT request digest[32]
+112..144  expected PXMT Receipt digest[32]
+144..176  SHA-256 request frame digest
+```
+
+request frame digest 严格为 `SHA-256("paraegox.local.receipt-latest-request.v1" || frame[0..144])`。server 必须验证 exact 208-byte transport 与 EOF、same uid/gid peer、constant-time token、全部 nonzero correlation、reserved/header/frame/action/version、digest、canonical re-encode，以及 request id、generation、config、两个 expected PXMT digest 与本 PXRB/immutable slot 全部一致；token 不进入 PXRQ frame/digest或任何响应。wrong peer、token、frame、request id、generation、config 或 digest correlation 一律直接关闭且不发送任何 response bytes，不能返回可区分的认证 oracle。
+
+只有上述认证与 correlation 全部成功后，server 才返回一个 outer `u32_be frame_len`，随后是一份 `PXRO` v1 frame 并 write-half close；客户端必须继续读取 exact EOF。`PXRO` header 固定 224 bytes，payload 为 0..2048 bytes，frame 为 224..2272 bytes，含 4-byte outer length 的 response transport 为 228..2276 bytes。布局严格为：
+
+```text
+0..4      magic = PXRO
+4..6      u16 version = 1
+6         action = L
+7         outcome = R or N
+8..10     u16 header_len = 224
+10..12    reserved = 0
+12..16    u32 frame_len
+16..20    u32 payload_len
+20..24    reserved = 0
+24..40    request_id[16]
+40..56    lifecycle generation[16]
+56..88    config commitment[32]
+88..120   expected PXMT request digest[32]
+120..152  expected PXMT Receipt digest[32]
+152..184  SHA-256 payload digest or all-zero
+184..192  reserved = 0
+192..224  SHA-256 response frame digest
+224..     canonical PXMT payload
+```
+
+response frame digest 严格为 `SHA-256("paraegox.local.receipt-latest-response.v1" || frame[0..192] || payload)`。ASCII outcome `R` 要求 payload 1..2048 bytes、payload digest 精确为 `SHA-256(payload)`、outer length/`frame_len = 224 + payload_len`，且 payload 是与两个 expected digest、Runtime target/store/key 和 Ed25519 transcript 相符的 exact canonical PXMT v1。ASCII outcome `N` 只允许 header-only：outer length 与 `frame_len = 224`、`payload_len = 0`、payload digest 全零，其余 correlation 字段仍逐 byte 回显请求；它仅表示一个已通过 peer/token/canonical/correlation 验证的请求在竞态中遇到已进入 retiring、不可再供应 bytes 的同 generation immutable slot，client 映射为 `PXLC-RECEIPT-NOT-FOUND`。never-started、旧 generation、错误 expected digest、认证失败或任意 malformed input 都不得得到 `N`，也不得借 `N` 返回 cached Receipt。
+
+PXRB 中的 5-second timeout 是一次不可续期的绝对 operation deadline：client 从 connect 前开始，覆盖 peer 验证、完整 208-byte write、write-half close、outer length、PXRO frame 与 EOF；server 对每个 accepted exchange 从读取 request 到 response write-half close也只有同一 5-second deadline，partial progress 不能重置。endpoint 同时最多处理 8 个 exchange，不建立无界等待队列；超出容量的连接直接关闭且不响应。每次 public command 只允许一次 connect/request/response，任何 partial/trailing/oversize、length-prefix mismatch、timeout、EOF、`N` 或 endpoint replacement 都失败，自动 retry/reconnect/fallback budget 精确为 0。
+
+PXRB v1 精确绑定 PXRQ/PXRO v1；PXRL、PXRB、PXRQ、PXRO 的 magic/version/offset/length/reserved、四个 frame digest domain 与一个 request-id domain、raw token placement、request fixed-length 与 response outer-length framing、`R`/`N` 语义共同构成一个兼容单元。decoder 必须 strict decode 后 canonical re-encode 并逐 byte 相等，不做 version negotiation、content sniffing、旧格式 fallback 或宽松保留字段；任何不兼容变化必须使用显式 successor version 与新 golden，不得静默改写 v1。
+
+adapter 在发布 Ready 之前必须从现有真实 activation outcome 中取得 exact canonical PXMT，独立 strict decode/re-encode，核对 request/receipt digest、Runtime target/store/key，并用该 Runtime response public key 严格验证 Ed25519 signing transcript。CLI typed client 取回同一 bytes 后必须重做这些验证，再投影 public-safe allowlist；server 或 client 都不能用 D0a 摘要、Inspection 投影、进程存在、endpoint 可达或日志文本代替 PXMT 签名/关联。adapter 只保有该 RunningStack 生命期内的不可变 bytes，down/join 时与 owner graph 一起关闭并安全清理 endpoint/bootstrap；它不是 durable Receipt/Evidence store 或第二 writer。
+
+M4a JSON v1 的 top-level 字段严格且仅有，并按下列顺序序列化：
+
+```text
+schema_version
+command
+ok
+changed
+generation
+snapshot
+diagnostics
+```
+
+- `schema_version` 固定为 JSON number `1`，`command = "receipt.snapshot"`，`changed` 始终为 `false`。成功时 `ok = true`、`generation` 是当前 16-byte lifecycle identity 的精确 32 字符 lower-case hex、`diagnostics = []`；`ok` 只表示本次 locator/exchange/PXMT 验证成功，不是当前 health、Deployment 收敛或一个可泛化的终态成功推断。
+- 成功的 `snapshot` 字段严格且仅有，并按下列顺序序列化：
+
+```text
+snapshot_version
+query_scope
+source_owner
+record_kind
+receipt_version
+request_digest
+receipt_digest
+request_mode
+terminal_outcome
+lifecycle_effect
+desired_head
+desired_head_digest
+fabric_generation
+model_generation
+agent_generation
+physical_binding_census
+census_complete
+fabric_ready
+model_ready
+agent_ready
+fabric_to_agent_dependency_ready
+model_to_agent_dependency_ready
+exact_zero
+quarantined
+resource_census_digest
+raw_outcome_digest
+completion_runtime_host_epoch
+completion_snapshot_sequence
+selection_clock_generation
+selection_observed_at_nanos
+current_health_checked
+```
+
+- `snapshot_version` 与 `receipt_version` 都是 JSON number `1`；`query_scope = "current_running_generation"`、`source_owner = "runtime_host"`、`record_kind = "managed_model_agent_stack_terminal_receipt"`。`request_digest`、`receipt_digest`、`desired_head_digest`、`resource_census_digest` 与 `raw_outcome_digest` 都是非 null、精确 64 字符 lower-case hex；不输出 raw receipt、signature、signing transcript、Runtime key/channel 或未在此 allowlist 中的 PXMT 内部 identity。
+- M4a v1 只接受当前真实 Running/ready producer 的 `request_mode = "fabric_model_and_agent"`、`terminal_outcome = "active_ready"`、`lifecycle_effect = "may_have_started"`、`desired_head = "committed_incoming"`；三个 generation 全部非 null、`physical_binding_census = 2`、census/readiness/dependency 全为 true、`exact_zero = false`、`quarantined = false`。即使其他 PXMT v1 terminal 可以被 contract decoder 识别，adapter/client 也必须以 `PXLC-RECEIPT-PROTOCOL` 拒绝，不能将其序列化成 M4a 成功或冒充 failed/stopped outcome 查询。
+- `physical_binding_census` 是 JSON number，布尔字段都是 JSON boolean。三个 service generation 与 `completion_runtime_host_epoch`、`completion_snapshot_sequence`、`selection_clock_generation`、`selection_observed_at_nanos` 都是非 null、无前导零的 canonical 十进制 JSON string，不能使用 JSON number。`current_health_checked` 始终为 `false`：PXMT 是 point-in-time Runtime terminal，不替代 M3a Inspection。
+- 错误时 `ok = false`、`generation = null`、`snapshot = null`、`changed = false`，`diagnostics` 恰有一项且仅含稳定 `code` 与 public-safe `message`。稳定 taxonomy 逐项固定为 `PXLC-RECEIPT-GRAMMAR`、严格 chat config decoder 已有的 ConfigError code、`PXLC-LIFECYCLE-CONFIGURATION`、`PXLC-EXECUTION-IDENTITY`、`PXLC-RECEIPT-NOT-RUNNING`、`PXLC-RECEIPT-LOCATOR`、`PXLC-RECEIPT-BOOTSTRAP`、`PXLC-RECEIPT-PEER`、`PXLC-RECEIPT-PROTOCOL`、`PXLC-RECEIPT-NOT-FOUND`、`PXLC-RECEIPT-IO`、`PXLC-RECEIPT-JSON-OUTPUT`。已识别 receipt namespace 的 grammar、absolute/config 安全或 config-authority drift 为 exit 2；execution identity、not-running、locator/bootstrap/peer/protocol、NotFound、I/O 为 exit 1，timeout 精确归入 `PXLC-RECEIPT-IO`，完整 JSON 无法交付精确归入 `PXLC-RECEIPT-JSON-OUTPUT`；成功仅为 exit 0。
+- stdout 可写时严格为一个 compact JSON object 加一个 LF，stderr 为空；无法完整交付 JSON 的 stdout failure 仍以 exit 1 失败关闭。任何 envelope 都不得包含 config/state/bootstrap/socket/store path、uid/gid、PID/PGID、capability/token、Secret/SecretRef、credential/seed/private key、endpoint/route、raw PXMT/signature 或未审计底层错误。
 
 ### M5a — 附着已运行实例的 TUI
 
@@ -208,24 +896,28 @@ paraegox tui --config <absolute-paraegox.toml>
 - global `paraegox --help` 成功并包含 exact `paraegox tui --config <absolute-paraegox.toml>` 行；为保持现有单一 global-help grammar，`paraegox tui --help` 不是第二条 help surface，而是 recognized TUI grammar error，返回 exit 2 与 `PXLC-TUI-GRAMMAR`。UI 启动前，recognized grammar/config/config-authority failure 为 exit 2；execution identity、not-running、terminal、locator/handoff/bootstrap/peer/protocol/I/O/child-start failure 为 exit 1，并且 stderr 恰有一条 `paraegox: code=<stable-code> message=<public-safe-message>`，stdout 不输出 bootstrap/path/token。稳定 taxonomy 使用 `PXLC-TUI-GRAMMAR`、既有 ConfigError/PXLC-LIFECYCLE-CONFIGURATION、`PXLC-EXECUTION-IDENTITY`，以及 `PXLC-TUI-NOT-RUNNING|TERMINAL|LOCATOR|HANDOFF|BOOTSTRAP|PEER|PROTOCOL|IO|CHILD`。
 - 为同时满足一条 public diagnostic与 ADR-0009 direct child，hidden fd mode在 Textual接管 terminal前不得写 stdout/stderr或 traceback；Rust parent把该 mode的 child stderr直接重定向到 null而不是可能阻塞的未drain pipe，只按 private exit status映射一次 public错误：20=`HANDOFF`，21=`BOOTSTRAP`，22=`PEER`，23=`PROTOCOL`（包含 initial Inspection NotFound/correlation/frame拒绝），24=`IO`（包含 timeout）；任何其他 nonzero、signal、parent wait/join failure或无法分类的 child failure=`CHILD`。这些20..24只是 parent/child private ABI，不是public CLI exit code；parent统一返回public exit 1与恰一条对应 `PXLC-TUI-*` stderr。既有 `chat` path mode的输出/exit保持不变。UI 启动后的 typed unavailable在TUI内显示；用户 `/quit`、Escape或Ctrl-C完成terminal restore、child join与两个typed client close后exit 0。child crash、terminal restore或join失败均按`CHILD`返回exit 1，但仍不得调用lifecycle `down`。
 - Rust parent必须在spawn前保存当前terminal state，并以supervision latch处理POSIX `SIGINT`/`SIGTERM`，不能按default handler先于child退出。Textual raw-mode内的Ctrl-C按键仍由App clean exit并最终返回0；外部送达parent的首个SIGINT/SIGTERM只向child转发至多一次、关闭handoff writer并进入wait/reap，不调用`down`。parent在所有child结果后恢复原terminal；child若5秒内未退出则只对该presentation child发送一次SIGKILL并reap。外部signal、forced kill、terminal restore或wait/reap失败都以唯一`PXLC-TUI-CHILD`、public exit1结束；任何路径都不得遗留child或停止Session/Runtime。
-- M5a 只提供已运行实例的 Agent conversation 与 Inspection presentation；它没有 Evidence/log view、M3b public stream、deployment/lifecycle action、current-health inference、remote attach、OpsService、Web Console 或 production support。Evidence/logs 只在 M4 完成后由 M5b 通过另一个 bounded typed read adapter加入，不改变本 grammar。
+- M5a 只提供已运行实例的 Agent conversation 与 Inspection presentation；它没有 Evidence/log view、M3b public stream、deployment/lifecycle action、current-health inference、remote attach、OpsService、Web Console 或 production support。M4a Receipt snapshot 也不解锁该 view；Evidence/logs 只在 M4b 完成后由 M5b 通过另一个 bounded typed read adapter加入，不改变本 grammar。
 
-除上述 M1、I0、D0a、M3a snapshot、M5a TUI 与下文 M2a grammar 外，external Artifact build/inspect/materialize、D0b、replace/restart、rollback、public Inspection watch、Evidence/logs、push 和 remote deploy 的 exact command name、参数顺序与 JSON schema 尚未冻结。M5a 的实现、真实 consumer、system evidence 与 `governance.toml` public row 已在同一候选批登记；当前状态只到 `Implemented candidate`，登记不代表 immutable exact-ref 验证或里程碑完成。其余尚未实现的 public API/CLI 不得预登记到 `governance.toml`，必须在实现、真实 consumer 与 system test 同一批次内同步登记 producer、consumer、owner、权限、失败语义与兼容规则。
+上述 Artifact F0 已冻结 A1 与 D0b 的六条 intended-public exact grammar、JSON v1、reference、profile 和 owner seam；它们仍未实现、未验证、未登记或发布。A1只是同一candidate内先行的internal implementation slice，不是可独立merge的里程碑；Artifact crate/store、前四CLI、D0b真实consumer、六条system/contract surface与governance rows必须同一exact ref共同过门。除已冻结的 M1、I0、D0a、Artifact F0 candidate、M3a snapshot、M4a Receipt snapshot、M5a TUI 与下文 M2a grammar 外，R0 replace/restart、D1 rollback、M3b public Inspection watch、M4b Evidence/logs、M5b integration、push 和 remote deploy 的 exact command name、参数顺序与 JSON schema 尚未冻结。M4a 与 M5a 的实现、真实 consumer、system harness 与 public row 都已在各自候选批登记，但当前状态仍只到 `Implemented candidate`；登记不代表 immutable exact-ref 验证或里程碑完成。其余尚未实现的 public API/CLI 不得预登记到 `governance.toml`，必须在实现、真实 consumer 与 system test 同一批次内同步登记 producer、consumer、owner、权限、失败语义与兼容规则。
 
 ## Step DAG 与当前进度图
 
 ```text
-M0 文档/治理 ─> M1 离线 CLI ─┬─> I0 本地 init ───────────┐
-                         └─> M2a headless 生命周期 ─┬─> D0a compiled-in local deploy ─┐
-                                                    └─> M3a snapshot ─┬─> M5a attach TUI ──────┐
-                                                                      └─> M3b public watch      │（独立后续）
-D0a + M3a ─> M4 Evidence/日志 ────────────────────────────────────────┴─> M5b TUI logs integration
-ADR-0011 Proposed ──用户显式 Accepted──> A1 external Artifact ─> D0b external-artifact deploy ─> R0 replace/restart ─> D1 rollback
+M0 文档/治理 ─> M1 离线 CLI ─┬─> I0 本地 init ──────────┐
+                         └─> M2a headless 生命周期 ─┬─> D0a compiled-in local deploy
+                                                    └─> M3a snapshot ─┬─> M5a attach TUI
+                                                                      └─> M3b public watch（独立后续）
+D0a + M3a ─> M4a current-Running PXMT snapshot ─> M4b durable PXEV/failure query/logs
+M5a + M4b ─> M5b TUI logs integration
+ADR-0011 Accepted + authorization receipt（decision complete）
+  └─> Artifact F0 single admission candidate（六条合同冻结，未发布）
+        └─> A1 internal mechanism/evidence ─> D0b fresh real consumer
+              └─> same exact-ref admission + governance + review + merge gate ─> R0 replace/restart ─> D1 rollback
 ADR-0004 真实触发 fixture ─> A0 条件 gate ─> 最小 owner ADR Accepted 或稳定拒绝（当前 D0a 不触发）
 D1 + M5b ─> G0 本地 golden path ─> N0 Node enroll/transfer ─> N1 push-only ─> N2 remote deploy ─> O0 OpsService 最后准入
 ```
 
-依赖说明：I0 可在 M0/M1 收口后与 M2a exact-ref 收口并行，D0a 只等待 I0 + M2a，不等待 A0、ADR-0011 或 A1。M3a 的 immutable exact-ref gate 是 M5a 唯一新增前置；M5a 不等待 M3b、M4、ADR-0003 或 OpsService。M3b 是消费 M3a 的独立后续 public watch 路线，既不阻塞 M5a，也不被 M5a 内部受限的一次一请求 Watch loop 冒充完成。M4 同时等待真实 D0a point-in-time Receipt projection 与 M3a read-only projection；M5b 再等待 M5a 与 M4，把已准入的 bounded Evidence/log adapter 接入既有 TUI，而不依赖 M3b。A1 与 D0b 必须等待 ADR-0011 由用户显式 Accepted，D0b 再消费 D0a 已验证的本地路径与 A1；R0/D1 不得越过 D0b。A0 不是正常链的预置层，只在 ADR-0004 的真实 fixture 出现时截断相关副作用。只有 D1 与 M5b 都完成，G0 完整本地 golden path 才成立。N0–N2 不得越过 G0，O0 永远最后。
+依赖说明：I0 可在 M0/M1 收口后与 M2a exact-ref 收口并行，D0a 只等待 I0 + M2a，不等待 A0、ADR-0011 或 Artifact F0。M3a 的 immutable exact-ref gate 是 M5a 唯一新增前置；M5a 不等待 M3b、M4a/M4b、ADR-0003 或 OpsService。M3b 是消费 M3a 的独立后续 public watch 路线，既不阻塞 M5a，也不被 M5a 内部受限的一次一请求 Watch loop 冒充完成。M4a 同时等待真实 D0a point-in-time PXMT 输出与 M3a 已验证的 read-only owner-locator 路型，但只增加 current-Running Receipt 可见性。M4b 再等待 M4a 与对 D0a/PXAR9 PXEV producer、唯一 writer、失败生命期查询和 structured-log redaction/retention 的显式决策；M5b 只等待 M5a + M4b，不被 M4a 解锁，也不依赖 M3b。ADR-0011 Accepted + receipt 决策 gate与六条A1/D0b contract freeze已完成，D0a历史路径前置也由r363满足；执行上仍先形成A1内部机制证据再接D0b，但A1没有独立admission/merge状态，D0b也不是“等待一个已发布A1”。二者必须在同一immutable ref由真实Controller/Runtime/TUI消费、system evidence、governance与review共同收口，之后R0/D1才可前进。A0 不是正常链的预置层，只在 ADR-0004 的真实 fixture 出现时截断相关副作用。只有 D1 与 M5b 都完成，G0 完整本地 golden path 才成立。N0–N2 不得越过 G0，O0 永远最后。
 
 | Step | 当前状态 | 依赖 | 用户可见结果 | 完成证据 |
 | --- | --- | --- | --- | --- |
@@ -234,17 +926,18 @@ D1 + M5b ─> G0 本地 golden path ─> N0 Node enroll/transfer ─> N1 push-on
 | M2a 本地 headless 生命周期 | Validated candidate（r356 Ubuntu Rust、174/174 local 与 2/2 real-process 场景 PASS） | M1 | 用一份现有严格 chat 配置执行 `up/status/down`，三条操作共享一个 headless whole-local composition owner | exact grammar/JSON 正负测试；pre-state Secret 失败零副作用；并发同 generation 且 `changed` 与请求相关；private lock/record/same-user UDS、signal/joined shutdown、owned-socket 清理与 terminal record；同一 exact Ubuntu ref 的完整证据 |
 | I0 本地 init | Active（r363 Ubuntu Rust/unit + macOS artifact light smoke PASS；sudo ownership matrix 待验） | M1；可与 M2a 收口并行 | 一条离线命令生成 private deterministic-echo config workspace，不创建 domain state | exact grammar/JSON 正负测试；byte-identical 幂等 `changed = false`；文件/权限/symlink/内容冲突不覆盖；Secret/owner/network/state 零副作用；public API 登记与 exact-ref 平台证据 |
 | A0 条件式 Application/Installation gate | Not triggered（当前 D0a） | ADR-0004 真实触发 fixture | 只在 multi-Deck 统一发布/更新/卸载、installation-owned mutable state、多隔离安装或多 Artifact 稳定 owner 出现时准入最小 owner | 与触发条件对应的真实 fixture、owner/consumer/failure evidence，以及最小后继 ADR Accepted 或稳定拒绝；不预建 Application/Installation |
-| ADR-0011 external-Artifact 边界 | Proposed（未授权实现） | 用户显式决策 | 决定单 external Artifact 的 immutable materialization、Deployment selection 与 Runtime reopen 边界 | 用户显式 Accepted 与有效决策记录；文档/代码存在不得替代决策 |
-| A1 external Artifact build/inspect/materialize | Planned/Blocked | ADR-0011 用户显式 Accepted；若触发 A0 还需其最小 ADR Accepted | 用户能构建、只读 inspect 并由真实 owner 物化单个 immutable Artifact，不创建 Installation active pointer | reproducible bytes/digest、strict canonical manifest、tamper/unsupported-target pre-effect fail-closed、crash/idempotency/Receipt 与 zero-install inspect 证据 |
+| ADR-0011 external-Artifact 边界 | Accepted / decision complete（receipt 三元组已冻结） | 已满足 | 决定单 external Artifact 的 immutable materialization、Deployment selection 与 Runtime reopen 边界 | Accepted ADR、ADR index 与 authorization receipt 的三个冻结 SHA；不把决策记录当成实现证据 |
+| A1 external Artifact build/inspect/materialize | Contract frozen / Internal slice（未实现；不可独立登记/合并/发布） | ADR-0011 Accepted + receipt；必须与D0b同一candidate；若触发A0还需其最小ADR Accepted | 无独立用户可用结果；只在候选内部构建、inspect并物化`developer-local-echo-prefix-v1`供D0b真实消费 | 六条合同中的前四条 grammar/JSON/reference/profile golden；reproducible pair、strict inspect、tamper/compatibility、crash/durability/idempotency/Receipt 与 noexec/no-install/no-Graph 证据；这些证据单独不完成admission |
 | D0a compiled-in local deploy | Validated（r363 Ubuntu exact-ref gates、182/182 non-root local、3/3 真实 binary system functions + macOS artifact light smoke PASS） | I0 + M2a | 用 exact CLI 把唯一 deterministic fixture 经现有 Controller/Runtime 到达 point-in-time `ActiveReady`；重复/并发 follower 不新增 revision/apply | exact grammar/strict JSON、真实 owner/receipt correlation、same-request/replay/concurrency、unsupported profile pre-effect reject、down race/supervisor crash/output failure/tamper/no-leak 的 focused/system/exact-ref 证据 |
-| D0b external-artifact local deploy | Planned/Blocked（未登记 public grammar） | D0a + A1 + ADR-0011 用户显式 Accepted | 本地消费 exact immutable Artifact owner Receipt，由 Controller 选择 desired revision、Runtime 复验并到达 Ready，无 Installation active pointer | materialized/committed/activated/ready 不混同；crash/partial failure、同 operation 幂等、Uncertain query/reconcile、owner Receipt 关联与失败不破坏旧实例 |
+| D0b external-artifact local deploy | Contract frozen / Joint candidate（未实现、未登记、未发布） | 同candidate内A1 internal evidence；D0a r363与ADR-0011 gate已满足 | joint gate后才允许用户在独立fresh workspace消费exact pair/owner Receipt，由Controller/Runtime到达Ready | exact grammar/JSON/fresh-only；pair 进入 Plan/Slice；Controller/Runtime/TUI真实消费与Receipt correlation；replay/conflict/output-loss/Uncertain/tamper-race/no-second-writer/no-double-active；与A1同一exact-ref/governance/review/merge gate |
 | R0 replace/restart | Planned/Blocked | D0b | 显式替换新 Artifact；或在同 Artifact/state 上安全停止后重启，不透明自动 retry | forward DeploymentRevision、generation fencing、joined stop、SIGKILL/owner loss、stale generation、same-state restart、partial failure 与 no-double-active 证据 |
 | D1 rollback | Planned/Blocked | D0b + R0 | 选择已知 `ArtifactObjectRefV1` 为新的前向 DeploymentRevision，并重新验证 Ready | target identity/compatibility、历史 Artifact 完整对象复验、rollback partial failure、Ready/Uncertain 与 Receipt correlation；不切 active pointer |
 | M3a 本地 Inspection snapshot | Implemented candidate（中央 immutable exact-ref CI pending；不是 Validated/Completed） | M2a | 用户通过一条 exact read-only CLI 读取带 typed source/revision/freshness 的 PXIS v2 snapshot | exact grammar/JSON/exit/channel；安全 locator；一次 Latest、无 retry/mutation；fresh→stale 与 no-leak 的 focused/system/exact-ref 证据 |
 | M3b 本地 Inspection watch | Planned/Deferred（未登记 public grammar） | M3a | 在另行授权后持续观察 projection 变化 | projection-aware cursor、NotModified/gap/reset、断连、backpressure、bounded reconnect 与 restart 证据；不得写 desired state |
-| M4 Evidence 与日志诊断 | Planned | D0a + M3a | 用户从失败定位到 owner、Receipt/Evidence 和有界日志，而不是只看“启动失败” | Secret-free 输出、bounded retention/query、owner-issued Receipt correlation、缺证据时 Unknown/Uncertain |
+| M4a current-Running PXMT Receipt snapshot | Implemented candidate（Ubuntu immutable exact-ref完整门禁 pending；不是 Validated/Completed） | D0a + M3a | 用 exact read-only CLI 读取当前 Running generation 的一份 verified Runtime PXMT public-safe snapshot | exact grammar/JSON/exit/taxonomy；Status→PXRL→typed Latest；canonical/digest/correlation/Ed25519 双重验证；Secret-free/no-mutation/down-no-cache exact-ref 证据 |
+| M4b durable Evidence 与 structured logs | Planned/Blocked（需 producer/writer/failure-lifecycle 决策，未冻结 public grammar） | M4a + 显式 M4b 决策 | 用户在 activation 失败或 owner 退出后仍能查到 owner-issued PXEV、Receipt ref 与 bounded structured logs | D0a/PXAR9 真实 producer→唯一 durable writer→typed reader；重启/失败后查询、storage-full/retention/cursor/truncation/redaction、Unknown/Uncertain 与无 raw-store 证据 |
 | M5a 已运行实例 attach TUI | Implemented candidate（已实现、登记并接入 exact CI；不是 Validated/Completed） | M3a | 用户用 exact CLI 附着同一 Running generation，由 Python Textual 直接 typed clients查看 Agent conversation 与 Inspection；detach 后 Session/Runtime 继续 | exact grammar、atomic dual locator/pins、token-free child handoff、pinned direct clients、一次 Latest + 单 Watch/≥1s、no reconnect、TTY/slow-consumer、detach/no-owner-stop 的 focused/Linux system 证据；Mac bounded artifact light smoke |
-| M5b TUI logs integration | Planned/Blocked（未登记 surface） | M5a + M4 | 把 M4 已准入的 bounded Evidence/log projection 加入既有 attach TUI | M4 owner Receipt/cursor/retention 与 typed client/TUI backpressure、redaction、unavailable/no-health-inference 的组合证据；不发明第二套日志 owner/API |
+| M5b TUI logs integration | Planned/Blocked（未登记 surface） | M5a + M4b | 把 M4b 已准入的 bounded Evidence/log projection 加入既有 attach TUI | M4b owner Receipt/cursor/retention 与 typed client/TUI backpressure、redaction、unavailable/no-health-inference 的组合证据；不发明第二套日志 owner/API |
 | G0 本地 golden path | Derived gate，未满足 | D1 + M5b | 新用户可复现 init 到 rollback 的完整本地路线 | immutable exact-ref Mac/Linux guide run、claim-to-evidence、已知限制；不是独立实现 Step |
 | N0 Node enroll/transfer contract | Planned | G0 | 显式登记目标、信任、传输身份和暂存边界；不依赖 Remote Agent | target identity/host-key/trust pin、Secret-safe credential reference、transport interruption/resume/cleanup 与 staging integrity 证据 |
 | N1 push-only | Planned | N0 | 只把一个 exact artifact 传到 target staging，不安装、不激活、不重启 | source/target digest 相等；重复传输幂等；中断无半成品；证明零 install/activate/restart/domain mutation |
@@ -277,7 +970,7 @@ paraegox down --config <absolute-chat.toml> --json
 
 三条操作共享一个 composition owner：生命周期全程持有的 private owner lock 串行化 owner 权限，config-bound CSPRNG generation 的 durable record 负责状态与关联，mode-0600 且校验同 uid/gid peer 的 private UDS 只传 bounded control request；PID/PGID 不写入记录，也不是控制或恢复权限。`up` 只有在当前 generation 已跨过现有 composition 的 bounded owner-readiness 边界且 lifecycle owner 仍存活时才成功返回 `running`；socket 存在或单独的 stdout marker 同样不是成功依据。并发 same-config `up` 只能由一个请求接受一个 generation，且每个响应的 `changed` 必须与该请求是否赢得该 generation 相关；跟随 winner 的请求不能借共享状态声称 `changed = true`。同配置已处于 `running` 时是成功且 `changed = false`；同 root/config authority 漂移必须在新 mutation 前失败关闭。`status` 只读并且 `changed` 永远为 `false`，它不执行 Inspection，也不把 lifecycle 存活分类升级为健康或收敛。`down` 通过同一个 lifecycle owner 触发现有反向 joined shutdown；只有所有已启动 owner 已 join、精确 owned socket 经 identity recheck 后 unlink 并 fsync 父目录、随后 terminal record durable publish 后才可返回 `stopped`。从未启动或已经安全停止时是成功且 `changed = false`。
 
-M2a 不包含 `restart`、SIGKILL/owner 丢失后的 orphan recovery 或强制清理，也不包含健康/Inspection、日志/Evidence、attach/TUI 或任何 Remote Agent 扩张；它们分别属于 R0、M3、M4、M5a/M5b 或冻结范围。
+M2a 不包含 `restart`、SIGKILL/owner 丢失后的 orphan recovery 或强制清理，也不包含健康/Inspection、Receipt/Evidence/日志、attach/TUI 或任何 Remote Agent 扩张；它们分别属于 R0、M3、M4a/M4b、M5a/M5b 或冻结范围。
 
 M2a lifecycle JSON v1 的 top-level 字段严格且仅有：
 
@@ -314,7 +1007,27 @@ A0 不是 D0a 的固定前置层，也不是“创建完整 Application 平台�
 
 ### A1 — external Artifact build/inspect/materialize
 
-A1 只能在 ADR-0011 被用户显式 Accepted 后开始；`Proposed` 文本不授权代码、public contract、package/store 或 `governance.toml` 登记。获准后，build 只从 exact source/build inputs 产生 immutable、可重复验证的 Artifact 与 canonical manifest；inspect 只读 bytes/metadata 且零物化/部署副作用；materialize 由决策准入的 owner 以 immutable object 和 owner Receipt 发布，不创建 Installation、active/current pointer、Deployment desired state 或 Runtime generation。篡改、未知字段、unsupported target、digest/pair mismatch 必须在任何 store/deployment/runtime 副作用前失败关闭。
+A1 的 Accepted decision gate 与 Program contract 已完成，但 delivery状态只能是 `Contract frozen / Internal slice`：它没有实现、真实外部 consumer、governance row 或 exact-ref evidence，也不能独立进入main/merge/admission。候选分支可以先实现和验证 Artifact crate/store与前四CLI，为同一candidate内的D0b接线提供机制；在D0b真实Controller/Runtime/TUI consumer、两份system harness、六条surface与governance rows齐备前，这些入口保持implementation-internal，不得打包、发布或声称用户可用。实现必须严格消费上文 profile/reference/grammar/JSON：build 从 exact source 产生 byte-identical payload/canonical manifest，inspect 严格只读且零 mutation，ArtifactStore 以 durable admission→pair publication→exact reopen→terminal record/Receipt 的唯一顺序物化完整 ref。任何 tamper、truncate、oversize、unknown version/field、pair swap、ABI/target/entrypoint mismatch 必须在 store mutation 前失败关闭。
+
+A1 internal claim-to-evidence 必须在最终包含D0b的同一 immutable candidate ref完整覆盖；任何较早内部commit的结果只能是开发证据，不能单独升级状态：
+
+- hardcoded Rust/Python goldens逐 byte覆盖 206-byte PXAM、72-byte PXAK、text object/Receipt refs、两个 SHA-256 domain、pair swap、materialization request/record/Receipt与全部 frozen JSON key order；同输入 reproducible build byte/digest一致，payload/string/limit/reserved/flag/trailing每个边界有正反例，且 producer 与 strict decoder 不共享期望值生成器；
+- build 不执行 payload；inspect 前后 workspace/store/lifecycle/domain digest 不变；tamper、truncate、oversize、unknown、payload/manifest pair swap、相同 payload/不同 manifest 与 unsupported ABI/target/entrypoint 都在 pre-effect拒绝；
+- same operation + same request replay/advance同一 durable record，same operation + different request/ref pre-effect conflict，terminal JSON output loss后用原 operation query取回同一 materialization Receipt；query NotFound 零 mutation；PXAA ArtifactStore-global operation sequence从1逐次+1并在same durable commit推进high-water，replay沿用、overflow/capacity preflight、uncertain publication与owner fail-closed均有exact evidence；
+- durable admission、两份 temp write/sync、各 final no-overwrite publish、directory sync、pair exact reopen、terminal object/journal commit与 Receipt output逐点 crash；PXMU restart只以PXAQ/PXAA exact PXAK和fixed object location恢复原operation，recovery开始时已有可证明exact PXAV必须复用并终结E，开始时无PXAV而由恢复新发布必须终结M，partial/identity/durability不明才U；golden与fault harness必须拒绝交换M/E，marker证明零目录扫描、零新operation、零overwrite/delete/path fallback，partial pair对消费者不可见；
+- private absolute root与0700目录、0600 regular single-link objects、owner/mode、path traversal、symlink/hardlink、nlink/inode replacement、short write与no-overwrite；PXAV ArtifactStore-global object sequence从1逐次+1、same object replay复用、PXAV/high-water同commit、overflow/ambiguous publication fail-closed；精确验证64 terminal objects、1024 operations与8388608-byte checked budget的边界/耗尽，且无GC/delete/background cleanup；无法证明object/temp identity时quarantine/uncertain，不覆盖或删除；
+- architecture negatives 证明没有 Application/Installation/InstallationId/active pointer/uninstall/GC、没有 RuntimeHost `install-v1` alias、没有 Process/reference-worker执行，也没有 Graph/workflow owner；A0 三类触发 fixture在首个 mutation 前精确拒绝。
+
+Artifact F0 A1-internal→D0b 实现序列的 exact write-set union 冻结为以下路径；候选内可按owner拆commit并先完成A1 mechanism evidence，但不能越出union、不能让D0b在缺少这些机制时伪造consumer，也不能把任何A1-only commit独立merge/admit/release：
+
+- 本 Program、workspace `Cargo.toml` 与 `Cargo.lock`；新建 `crates/paraegox-artifact/Cargo.toml`、`crates/paraegox-artifact/src/{lib.rs,contract.rs,store.rs}`；
+- `crates/paraegox-local/Cargo.toml` 与 `crates/paraegox-local/src/{artifact.rs,config.rs,error.rs,main.rs,layout.rs,lifecycle.rs,composition.rs}`；
+- `crates/paraegox-runtime-contracts/Cargo.toml` 与 `crates/paraegox-runtime-contracts/src/{lib.rs,managed_model_agent_stack_plan.rs}`；
+- `crates/paraegox-deployment/Cargo.toml` 与 `crates/paraegox-deployment/src/{lib.rs,developer_fixture_agent_stack.rs,managed_model_agent_stack_producer.rs,managed_model_agent_stack_apply.rs}`；
+- `crates/paraegox-runtime/Cargo.toml` 与 `crates/paraegox-runtime/src/{lib.rs,managed_model_agent_stack_runtime.rs,managed_model_agent_stack_state.rs,managed_model_runtime.rs,managed_service_assembly.rs}`；
+- 仅与本合同相关的 `tests/fixtures/**/*artifact*`、`tests/system/test_a1_local_artifact_cli.py`、`tests/system/test_d0b_external_artifact_deploy_cli.py`、必要的 `tests/governance/test_artifact_f0_boundary.py`、`.github/workflows/{ci.yml,macos-cli-artifact.yml}`；只有A1 producer、D0b Controller/Runtime/TUI consumer、六条命令与两个system harness在同一candidate存在时才于该candidate更新`governance.toml`，任何A1-only阶段不预登记且不可merge。
+
+明确不在 write-set：`crates/paraegox-process/**`、reference worker、RuntimeHost install-v1 文件、ADR-0003/0004/0005/0011、其他 Program/guide，以及 Ops/Remote Agent/Graph/push/remote/R0/D1 surface。若真实实现必须越界，停止该批并回到 Program/ADR 决策，不以“接线”名义扩张。
 
 ### D0a — compiled-in local deploy
 
@@ -326,7 +1039,20 @@ r363（`20ef3f281501e3399d83c7e42e0150f208f4e8cd`）的 Ubuntu exact-ref 结果�
 
 ### D0b — external-artifact local deploy
 
-D0b 必须等待 ADR-0011 用户显式 Accepted、A1 与 D0a；当前不冻结 public grammar/JSON，不授权实现。它未来只能消费严格验证的 immutable Artifact projection 与 materialization Receipt reference，由 DeploymentController 独占 desired Artifact 选择/DeploymentRevision，Runtime 经只读 port 重开并复验 exact object 后拥有 live generation。Materialized、Committed、Activated 与 Ready 不得互相推导；CLI 只聚合 owner references，不写 store、不创建 active pointer、不合成第二份 desired state 或 Receipt。若具体 fixture 出现 ADR-0004 触发条件，D0b 在副作用前还必须通过 A0。
+D0b 的 intended-public contract 与 owner seam 已冻结，状态为 `Contract frozen / Joint candidate`，不是等待一个已独立admitted A1的blocked step。r363 D0a与ADR-0011 Accepted/receipt gate已满足；下一执行动作是在同一candidate先完成A1 internal mechanism/evidence后立即接入本真实consumer，最终统一做exact-ref admission/governance/review/merge。任一中间点都不能把external path或前四CLI标成实现可用。D0b 只能在 workspace B 的 fresh lifecycle/deployment state中消费已 terminal materialized 的完整 ref 与 owner Receipt，且 D0b 必须是第一次 lifecycle mutation；不得先调用 D0a `run_up()`、读取 workspace A、保留旧 desired、用 compiled-in fallback或让 ArtifactStore选择 active object。
+
+Controller 必须把完整 ref、materialization Receipt commitment、profile/ABI/target/entrypoint写入 PlanContent 与受影响 Slice，再独占 commit/revision/deployment operation/Receipt。Runtime 对 authenticated apply 与 exact Slice 做 read-only pre-effect reopen/reverify，只有 exact external payload 驱动的 `prefix || prompt` 已由 Agent/TUI 外部观察、Runtime PXMT terminal 为 `ActiveReady` 且 Controller关联当前未 supersede revision时，CLI 才可返回 `state = "active_ready"`。Materialized、Committed、Applying、Runtime terminal与Ready互不推导；Inspection仍独占当前 health。
+
+D0b claim-to-evidence 必须在同一 immutable candidate ref 完整覆盖：
+
+- 六条中后两条 exact grammar/JSON、D0a 五 token不变、help与strict dispatch；workspace B fresh initial成功，workspace A 既有 D0a desired精确返回 `PXLC-DEPLOY-REPLACE-REQUIRED`，fresh workspace不得先出现D0a lifecycle mutation；
+- complete object ref/materialization Receipt/profile/ABI/target/entrypoint逐项进入 PlanContentDigest 与 target Slice digest，DeploymentController 独占 revision/operation/Receipt；source/dependency guard证明 Controller不读payload/store目录；
+- Runtime只经 read-only port pre-effect exact reopen；missing、wrong pair/digest/target/entrypoint、materialized-only、inode/pair replacement与 reopen→effect tamper race全部稳定拒绝且不改变 active head；Runtime不写 ArtifactStore、不签第二份 materialization/deployment Receipt；
+- same operation + same canonical request只 replay/推进同一 operation及其exact desired，同 id + different request pre-effect conflict；different id或首次admission前任何非本operation既有desired一律replace-required；PXDK Controller-global admission sequence从1逐次+1、same replay沿用、PXDK/high-water同一durable commit、overflow/preflight与ambiguous publication fail-closed；terminal output loss以原id query，timeout/owner-loss/correlation缺失保留 `uncertain` 且零透明retry；
+- 真实 TUI/Agent response逐 byte证明 external prefix改变结果；owner Receipt refs、Controller revision、Runtime apply request digest与PXMT terminal digest全链相关；CLI/file/process/ACK/log不能合成Ready，`current_health_checked = false`；
+- fault/race覆盖 admitted→committed→applying→active_ready、failed/uncertain/superseded、Controller commit后Runtime失败、supervisor crash、down/output fault、stale generation与并发 follower；任何时刻无第二writer、无active pointer、无两个live generation/double-active，也不破坏workspace A的D0a/M3/M5基线。
+
+Ubuntu non-root ext4必须对同一最终immutable ref执行全部Rust/focused、跨语言golden、完整governance、deterministic crash harness与A1/D0b两个真实binary system files；只有这一joint result才能同时admit/merge/register/publish Artifact F0，绝不先升级A1。Mac只允许candidate内offline build/inspect、grammar/JSON/golden与bundled light smoke；不运行本机Cargo，也不以Mac light证据替代Ubuntu owner、ext4 durability、fault、ActiveReady或joint admission矩阵。
 
 ### R0 — replace/restart
 
@@ -348,9 +1074,46 @@ M3a 候选批的写集限于本 Program，以及 `crates/paraegox-local/src/{con
 
 连续 watch 后置且尚无 public grammar/JSONL schema。后续准入必须把 cursor 定义为至少 `(snapshot/protocol version, projection_id, projection_revision)`，不能只用 revision；同 projection 的 NotModified、gap/cursor-ahead 必须显式 resync，新 projection_id 表示 restart reset。一个外层 coordinator 可以循环既有 one-shot Watch，但每次仍只有一个 in-flight exchange，stdout flush 前不得取下一项，不得建无界 queue；poll floor、backpressure、bounded reconnect budget、断连与 down/up 后的 projection reset 都必须有证据。endpoint 断连不等于 source `Partitioned`，restart 不得比较旧 clock/revision，也不得自动调用 `up`、restart 或 orphan recovery。现有 producer 目前只足以证明 initial snapshot 与一次 freshness 变 stale；在真实 refresh/recovery producer 与上述测试存在前，不冻结 watch command，也不声称持续运维能力。
 
-### M4 — Evidence 与日志
+### M4a — current-Running verified PXMT Receipt
 
-生产者是领域 owner 的 Receipt/Evidence 与 bounded diagnostic adapters，消费者是 CLI/TUI/runbook。日志不替代 Receipt；probe、stdout、进程退出码、文件复制或 transport ACK 不能在证据不足时推导副作用成功。恢复路径要说明数据不可用、过期或被截断，而不是无限重试。
+M4a 的真实 producer 是现有 D0a/M2a DeveloperLocal activation 路径中由 Runtime 签出的 PXMT v1；fixture 与 provisioned profile 都已经产生同一类 canonical Receipt。新增 owner-private adapter 只消费这份真实输出，使其在同一 RunningStack 生命期内可被一次性查询；它不从 D0a 摘要重建 Receipt，不让 lifecycle 返回 domain payload，不让 Inspection 容纳 Receipt history，也不让 CLI 打开任何 owner store。这一命名使用 `receipt` 而非 `evidence`，因为当前 D0a/PXAR9 没有 PXEV producer，且本切片不消费 `EvidenceRecordV1`、`EvidenceRefV1` 或 `LocalEvidenceStore`。
+
+M4a 候选实现批的 exact write-set 冻结为：
+
+- 本 Program；
+- `crates/paraegox-local/src/{config.rs,error.rs,main.rs,layout.rs,composition.rs,lifecycle.rs,receipt_snapshot.rs}`；新的一个 `receipt_snapshot.rs` 内聚 owner-private bootstrap/endpoint、bounded typed client、PXMT 验证与 public-safe projection，不为 server/client 再拆一调用 wrapper；
+- shared wire goldens `tests/fixtures/wire/{m4a_receipt_locator_v1.hex,m4a_receipt_bootstrap_v1.hex,m4a_receipt_latest_request_transport_v1.hex,m4a_receipt_latest_ready_response_transport_v1.hex,m4a_receipt_latest_not_found_response_transport_v1.hex}`；request transport golden 必须包含 raw token + PXRQ，两个 response transport golden 必须包含 outer u32 length + PXRO frame/payload；
+- `tests/system/test_m4a_local_receipt_snapshot_cli.py`；
+- `.github/workflows/{ci.yml,macos-cli-artifact.yml}`；
+- 只在 exact CLI、真实 Runtime Receipt producer、可执行 consumer 与 system evidence 已在同一候选批出现时才同步更新的 `governance.toml`。
+
+合同冻结阶段不预登记 `governance.toml`；当前候选只因为 exact CLI、真实 Runtime Receipt producer、可执行 consumer 与 system evidence 已同批出现，才按上面的 write-set 同步新增对应治理行，登记不能替代 immutable exact-ref 验证。候选实现不修改 `crates/paraegox-evidence/**`、`crates/paraegox-runtime/**`、`crates/paraegox-runtime-contracts/**`、`crates/paraegox-deployment/**`、`crates/paraegox-inspection/**`、`crates/paraegox-agent-service/**`、`src/paraegox_sdk/**`、Cargo dependency/feature、ADR、其他 Program/guide、M3b/M4b/M5b/Ops/Remote Agent/Graph 或 persistent format。如果实现证明必须越过这个写集，必须停止并回到 Program/M4b 决策，不得以“接线”名义修改 Runtime、Inspection 或 Evidence owner。
+
+M4a 的 claim-to-evidence 验收矩阵固定为：
+
+| 合同 claim | focused / consumer evidence | Linux exact-binary system evidence | Mac artifact 边界 |
+| --- | --- | --- | --- |
+| exact grammar、JSON、exit 与 taxonomy | parser exact positive/negative；global help 只增加唯一 grammar；成功/每个稳定错误 envelope 的 exact key set/type/order、decimal/hex/enum/null 与 stdout failure | 真实 binary 验证 help、relative/default/extra/unknown/config/root/not-running，stdout 一 JSON+LF、stderr 空，exit 0/1/2 精确映射 | 验证 help/grammar/not-running light envelope；不冒充 Linux owner/fault 矩阵 |
+| 一次 Status 与一次 PXRL owner locator | exact 54-byte PXLO action `R`、expected generation/config、same-peer、single exchange/exact EOF/no retry；PXRL 布局、digest domain、strict canonical re-encode | marker 证明恰一次 Status、一次 locator、一次 typed Latest；starting/stopping/down、config drift、old/new generation 和 locator replacement 都不返回 cached success | 只运行 never-started/not-running pre-effect envelope；不进入 Running locator，也不声称 raw Status/PXRL 计数、owner、ABA 或 fault 覆盖 |
+| 完整 typed Latest ABI 与兼容性 | hardcoded shared goldens逐 byte 覆盖 PXRL、PXRB、raw token + 176-byte PXRQ、outer u32 + PXRO `R`/`N`；request-id、四个 frame digest domain、header/offset/reserved/length/EOF、strict re-encode 与 incompatible-v1 reject | marker 捕获 exact 208-byte request、228..2276-byte response、一次 sequence 1；wrong peer/token/correlation 静默关闭，只有 retiring correlated slot 返回 `N`；5s single deadline、concurrency 8 与 zero retry/fallback | 只证明包含该实现的 artifact 可编译与 light CLI envelope；不执行 PXRB/PXRQ/PXRO `R|N`、golden、silent-close、deadline 或 capacity 语义 |
+| 真实 Runtime PXMT 与双重验证 | adapter 与 typed client 各自对 canonical decode/re-encode、request/receipt digest、target/store/key correlation、Ed25519 signing transcript 建立独立正/反/tamper 证据；D0a digest 与 exact bytes 一致 | 真实 deterministic Runtime PXMT 通过；替换 receipt、request digest、public key、signature、target/store 或 canonical bytes 全部 fail-closed，无 fallback | 不启动 M4a Running owner、不读取 PXMT，也不声称 Receipt 或 tamper/peer 证据 |
+| bootstrap、peer、bounded protocol 与 TOCTOU fencing | no-symlink/private-parent/regular/0600/nlink-1/device/inode/length/SHA pin；same-uid/gid socket/token/request/correlation；partial/trailing/oversize/NotFound/5s timeout/8-in-flight 上限与 zero retry | locator 后执行 `down` 再 new `up`、替换同名 bootstrap/socket、wrong peer、token/correlation 篡改、endpoint 提前退出；旧请求失败而新请求可独立成功 | 不创建 Receipt bootstrap/socket，不声称 pin、peer、replacement、down/up race 或 bounded protocol 证据 |
+| 只读、无 Secret、无第二 owner | 命令不包含 mutation/raw-store API；public projection allowlist、Debug 脱敏、token/seed zeroizing；fixture/provisioned 序列化一致 | 查询前后 lifecycle generation/record、Controller revision/snapshot、Runtime/Deployment/Agent/Inspection/Evidence 文件 digest 不变；provisioned 在 Secret env 移除后成功；不存在或不可读 Evidence state 也不影响 Receipt 查询 | 只验证 rejected/not-running envelope 不泄漏配置、state 与注入 canary，且 relocated bundle 输出一致；不声称 Running no-mutation或 Secret-removal 证据 |
+| point-in-time 而非健康/失败历史 | 固定 ActiveReady 投影、`current_health_checked=false` 与其他 valid PXMT terminal 一律按 protocol 拒绝的 contract 测试；M4a server 只准入 current Running `ActiveReady` 行 | 真实 Running 输出 `active_ready`；`down` 后、never-started 或 activation failure 都返回 snapshot null/稳定错误，不从 D0a 摘要或日志恢复 | 只验证 never-started/not-running 时 snapshot null；不验证 point-in-time success、down 后缓存或 failure-surviving query |
+| bounded 且脱敏 | PXMT 最大 2048 bytes、locator/bootstrap/request/response/in-flight/time 上限；全字段 canary、输出故障与未审计 low-level error 抑制 | Secret/SecretRef/config/state/bootstrap/socket/store path、token/key/signature/raw PXMT 与 error canary 不出现在 stdout/stderr；输出失败为 exit 1 且不改变 owner state | 只验证 light envelope 的有界单行输出与配置/state/Secret canary；不替代 Linux frame、timeout、oversize或输出故障证据 |
+| exact-ref 状态诚实 | 实现、真实 consumer、system harness 与 governance row 同批；Program 只在当前 evidence 上升级 | Ubuntu 对同一 immutable exact ref 执行必需 Rust、完整 governance 与 system gates | macOS workflow 是 artifact/light 边界，不替代 Ubuntu exact-ref 验收 |
+
+上述实现、真实 consumer、focused/system harness、治理与 workflow 接线已经形成同一候选写集；当前 Program 因此只把 M4a 升为 `Implemented candidate`。在该完整写集的同一 Ubuntu immutable exact ref 通过 Rust、governance 与四个真实 system 场景，并由独立复核确认之前，M4a 仍不能标为 `Validated` 或 `Completed`。
+
+M4a 的明确 nonclaims 是：不生产、append、query 或返回 PXEV/`EvidenceRecordV1`/`EvidenceRefV1`；不修改或 raw-open `paraegox-evidence`/`LocalEvidenceStore`；不提供 activation failure、stopped、failed、owner crash 或重启后查询；不提供 history/list/cursor/watch/follow、retention/expiry/truncation、log/trace/metric/exporter、structured startup diagnostic 或 incident timeline；不返回 raw Receipt/signature/key/channel/path/token；不替代 Inspection/current health、D0a deploy outcome、M3b、OpsService、Remote Agent 或 production support；不完成原 M4，不解锁 M5b，不满足 `governance.toml` 的 P6a producer→store→reader checkpoint。在首次公开发布前可整批撤回 grammar/adapter，因为它不引入 persistent format；一旦公开发布，grammar、JSON、PXRL/PXRB/PXRQ/PXRO、token/length framing 或语义不兼容变化必须走显式 successor/deprecation。
+
+### M4b — durable PXEV、failure-surviving query 与 structured logs
+
+M4b 才是原 M4 Evidence/日志诊断的完成步骤。当前真实代码中，只有 distributed PXAR8 Runtime 将 PXTP transport facts 包成 PXEV，并向 `LocalEvidenceStore` append/fsync/readback；D0a/PXAR9 未产生 PXEV，store 没有运行中 read service/IPC，failed activation 会拆除 RunningStack/endpoint，而当前 lifecycle locator 只对 Running generation 生效。此外 supervisor 将 stdout/stderr 重定向到 null，Agent journal 含有会话/request payload 且不是 public-safe 日志。这些是 blocker，不能用 M4a、raw store 或文本 grep 绕过。
+
+M4b 实现前必须以被接受或当前用户显式授权的窄决策冻结：D0a/PXAR9 Runtime owner 如何产生 owner-issued PXEV/Receipt ref；Runtime 与 EvidenceService/store 之间的唯一 writer 与 storage-full/uncertain-commit 语义；activation failure 或 lifecycle owner 退出后哪个独立生命期仍可查询；typed filter/cursor/page、retention/expiry/truncation/gap/reset；structured diagnostic producer、redaction 与 bounded backpressure；Inspection 只投影 Evidence availability/ref 而不容纳 payload/history；M5b Python 经独立 direct typed client 消费，不经 Rust parent proxy。composition/lifecycle 绝不得伪造 `owner_ref = Runtime` 的 PXEV，CLI/TUI 绝不 raw-open store。ADR-0003 仍保持 Proposed；若 M4b 只需 node-local Evidence read owner，不得借此提前实现 OpsService。
+
+M4b 当前不冻结 public command/JSON 或 write-set，不预登记 governance。它的最小完成证据是同一 immutable exact ref 上的真实 D0a/PXAR9 producer→唯一 durable commit owner→失败/重启后 typed reader，再加上 bounded structured logs、retention/cursor/truncation、redaction、storage-full/uncertain 和 no-health-inference 证据。只有 M4b 达到这些条件时，原 M4 才可标记完成并解锁 M5b。日志不替代 Receipt；probe、stdout、进程退出码、文件复制或 transport ACK 不能在证据不足时推导副作用成功，数据不可用、过期、缺失或被截断必须显式保持 Unknown/Uncertain。
 
 ### M5a — 已运行实例 attach TUI
 
@@ -367,7 +1130,7 @@ M5a 候选实现批的冻结 exact write-set 是：
 - `tests/console/{test_console_client.py,test_console_tui.py}`、共享跨语言 golden `tests/fixtures/wire/m5a_tui_attach_handoff_v1.hex` 与 `tests/system/test_m5a_local_tui_attach.py`；
 - `.github/workflows/{ci.yml,macos-cli-artifact.yml}`，以及只在实现、真实 consumer 与 system evidence 同批出现时才更新的 `governance.toml`。
 
-该实现批不修改 `crates/paraegox-runtime/**`、`crates/paraegox-inspection/**`、`scripts/paraegox-console`、Cargo dependency/feature、ADR、其他 Program/guide、既有 `chat` child grammar、M3b/M4/Ops/Remote Agent/Graph 或 persistent domain format，也不新增 `tui_bridge.rs`、`console_bridge.py` 或任何 Rust presentation/domain proxy。若实现证明必须越过这个列表，必须先回到 Program 重新评审 write-set，不能以“接线”名义静默扩张。`paraegox tui`、private locator/handoff、真实 consumer、system evidence 与 `governance.toml` public API row 已在同一候选批登记；登记只冻结候选兼容边界，不替代 immutable exact-ref 验证或里程碑完成判定。
+该实现批不修改 `crates/paraegox-runtime/**`、`crates/paraegox-inspection/**`、`scripts/paraegox-console`、Cargo dependency/feature、ADR、其他 Program/guide、既有 `chat` child grammar、M3b/M4a/M4b/Ops/Remote Agent/Graph 或 persistent domain format，也不新增 `tui_bridge.rs`、`console_bridge.py` 或任何 Rust presentation/domain proxy。若实现证明必须越过这个列表，必须先回到 Program 重新评审 write-set，不能以“接线”名义静默扩张。`paraegox tui`、private locator/handoff、真实 consumer、system evidence 与 `governance.toml` public API row 已在同一候选批登记；登记只冻结候选兼容边界，不替代 immutable exact-ref 验证或里程碑完成判定。
 
 后继实现的 claim-to-evidence 验收矩阵固定为：
 
@@ -387,13 +1150,13 @@ M5a 候选实现批的冻结 exact write-set 是：
 
 当前 `tests/system/test_m5a_local_tui_attach.py` 已实现的 Linux exact-binary 场景覆盖 grammar/never-started、真实 Running r1→stale r2、一次 Echo、clean detach、SIGINT/SIGTERM 与五秒 child kill/reap、private 20/21/23/24/other 映射、bootstrap generation race、wrong-peer/root execution及最终 cleanup。它还没有覆盖 stopping pre-effect、一次 Status/一次 raw PXTL-to-EOF 的精确计数、pending request detach/re-attach 后的 capacity/conflict、Agent 与 Inspection channel 分别断连且另一 channel继续、real slow-Watch/backpressure、长输入/slow consumer或输出失败。focused Rust/Python机制测试与 shared PXTH golden不能冒充这些缺失的 system 场景；在同一 immutable exact-ref完整门禁与这些高价值矩阵收口前，M5a 只保持 `Implemented candidate`，不能标 `Validated` 或 `Completed`。
 
-M5a 的明确 nonclaims 是：不提供 Agent transcript/history或detach后pending-request discovery，不提供 M3b public watch/JSONL/Inspection history/gap recovery，不提供 M4/M5b Evidence/logs，不声称 r2 之后持续刷新、心跳、当前健康或 Deployment 收敛，不提供自动 reconnect/retry/recovery，不提供 lifecycle/deploy/down/restart/rollback action，不提供 remote attach、OpsService、Web Console、生产 HA、新的 durable TUI owner、Rust presentation proxy或 replacement `ConsoleBridge`。当前 producer 只足以验证 r1 到 freshness stale r2；UI 显示 `unavailable` 只是 presentation-side连接状态，不是 Inspection source `Partitioned`。M5a 验证失败时可以在发布前整批撤回新 grammar/handoff，因为它不引入 persistent format或迁移；一旦公开发布，grammar 或语义变化必须走显式兼容 successor/deprecation，不能把 `chat` 或 `tui` 静默换义。
+M5a 的明确 nonclaims 是：不提供 Agent transcript/history或detach后pending-request discovery，不提供 M3b public watch/JSONL/Inspection history/gap recovery，不提供 M4a/M4b/M5b Receipt/Evidence/logs，不声称 r2 之后持续刷新、心跳、当前健康或 Deployment 收敛，不提供自动 reconnect/retry/recovery，不提供 lifecycle/deploy/down/restart/rollback action，不提供 remote attach、OpsService、Web Console、生产 HA、新的 durable TUI owner、Rust presentation proxy或 replacement `ConsoleBridge`。当前 producer 只足以验证 r1 到 freshness stale r2；UI 显示 `unavailable` 只是 presentation-side连接状态，不是 Inspection source `Partitioned`。M5a 验证失败时可以在发布前整批撤回新 grammar/handoff，因为它不引入 persistent format或迁移；一旦公开发布，grammar 或语义变化必须走显式兼容 successor/deprecation，不能把 `chat` 或 `tui` 静默换义。
 
 ### M5b — TUI logs integration
 
-M5b 只在 M5a 与 M4 都完成后开始。生产者是 M4 准入的 owner-issued Receipt/Evidence 与 bounded log projection；消费者是 M4 另行准入的 direct typed client与既有 Python Textual presentation。M5b 不新增 public CLI grammar，不借 Rust local parent代理 log/domain traffic，不让 Python读取 raw log/store/Receipt path或 token，不让 TUI成为 retention、cursor、Evidence 或日志 owner，也不从日志文本、缺失记录、进程/transport状态推导成功或当前健康。
+M5b 只在 M5a 与 M4b 都完成后开始，M4a 的 current-Running PXMT snapshot 单独不能解锁它。生产者是 M4b 准入的 owner-issued Receipt/Evidence 与 bounded structured-log projection；消费者是 M4b 另行准入的 direct typed client 与既有 Python Textual presentation。M5b 不新增 public CLI grammar，不借 Rust local parent代理 log/domain traffic，不让 Python读取 raw log/store/Receipt path或 token，不让 TUI成为 retention、cursor、Evidence 或日志 owner，也不从日志文本、缺失记录、进程/transport状态推导成功或当前健康。
 
-M5b 的字段、cursor、retention、truncation、Unavailable/Unknown/Uncertain 与 owner correlation 必须由 M4 先冻结并验证；在此之前本 Program 不猜测 log schema、Evidence API 或 governance row。M3b 是独立的 public Inspection watch 后续，不是 M5b 前置，也不能用 M5a 内部 Watch loop或 M5b logs view冒充完成。
+M5b 的字段、cursor、retention、truncation、Unavailable/Unknown/Uncertain 与 owner correlation 必须由 M4b 先冻结并验证；在此之前本 Program 不猜测 log schema、Evidence API 或 governance row，也不将 M4a JSON 直接塞进 TUI。M3b 是独立的 public Inspection watch 后续，不是 M5b 前置，也不能用 M5a 内部 Watch loop或 M5b logs view冒充完成。
 
 ### N0 — Node enroll/transfer contract
 
@@ -428,11 +1191,12 @@ O0 只有在 N2 后、ADR-0003 被 Accepted 或由后继决策替代、且至少
 2. 对生成配置执行 M1 `config check` 与 `doctor --offline`，全程无 Secret、网络和 state mutation。
 3. 执行 `paraegox deploy --local --config <absolute-paraegox.toml> --json`：唯一 compiled-in deterministic fixture 通过真实 Controller/Runtime 返回 point-in-time `active_ready`；相同请求、重复执行与并发 follower 不创建新 revision/apply，且 `changed = false`。这一 D0a 基线不等待 Artifact/Installation 路线。
 4. 读取 M2a lifecycle status，再由 M3a Inspection snapshot 解释 freshness、stale、unknown、partial 或 reconcile-required，不能把 lifecycle、历史 deployment outcome 与当前健康混成一份状态。M3b public watch 是另行授权和验收的独立后续，不阻塞下一步。
-5. 执行 `paraegox tui --config <absolute-paraegox.toml>`，一次性附着同一 Running generation 的 Agent conversation 与 Inspection：首屏只声明 initial r1，现有 producer 后续只证明 freshness stale r2；断连只显示 `unavailable`且不自动重连。退出 TUI 后 lifecycle status 仍是同一 Running generation，Session/Runtime 继续由原 owner持有。至此形成不等待 M3b/M4 的快速可见本地 attach 基线。
-6. M4 提供 bounded、无 Secret、owner-correlated 的日志/Evidence 后，M5b 再把它接入同一 TUI；缺证据、截断或不可用保持 Unknown/Uncertain，不从日志合成当前健康。这个集成不改变 `paraegox tui` grammar。
-7. ADR-0011 经用户显式 Accepted 后，构建一个 immutable ParaEGOX Artifact，以只读 inspect 获取 version/digest/manifest/target compatibility，再由 Artifact owner 物化；任何 tamper/unsupported 在 store/deployment/runtime 副作用前拒绝。
-8. D0b 消费 exact immutable Artifact reference，由 DeploymentController 提交 forward revision、Runtime 复验并到达 `ActiveReady`；Materialized/Committed/Activated/Ready 各自只由 owner evidence 证明，任何缺失证据只能是 Failed/Uncertain。
-9. 完成 same-state restart 与 new-Artifact replace，证明 joined stop、generation fencing、forward revision 与 no-double-active；再选择已知历史 `ArtifactObjectRefV1` 作为新 forward revision rollback 并重新验证 Ready，不使用 Installation active pointer。
+5. 执行 `paraegox tui --config <absolute-paraegox.toml>`，一次性附着同一 Running generation 的 Agent conversation 与 Inspection：首屏只声明 initial r1，现有 producer 后续只证明 freshness stale r2；断连只显示 `unavailable`且不自动重连。退出 TUI 后 lifecycle status 仍是同一 Running generation，Session/Runtime 继续由原 owner持有。至此形成不等待 M3b/M4a/M4b 的快速可见本地 attach 基线。
+6. M4a 通过 `paraegox receipt snapshot --config <absolute-paraegox.toml> --json` 读取同一 current Running generation 的 verified PXMT public-safe projection；`current_health_checked = false`，退出 owner 后不保留 cached success，这一步不完成 M4 也不解锁 TUI logs。
+7. M4b 建立真实 D0a/PXAR9 PXEV producer、唯一 durable commit/query owner、failure-surviving typed read 与 bounded structured logs 后，M5b 再把这些投影接入同一 TUI；缺证据、截断或不可用保持 Unknown/Uncertain，不从日志合成当前健康。这个集成不改变 `paraegox tui` grammar。
+8. 保留上述 workspace A 的 D0a/M3/M5 running state不变；以 A1 exact build/inspect 产生并零 mutation复验 `developer-local-echo-prefix-v1`，再为独立 workspace B 执行 `init` 与 ArtifactStore materialize/query。workspace B 到此只有配置和已物化 pair，不得有 lifecycle generation或Deployment desired；任何 tamper/unsupported 在 store/deployment/runtime副作用前拒绝。
+9. 在 workspace B 以 D0b exact deploy作为第一次 lifecycle/deployment mutation，消费同一完整 object ref/materialization Receipt；DeploymentController提交Plan/Slice/revision，Runtime pre-effect reopen复验并由真实TUI/Agent观察 `prefix || prompt` 后到达 `ActiveReady`。Materialized/Committed/Applying/Ready各自由owner evidence证明；output loss以原operation query，任何缺证据保持Failed/Uncertain。workspace A的D0a/M3/M5 generation、revision和owner state必须保持不变。
+10. 完成 same-state restart 与 new-Artifact replace，证明 joined stop、generation fencing、forward revision 与 no-double-active；再选择已知历史 `ArtifactObjectRefV1` 作为新 forward revision rollback 并重新验证 Ready，不使用 Installation active pointer。
 
 ### 远端闭环
 
@@ -445,8 +1209,8 @@ O0 只有在 N2 后、ADR-0003 被 Accepted 或由后继决策替代、且至少
 
 - 本 Program 可重排 Draft `kernel-foundation.md` 中的候选顺序，但不能覆盖 Accepted ADR。
 - I0 与 D0a 都不触发 A0。A0 只由 ADR-0004 的真实 fixture 触发：多 DeckLock 统一发布/更新/卸载、installation-owned mutable state、或多隔离安装/多 Artifact 共同稳定 owner。一旦触发，相关副作用必须在最小后继 ADR Accepted 前以稳定 diagnostic 失败关闭。
-- ADR-0011 的 `Proposed` 状态不授权 A1/D0b。只有用户显式 Accepted 并留下有效决策记录后，才能实现 external Artifact build/inspect/materialize 与 external-artifact deploy；R0/D1 继续依赖 D0b。
-- 如 M3a、M3b、M4、M5a、M5b 或 N0–N2 需要完整 OpsService 语义，不能把 O0 前移；必须继续使用窄 typed owner seam，或先单独评审并接受 ADR-0003 后再修改本 Program。
+- ADR-0011 的 Accepted 状态与有效 authorization receipt 已完成决策 gate；本 Program 进一步冻结A1/D0b intended-public contract。实现内部按A1 mechanism/evidence→fresh D0b real consumer排序，但Artifact crate/store与前四CLI不得独立登记、merge或发布；A1 producer、D0b Controller/Runtime/TUI consumer、六条命令、两个system harness与governance rows必须在同一immutable candidate ref共同通过admission/review/merge。决策记录、合同文本或A1-only evidence都不构成capability evidence；R0/D1继续依赖joint D0b gate。
+- 如 M3a、M3b、M4a、M4b、M5a、M5b 或 N0–N2 需要完整 OpsService 语义，不能把 O0 前移；必须继续使用窄 typed owner seam，或先单独评审并接受 ADR-0003 后再修改本 Program。
 - 新增公共命令、JSON 字段、persistent format、state mutation、Secret access 或网络行为必须先在本 Program 冻结对应 Step。尚未实现的 public surface 不得预登记；实现、真实 consumer、system test 与 `governance.toml` 登记必须在同一批次内提交。
 - milestone 只有在列出的 evidence 可由评审者对 immutable exact ref 复现后才能标 Completed；代码存在、工作树存在、文档存在或某个下游模块引用它都不够。
 - Mac 是唯一 writable source authority；本机不得运行 Cargo/rustc/rustfmt。Rust、完整治理与真实 system evidence 必须在 admitted Ubuntu/CI host 对同一 exact ref 执行，且不能把 Mac focused evidence升级为平台验收。

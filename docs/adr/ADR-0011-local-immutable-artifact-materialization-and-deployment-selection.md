@@ -1,13 +1,13 @@
 # ADR-0011 — 本地不可变 Artifact 物化与 Deployment 选择边界
 
-> 状态：Proposed
+> 状态：Accepted
 > 日期：2026-08-10
-> 决策者：待定
+> 决策者：ParaEGOX workspace user（以 `docs/plans/local-artifact-baseline-v1.authorization-receipt` 为生效证据）
 > 关联文档：[ADR-0001 — DeploymentController、DeploymentPlan 与 Runtime 边界](ADR-0001-deployment-controller-boundary.md)、[ADR-0004 — Deck 工作负载、DeckLock 与 Application 准入边界](ADR-0004-deck-workload-and-application-admission-boundary.md)、[ADR-0005 — Typed Domain Graph、Graph Foundation 与 Runtime Assembly 边界](ADR-0005-typed-domain-graphs-and-runtime-assembly-boundary.md)、[ADR-0008 — PXTE v4 / PXAR v5 source-only/empty reference target successor](ADR-0008-pxte-v4-pxar-v5-subject-ingress-separation.md)、[CardDefinition、Card 与 Deck](../concepts/card-definition-card-deck.md)、[Local Operator CLI/Ops Program](../plans/local-operator-cli-ops-program.md)
 
 ## 一句话结论
 
-提议让未来首个外部单 Artifact 路线只建立以完整 `ArtifactObjectRefV1 { artifact_digest, artifact_manifest_digest }` 为身份的不可变 `ArtifactStore` 物化边界：ArtifactStore 只拥有 canonical manifest 与 payload bytes 的联合验证、发布、重开和物化 Receipt，DeploymentController 继续独占 desired Artifact 选择，RuntimeHost 继续独占 live generation；不建立 Application、ProductRelease、Installation、InstallationId、active pointer、卸载、GC 或安装私有状态。
+未来首个外部单 Artifact 路线只建立以完整 `ArtifactObjectRefV1 { artifact_digest, artifact_manifest_digest }` 为身份的不可变 `ArtifactStore` 物化边界：ArtifactStore 只拥有 canonical manifest 与 payload bytes 的联合验证、发布、重开和物化 Receipt，DeploymentController 继续独占 desired Artifact 选择，RuntimeHost 继续独占 live generation；首个实现准入方向只允许有界、不可执行且被真实运行链消费的 deterministic model-data，不建立 Application、ProductRelease、Installation、InstallationId、active pointer、卸载、GC 或安装私有状态。
 
 ## 背景
 
@@ -15,15 +15,16 @@
 
 现有 `paraegox-runtime-host release-descriptor-v1/install-v1` 只拥有 exact RuntimeHost executable、singleton compatibility manifest 与 sequence-one Runtime store 初始化。它不是通用 ArtifactStore、产品 Installation、active release pointer 或 workload rollback owner；相同 install 命令在 initializer marker 已消费后也不会成为可查询的通用部署幂等操作。因此未来外部单 Artifact 路线可以复用 strict canonical verification、pinned-file 与 crash-safe publication的设计原则，但不能复用或重解释该 Runtime installation identity。
 
-[ADR-0004](ADR-0004-deck-workload-and-application-admission-boundary.md) 的 A0 只在真实切片需要多 Deck 统一 release/update/uninstall、installation-owned mutable state，或同一 release 多次隔离安装/多 Artifact 共同稳定 owner 时触发。一个 compiled-in deterministic fixture、一个 DeploymentScope、一个 target 且没有安装私有状态，不满足这些条件。另一方面，未来即使只有一个外部 Artifact，公开内容身份、持久物化格式、唯一 writer、崩溃恢复和 Receipt 仍是需要显式裁决的架构边界；这正是本 Proposed ADR 的范围。
+[ADR-0004](ADR-0004-deck-workload-and-application-admission-boundary.md) 的 A0 只在真实切片需要多 Deck 统一 release/update/uninstall、installation-owned mutable state，或同一 release 多次隔离安装/多 Artifact 共同稳定 owner 时触发。一个 compiled-in deterministic fixture、一个 DeploymentScope、一个 target 且没有安装私有状态，不满足这些条件。另一方面，未来即使只有一个外部 Artifact，公开内容身份、持久物化格式、唯一 writer、崩溃恢复和 Receipt 仍是需要显式裁决的架构边界；这正是本 ADR 已接受的范围。
 
-当前 [Local Operator CLI/Ops Program](../plans/local-operator-cli-ops-program.md) 仍是交付顺序权威，且它对 A0/D0 的现有表述尚未由本 Proposed ADR 修改。本记录不改变 Program 状态、依赖或完成声明，也不能以 Proposed 状态绕过 Program、治理登记或用户授权。
+当前 [Local Operator CLI/Ops Program](../plans/local-operator-cli-ops-program.md) 仍是交付顺序权威。`Accepted` 只解除 A1/D0b 的架构决策前置，不自行改变 Program 状态、依赖或完成声明，也不绕过具体 implementation admission、治理登记和证据要求。
 
 ## 范围与非目标
 
-本 ADR 提议决定：
+本 ADR 决定：
 
 - compiled-in deterministic D0a 与未来外部单 Artifact 路线的分界；
+- 首个真实外部 Artifact 只采用 bounded、non-executable deterministic model-data 的准入方向，并由真实 Runtime/Agent/TUI 链消费其 bytes；
 - 完整 `ArtifactObjectRefV1`、canonical Artifact manifest/payload、ArtifactStore immutable materialization 与物化 operation/Receipt 的唯一 owner；
 - ArtifactStore、DeploymentController、RuntimeHost 与 operator CLI 之间的依赖方向；
 - 单 Artifact 物化的 crash、幂等、兼容和失败关闭规则；
@@ -38,6 +39,7 @@
 - active/current release pointer、符号链接选择、安装记录、卸载、GC、retain/delete/transfer、backup/migration 或 installation-owned private state；
 - Artifact registry、catalog、marketplace、签名/SBOM、Artifact Trust、远端传输或供应链 policy；
 - 新 crate、CoreService、daemon、后台清理任务或通用包管理器；
+- 任意用户代码、native executable、dynamic library、ProcessDomain workload、脚本/eval、payload 自带 OS authority 或 sandbox 能力声明；
 - 通用 Graph、workflow、saga、retry、compensation 或 rollback engine。
 
 ## 决策
@@ -53,6 +55,12 @@
 - 不拥有跨 DeckRun/升级的 installation-private mutable state。
 
 因此该窄切片不满足 ADR-0004 §6 的 A0 三项触发条件，也不以本 ADR Accepted 作为前置依赖。D0a 仍必须单独冻结 public CLI/JSON compatibility、登记治理 surface，并取得 exact-ref 行为证据；本条不是 D0a 实现或发布授权。
+
+### 1.1 首个 external Artifact profile 只允许 bounded non-executable model-data
+
+本次 Accepted 决策把首个 A1/D0b implementation admission 方向收窄为一个外部、不可变、有界、不可执行的 deterministic model-data Artifact。payload 必须由 Runtime 对完整 `ArtifactObjectRefV1` exact reopen 并重新验证后，交给仓库内编译且有界的确定性解释器/adapter消费；payload 必须实际改变 Agent/TUI 可观察的确定性结果。只物化 declaration、marker 或 label、而实际行为仍完全来自 compiled-in D0a fixture，不构成真实 external Artifact deployment consumer，也不能据此声明 D0b。
+
+该方向不准入 payload 作为 native executable、dynamic library、ProcessDomain program、脚本/eval输入或任意代码加载，不授予文件路径、环境变量、网络、子进程或其他 ambient OS authority，也不产生 sandbox/containment 声明。具体 profile 名、canonical manifest/wire、byte/输出上限、adapter identity、target compatibility、config successor、CLI grammar/JSON 与 Plan/Slice successor 必须由 Program 和后续 implementation admission 同批冻结；本 ADR 的 Accepted 状态本身不创建这些公共合同。
 
 ### 2. 未来单 Artifact 路线只有一个完整对象引用
 
@@ -179,17 +187,17 @@ Artifact materialization、Deployment commit、Runtime apply与未来rollback保
 
 纯确定性步骤表或局部算法可以保留在实际 owner内部；任何跨领域 Graph Foundation仍服从 [ADR-0005](ADR-0005-typed-domain-graphs-and-runtime-assembly-boundary.md) 的双真实生产消费者门，且不得拥有I/O、持久状态、operation、Receipt、retry或rollback。
 
-### 11. Proposed 状态不授权实现
+### 11. Accepted 只冻结决策边界，不授权实现
 
-本 ADR 处于 `Proposed` 时仅是候选边界。它不授权：
+用户以 `docs/plans/local-artifact-baseline-v1.authorization-receipt` 接受本 ADR 所定义的单 external-Artifact owner 边界、首个 bounded non-executable model-data 方向、ADR-0004 A0 gate 与 no-Graph 约束。本次接受是架构决策生效证据，不是实现、治理或能力完成证据；它不授权：
 
 - 创建 Artifact crate/package/service、公共 manifest/API/CLI或持久 store；
 - 修改 DeploymentPlan/RuntimePlanSlice/public Receipt Schema；
 - 实现或宣称 artifact build/inspect/materialize、D0、replace、restart或rollback；
 - 修改 Local Operator Program、`governance.toml` 或任何 milestone状态；
-- 创建 authorization receipt或把本记录视为用户接受证据。
+- 把 receipt、ADR 文本、文件存在或静态 fixture 视为外部 Artifact 已可构建、物化、部署或运行的证据。
 
-即使未来 Accepted，也只授权按本边界进入具体 implementation admission；每个公共 contract、持久格式、package和CLI仍需同批登记真实 producer、独立 consumer、compatibility、migration/removal与first functional evidence。
+后续只能由 Program 另行冻结并准入具体 A1/D0b 批次；每个公共 contract、持久格式、package和CLI仍需同批登记真实 producer、独立 consumer、compatibility、migration/removal与first functional evidence。在该准入完成前，本 ADR 只约束未来实现应遵守的边界。
 
 ## 备选方案
 
@@ -247,7 +255,7 @@ Artifact materialization、Deployment commit、Runtime apply与未来rollback保
 
 ## 实施与验证
 
-若本 ADR 后续 Accepted，仍须按依赖分批实施，且文档或代码存在都不构成完成证据：
+本 ADR 已 Accepted，但任何后续实现仍须按依赖分批准入和实施，且文档或代码存在都不构成完成证据：
 
 1. D0a 单独证明 compiled-in deterministic profile不创建ArtifactStore/Installation/active pointer，并通过真实DeploymentController commit与Runtime terminal返回point-in-time Ready；该证据不声明外部Artifact能力。
 2. 首个external-artifact batch同时冻结canonical manifest、digest pair、`ArtifactObjectRefV1`编码与bounds、strict decoder、unknown version/field behavior、Rust/Python golden vectors和reproducible build input/output；pair交换/截断、payload相同但manifest不同、tamper、truncation、oversize、unsupported target与entrypoint drift在store mutation前失败。
@@ -267,6 +275,6 @@ Artifact materialization、Deployment commit、Runtime apply与未来rollback保
 
 ## 后继与替代
 
-本 ADR 不替代 ADR-0001、ADR-0004、ADR-0005或ADR-0008；它只提议补充这些记录之间尚未拥有的单external-Artifact immutable materialization与Deployment selection边界。
+本 ADR 不替代 ADR-0001、ADR-0004、ADR-0005或ADR-0008；它只补充这些记录之间尚未拥有的单external-Artifact immutable materialization与Deployment selection边界。
 
-任何满足ADR-0004 A0触发条件的后继ProductRelease/Installation/Application或更窄owner ADR必须明确本记录哪些单Artifact规则继续保留、哪些被supersede，以及object、operation、Receipt和Deployment引用如何迁移。若本提案未获得真实producer/consumer或平台durability证据，应Rejected或缩回internal implementation，不保留orphan公共合同、package或store。
+任何满足ADR-0004 A0触发条件的后继ProductRelease/Installation/Application或更窄owner ADR必须明确本记录哪些单Artifact规则继续保留、哪些被supersede，以及object、operation、Receipt和Deployment引用如何迁移。若本决策未获得真实producer/consumer或平台durability证据，应Rejected或缩回internal implementation，不保留orphan公共合同、package或store。

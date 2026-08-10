@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Instant, sleep, timeout};
+use zeroize::Zeroizing;
 
 use crate::composition::{
     HeadlessLifecycleControlV1, PreparedHeadlessChatV1, VerifiedLocalDeploymentProjectionV1,
@@ -36,6 +37,10 @@ use crate::composition::{
 };
 use crate::config::{LocalLifecycleActionV1, LocalManagedChatConfigV1};
 use crate::error::LocalProcessError;
+use crate::receipt_snapshot::{
+    LocalReceiptAdapterReadyLeaseV1, LocalReceiptBootstrapLocatorV1, LocalReceiptOwnerBindingV1,
+    LocalReceiptRetirementHandleV1, MAX_RECEIPT_BOOTSTRAP_BYTES, MIN_RECEIPT_BOOTSTRAP_BYTES,
+};
 
 pub(crate) const LOCAL_CHAT_SUPERVISOR_MODE_V1: &str = "__local-chat-supervisor-v1";
 pub(crate) const EXPECTED_CONFIG_COMMITMENT_OPTION: &str = "--expected-config-commitment";
@@ -59,10 +64,15 @@ const INTERNAL_REQUEST_BYTES: usize = 38;
 const INTERNAL_DEPLOY_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
 const INTERNAL_INSPECTION_LOCATOR_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
 const INTERNAL_TUI_ATTACH_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
+const INTERNAL_RECEIPT_LOCATOR_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
 const INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES: usize = 160;
 const MAX_INSPECTION_LOCATOR_PATH_BYTES: usize = 4_096;
 const MAX_INSPECTION_LOCATOR_RESPONSE_BYTES: usize =
     INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES + MAX_INSPECTION_LOCATOR_PATH_BYTES;
+const RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES: usize = 160;
+const MAX_RECEIPT_LOCATOR_PATH_BYTES: usize = 4_096;
+const MAX_RECEIPT_LOCATOR_RESPONSE_BYTES: usize =
+    RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES + MAX_RECEIPT_LOCATOR_PATH_BYTES;
 const TUI_ATTACH_FRAME_HEADER_BYTES: usize = 288;
 const TUI_ATTACH_PIN_RECORD_BYTES: usize = 96;
 const MAX_TUI_ATTACH_PATH_BYTES: usize = 4_096;
@@ -87,6 +97,10 @@ const INSPECTION_LOCATOR_RESPONSE_VERSION: u16 = 1;
 const INSPECTION_LOCATOR_READY_OUTCOME: u8 = b'R';
 const INSPECTION_LOCATOR_RESPONSE_DIGEST_DOMAIN: &[u8] =
     b"paraegox.local.inspection-locator-response.v1";
+const RECEIPT_LOCATOR_RESPONSE_MAGIC: [u8; 4] = *b"PXRL";
+const RECEIPT_LOCATOR_RESPONSE_VERSION: u16 = 1;
+const RECEIPT_LOCATOR_READY_OUTCOME: u8 = b'R';
+const RECEIPT_LOCATOR_RESPONSE_DIGEST_DOMAIN: &[u8] = b"paraegox.local.receipt-locator-response.v1";
 const TUI_ATTACH_LOCATOR_RESPONSE_MAGIC: [u8; 4] = *b"PXTL";
 const TUI_ATTACH_HANDOFF_MAGIC: [u8; 4] = *b"PXTH";
 const TUI_ATTACH_FRAME_VERSION: u16 = 1;
@@ -416,6 +430,7 @@ enum InternalActionV1 {
     Deploy,
     Inspection,
     TuiAttach,
+    Receipt,
 }
 
 impl InternalActionV1 {
@@ -426,6 +441,7 @@ impl InternalActionV1 {
             Self::Deploy => b'P',
             Self::Inspection => b'I',
             Self::TuiAttach => b'T',
+            Self::Receipt => b'R',
         }
     }
 
@@ -436,6 +452,7 @@ impl InternalActionV1 {
             b'P' => Some(Self::Deploy),
             b'I' => Some(Self::Inspection),
             b'T' => Some(Self::TuiAttach),
+            b'R' => Some(Self::Receipt),
             _ => None,
         }
     }
@@ -452,6 +469,13 @@ struct InternalInspectionLocatorResponseV1 {
     generation: [u8; 16],
     config_commitment: [u8; 32],
     locator: LocalInspectionBootstrapLocatorV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InternalReceiptLocatorResponseV1 {
+    generation: [u8; 16],
+    config_commitment: [u8; 32],
+    locator: LocalReceiptBootstrapLocatorV1,
 }
 
 /// One exact owner-private bootstrap file pinned before the lifecycle Ready
@@ -670,14 +694,21 @@ impl LifecyclePathsV1 {
 struct HeadlessControlV1 {
     events: UnboundedSender<SupervisorEventV1>,
     shutdown: Receiver<()>,
+    generation: [u8; 16],
+    config_commitment: [u8; 32],
 }
 
 impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
+    fn receipt_owner_binding(&self) -> Result<LocalReceiptOwnerBindingV1, LocalProcessError> {
+        LocalReceiptOwnerBindingV1::try_new(self.generation, self.config_commitment)
+    }
+
     fn mark_ready(
         &mut self,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
         conversation_bootstrap_path: PathBuf,
         inspection_bootstrap_path: Option<PathBuf>,
+        receipt_ready: LocalReceiptAdapterReadyLeaseV1,
     ) -> Result<(), LocalProcessError> {
         let inspection_bootstrap_locator = inspection_bootstrap_path
             .as_deref()
@@ -689,11 +720,21 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
                 capture_tui_attach_bootstrap_pair(&conversation_bootstrap_path, inspection_path)
             })
             .transpose()?;
+        let (receipt_bootstrap_path, receipt_retirement) = receipt_ready.into_parts();
+        let receipt_bootstrap_locator = capture_receipt_bootstrap_locator(
+            &receipt_bootstrap_path,
+            self.generation,
+            self.config_commitment,
+        )?;
         self.events
             .send(SupervisorEventV1::Ready(Box::new(SupervisorReadyEventV1 {
                 deployment,
                 inspection_bootstrap_locator,
                 tui_attach_locators,
+                receipt_owner: SupervisorReceiptOwnerV1 {
+                    locator: receipt_bootstrap_locator,
+                    _retirement: receipt_retirement,
+                },
             })))
             .map_err(|_| LocalProcessError::LifecycleControl)
     }
@@ -709,6 +750,12 @@ struct SupervisorReadyEventV1 {
     deployment: Option<VerifiedLocalDeploymentProjectionV1>,
     inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
     tui_attach_locators: Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
+    receipt_owner: SupervisorReceiptOwnerV1,
+}
+
+struct SupervisorReceiptOwnerV1 {
+    locator: LocalReceiptBootstrapLocatorV1,
+    _retirement: LocalReceiptRetirementHandleV1,
 }
 
 enum SupervisorEventV1 {
@@ -945,6 +992,50 @@ pub(crate) fn locate_local_inspection_bootstrap(
             }
             Ok(None) | Err(_) => Err(LocalProcessError::LocalInspectionLocator),
         },
+    }
+}
+
+/// Resolves the owner-private PXRB locator for exactly the current Running
+/// generation. It performs one Status and one generation-bound `R` exchange,
+/// with no retry, recovery, lifecycle mutation, or cached-success path.
+pub(crate) fn locate_local_receipt_bootstrap(
+    config: &LocalManagedChatConfigV1,
+) -> Result<LocalReceiptBootstrapLocatorV1, LocalProcessError> {
+    validate_execution_identity()?;
+    let status = observe(config).map_err(classify_receipt_status_observation_error)?;
+    if status.diagnostic().is_some_and(|diagnostic| {
+        diagnostic.code() == LocalProcessError::LifecycleConfiguration.code()
+    }) {
+        return Err(LocalProcessError::LifecycleConfiguration);
+    }
+    if !status.ok()
+        || status.state() != LocalLifecycleStateV1::Running
+        || !status.owner_readiness_observed()
+    {
+        return Err(LocalProcessError::LocalReceiptNotRunning);
+    }
+    let generation = status
+        .generation()
+        .ok_or(LocalProcessError::LocalReceiptLocator)?;
+    let expected_generation =
+        decode_generation(generation).map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    match query_local_receipt_locator(config, expected_generation) {
+        Ok(response) => Ok(response.locator),
+        Err(error) => match config_authority_drift(config) {
+            Ok(Some(_)) => Err(LocalProcessError::LifecycleConfiguration),
+            Ok(None) if error == LocalProcessError::LifecycleConfiguration => {
+                Err(LocalProcessError::LifecycleConfiguration)
+            }
+            Ok(None) | Err(_) => Err(LocalProcessError::LocalReceiptLocator),
+        },
+    }
+}
+
+fn classify_receipt_status_observation_error(error: LocalProcessError) -> LocalProcessError {
+    if error == LocalProcessError::LifecycleConfiguration {
+        LocalProcessError::LifecycleConfiguration
+    } else {
+        LocalProcessError::LocalReceiptLocator
     }
 }
 
@@ -1220,7 +1311,13 @@ async fn run_supervisor_async(
 
     let (events_tx, events_rx) = unbounded_channel();
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
-    let composition = spawn_composition(prepared, events_tx, shutdown_rx)?;
+    let composition = spawn_composition(
+        prepared,
+        events_tx,
+        shutdown_rx,
+        expected_generation,
+        config.config_commitment(),
+    )?;
     let mut down_waiters = Vec::new();
     let mut shutdown_deadline = None;
     let supervisor_result = supervise(
@@ -1307,6 +1404,8 @@ fn spawn_composition(
     prepared: PreparedHeadlessChatV1,
     events: UnboundedSender<SupervisorEventV1>,
     shutdown: Receiver<()>,
+    generation: [u8; 16],
+    config_commitment: [u8; 32],
 ) -> Result<JoinHandle<Result<(), LocalProcessError>>, LocalProcessError> {
     thread::Builder::new()
         .name("paraegox-local-owner".to_owned())
@@ -1315,6 +1414,8 @@ fn spawn_composition(
             let mut control = HeadlessControlV1 {
                 events: events.clone(),
                 shutdown,
+                generation,
+                config_commitment,
             };
             let result = run_prepared_headless_chat(prepared, &mut control);
             let _ = events.send(SupervisorEventV1::Exited(result));
@@ -1357,6 +1458,7 @@ async fn supervise(
     let mut deployment_projection = None;
     let mut inspection_bootstrap_locator = None;
     let mut tui_attach_locators = None;
+    let mut receipt_owner = None;
 
     loop {
         tokio::select! {
@@ -1385,9 +1487,12 @@ async fn supervise(
                         down_waiters.push((stream, changed));
                         if !stopping {
                             stopping = true;
-                            *shutdown_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
-                            record.state = LocalLifecycleStateV1::Stopping;
-                            publish_record(paths, record)?;
+                            begin_stopping(
+                                paths,
+                                record,
+                                &mut receipt_owner,
+                                shutdown_deadline,
+                            )?;
                             if shutdown.send(()).is_err() {
                                 failure = Some(LocalProcessError::LifecycleShutdown);
                             }
@@ -1439,6 +1544,22 @@ async fn supervise(
                         let _ = write_internal_tui_attach_locator_response(&mut stream, &response)
                             .await;
                     }
+                    InternalActionV1::Receipt => {
+                        let Some(expected_generation) = request.expected_generation else {
+                            continue;
+                        };
+                        let Some(response) = receipt_locator_response_for_request(
+                            record,
+                            stopping,
+                            expected_generation,
+                            commitment,
+                            receipt_owner.as_ref(),
+                        ) else {
+                            continue;
+                        };
+                        let _ = write_internal_receipt_locator_response(&mut stream, &response)
+                            .await;
+                    }
                 }
             }
             event = events.recv() => {
@@ -1453,6 +1574,7 @@ async fn supervise(
                             &mut deployment_projection,
                             &mut inspection_bootstrap_locator,
                             &mut tui_attach_locators,
+                            &mut receipt_owner,
                             *ready,
                         );
                         publish_record(paths, record)?;
@@ -1478,9 +1600,7 @@ async fn supervise(
                     return Err(LocalProcessError::SignalHandling);
                 }
                 stopping = true;
-                *shutdown_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
-                record.state = LocalLifecycleStateV1::Stopping;
-                publish_record(paths, record)?;
+                begin_stopping(paths, record, &mut receipt_owner, shutdown_deadline)?;
                 shutdown.send(()).map_err(|_| LocalProcessError::LifecycleShutdown)?;
             }
             signal = terminate.recv(), if !stopping => {
@@ -1488,17 +1608,13 @@ async fn supervise(
                     return Err(LocalProcessError::SignalHandling);
                 }
                 stopping = true;
-                *shutdown_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
-                record.state = LocalLifecycleStateV1::Stopping;
-                publish_record(paths, record)?;
+                begin_stopping(paths, record, &mut receipt_owner, shutdown_deadline)?;
                 shutdown.send(()).map_err(|_| LocalProcessError::LifecycleShutdown)?;
             }
             () = sleep_until_deadline(startup_deadline), if !stopping && !record.owner_readiness_observed => {
                 stopping = true;
-                *shutdown_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
                 failure = Some(LocalProcessError::LifecycleStartup);
-                record.state = LocalLifecycleStateV1::Stopping;
-                publish_record(paths, record)?;
+                begin_stopping(paths, record, &mut receipt_owner, shutdown_deadline)?;
                 shutdown.send(()).map_err(|_| LocalProcessError::LifecycleShutdown)?;
             }
             () = sleep_until_optional_deadline(*shutdown_deadline), if stopping => {
@@ -1510,18 +1626,35 @@ async fn supervise(
     }
 }
 
+fn begin_stopping(
+    paths: &LifecyclePathsV1,
+    record: &mut LifecycleRecordV1,
+    receipt_owner: &mut Option<SupervisorReceiptOwnerV1>,
+    shutdown_deadline: &mut Option<Instant>,
+) -> Result<(), LocalProcessError> {
+    // Retire immutable PXMT supply before a Stopping record can become visible.
+    // A correlated request already admitted by the adapter may then observe its
+    // sole authenticated `N`; lifecycle itself never retains a locator cache.
+    drop(receipt_owner.take());
+    *shutdown_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
+    record.state = LocalLifecycleStateV1::Stopping;
+    publish_record(paths, record)
+}
+
 fn apply_supervisor_ready_event(
     record: &mut LifecycleRecordV1,
     stopping: bool,
     deployment_projection: &mut Option<VerifiedLocalDeploymentProjectionV1>,
     inspection_bootstrap_locator: &mut Option<LocalInspectionBootstrapLocatorV1>,
     tui_attach_locators: &mut Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
+    receipt_owner: &mut Option<SupervisorReceiptOwnerV1>,
     ready: SupervisorReadyEventV1,
 ) {
     *deployment_projection = ready.deployment;
     if !stopping {
         *inspection_bootstrap_locator = ready.inspection_bootstrap_locator;
         *tui_attach_locators = ready.tui_attach_locators;
+        *receipt_owner = Some(ready.receipt_owner);
     }
     apply_ready_observation(record, stopping);
 }
@@ -1569,6 +1702,30 @@ fn inspection_locator_response_for_request(
         generation: expected_generation,
         config_commitment,
         locator: locator?.clone(),
+    })
+    .ok()
+}
+
+fn receipt_locator_response_for_request(
+    record: &LifecycleRecordV1,
+    stopping: bool,
+    expected_generation: [u8; 16],
+    config_commitment: [u8; 32],
+    owner: Option<&SupervisorReceiptOwnerV1>,
+) -> Option<Vec<u8>> {
+    if stopping
+        || record.state != LocalLifecycleStateV1::Running
+        || !record.owner_readiness_observed
+        || decode_generation(&record.generation).ok()? != expected_generation
+        || decode_lower_hex_32(&record.config_commitment).ok()? != config_commitment
+    {
+        return None;
+    }
+    let owner = owner?;
+    encode_internal_receipt_locator_response(&InternalReceiptLocatorResponseV1 {
+        generation: expected_generation,
+        config_commitment,
+        locator: owner.locator.clone(),
     })
     .ok()
 }
@@ -1669,6 +1826,81 @@ fn capture_inspection_bootstrap_locator(
         device: opened.dev(),
         inode: opened.ino(),
     })
+}
+
+fn capture_receipt_bootstrap_locator(
+    path: &Path,
+    generation: [u8; 16],
+    config_commitment: [u8; 32],
+) -> Result<LocalReceiptBootstrapLocatorV1, LocalProcessError> {
+    let path_bytes = path
+        .to_str()
+        .ok_or(LocalProcessError::LifecycleStartup)?
+        .as_bytes();
+    if !is_lexically_absolute_file(path)
+        || path_bytes.is_empty()
+        || path_bytes.len() > MAX_RECEIPT_LOCATOR_PATH_BYTES
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let expected_uid = Uid::effective().as_raw();
+    let expected_gid = Gid::effective().as_raw();
+    let before = fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_receipt_bootstrap_metadata(&before, expected_uid, expected_gid)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let after = fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_receipt_bootstrap_metadata(&opened, expected_uid, expected_gid)?;
+    validate_receipt_bootstrap_metadata(&after, expected_uid, expected_gid)?;
+    if before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let content_length =
+        usize::try_from(opened.len()).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    if !(MIN_RECEIPT_BOOTSTRAP_BYTES..=MAX_RECEIPT_BOOTSTRAP_BYTES).contains(&content_length) {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let read_limit = u64::try_from(MAX_RECEIPT_BOOTSTRAP_BYTES + 1)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let mut content = Zeroizing::new(Vec::with_capacity(content_length));
+    (&file)
+        .take(read_limit)
+        .read_to_end(&mut content)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let final_metadata =
+        fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_receipt_bootstrap_metadata(&final_metadata, expected_uid, expected_gid)?;
+    if content.len() != content_length
+        || final_metadata.dev() != opened.dev()
+        || final_metadata.ino() != opened.ino()
+        || final_metadata.len() != opened.len()
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let content_sha256: [u8; 32] = Sha256::digest(content.as_slice()).into();
+    if content_sha256.iter().all(|byte| *byte == 0) {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    LocalReceiptBootstrapLocatorV1::try_from_pinned_parts(
+        generation,
+        config_commitment,
+        path.to_path_buf(),
+        u32::try_from(content_length).map_err(|_| LocalProcessError::LifecycleStartup)?,
+        content_sha256,
+        opened.dev(),
+        opened.ino(),
+    )
+    .map_err(|()| LocalProcessError::LifecycleStartup)
 }
 
 fn capture_tui_attach_bootstrap_pair(
@@ -1792,6 +2024,22 @@ fn validate_tui_bootstrap_metadata(
 }
 
 fn validate_inspection_bootstrap_metadata(
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), LocalProcessError> {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_gid
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    Ok(())
+}
+
+fn validate_receipt_bootstrap_metadata(
     metadata: &fs::Metadata,
     expected_uid: u32,
     expected_gid: u32,
@@ -2276,6 +2524,65 @@ async fn query_local_inspection_locator_async(
     )
 }
 
+fn query_local_receipt_locator(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<InternalReceiptLocatorResponseV1, LocalProcessError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    runtime.block_on(query_local_receipt_locator_async(
+        config,
+        expected_generation,
+    ))
+}
+
+async fn query_local_receipt_locator_async(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<InternalReceiptLocatorResponseV1, LocalProcessError> {
+    let paths = LifecyclePathsV1::from_state_root(config.state_root())
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let mut stream = timeout(CLIENT_IO_TIMEOUT, UnixStream::connect(&paths.socket))
+        .await
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let credentials = stream
+        .peer_cred()
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    if credentials.uid() != Uid::effective().as_raw()
+        || credentials.gid() != Gid::effective().as_raw()
+    {
+        return Err(LocalProcessError::LocalReceiptLocator);
+    }
+    let request =
+        encode_internal_receipt_locator_query(config.config_commitment(), expected_generation);
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(&request))
+        .await
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    accept_client_write_half_shutdown(stream.shutdown().await)
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let mut response = Vec::new();
+    let response_limit = u64::try_from(MAX_RECEIPT_LOCATOR_RESPONSE_BYTES + 1)
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    timeout(
+        CLIENT_IO_TIMEOUT,
+        (&mut stream)
+            .take(response_limit)
+            .read_to_end(&mut response),
+    )
+    .await
+    .map_err(|_| LocalProcessError::LocalReceiptLocator)?
+    .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    decode_internal_receipt_locator_response(
+        &response,
+        expected_generation,
+        config.config_commitment(),
+    )
+}
+
 fn query_local_tui_attach(
     config: &LocalManagedChatConfigV1,
     expected_generation: [u8; 16],
@@ -2375,6 +2682,19 @@ fn encode_internal_inspection_locator_query(
     let mut request = [0_u8; INTERNAL_INSPECTION_LOCATOR_QUERY_BYTES];
     request[..INTERNAL_REQUEST_BYTES].copy_from_slice(&encode_internal_request(
         InternalActionV1::Inspection,
+        commitment,
+    ));
+    request[INTERNAL_REQUEST_BYTES..].copy_from_slice(&expected_generation);
+    request
+}
+
+fn encode_internal_receipt_locator_query(
+    commitment: [u8; 32],
+    expected_generation: [u8; 16],
+) -> [u8; INTERNAL_RECEIPT_LOCATOR_QUERY_BYTES] {
+    let mut request = [0_u8; INTERNAL_RECEIPT_LOCATOR_QUERY_BYTES];
+    request[..INTERNAL_REQUEST_BYTES].copy_from_slice(&encode_internal_request(
+        InternalActionV1::Receipt,
         commitment,
     ));
     request[INTERNAL_REQUEST_BYTES..].copy_from_slice(&expected_generation);
@@ -2558,6 +2878,183 @@ fn decode_internal_inspection_locator_response(
 fn inspection_locator_response_digest(prefix: &[u8], path: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(INSPECTION_LOCATOR_RESPONSE_DIGEST_DOMAIN);
+    digest.update(prefix);
+    digest.update(path);
+    digest.finalize().into()
+}
+
+fn encode_internal_receipt_locator_response(
+    response: &InternalReceiptLocatorResponseV1,
+) -> Result<Vec<u8>, LocalProcessError> {
+    let path = response
+        .locator
+        .path()
+        .to_str()
+        .ok_or(LocalProcessError::LocalReceiptLocator)?
+        .as_bytes();
+    let content_length = usize::try_from(response.locator.content_length())
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    if response.generation.iter().all(|byte| *byte == 0)
+        || response.config_commitment.iter().all(|byte| *byte == 0)
+        || response.locator.generation() != response.generation
+        || response.locator.config_commitment() != response.config_commitment
+        || response
+            .locator
+            .content_sha256()
+            .iter()
+            .all(|byte| *byte == 0)
+        || !(MIN_RECEIPT_BOOTSTRAP_BYTES..=MAX_RECEIPT_BOOTSTRAP_BYTES).contains(&content_length)
+        || !is_lexically_absolute_file(response.locator.path())
+        || path.is_empty()
+        || path.len() > MAX_RECEIPT_LOCATOR_PATH_BYTES
+    {
+        return Err(LocalProcessError::LocalReceiptLocator);
+    }
+    let frame_length = RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES
+        .checked_add(path.len())
+        .ok_or(LocalProcessError::LocalReceiptLocator)?;
+    let mut frame = vec![0_u8; frame_length];
+    frame[..4].copy_from_slice(&RECEIPT_LOCATOR_RESPONSE_MAGIC);
+    frame[4..6].copy_from_slice(&RECEIPT_LOCATOR_RESPONSE_VERSION.to_be_bytes());
+    frame[6] = InternalActionV1::Receipt.wire();
+    frame[7] = RECEIPT_LOCATOR_READY_OUTCOME;
+    frame[8..10].copy_from_slice(
+        &u16::try_from(RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES)
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?
+            .to_be_bytes(),
+    );
+    frame[12..16].copy_from_slice(
+        &u32::try_from(frame_length)
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?
+            .to_be_bytes(),
+    );
+    frame[16..20].copy_from_slice(
+        &u32::try_from(path.len())
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?
+            .to_be_bytes(),
+    );
+    frame[20..24].copy_from_slice(&response.locator.content_length().to_be_bytes());
+    frame[24..40].copy_from_slice(&response.generation);
+    frame[40..72].copy_from_slice(&response.config_commitment);
+    frame[72..104].copy_from_slice(&response.locator.content_sha256());
+    frame[104..112].copy_from_slice(&response.locator.device().to_be_bytes());
+    frame[112..120].copy_from_slice(&response.locator.inode().to_be_bytes());
+    frame[RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES..].copy_from_slice(path);
+    let digest = receipt_locator_response_digest(
+        &frame[..128],
+        &frame[RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES..],
+    );
+    if digest.iter().all(|byte| *byte == 0) {
+        return Err(LocalProcessError::LocalReceiptLocator);
+    }
+    frame[128..RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES].copy_from_slice(&digest);
+    Ok(frame)
+}
+
+fn decode_internal_receipt_locator_response(
+    frame: &[u8],
+    expected_generation: [u8; 16],
+    expected_config_commitment: [u8; 32],
+) -> Result<InternalReceiptLocatorResponseV1, LocalProcessError> {
+    if frame.len() < RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES
+        || frame.len() > MAX_RECEIPT_LOCATOR_RESPONSE_BYTES
+        || frame[..4] != RECEIPT_LOCATOR_RESPONSE_MAGIC
+        || u16::from_be_bytes([frame[4], frame[5]]) != RECEIPT_LOCATOR_RESPONSE_VERSION
+        || frame[6] != InternalActionV1::Receipt.wire()
+        || frame[7] != RECEIPT_LOCATOR_READY_OUTCOME
+        || usize::from(u16::from_be_bytes([frame[8], frame[9]]))
+            != RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES
+        || frame[10..12].iter().any(|byte| *byte != 0)
+        || frame[120..128].iter().any(|byte| *byte != 0)
+    {
+        return Err(LocalProcessError::LocalReceiptLocator);
+    }
+    let frame_length = usize::try_from(u32::from_be_bytes(
+        frame[12..16]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?,
+    ))
+    .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let path_length = usize::try_from(u32::from_be_bytes(
+        frame[16..20]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?,
+    ))
+    .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let content_length = u32::from_be_bytes(
+        frame[20..24]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?,
+    );
+    let content_length_usize =
+        usize::try_from(content_length).map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    if frame_length != frame.len()
+        || !(1..=MAX_RECEIPT_LOCATOR_PATH_BYTES).contains(&path_length)
+        || RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES.checked_add(path_length) != Some(frame.len())
+        || !(MIN_RECEIPT_BOOTSTRAP_BYTES..=MAX_RECEIPT_BOOTSTRAP_BYTES)
+            .contains(&content_length_usize)
+    {
+        return Err(LocalProcessError::LocalReceiptLocator);
+    }
+    let generation: [u8; 16] = frame[24..40]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let config_commitment: [u8; 32] = frame[40..72]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let content_sha256: [u8; 32] = frame[72..104]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let device = u64::from_be_bytes(
+        frame[104..112]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?,
+    );
+    let inode = u64::from_be_bytes(
+        frame[112..120]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalReceiptLocator)?,
+    );
+    let declared_digest: [u8; 32] = frame[128..RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let path_bytes = &frame[RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES..];
+    if generation != expected_generation
+        || config_commitment != expected_config_commitment
+        || generation.iter().all(|byte| *byte == 0)
+        || config_commitment.iter().all(|byte| *byte == 0)
+        || content_sha256.iter().all(|byte| *byte == 0)
+        || declared_digest.iter().all(|byte| *byte == 0)
+        || declared_digest != receipt_locator_response_digest(&frame[..128], path_bytes)
+    {
+        return Err(LocalProcessError::LocalReceiptLocator);
+    }
+    let path =
+        std::str::from_utf8(path_bytes).map_err(|_| LocalProcessError::LocalReceiptLocator)?;
+    let locator = LocalReceiptBootstrapLocatorV1::try_from_pinned_parts(
+        generation,
+        config_commitment,
+        PathBuf::from(path),
+        content_length,
+        content_sha256,
+        device,
+        inode,
+    )
+    .map_err(|()| LocalProcessError::LocalReceiptLocator)?;
+    let response = InternalReceiptLocatorResponseV1 {
+        generation,
+        config_commitment,
+        locator,
+    };
+    if encode_internal_receipt_locator_response(&response)?.as_slice() != frame {
+        return Err(LocalProcessError::LocalReceiptLocator);
+    }
+    Ok(response)
+}
+
+fn receipt_locator_response_digest(prefix: &[u8], path: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(RECEIPT_LOCATOR_RESPONSE_DIGEST_DOMAIN);
     digest.update(prefix);
     digest.update(path);
     digest.finalize().into()
@@ -2908,7 +3405,10 @@ async fn read_internal_request(
     let action = InternalActionV1::decode(request[5]).ok_or(LocalProcessError::LifecycleControl)?;
     let expected_generation = if matches!(
         action,
-        InternalActionV1::Deploy | InternalActionV1::Inspection | InternalActionV1::TuiAttach
+        InternalActionV1::Deploy
+            | InternalActionV1::Inspection
+            | InternalActionV1::TuiAttach
+            | InternalActionV1::Receipt
     ) {
         let mut generation = [0_u8; 16];
         timeout(CLIENT_IO_TIMEOUT, stream.read_exact(&mut generation))
@@ -2979,6 +3479,25 @@ async fn write_internal_inspection_locator_response(
 ) -> Result<(), LocalProcessError> {
     if response.len() < INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES
         || response.len() > MAX_INSPECTION_LOCATOR_RESPONSE_BYTES
+    {
+        return Err(LocalProcessError::LifecycleControl);
+    }
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(response))
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)?
+        .map_err(|_| LocalProcessError::LifecycleControl)?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)
+}
+
+async fn write_internal_receipt_locator_response(
+    stream: &mut UnixStream,
+    response: &[u8],
+) -> Result<(), LocalProcessError> {
+    if response.len() < RECEIPT_LOCATOR_RESPONSE_HEADER_BYTES
+        || response.len() > MAX_RECEIPT_LOCATOR_RESPONSE_BYTES
     {
         return Err(LocalProcessError::LifecycleControl);
     }
@@ -3485,6 +4004,14 @@ mod tests {
         assert_eq!(tui[5], b'T');
         assert_eq!(&tui[6..INTERNAL_REQUEST_BYTES], &commitment);
         assert_eq!(&tui[INTERNAL_REQUEST_BYTES..], &expected_generation);
+
+        let receipt = encode_internal_receipt_locator_query(commitment, expected_generation);
+        assert_eq!(receipt.len(), INTERNAL_RECEIPT_LOCATOR_QUERY_BYTES);
+        assert_eq!(&receipt[..4], b"PXLO");
+        assert_eq!(receipt[4], 1);
+        assert_eq!(receipt[5], b'R');
+        assert_eq!(&receipt[6..INTERNAL_REQUEST_BYTES], &commitment);
+        assert_eq!(&receipt[INTERNAL_REQUEST_BYTES..], &expected_generation);
     }
 
     #[test]
@@ -4024,13 +4551,12 @@ mod tests {
             )
             .is_none()
         );
-
         let source = include_str!("lifecycle.rs");
         let locator_read = source
             .split("pub(crate) fn locate_local_inspection_bootstrap(")
             .nth(1)
             .and_then(|tail| {
-                tail.split("/// Resolves one atomic conversation+Inspection locator")
+                tail.split("/// Resolves the owner-private PXRB locator")
                     .next()
             })
             .expect("bounded locator read source");
@@ -4043,6 +4569,108 @@ mod tests {
         assert!(!locator_read.contains("run_up("));
         assert!(!locator_read.contains("loop {"));
         assert!(!locator_read.contains("retry"));
+    }
+
+    #[test]
+    fn receipt_locator_frame_matches_shared_golden_and_never_serves_stopping_state() {
+        let generation = [0x41; 16];
+        let commitment = [0x42; 32];
+        let bootstrap = decode_lower_hex_fixture(include_str!(
+            "../../../tests/fixtures/wire/m4a_receipt_bootstrap_v1.hex"
+        ));
+        let locator = LocalReceiptBootstrapLocatorV1::try_from_pinned_parts(
+            generation,
+            commitment,
+            PathBuf::from("/private/run/receipt.pxrb"),
+            u32::try_from(bootstrap.len()).expect("bounded PXRB length"),
+            Sha256::digest(&bootstrap).into(),
+            7,
+            11,
+        )
+        .expect("canonical Receipt bootstrap locator");
+        let response = InternalReceiptLocatorResponseV1 {
+            generation,
+            config_commitment: commitment,
+            locator: locator.clone(),
+        };
+        let golden = decode_lower_hex_fixture(include_str!(
+            "../../../tests/fixtures/wire/m4a_receipt_locator_v1.hex"
+        ));
+        let encoded =
+            encode_internal_receipt_locator_response(&response).expect("canonical PXRL response");
+        assert_eq!(encoded, golden);
+        assert_eq!(golden.len(), 185);
+        assert_eq!(&golden[..4], b"PXRL");
+        assert_eq!(u16::from_be_bytes([golden[4], golden[5]]), 1);
+        assert_eq!(golden[6], b'R');
+        assert_eq!(golden[7], b'R');
+        assert_eq!(u16::from_be_bytes([golden[8], golden[9]]), 160);
+        assert_eq!(&golden[10..12], &[0_u8; 2]);
+        assert_eq!(&golden[120..128], &[0_u8; 8]);
+        assert_eq!(&golden[160..], b"/private/run/receipt.pxrb");
+        assert_eq!(
+            decode_internal_receipt_locator_response(&golden, generation, commitment),
+            Ok(response)
+        );
+
+        for offset in [0, 4, 6, 7, 8, 10, 72, 120, 128, 160] {
+            let mut invalid = golden.clone();
+            invalid[offset] ^= 1;
+            assert_eq!(
+                decode_internal_receipt_locator_response(&invalid, generation, commitment,),
+                Err(LocalProcessError::LocalReceiptLocator),
+                "unexpectedly accepted PXRL mutation at offset {offset}"
+            );
+        }
+        let mut trailing = golden.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_internal_receipt_locator_response(&trailing, generation, commitment),
+            Err(LocalProcessError::LocalReceiptLocator)
+        );
+        assert_eq!(
+            decode_internal_receipt_locator_response(&golden, [0x40; 16], commitment),
+            Err(LocalProcessError::LocalReceiptLocator)
+        );
+        assert_eq!(
+            decode_internal_receipt_locator_response(&golden, generation, [0x43; 32]),
+            Err(LocalProcessError::LocalReceiptLocator)
+        );
+
+        let record = LifecycleRecordV1 {
+            schema_version: RECORD_SCHEMA_VERSION,
+            config_commitment: lower_hex(&commitment).into_boxed_str(),
+            generation: lower_hex(&generation).into_boxed_str(),
+            state: LocalLifecycleStateV1::Running,
+            owner_readiness_observed: true,
+        };
+        let (retirement, probe) = LocalReceiptRetirementHandleV1::for_test();
+        let owner = SupervisorReceiptOwnerV1 {
+            locator,
+            _retirement: retirement,
+        };
+        assert_eq!(
+            receipt_locator_response_for_request(
+                &record,
+                false,
+                generation,
+                commitment,
+                Some(&owner),
+            ),
+            Some(golden)
+        );
+        assert!(
+            receipt_locator_response_for_request(
+                &record,
+                true,
+                generation,
+                commitment,
+                Some(&owner),
+            )
+            .is_none()
+        );
+        drop(owner);
+        assert!(probe.is_retired());
     }
 
     #[test]
@@ -4085,6 +4713,40 @@ mod tests {
     }
 
     #[test]
+    fn receipt_status_observation_errors_use_only_the_admitted_public_taxonomy() {
+        assert_eq!(
+            classify_receipt_status_observation_error(LocalProcessError::LifecycleConfiguration),
+            LocalProcessError::LifecycleConfiguration
+        );
+        for error in [
+            LocalProcessError::LifecycleState,
+            LocalProcessError::LifecycleControl,
+            LocalProcessError::LifecycleUnavailable,
+            LocalProcessError::LifecycleReconcileRequired,
+        ] {
+            assert_eq!(
+                classify_receipt_status_observation_error(error),
+                LocalProcessError::LocalReceiptLocator
+            );
+        }
+
+        let source = include_str!("lifecycle.rs");
+        let locator_read = source
+            .split("pub(crate) fn locate_local_receipt_bootstrap(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn classify_receipt_status_observation_error")
+                    .next()
+            })
+            .expect("bounded Receipt locator read");
+        assert!(
+            locator_read
+                .contains("observe(config).map_err(classify_receipt_status_observation_error)?")
+        );
+        assert!(!locator_read.contains("observe(config)?"));
+    }
+
+    #[test]
     fn inspection_ready_pin_precedes_event_and_down_wins_queued_ready_cleanly() {
         let locator = LocalInspectionBootstrapLocatorV1 {
             path: PathBuf::from("/private/tmp/paraegox-m3a/i.pxib"),
@@ -4104,22 +4766,41 @@ mod tests {
         let mut deployment = None;
         let mut cached_locator = None;
         let mut cached_tui_locators = None;
+        let receipt_locator = LocalReceiptBootstrapLocatorV1::try_from_pinned_parts(
+            [0x63; 16],
+            [0x62; 32],
+            PathBuf::from("/private/tmp/paraegox-m4a/receipt.pxrb"),
+            u32::try_from(MIN_RECEIPT_BOOTSTRAP_BYTES).expect("PXRB minimum length"),
+            [0x64; 32],
+            13,
+            17,
+        )
+        .expect("receipt locator");
+        let (receipt_retirement, receipt_probe) = LocalReceiptRetirementHandleV1::for_test();
+        let mut cached_receipt_owner = None;
         apply_supervisor_ready_event(
             &mut record,
             true,
             &mut deployment,
             &mut cached_locator,
             &mut cached_tui_locators,
+            &mut cached_receipt_owner,
             SupervisorReadyEventV1 {
                 deployment: None,
                 inspection_bootstrap_locator: Some(locator),
                 tui_attach_locators: None,
+                receipt_owner: SupervisorReceiptOwnerV1 {
+                    locator: receipt_locator,
+                    _retirement: receipt_retirement,
+                },
             },
         );
         assert_eq!(record.state, LocalLifecycleStateV1::Stopping);
         assert!(record.owner_readiness_observed);
         assert!(cached_locator.is_none());
         assert!(cached_tui_locators.is_none());
+        assert!(cached_receipt_owner.is_none());
+        assert!(receipt_probe.is_retired());
         assert!(
             inspection_locator_response_for_request(
                 &record,
@@ -4143,11 +4824,40 @@ mod tests {
         let dual_capture = ready
             .find("capture_tui_attach_bootstrap_pair")
             .expect("atomic TUI dual-pin capture");
+        let receipt_capture = ready
+            .find("capture_receipt_bootstrap_locator")
+            .expect("PXRB pin capture");
         let send = ready
             .find(".send(SupervisorEventV1::Ready")
             .expect("Ready send");
         assert!(capture < send);
         assert!(dual_capture < send);
+        assert!(receipt_capture < send);
+
+        let stopping = source
+            .split("fn begin_stopping(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn apply_supervisor_ready_event(").next())
+            .expect("bounded begin_stopping source");
+        let retire = stopping
+            .find("drop(receipt_owner.take())")
+            .expect("Receipt retirement before Stopping");
+        let publish_stopping = stopping
+            .find("record.state = LocalLifecycleStateV1::Stopping")
+            .expect("Stopping record publication");
+        assert!(retire < publish_stopping);
+
+        let response = source
+            .split("fn receipt_locator_response_for_request(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn tui_attach_locator_response_for_request(")
+                    .next()
+            })
+            .expect("bounded Receipt locator response source");
+        assert!(response.contains("record.state != LocalLifecycleStateV1::Running"));
+        assert!(response.contains("!record.owner_readiness_observed"));
+        assert!(response.contains("let owner = owner?;"));
     }
 
     #[test]
@@ -4222,6 +4932,85 @@ mod tests {
 
         fs::remove_file(&path).expect("remove PXIB fixture");
         fs::remove_dir(&directory).expect("remove PXIB fixture directory");
+    }
+
+    #[test]
+    fn receipt_ready_pin_rejects_unsafe_or_replaced_pxrb_files() {
+        let parent = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+        let directory = parent.join(format!(
+            "paraegox-receipt-pin-test-{}",
+            new_generation().expect("unique test generation")
+        ));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .expect("private test directory");
+        let path = directory.join("receipt.pxrb");
+        let generation = [0x41; 16];
+        let commitment = [0x42; 32];
+        let first_content = decode_lower_hex_fixture(include_str!(
+            "../../../tests/fixtures/wire/m4a_receipt_bootstrap_v1.hex"
+        ));
+        fs::write(&path, &first_content).expect("write bounded PXRB fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private PXRB mode");
+
+        let first = capture_receipt_bootstrap_locator(&path, generation, commitment)
+            .expect("verified PXRB pin");
+        let metadata = fs::symlink_metadata(&path).expect("PXRB metadata");
+        assert_eq!(first.path(), path);
+        assert_eq!(
+            first.content_length(),
+            u32::try_from(first_content.len()).expect("bounded PXRB length")
+        );
+        let expected_digest: [u8; 32] = Sha256::digest(&first_content).into();
+        assert_eq!(first.content_sha256(), expected_digest);
+        assert_eq!(first.device(), metadata.dev());
+        assert_eq!(first.inode(), metadata.ino());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("insecure PXRB mode");
+        assert_eq!(
+            capture_receipt_bootstrap_locator(&path, generation, commitment),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore PXRB mode");
+
+        let hardlink = directory.join("receipt-hardlink.pxrb");
+        fs::hard_link(&path, &hardlink).expect("PXRB hardlink fixture");
+        assert_eq!(
+            capture_receipt_bootstrap_locator(&path, generation, commitment),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+        fs::remove_file(&hardlink).expect("remove PXRB hardlink fixture");
+
+        let symlink = directory.join("receipt-symlink.pxrb");
+        std::os::unix::fs::symlink(&path, &symlink).expect("PXRB symlink fixture");
+        assert_eq!(
+            capture_receipt_bootstrap_locator(&symlink, generation, commitment),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+        fs::remove_file(&symlink).expect("remove PXRB symlink fixture");
+
+        fs::write(&path, vec![0x72; MAX_RECEIPT_BOOTSTRAP_BYTES + 1])
+            .expect("write oversized PXRB fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("private oversized PXRB mode");
+        assert_eq!(
+            capture_receipt_bootstrap_locator(&path, generation, commitment),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+
+        fs::remove_file(&path).expect("remove old PXRB generation");
+        let replacement_content = vec![0x73; MIN_RECEIPT_BOOTSTRAP_BYTES];
+        fs::write(&path, &replacement_content).expect("write replacement PXRB fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("private replacement PXRB mode");
+        let replacement = capture_receipt_bootstrap_locator(&path, generation, commitment)
+            .expect("replacement PXRB pin");
+        assert_ne!(replacement.content_sha256(), first.content_sha256());
+        assert_ne!(replacement, first);
+
+        fs::remove_file(&path).expect("remove PXRB fixture");
+        fs::remove_dir(&directory).expect("remove PXRB fixture directory");
     }
 
     #[test]
