@@ -2727,7 +2727,7 @@ impl SavedTuiTerminalStateV1 {
         }
         let state = std::str::from_utf8(&output.stdout)
             .map_err(|_| LocalProcessError::LocalTuiTerminal)?
-            .trim_end_matches(|value| matches!(value, '\r' | '\n'));
+            .trim_end_matches(['\r', '\n']);
         if state.is_empty()
             || state
                 .chars()

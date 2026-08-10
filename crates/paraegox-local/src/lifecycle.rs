@@ -675,11 +675,11 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
             })
             .transpose()?;
         self.events
-            .send(SupervisorEventV1::Ready {
+            .send(SupervisorEventV1::Ready(Box::new(SupervisorReadyEventV1 {
                 deployment,
                 inspection_bootstrap_locator,
                 tui_attach_locators,
-            })
+            })))
             .map_err(|_| LocalProcessError::LifecycleControl)
     }
 
@@ -690,12 +690,14 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
     }
 }
 
+struct SupervisorReadyEventV1 {
+    deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+    inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
+    tui_attach_locators: Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
+}
+
 enum SupervisorEventV1 {
-    Ready {
-        deployment: Option<VerifiedLocalDeploymentProjectionV1>,
-        inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
-        tui_attach_locators: Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
-    },
+    Ready(Box<SupervisorReadyEventV1>),
     Exited(Result<(), LocalProcessError>),
 }
 
@@ -1418,11 +1420,7 @@ async fn supervise(
             }
             event = events.recv() => {
                 match event {
-                    Some(SupervisorEventV1::Ready {
-                        deployment,
-                        inspection_bootstrap_locator: ready_inspection_bootstrap_locator,
-                        tui_attach_locators: ready_tui_attach_locators,
-                    }) => {
+                    Some(SupervisorEventV1::Ready(ready)) => {
                         // Readiness is a monotonic historical latch even when
                         // shutdown won the race. Keep Stopping, but durably
                         // remember that this generation crossed the boundary.
@@ -1432,9 +1430,7 @@ async fn supervise(
                             &mut deployment_projection,
                             &mut inspection_bootstrap_locator,
                             &mut tui_attach_locators,
-                            deployment,
-                            ready_inspection_bootstrap_locator,
-                            ready_tui_attach_locators,
+                            *ready,
                         );
                         publish_record(paths, record)?;
                     }
@@ -1497,14 +1493,12 @@ fn apply_supervisor_ready_event(
     deployment_projection: &mut Option<VerifiedLocalDeploymentProjectionV1>,
     inspection_bootstrap_locator: &mut Option<LocalInspectionBootstrapLocatorV1>,
     tui_attach_locators: &mut Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
-    ready_deployment_projection: Option<VerifiedLocalDeploymentProjectionV1>,
-    ready_inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
-    ready_tui_attach_locators: Option<(LocalTuiBootstrapPinV1, LocalTuiBootstrapPinV1)>,
+    ready: SupervisorReadyEventV1,
 ) {
-    *deployment_projection = ready_deployment_projection;
+    *deployment_projection = ready.deployment;
     if !stopping {
-        *inspection_bootstrap_locator = ready_inspection_bootstrap_locator;
-        *tui_attach_locators = ready_tui_attach_locators;
+        *inspection_bootstrap_locator = ready.inspection_bootstrap_locator;
+        *tui_attach_locators = ready.tui_attach_locators;
     }
     apply_ready_observation(record, stopping);
 }
@@ -2616,11 +2610,11 @@ fn encode_tui_attach_frame(
     Ok(frame)
 }
 
-fn validate_tui_attach_pin<'a>(
-    pin: &'a LocalTuiBootstrapPinV1,
+fn validate_tui_attach_pin(
+    pin: &LocalTuiBootstrapPinV1,
     expected_kind: u8,
     error: LocalProcessError,
-) -> Result<&'a [u8], LocalProcessError> {
+) -> Result<&[u8], LocalProcessError> {
     let path = pin.path.to_str().ok_or(error)?.as_bytes();
     let content_bounds = match expected_kind {
         b'C' => CONVERSATION_BOOTSTRAP_MIN_BYTES..=CONVERSATION_BOOTSTRAP_MAX_BYTES,
@@ -3951,9 +3945,11 @@ mod tests {
             &mut deployment,
             &mut cached_locator,
             &mut cached_tui_locators,
-            None,
-            Some(locator),
-            None,
+            SupervisorReadyEventV1 {
+                deployment: None,
+                inspection_bootstrap_locator: Some(locator),
+                tui_attach_locators: None,
+            },
         );
         assert_eq!(record.state, LocalLifecycleStateV1::Stopping);
         assert!(record.owner_readiness_observed);
