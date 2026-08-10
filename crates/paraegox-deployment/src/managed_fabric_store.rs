@@ -1800,8 +1800,7 @@ mod tests {
         });
     }
 
-    #[test]
-    fn successor_store_persists_request_uncertain_and_authenticated_terminal() {
+    fn successor_store_persists_request_uncertain_and_authenticated_terminal_inner() {
         let legacy_directory = TestDirectory::new("legacy-active");
         let successor_directory = TestDirectory::new("successor-active");
         let legacy_store = install_legacy(&legacy_directory);
@@ -1947,5 +1946,12 @@ mod tests {
             .expect("terminal revalidates")
             .expect("terminal exists");
         assert!(replay.replayed_from_journal());
+    }
+
+    #[test]
+    fn successor_store_persists_request_uncertain_and_authenticated_terminal() {
+        run_large_cutover_recovery_test("px-fabric-successor-store", || {
+            successor_store_persists_request_uncertain_and_authenticated_terminal_inner();
+        });
     }
 }
