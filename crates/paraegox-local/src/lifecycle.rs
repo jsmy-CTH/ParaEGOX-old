@@ -3891,7 +3891,10 @@ mod tests {
         let locator_read = source
             .split("pub(crate) fn locate_local_inspection_bootstrap(")
             .nth(1)
-            .and_then(|tail| tail.split("pub(crate) fn locate_local_tui_attach(").next())
+            .and_then(|tail| {
+                tail.split("/// Resolves one atomic conversation+Inspection locator")
+                    .next()
+            })
             .expect("bounded locator read source");
         assert_eq!(
             locator_read
