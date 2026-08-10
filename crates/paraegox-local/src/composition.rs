@@ -4101,7 +4101,22 @@ mod tests {
     const IPC_PROBE_BOOTSTRAP_ENVIRONMENT: &str = "PARAEGOX_TEST_IPC_BOOTSTRAP";
     const INSPECTION_PROBE_BOOTSTRAP_ENVIRONMENT: &str = "PARAEGOX_TEST_INSPECTION_BOOTSTRAP";
     const IPC_PROBE_TEST_NAME: &str = "composition::tests::runtime_ipc_subprocess_probe";
+    const FULL_COMPOSITION_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    fn run_full_composition_test(
+        thread_name: &'static str,
+        test: impl FnOnce() + Send + 'static,
+    ) {
+        let worker = std::thread::Builder::new()
+            .name(thread_name.to_owned())
+            .stack_size(FULL_COMPOSITION_TEST_STACK_BYTES)
+            .spawn(test)
+            .expect("start bounded full-composition test thread");
+        if let Err(payload) = worker.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[derive(Default)]
     struct FlushProbe {
@@ -5880,51 +5895,53 @@ mod tests {
 
     #[test]
     fn prepared_provisioned_headless_owner_consumes_one_resolved_secret() {
-        let state_root = fresh_state_root("prepared-secret-once");
-        let (port, fabric_listen) = ephemeral_fabric_listen();
-        let config = provisioned_config(
-            &state_root,
-            &fabric_listen,
-            "openai-responses-v1",
-            "gpt-test-model",
-            "env:OPENAI_API_KEY",
-        );
-        let mut cleanup = TestCleanup {
-            state_root: state_root.clone(),
-            socket_directory: None,
-        };
-        let environment_reads = AtomicUsize::new(0);
-        let prepared = prepare_headless_chat_with_environment(
-            LocalManagedChatOwnerConfigV1::Provisioned(config.clone()),
-            |name| {
-                assert_eq!(name, "OPENAI_API_KEY");
-                environment_reads.fetch_add(1, Ordering::AcqRel);
-                Some(OsString::from("test-api-key"))
-            },
-        )
-        .expect("headless Secret preparation");
-        assert_eq!(environment_reads.load(Ordering::Acquire), 1);
-        assert!(!state_root.exists());
+        run_full_composition_test("px-secret-e2e", || {
+            let state_root = fresh_state_root("prepared-secret-once");
+            let (port, fabric_listen) = ephemeral_fabric_listen();
+            let config = provisioned_config(
+                &state_root,
+                &fabric_listen,
+                "openai-responses-v1",
+                "gpt-test-model",
+                "env:OPENAI_API_KEY",
+            );
+            let mut cleanup = TestCleanup {
+                state_root: state_root.clone(),
+                socket_directory: None,
+            };
+            let environment_reads = AtomicUsize::new(0);
+            let prepared = prepare_headless_chat_with_environment(
+                LocalManagedChatOwnerConfigV1::Provisioned(config.clone()),
+                |name| {
+                    assert_eq!(name, "OPENAI_API_KEY");
+                    environment_reads.fetch_add(1, Ordering::AcqRel);
+                    Some(OsString::from("test-api-key"))
+                },
+            )
+            .expect("headless Secret preparation");
+            assert_eq!(environment_reads.load(Ordering::Acquire), 1);
+            assert!(!state_root.exists());
 
-        let mut control = ImmediateHeadlessControl::default();
-        run_prepared_headless_chat(prepared, &mut control)
-            .expect("prepared provisioned headless owner");
-        assert!(control.ready);
-        assert!(control.shutdown_waited);
-        assert_eq!(environment_reads.load(Ordering::Acquire), 1);
+            let mut control = ImmediateHeadlessControl::default();
+            run_prepared_headless_chat(prepared, &mut control)
+                .expect("prepared provisioned headless owner");
+            assert!(control.ready);
+            assert!(control.shutdown_waited);
+            assert_eq!(environment_reads.load(Ordering::Acquire), 1);
 
-        let manifest = identity::load_or_create_provisioned(&config)
-            .expect("stable provisioned identity manifest");
-        let prepared_layout =
-            layout::prepare_provisioned(&config, &manifest).expect("stable provisioned layout");
-        cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
-        assert!(!prepared_layout.authority_socket_path().exists());
-        assert!(!prepared_layout.runtime_socket_path().exists());
-        drop(prepared_layout);
-        drop(manifest);
-        let rebound = TcpListener::bind(("127.0.0.1", port))
-            .expect("Fabric port must be released after joined shutdown");
-        drop(rebound);
+            let manifest = identity::load_or_create_provisioned(&config)
+                .expect("stable provisioned identity manifest");
+            let prepared_layout = layout::prepare_provisioned(&config, &manifest)
+                .expect("stable provisioned layout");
+            cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
+            assert!(!prepared_layout.authority_socket_path().exists());
+            assert!(!prepared_layout.runtime_socket_path().exists());
+            drop(prepared_layout);
+            drop(manifest);
+            let rebound = TcpListener::bind(("127.0.0.1", port))
+                .expect("Fabric port must be released after joined shutdown");
+            drop(rebound);
+        });
     }
 
     #[test]
@@ -6008,140 +6025,149 @@ mod tests {
 
     #[test]
     fn provisioned_loopback_composition_rebuilds_provider_on_restart() {
-        let state_root = fresh_state_root("openai-loopback");
-        let (port, fabric_listen) = ephemeral_fabric_listen();
-        let config = provisioned_config(
-            &state_root,
-            &fabric_listen,
-            "openai-responses-v1",
-            "gpt-test-model",
-            "env:OPENAI_API_KEY",
-        );
-        let mut cleanup = TestCleanup {
-            state_root,
-            socket_directory: None,
-        };
-        let manifest =
-            identity::load_or_create_provisioned(&config).expect("OpenAI identity manifest");
-        let prepared_layout =
-            layout::prepare_provisioned(&config, &manifest).expect("OpenAI prepared layout");
-        cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
-        let authority_socket = prepared_layout.authority_socket_path().to_path_buf();
-        let runtime_socket = prepared_layout.runtime_socket_path().to_path_buf();
-        drop(prepared_layout);
-        drop(manifest);
-
-        let builds = Arc::new(AtomicUsize::new(0));
-        let peer = current_developer_local_peer().expect("non-root test peer");
-        for (launch, inputs) in [
-            vec!["first provisioned turn"],
-            vec!["restart provisioned turn"],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let manifest = identity::load_or_create_provisioned(&config)
-                .expect("stable OpenAI identity manifest");
+        run_full_composition_test("px-provider-e2e", || {
+            let state_root = fresh_state_root("openai-loopback");
+            let (port, fabric_listen) = ephemeral_fabric_listen();
+            let config = provisioned_config(
+                &state_root,
+                &fabric_listen,
+                "openai-responses-v1",
+                "gpt-test-model",
+                "env:OPENAI_API_KEY",
+            );
+            let mut cleanup = TestCleanup {
+                state_root,
+                socket_directory: None,
+            };
+            let manifest =
+                identity::load_or_create_provisioned(&config).expect("OpenAI identity manifest");
             let prepared_layout =
-                layout::prepare_provisioned(&config, &manifest).expect("stable OpenAI layout");
-            let provider = loopback_composition_provider(&config, &manifest, Arc::clone(&builds));
-            let mut runner = NonInteractiveConversationRunner::provisioned(inputs);
-            run_prepared(
-                CompositionConfigRef::Provisioned(&config),
-                manifest,
-                prepared_layout,
-                provider,
-                peer,
-                &mut runner,
-            )
-            .expect("provisioned loopback composition run");
-            assert_eq!(runner.successful_turns, 1);
-            assert_eq!(builds.load(Ordering::Acquire), launch + 1);
-            runner.assert_old_handle_is_retired();
-            assert!(!authority_socket.exists());
-            assert!(!runtime_socket.exists());
-            let rebound = TcpListener::bind(("127.0.0.1", port))
-                .expect("Fabric port must be released after joined shutdown");
-            drop(rebound);
-        }
+                layout::prepare_provisioned(&config, &manifest).expect("OpenAI prepared layout");
+            cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
+            let authority_socket = prepared_layout.authority_socket_path().to_path_buf();
+            let runtime_socket = prepared_layout.runtime_socket_path().to_path_buf();
+            drop(prepared_layout);
+            drop(manifest);
+
+            let builds = Arc::new(AtomicUsize::new(0));
+            let peer = current_developer_local_peer().expect("non-root test peer");
+            for (launch, inputs) in [
+                vec!["first provisioned turn"],
+                vec!["restart provisioned turn"],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let manifest = identity::load_or_create_provisioned(&config)
+                    .expect("stable OpenAI identity manifest");
+                let prepared_layout = layout::prepare_provisioned(&config, &manifest)
+                    .expect("stable OpenAI layout");
+                let provider =
+                    loopback_composition_provider(&config, &manifest, Arc::clone(&builds));
+                let mut runner = NonInteractiveConversationRunner::provisioned(inputs);
+                run_prepared(
+                    CompositionConfigRef::Provisioned(&config),
+                    manifest,
+                    prepared_layout,
+                    provider,
+                    peer,
+                    &mut runner,
+                )
+                .expect("provisioned loopback composition run");
+                assert_eq!(runner.successful_turns, 1);
+                assert_eq!(builds.load(Ordering::Acquire), launch + 1);
+                runner.assert_old_handle_is_retired();
+                assert!(!authority_socket.exists());
+                assert!(!runtime_socket.exists());
+                let rebound = TcpListener::bind(("127.0.0.1", port))
+                    .expect("Fabric port must be released after joined shutdown");
+                drop(rebound);
+            }
+        });
     }
 
     #[test]
     fn real_runtime_ipc_serves_a_separate_noninteractive_process_and_joins() {
-        let state_root = fresh_state_root("ipc-process");
-        let (port, fabric_listen) = ephemeral_fabric_listen();
-        let config = fixture_config(&state_root, &fabric_listen);
-        let mut cleanup = TestCleanup {
-            state_root,
-            socket_directory: None,
-        };
-        let manifest = identity::load_or_create(&config).expect("identity manifest");
-        let prepared_layout = layout::prepare(&config, &manifest).expect("prepared layout");
-        cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
-        let authority_socket = prepared_layout.authority_socket_path().to_path_buf();
-        let runtime_socket = prepared_layout.runtime_socket_path().to_path_buf();
-        let ipc_socket = prepared_layout.agent_ipc_socket_path().to_path_buf();
-        let ipc_bootstrap = prepared_layout.agent_ipc_bootstrap_path().to_path_buf();
-        let inspection_socket = prepared_layout.inspection_ipc_socket_path().to_path_buf();
-        let inspection_bootstrap = prepared_layout
-            .inspection_ipc_bootstrap_path()
-            .to_path_buf();
-        drop(prepared_layout);
-        drop(manifest);
+        run_full_composition_test("px-ipc-e2e", || {
+            let state_root = fresh_state_root("ipc-process");
+            let (port, fabric_listen) = ephemeral_fabric_listen();
+            let config = fixture_config(&state_root, &fabric_listen);
+            let mut cleanup = TestCleanup {
+                state_root,
+                socket_directory: None,
+            };
+            let manifest = identity::load_or_create(&config).expect("identity manifest");
+            let prepared_layout = layout::prepare(&config, &manifest).expect("prepared layout");
+            cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
+            let authority_socket = prepared_layout.authority_socket_path().to_path_buf();
+            let runtime_socket = prepared_layout.runtime_socket_path().to_path_buf();
+            let ipc_socket = prepared_layout.agent_ipc_socket_path().to_path_buf();
+            let ipc_bootstrap = prepared_layout.agent_ipc_bootstrap_path().to_path_buf();
+            let inspection_socket = prepared_layout.inspection_ipc_socket_path().to_path_buf();
+            let inspection_bootstrap = prepared_layout
+                .inspection_ipc_bootstrap_path()
+                .to_path_buf();
+            drop(prepared_layout);
+            drop(manifest);
 
-        let mut runner = IpcSubprocessConversationRunner::default();
-        let peer = current_developer_local_peer().expect("non-root test peer");
-        run_with_runner(config, peer, &mut runner).expect("real separate-process IPC conversation");
-        assert!(runner.completed);
-        assert!(!authority_socket.exists());
-        assert!(!runtime_socket.exists());
-        assert!(!ipc_socket.exists());
-        assert!(!ipc_bootstrap.exists());
-        assert!(!inspection_socket.exists());
-        assert!(!inspection_bootstrap.exists());
-        let rebound = TcpListener::bind(("127.0.0.1", port))
-            .expect("Fabric port must be released after joined shutdown");
-        drop(rebound);
+            let mut runner = IpcSubprocessConversationRunner::default();
+            let peer = current_developer_local_peer().expect("non-root test peer");
+            run_with_runner(config, peer, &mut runner)
+                .expect("real separate-process IPC conversation");
+            assert!(runner.completed);
+            assert!(!authority_socket.exists());
+            assert!(!runtime_socket.exists());
+            assert!(!ipc_socket.exists());
+            assert!(!ipc_bootstrap.exists());
+            assert!(!inspection_socket.exists());
+            assert!(!inspection_bootstrap.exists());
+            let rebound = TcpListener::bind(("127.0.0.1", port))
+                .expect("Fabric port must be released after joined shutdown");
+            drop(rebound);
+        });
     }
 
     #[test]
     fn same_state_root_runs_two_real_typed_conversations_and_releases_resources() {
-        let state_root = fresh_state_root("fixture");
-        assert!(!state_root.exists());
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral loopback port");
-        let port = listener.local_addr().expect("listener address").port();
-        drop(listener);
-        let config = fixture_config(&state_root, &format!("tcp/127.0.0.1:{port}"));
-        let mut cleanup = TestCleanup {
-            state_root,
-            socket_directory: None,
-        };
-        let manifest = identity::load_or_create(&config).expect("identity manifest");
-        let prepared_layout = layout::prepare(&config, &manifest).expect("prepared layout");
-        cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
-        let authority_socket = prepared_layout.authority_socket_path().to_path_buf();
-        let runtime_socket = prepared_layout.runtime_socket_path().to_path_buf();
-        drop(manifest);
+        run_full_composition_test("px-restart-e2e", || {
+            let state_root = fresh_state_root("fixture");
+            assert!(!state_root.exists());
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral loopback port");
+            let port = listener.local_addr().expect("listener address").port();
+            drop(listener);
+            let config = fixture_config(&state_root, &format!("tcp/127.0.0.1:{port}"));
+            let mut cleanup = TestCleanup {
+                state_root,
+                socket_directory: None,
+            };
+            let manifest = identity::load_or_create(&config).expect("identity manifest");
+            let prepared_layout = layout::prepare(&config, &manifest).expect("prepared layout");
+            cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
+            let authority_socket = prepared_layout.authority_socket_path().to_path_buf();
+            let runtime_socket = prepared_layout.runtime_socket_path().to_path_buf();
+            drop(manifest);
 
-        let launch_inputs = [
-            vec!["first local turn", "second local turn"],
-            vec!["restart local turn"],
-        ];
-        let mut successful_turns = 0;
-        let peer = current_developer_local_peer().expect("non-root test peer");
-        for inputs in launch_inputs {
-            let expected_turns = inputs.len();
-            let mut runner = NonInteractiveConversationRunner::new(inputs);
-            run_with_runner(config.clone(), peer, &mut runner).expect("real local composition run");
-            assert_eq!(runner.successful_turns, expected_turns);
-            successful_turns += runner.successful_turns;
-            runner.assert_old_handle_is_retired();
-            assert!(!authority_socket.exists());
-            assert!(!runtime_socket.exists());
-            let rebound = TcpListener::bind(("127.0.0.1", port))
-                .expect("Fabric port must be released after joined shutdown");
-            drop(rebound);
-        }
-        assert_eq!(successful_turns, 3);
+            let launch_inputs = [
+                vec!["first local turn", "second local turn"],
+                vec!["restart local turn"],
+            ];
+            let mut successful_turns = 0;
+            let peer = current_developer_local_peer().expect("non-root test peer");
+            for inputs in launch_inputs {
+                let expected_turns = inputs.len();
+                let mut runner = NonInteractiveConversationRunner::new(inputs);
+                run_with_runner(config.clone(), peer, &mut runner)
+                    .expect("real local composition run");
+                assert_eq!(runner.successful_turns, expected_turns);
+                successful_turns += runner.successful_turns;
+                runner.assert_old_handle_is_retired();
+                assert!(!authority_socket.exists());
+                assert!(!runtime_socket.exists());
+                let rebound = TcpListener::bind(("127.0.0.1", port))
+                    .expect("Fabric port must be released after joined shutdown");
+                drop(rebound);
+            }
+            assert_eq!(successful_turns, 3);
+        });
     }
 }
