@@ -351,16 +351,16 @@ fn validate_socket_generation(
         .parent()
         .ok_or(LocalProcessError::LocalInspectionBootstrap)?;
     let pin_path = locate_socket_generation_pin(parent)?;
-    let pin_before = fs::symlink_metadata(&pin_path)
-        .map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+    let pin_before =
+        fs::symlink_metadata(&pin_path).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
     validate_socket_metadata(&pin_before, expected_uid, expected_gid)?;
     if FileIdentityV1::from_metadata(&pin_before) != identity {
         return Err(LocalProcessError::LocalInspectionBootstrap);
     }
 
     validate_private_parent(path, expected_uid, expected_gid)?;
-    let pin_after = fs::symlink_metadata(&pin_path)
-        .map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
+    let pin_after =
+        fs::symlink_metadata(&pin_path).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
     let after =
         fs::symlink_metadata(path).map_err(|_| LocalProcessError::LocalInspectionBootstrap)?;
     validate_socket_metadata(&pin_after, expected_uid, expected_gid)?;
@@ -480,11 +480,8 @@ fn validate_socket_path_identity(
     path: &Path,
     expected: FileIdentityV1,
 ) -> Result<(), LocalProcessError> {
-    let observed = validate_socket_generation(
-        path,
-        Uid::effective().as_raw(),
-        Gid::effective().as_raw(),
-    )?;
+    let observed =
+        validate_socket_generation(path, Uid::effective().as_raw(), Gid::effective().as_raw())?;
     if observed != expected {
         return Err(LocalProcessError::LocalInspectionBootstrap);
     }
@@ -1233,8 +1230,8 @@ mod tests {
             load_bootstrap(&restored_locator).expect("capture original socket generation");
         fs::remove_file(&fixture.socket_pin_path).expect("remove original socket pin");
         fs::remove_file(&fixture.socket_path).expect("remove original public socket name");
-        let replacement_listener =
-            StdUnixListener::bind(&fixture.socket_path).expect("bind replacement socket generation");
+        let replacement_listener = StdUnixListener::bind(&fixture.socket_path)
+            .expect("bind replacement socket generation");
         fs::set_permissions(
             &fixture.socket_path,
             fs::Permissions::from_mode(PRIVATE_FILE_MODE),
