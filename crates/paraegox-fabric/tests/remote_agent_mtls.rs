@@ -405,8 +405,7 @@ async fn assert_port_rebinds(address: SocketAddrV4) {
 }
 
 fn assert_port_is_owned(address: SocketAddrV4, owner: &str) {
-    let error = TcpListener::bind(address)
-        .expect_err("live session must retain its listener port");
+    let error = TcpListener::bind(address).expect_err("live session must retain its listener port");
     assert_eq!(
         error.kind(),
         std::io::ErrorKind::AddrInUse,
