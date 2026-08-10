@@ -708,7 +708,7 @@ jobs:
           done
           if pgrep -f "$binary" >/dev/null 2>&1; then
             printf 'joined lifecycle down left a ParaEGOX process\n' >&2
-            ps -axo pid=,command= | grep -F "$binary" >&2 || true
+            pgrep -fl "$binary" >&2
             exit 1
           fi
           trap - EXIT
