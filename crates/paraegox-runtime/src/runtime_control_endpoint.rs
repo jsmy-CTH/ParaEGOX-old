@@ -10029,10 +10029,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("fresh Stable PXRJ metadata failed: {error}"))
             .ino();
 
-        let successor_clock = control
-            .core
-            .clock_reading()
-            .unwrap_or_else(|error| panic!("successor Runtime clock unavailable: {error}"));
+        let successor_clock = ClockReading::new(
+            ClockDomainRef::from_bytes(CLOCK_DOMAIN),
+            clock_generation,
+            MonotonicInstant::from_ticks(1_000_000_001),
+        );
         let observed = RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test(
             committed.same_epoch_snapshot_for_test(),
             [0xac; 16],
@@ -10162,12 +10163,21 @@ mod tests {
             let prepared = joint.same_epoch_snapshot_for_test();
             let prepared_sequence = prepared.sequence();
             let prepared_digest = prepared.snapshot_digest();
+            let successor_clock_generation = control
+                .core
+                .clock_reading()
+                .unwrap_or_else(|error| {
+                    panic!("{stage:?} successor failpoint clock unavailable: {error}")
+                })
+                .generation();
             let observed = RemoteAgentAccessObservedProgressV2::try_s1_open_intent_for_test(
                 prepared,
                 [operation_byte; 16],
-                control.core.clock_reading().unwrap_or_else(|error| {
-                    panic!("{stage:?} successor failpoint clock unavailable: {error}")
-                }),
+                ClockReading::new(
+                    ClockDomainRef::from_bytes(CLOCK_DOMAIN),
+                    successor_clock_generation,
+                    MonotonicInstant::from_ticks(1_000_000_001),
+                ),
             )
             .unwrap_or_else(|error| {
                 panic!("{stage:?} successor failpoint observation rejected: {error}")
