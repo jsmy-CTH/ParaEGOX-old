@@ -3645,6 +3645,19 @@ pub(crate) mod tests {
         ApplyAuthAlgorithm, ApplyAuthKeyRef, ApplyRequestAuthClaim,
     };
 
+    const LARGE_REMOTE_FABRIC_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    fn run_large_remote_fabric_test(thread_name: &str, test: impl FnOnce() + Send + 'static) {
+        let worker = std::thread::Builder::new()
+            .name(thread_name.into())
+            .stack_size(LARGE_REMOTE_FABRIC_TEST_STACK_BYTES)
+            .spawn(test)
+            .expect("spawn large-stack Remote Fabric test thread");
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     use crate::controller_journal::{
         ControllerAuthKeyFingerprint, ControllerBootstrapResponseDigest,
         ControllerChannelAuthFingerprint, ControllerJournalSnapshot, ControllerJournalState,
@@ -4952,8 +4965,7 @@ pub(crate) mod tests {
         assert_strict_reopen_rejects(&model_tampered, "Model sibling");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn remote_fabric_pxag_is_one_shot_and_commits_inner_outer_atomically() {
+    async fn remote_fabric_pxag_is_one_shot_and_commits_inner_outer_atomically_inner() {
         let controller = controller_signer();
         let (mut journal, remote, ingress) = remote_managed_ready_journal().await;
         let before_prepare = journal.state().sequence();
@@ -5124,6 +5136,19 @@ pub(crate) mod tests {
         assert!(replay.replayed_from_journal());
         assert_eq!(replay.inner(), terminal.inner());
         assert_eq!(replay.outer(), terminal.outer());
+    }
+
+    #[test]
+    fn remote_fabric_pxag_is_one_shot_and_commits_inner_outer_atomically() {
+        run_large_remote_fabric_test("px-remote-fabric-actions", || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread Remote Fabric test runtime");
+            runtime.block_on(
+                remote_fabric_pxag_is_one_shot_and_commits_inner_outer_atomically_inner(),
+            );
+        });
     }
 
     #[test]
