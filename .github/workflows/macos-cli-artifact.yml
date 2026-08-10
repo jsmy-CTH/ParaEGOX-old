@@ -57,6 +57,9 @@ jobs:
       - name: Build the ParaEGOX CLI
         run: cargo build --locked -p paraegox-local --bin paraegox
 
+      - name: Verify lifecycle transport regressions on macOS
+        run: cargo test --locked -p paraegox-local client_transport_ -- --nocapture
+
       - name: Verify native binary and public CLI
         shell: bash
         run: |
@@ -505,6 +508,210 @@ jobs:
             printf 'hidden or legacy CLI surface is still exposed\n' >&2
             exit 1
           fi
+
+      - name: Smoke macOS managed-local lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="$(cd target/debug && pwd -P)/paraegox"
+          lifecycle_root="$(mktemp -d /tmp/pxl.XXXXXX)"
+          lifecycle_root="$(cd "$lifecycle_root" && pwd -P)"
+          lifecycle_workspace="$lifecycle_root/w"
+          lifecycle_config="$lifecycle_workspace/paraegox.toml"
+          lifecycle_state="$lifecycle_workspace/state"
+          lifecycle_socket="$lifecycle_state/operator-v1/control-v1.sock"
+          init_json="$lifecycle_root/init.json"
+          up_json="$lifecycle_root/up.json"
+          running_json="$lifecycle_root/running.json"
+          down_json="$lifecycle_root/down.json"
+          stopped_json="$lifecycle_root/stopped.json"
+          init_stderr="$lifecycle_root/init.stderr"
+          up_stderr="$lifecycle_root/up.stderr"
+          running_stderr="$lifecycle_root/running.stderr"
+          down_stderr="$lifecycle_root/down.stderr"
+          stopped_stderr="$lifecycle_root/stopped.stderr"
+
+          chmod 0700 "$lifecycle_root"
+          test "${#lifecycle_socket}" -le 103
+          test ! -e "$lifecycle_workspace"
+          if pgrep -f "$binary" >/dev/null 2>&1; then
+            printf 'ParaEGOX process existed before lifecycle smoke\n' >&2
+            exit 1
+          fi
+
+          cleanup_lifecycle() {
+            set +e
+            if [ -f "$lifecycle_config" ]; then
+              "$binary" down --config "$lifecycle_config" --json >/dev/null 2>&1
+            fi
+            if pgrep -f "$binary" >/dev/null 2>&1; then
+              pkill -TERM -f "$binary" >/dev/null 2>&1
+              for _ in {1..100}; do
+                if ! pgrep -f "$binary" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 0.05
+              done
+              pkill -KILL -f "$binary" >/dev/null 2>&1
+            fi
+          }
+          trap cleanup_lifecycle EXIT
+
+          # The generated profile is compiled-in deterministic Echo. Removing
+          # provider variables proves this smoke cannot contact an external model.
+          unset OPENAI_API_KEY DEEPSEEK_API_KEY
+          "$binary" init \
+            --directory "$lifecycle_workspace" \
+            --json > "$init_json" 2> "$init_stderr"
+          test ! -s "$init_stderr"
+          test "$(stat -f '%Lp' "$lifecycle_workspace")" = '700'
+          test "$(stat -f '%Lp' "$lifecycle_config")" = '600'
+          test ! -e "$lifecycle_state"
+
+          # Fail clearly if the runner cannot provide the one loopback-only
+          # listener required by the generated local composition.
+          python3 - <<'PY'
+          import socket
+
+
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+              probe.bind(("127.0.0.1", 7447))
+          PY
+
+          "$binary" up \
+            --config "$lifecycle_config" \
+            --json > "$up_json" 2> "$up_stderr"
+          test ! -s "$up_stderr"
+          "$binary" status \
+            --config "$lifecycle_config" \
+            --json > "$running_json" 2> "$running_stderr"
+          test ! -s "$running_stderr"
+          "$binary" down \
+            --config "$lifecycle_config" \
+            --json > "$down_json" 2> "$down_stderr"
+          test ! -s "$down_stderr"
+          "$binary" status \
+            --config "$lifecycle_config" \
+            --json > "$stopped_json" 2> "$stopped_stderr"
+          test ! -s "$stopped_stderr"
+
+          INIT_JSON="$init_json" \
+            UP_JSON="$up_json" \
+            RUNNING_JSON="$running_json" \
+            DOWN_JSON="$down_json" \
+            STOPPED_JSON="$stopped_json" \
+            LIFECYCLE_ROOT="$lifecycle_root" \
+            python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+
+          def load_exact(name: str) -> dict:
+              wire = Path(os.environ[name]).read_bytes()
+              if not wire.endswith(b"\n") or wire.count(b"\n") != 1:
+                  raise SystemExit(f"{name} is not one newline-terminated JSON object")
+              value = json.loads(wire)
+              if not isinstance(value, dict):
+                  raise SystemExit(f"{name} is not a JSON object")
+              return value
+
+
+          initialized = load_exact("INIT_JSON")
+          expected_init_fields = {
+              "schema_version",
+              "command",
+              "ok",
+              "changed",
+              "profile",
+              "config_relative_path",
+              "state_relative_path",
+              "diagnostics",
+          }
+          if set(initialized) != expected_init_fields:
+              raise SystemExit(f"unexpected lifecycle init fields: {initialized!r}")
+          if (
+              initialized["schema_version"],
+              initialized["command"],
+              initialized["ok"],
+              initialized["changed"],
+              initialized["profile"],
+              initialized["config_relative_path"],
+              initialized["state_relative_path"],
+              initialized["diagnostics"],
+          ) != (
+              1,
+              "init",
+              True,
+              True,
+              "deterministic-echo-v1",
+              "paraegox.toml",
+              "state",
+              [],
+          ):
+              raise SystemExit(f"unexpected lifecycle init envelope: {initialized!r}")
+
+          expected_lifecycle_fields = {
+              "schema_version",
+              "command",
+              "ok",
+              "state",
+              "generation",
+              "changed",
+              "owner_readiness_observed",
+              "inspection_checked",
+              "diagnostics",
+          }
+          observations = (
+              (load_exact("UP_JSON"), "up", "running", True),
+              (load_exact("RUNNING_JSON"), "status", "running", False),
+              (load_exact("DOWN_JSON"), "down", "stopped", True),
+              (load_exact("STOPPED_JSON"), "status", "stopped", False),
+          )
+          generation = observations[0][0]["generation"]
+          if not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None:
+              raise SystemExit(f"invalid lifecycle generation: {generation!r}")
+          for observation, command, state, changed in observations:
+              if set(observation) != expected_lifecycle_fields:
+                  raise SystemExit(f"unexpected {command} fields: {observation!r}")
+              if (
+                  observation["schema_version"],
+                  observation["command"],
+                  observation["ok"],
+                  observation["state"],
+                  observation["generation"],
+                  observation["changed"],
+                  observation["owner_readiness_observed"],
+                  observation["inspection_checked"],
+                  observation["diagnostics"],
+              ) != (1, command, True, state, generation, changed, True, False, []):
+                  raise SystemExit(f"unexpected {command} lifecycle envelope: {observation!r}")
+              serialized = json.dumps(observation, separators=(",", ":"))
+              if os.environ["LIFECYCLE_ROOT"] in serialized:
+                  raise SystemExit(f"{command} leaked its private lifecycle root")
+              if "API_KEY" in serialized or "Secret" in serialized:
+                  raise SystemExit(f"{command} leaked provider material")
+          PY
+
+          if find "$lifecycle_state" -type s -print -quit | grep -q .; then
+            printf 'joined lifecycle down left a Unix socket\n' >&2
+            find "$lifecycle_state" -type s -print >&2
+            exit 1
+          fi
+          for _ in {1..100}; do
+            if ! pgrep -f "$binary" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.05
+          done
+          if pgrep -f "$binary" >/dev/null 2>&1; then
+            printf 'joined lifecycle down left a ParaEGOX process\n' >&2
+            ps -axo pid=,command= | grep -F "$binary" >&2 || true
+            exit 1
+          fi
+          trap - EXIT
 
       - name: Stage relocatable CLI and Textual bundle
         shell: bash

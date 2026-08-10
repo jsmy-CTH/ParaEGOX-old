@@ -1821,9 +1821,7 @@ async fn query_live_async(
         .await
         .map_err(|_| LocalProcessError::LifecycleControl)?
         .map_err(|_| LocalProcessError::LifecycleControl)?;
-    stream
-        .shutdown()
-        .await
+    accept_client_write_half_shutdown(stream.shutdown().await)
         .map_err(|_| LocalProcessError::LifecycleControl)?;
     let read_budget = if action == InternalActionV1::Down {
         SHUTDOWN_RESPONSE_TIMEOUT
@@ -1882,9 +1880,7 @@ async fn query_local_deployment_async(
         .await
         .map_err(|_| LocalProcessError::LocalDeployQuery)?
         .map_err(|_| LocalProcessError::LocalDeployQuery)?;
-    stream
-        .shutdown()
-        .await
+    accept_client_write_half_shutdown(stream.shutdown().await)
         .map_err(|_| LocalProcessError::LocalDeployQuery)?;
     let mut response = Vec::new();
     let response_limit = u64::try_from(MAX_INTERNAL_RESPONSE_BYTES + 1)
@@ -1942,9 +1938,7 @@ async fn query_local_inspection_locator_async(
         .await
         .map_err(|_| LocalProcessError::LocalInspectionLocator)?
         .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
-    stream
-        .shutdown()
-        .await
+    accept_client_write_half_shutdown(stream.shutdown().await)
         .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
     let mut response = Vec::new();
     let response_limit = u64::try_from(MAX_INSPECTION_LOCATOR_RESPONSE_BYTES + 1)
@@ -1963,6 +1957,20 @@ async fn query_local_inspection_locator_async(
         expected_generation,
         config.config_commitment(),
     )
+}
+
+/// Completes one client request without discarding an already-buffered reply.
+///
+/// On macOS, `shutdown(Write)` returns `NotConnected` when the peer has already
+/// written its complete response and closed. That outcome does not authorize
+/// success by itself: callers still perform their existing bounded read and
+/// strict decode. Every other shutdown error remains fail-closed.
+fn accept_client_write_half_shutdown(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn encode_internal_request(action: InternalActionV1, commitment: [u8; 32]) -> [u8; 38] {
@@ -2757,6 +2765,131 @@ mod tests {
         assert_eq!(deploy[5], b'P');
         assert_eq!(&deploy[6..INTERNAL_REQUEST_BYTES], &commitment);
         assert_eq!(&deploy[INTERNAL_REQUEST_BYTES..], &expected_generation);
+    }
+
+    #[test]
+    fn client_transport_accepts_only_peer_closed_write_half_shutdown() {
+        assert!(accept_client_write_half_shutdown(Ok(())).is_ok());
+        assert!(
+            accept_client_write_half_shutdown(Err(io::Error::from(
+                io::ErrorKind::NotConnected
+            )))
+            .is_ok()
+        );
+
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Other,
+        ] {
+            let error = accept_client_write_half_shutdown(Err(io::Error::from(kind)))
+                .expect_err("non-peer-closed shutdown failure must remain fail-closed");
+            assert_eq!(error.kind(), kind);
+        }
+    }
+
+    #[test]
+    fn client_transport_reads_buffered_valid_response_after_peer_close() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("client transport test runtime");
+        runtime.block_on(async {
+            let (mut client, mut peer) =
+                UnixStream::pair().expect("connected client transport pair");
+            let expected = InternalObservationV1 {
+                state: LocalLifecycleStateV1::Running,
+                generation: Some(lower_hex(&[0x6c; 16]).into_boxed_str()),
+                changed: true,
+                owner_readiness_observed: true,
+                diagnostic_code: None,
+            };
+            let wire = serde_json::to_vec(&expected).expect("valid Running response");
+            peer.write_all(&wire)
+                .await
+                .expect("peer writes complete Running response");
+            drop(peer);
+
+            let shutdown_result = client.shutdown().await;
+            #[cfg(target_os = "macos")]
+            assert!(
+                shutdown_result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotConnected),
+                "macOS peer-close must exercise the NotConnected classifier branch"
+            );
+            accept_client_write_half_shutdown(shutdown_result)
+                .expect("peer-close preserves the strict response read");
+
+            let mut received = Vec::new();
+            client
+                .read_to_end(&mut received)
+                .await
+                .expect("read already-buffered Running response");
+            let decoded: InternalObservationV1 =
+                serde_json::from_slice(&received).expect("strict Running response");
+            assert_eq!(decoded, expected);
+        });
+    }
+
+    #[test]
+    fn client_transport_request_waits_for_eof_and_rejects_trailing_bytes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("request EOF test runtime");
+        runtime.block_on(async {
+            let commitment = [0x7d; 32];
+            let request = encode_internal_request(InternalActionV1::Status, commitment);
+            let (mut client, mut server) =
+                UnixStream::pair().expect("connected EOF transport pair");
+            let mut reader = tokio::spawn(async move {
+                read_internal_request(&mut server, commitment).await
+            });
+            client
+                .write_all(&request)
+                .await
+                .expect("write complete status request");
+            assert!(
+                timeout(Duration::from_millis(25), &mut reader)
+                    .await
+                    .is_err(),
+                "server accepted a request before the client supplied EOF"
+            );
+            client
+                .shutdown()
+                .await
+                .expect("complete request with write-half EOF");
+            let decoded = timeout(Duration::from_secs(1), reader)
+                .await
+                .expect("EOF-bounded request read timed out")
+                .expect("EOF-bounded request task panicked")
+                .expect("EOF-bounded request failed strict decoding");
+            assert_eq!(decoded.action, InternalActionV1::Status);
+            assert_eq!(decoded.expected_generation, None);
+
+            let (mut trailing_client, mut trailing_server) =
+                UnixStream::pair().expect("connected trailing transport pair");
+            let trailing_reader = tokio::spawn(async move {
+                read_internal_request(&mut trailing_server, commitment).await
+            });
+            let mut trailing_request = request.to_vec();
+            trailing_request.push(0);
+            trailing_client
+                .write_all(&trailing_request)
+                .await
+                .expect("write request with forbidden trailing byte");
+            trailing_client
+                .shutdown()
+                .await
+                .expect("complete trailing request");
+            let trailing_result = timeout(Duration::from_secs(1), trailing_reader)
+                .await
+                .expect("trailing request read timed out")
+                .expect("trailing request task panicked");
+            assert_eq!(trailing_result, Err(LocalProcessError::LifecycleControl));
+        });
     }
 
     #[test]
