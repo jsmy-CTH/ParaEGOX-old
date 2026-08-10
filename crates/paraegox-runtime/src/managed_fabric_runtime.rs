@@ -70,16 +70,16 @@ use crate::runtime_control_endpoint::{
     RemoteAgentLiveLowerCurrentFinalGenesisPartsV2, RemoteAgentLiveLowerFactsV2,
     RemoteAgentLiveLowerProjectionV2,
 };
-#[cfg(test)]
-use crate::runtime_store::{
-    RemoteAgentAccessCommitErrorV2, RemoteAgentAccessCommitFailpointV2,
-    RemoteAgentAccessInitializeCommitErrorV2, RemoteAgentReplayJournalCommitFailpointV2,
-};
 use crate::runtime_store::{
     ManagedFabricStore, ManagedFabricStoreError, RemoteAgentAccessAbsentLeaseV2,
     RemoteAgentAccessFreshCommitErrorV2, RemoteAgentAccessGenesisInitializeCommitErrorV2,
     RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2,
     RemoteAgentReplayJournalAbsentLeaseV2, RemoteAgentReplayJournalStartupSlotV2, RuntimeStore,
+};
+#[cfg(test)]
+use crate::runtime_store::{
+    RemoteAgentAccessCommitErrorV2, RemoteAgentAccessCommitFailpointV2,
+    RemoteAgentAccessInitializeCommitErrorV2, RemoteAgentReplayJournalCommitFailpointV2,
 };
 use crate::task_registry::CancellationSource;
 
@@ -1396,9 +1396,7 @@ impl ManagedFabricRuntimeCore {
                         same_epoch.snapshot(),
                         same_epoch.canonical_wire(),
                     )
-                    .map_err(
-                        RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain,
-                    )?;
+                    .map_err(RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain)?;
                 Ok(RemoteAgentAccessInitializedAbsentReadbackV2 {
                     same_epoch,
                     target: self.projection.target(),
@@ -1411,9 +1409,7 @@ impl ManagedFabricRuntimeCore {
                 self.latch_remote_agent_access_s0_mutation_freeze_v2();
                 Err(error)
             }
-            Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)) => {
-                Err(error)
-            }
+            Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)) => Err(error),
         }
     }
 
@@ -1493,13 +1489,11 @@ impl ManagedFabricRuntimeCore {
             access_absent,
             replay_journal_absent,
         } = startup;
-        let result = self
-            .store
-            .initialize_remote_agent_access_v2_at_failpoint(
-                access_absent,
-                candidate,
-                failpoint,
-            );
+        let result = self.store.initialize_remote_agent_access_v2_at_failpoint(
+            access_absent,
+            candidate,
+            failpoint,
+        );
         drop(replay_journal_absent);
         self.finish_remote_agent_access_initialization_v2(result)
     }
@@ -1714,10 +1708,7 @@ impl ManagedFabricRuntimeCore {
         Commit: FnOnce(
             &mut ManagedFabricStore,
             RemoteAgentAccessSameEpochLeaseV2,
-            crate::remote_agent_access_state::RemoteAgentReplayFreshPreflightV2<
-                'request,
-                'running,
-            >,
+            crate::remote_agent_access_state::RemoteAgentReplayFreshPreflightV2<'request, 'running>,
         ) -> Result<
             RemoteAgentAccessSameEpochLeaseV2,
             RemoteAgentAccessFreshCommitErrorV2<'request, 'running>,
@@ -1766,9 +1757,7 @@ impl ManagedFabricRuntimeCore {
             }
             Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause)) => {
                 drop(exact_pxap);
-                Err(RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(
-                    cause,
-                ))
+                Err(RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(cause))
             }
         }
     }
@@ -1815,10 +1804,8 @@ impl ManagedFabricRuntimeCore {
         };
         let access_absent = match self
             .store
-            .adjudicate_remote_agent_access_startup_v2(
-                static_identity,
-                self.runtime_host_epoch,
-            ) {
+            .adjudicate_remote_agent_access_startup_v2(static_identity, self.runtime_host_epoch)
+        {
             Ok(RemoteAgentAccessStartupSlotV2::Absent(absent)) => absent,
             Ok(
                 RemoteAgentAccessStartupSlotV2::SameEpoch(_)
@@ -1920,9 +1907,7 @@ impl ManagedFabricRuntimeCore {
             drop(same_epoch);
             drop(preflight);
             drop(exact_pxap);
-            return Err(RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(
-                cause,
-            ));
+            return Err(RemoteAgentAccessManagedFreshCommitErrorV2::OutcomeUncertain(cause));
         }
         let (current_final, verified_ingress) = preflight.into_rejected_parts();
         Ok((
@@ -3766,7 +3751,11 @@ mod tests {
         assert!(gate.contains("RemoteAgentAccessStartupSlotV2::SameEpoch(_)"));
         assert!(gate.contains("RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_)"));
         assert_eq!(gate.match_indices("Ok(())").count(), 1);
-        assert_eq!(gate.match_indices("RemoteAgentAccessReconcileRequired").count(), 3);
+        assert_eq!(
+            gate.match_indices("RemoteAgentAccessReconcileRequired")
+                .count(),
+            3
+        );
         assert_eq!(
             gate.match_indices("self.latch_remote_agent_access_s0_mutation_freeze_v2();")
                 .count(),
@@ -3946,9 +3935,9 @@ mod tests {
             .expect("missing managed fresh transaction owner");
         let production = &production_tail[..production_end];
         assert!(production.contains("self.commit_remote_agent_access_fresh_v2_with("));
-        assert!(production.contains(
-            "store.commit_remote_agent_access_fresh_v2(same_epoch, preflight)"
-        ));
+        assert!(
+            production.contains("store.commit_remote_agent_access_fresh_v2(same_epoch, preflight)")
+        );
         let start = source
             .find("    fn commit_remote_agent_access_fresh_v2_with<'request, 'running, Commit>(")
             .expect("missing managed fresh transaction owner");
@@ -4057,9 +4046,9 @@ mod tests {
             .expect("missing managed fresh test-forwarding boundary");
         let test_forwarding = &test_forwarding_tail[..test_forwarding_end];
         assert!(source[..test_forwarding_start].ends_with("    #[cfg(test)]\n"));
-        assert!(test_forwarding.contains(
-            "store.commit_remote_agent_access_fresh_v2_at_failpoints("
-        ));
+        assert!(
+            test_forwarding.contains("store.commit_remote_agent_access_fresh_v2_at_failpoints(")
+        );
         assert!(test_forwarding.contains(
             ".seed_remote_agent_replay_unapplied_stable_for_test(&same_epoch, &preflight)"
         ));
@@ -4134,9 +4123,7 @@ mod tests {
         assert!(!commit[..lease_take].contains("self.store"));
         assert!(!commit[..lease_take].contains("latch_remote_agent_access_s0_mutation"));
         assert!(commit.contains("drop(candidate);"));
-        assert!(commit.contains(
-            "RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected("
-        ));
+        assert!(commit.contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected("));
         assert!(!commit.contains("into_retry"));
 
         let raw_start = source
@@ -4246,27 +4233,31 @@ mod tests {
             .expect("missing production genesis finish");
         let production_finish_tail = &source[production_finish_start..];
         let production_finish_end = production_finish_tail
-            .find(
-                "    #[cfg(test)]\n    fn take_remote_agent_access_absent_leases_v2<Candidate>(",
-            )
+            .find("    #[cfg(test)]\n    fn take_remote_agent_access_absent_leases_v2<Candidate>(")
             .expect("missing production genesis finish boundary");
         let production_finish = &production_finish_tail[..production_finish_end];
-        assert!(production_finish.contains(
-            "RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)"
-        ));
-        assert!(production_finish.contains(
-            "RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)"
-        ));
+        assert!(
+            production_finish
+                .contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)")
+        );
+        assert!(
+            production_finish
+                .contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)")
+        );
         let uncertain = production_finish
             .find("Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain")
             .expect("production genesis uncertainty branch disappeared");
         let rejected = production_finish
             .find("Err(error @ RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected")
             .expect("production genesis rejection branch disappeared");
-        assert!(production_finish[uncertain..rejected]
-            .contains("latch_remote_agent_access_s0_mutation_freeze_v2()"));
-        assert!(!production_finish[rejected..]
-            .contains("latch_remote_agent_access_s0_mutation_freeze_v2()"));
+        assert!(
+            production_finish[uncertain..rejected]
+                .contains("latch_remote_agent_access_s0_mutation_freeze_v2()")
+        );
+        assert!(
+            !production_finish[rejected..]
+                .contains("latch_remote_agent_access_s0_mutation_freeze_v2()")
+        );
 
         let endpoint_source = include_str!("runtime_control_endpoint.rs");
         let endpoint_map_start = endpoint_source
@@ -4277,12 +4268,13 @@ mod tests {
             .find("\nfn map_managed_agent_stack_error(")
             .expect("missing endpoint genesis error-map boundary");
         let endpoint_map = &endpoint_map_tail[..endpoint_map_end];
-        assert!(endpoint_map.contains(
-            "RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)"
-        ));
-        assert!(endpoint_map.contains(
-            "RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)"
-        ));
+        assert!(
+            endpoint_map
+                .contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(_)")
+        );
+        assert!(
+            endpoint_map.contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(_)")
+        );
         assert!(endpoint_map.contains("RuntimeControlRequestError::Unavailable"));
         assert!(endpoint_map.contains("RuntimeBootstrapEndpointError::InvalidStartedState"));
         assert!(!endpoint_map.contains("into_retry"));

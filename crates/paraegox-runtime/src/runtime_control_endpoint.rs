@@ -1981,8 +1981,7 @@ impl StartedManagedFabricService {
                 .adjudicate_remote_agent_replay_journal_startup_v2(
                     static_identity,
                     runtime_host_epoch,
-                )?
-            {
+                )? {
                 RemoteAgentReplayJournalStartupSlotV2::Absent(absent) => absent,
                 RemoteAgentReplayJournalStartupSlotV2::Stable(_)
                 | RemoteAgentReplayJournalStartupSlotV2::Pending(_)
@@ -1992,10 +1991,9 @@ impl StartedManagedFabricService {
                     );
                 }
             };
-            let access_absent = match store.adjudicate_remote_agent_access_startup_v2(
-                static_identity,
-                runtime_host_epoch,
-            )? {
+            let access_absent = match store
+                .adjudicate_remote_agent_access_startup_v2(static_identity, runtime_host_epoch)?
+            {
                 RemoteAgentAccessStartupSlotV2::Absent(absent) => absent,
                 RemoteAgentAccessStartupSlotV2::SameEpoch(_)
                 | RemoteAgentAccessStartupSlotV2::RestartReconcileRequired(_) => {
@@ -2022,10 +2020,7 @@ impl StartedManagedFabricService {
             },
         )?;
         if let Some((access_absent, replay_journal_absent)) = remote_agent_access_startup_v2 {
-            core.install_remote_agent_access_startup_v2(
-                access_absent,
-                replay_journal_absent,
-            )?;
+            core.install_remote_agent_access_startup_v2(access_absent, replay_journal_absent)?;
         }
         let stack_projection =
             ManagedAgentStackProjectionV1::try_from_managed_fabric_projection(projection)?;
@@ -6660,9 +6655,9 @@ mod tests {
             ValidatedReferenceLifecycleBudgetsV1,
         },
         remote_agent_access::{
-            ControllerAuthenticatedRemoteAgentAccessRequestV2,
-            RemoteAgentAccessRequestDraftV2, RemoteAgentAccessRequestFieldsV2,
-            RemoteAgentAccessRequestIdV2, RemoteAgentAccessRequestV2,
+            ControllerAuthenticatedRemoteAgentAccessRequestV2, RemoteAgentAccessRequestDraftV2,
+            RemoteAgentAccessRequestFieldsV2, RemoteAgentAccessRequestIdV2,
+            RemoteAgentAccessRequestV2,
         },
         remote_agent_data_plane_plan::{
             RemoteAgentActiveS1CasV2, RemoteAgentDataPlaneApplyRequestDraftV2,
@@ -6679,12 +6674,11 @@ mod tests {
         RuntimeFabricCredentialRequirementV1, RuntimeFabricCredentialResolveErrorV2,
         RuntimeResolvedFabricPeerCredentialV2,
     };
+    use crate::managed_fabric_runtime::{
+        RemoteAgentAccessFreshCommitRejectCauseV2, RemoteAgentAccessManagedFreshCommitErrorV2,
+    };
     use crate::managed_model_runtime::{
         RuntimeModelBackendResolveError, RuntimeResolvedModelBackendV1,
-    };
-    use crate::managed_fabric_runtime::{
-        RemoteAgentAccessFreshCommitRejectCauseV2,
-        RemoteAgentAccessManagedFreshCommitErrorV2,
     };
     use crate::remote_agent_access_state::{
         RemoteAgentAccessDurablePhaseV2, RemoteAgentAccessSnapshotIdentityPinsV2,
@@ -8621,36 +8615,28 @@ mod tests {
             .listen_endpoint()
             .unwrap_or_else(|| panic!("active managed Agent stack lost its loopback endpoint"))
             .as_str();
-        let profile = RemoteAgentDataPlaneProfileV1::try_new(
-            RemoteAgentDataPlaneProfileFieldsV1 {
-                target: TARGET,
-                base_loopback_listen_endpoint,
-                ubuntu_tls_listener_endpoint: "tls/192.0.2.61:7461",
-                endpoint_ref: [0xe1; 16],
-                endpoint_generation: 1,
-                trust_domain_ref: DistributedFabricTrustDomainRefV1::try_from_bytes([0xe2; 16])
-                    .unwrap_or_else(|error| {
-                        panic!("remote-Agent trust domain rejected: {error}")
-                    }),
-                trust_anchor_ref: DistributedFabricTrustAnchorRefV1::try_from_bytes([0xe3; 16])
-                    .unwrap_or_else(|error| {
-                        panic!("remote-Agent trust anchor rejected: {error}")
-                    }),
-                mac_connector_credential_ref: DistributedFabricCredentialRefV1::try_from_bytes(
-                    [0xe4; 16],
-                )
-                .unwrap_or_else(|error| {
-                    panic!("remote-Agent connector credential rejected: {error}")
-                }),
-                ubuntu_listener_credential_ref:
-                    DistributedFabricCredentialRefV1::try_from_bytes([0xe5; 16]).unwrap_or_else(
-                        |error| panic!("remote-Agent listener credential rejected: {error}"),
-                    ),
-                mac_agent_client_principal: intended_client,
-                ubuntu_agent_listener_principal: PrincipalRef::from_bytes([0xe6; 16]),
-                operation_timeout_nanos: RESTRICTED_OPERATION_TIMEOUT_NANOS,
-            },
-        )
+        let profile = RemoteAgentDataPlaneProfileV1::try_new(RemoteAgentDataPlaneProfileFieldsV1 {
+            target: TARGET,
+            base_loopback_listen_endpoint,
+            ubuntu_tls_listener_endpoint: "tls/192.0.2.61:7461",
+            endpoint_ref: [0xe1; 16],
+            endpoint_generation: 1,
+            trust_domain_ref: DistributedFabricTrustDomainRefV1::try_from_bytes([0xe2; 16])
+                .unwrap_or_else(|error| panic!("remote-Agent trust domain rejected: {error}")),
+            trust_anchor_ref: DistributedFabricTrustAnchorRefV1::try_from_bytes([0xe3; 16])
+                .unwrap_or_else(|error| panic!("remote-Agent trust anchor rejected: {error}")),
+            mac_connector_credential_ref: DistributedFabricCredentialRefV1::try_from_bytes(
+                [0xe4; 16],
+            )
+            .unwrap_or_else(|error| panic!("remote-Agent connector credential rejected: {error}")),
+            ubuntu_listener_credential_ref: DistributedFabricCredentialRefV1::try_from_bytes(
+                [0xe5; 16],
+            )
+            .unwrap_or_else(|error| panic!("remote-Agent listener credential rejected: {error}")),
+            mac_agent_client_principal: intended_client,
+            ubuntu_agent_listener_principal: PrincipalRef::from_bytes([0xe6; 16]),
+            operation_timeout_nanos: RESTRICTED_OPERATION_TIMEOUT_NANOS,
+        })
         .unwrap_or_else(|error| panic!("remote-Agent profile rejected: {error}"));
         let execution = RemoteAgentDataPlaneTargetExecutionV2::try_remote_access_active(
             projection,
@@ -8696,10 +8682,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("remote-Agent PXAR11 rejected: {error}"));
         let outer_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
             RemoteAgentAccessRequestFieldsV2 {
-                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
-                    *operation_id.as_bytes(),
-                )
-                .unwrap_or_else(|error| panic!("remote-Agent PXRA2 request ID rejected: {error}")),
+                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(*operation_id.as_bytes())
+                    .unwrap_or_else(|error| {
+                        panic!("remote-Agent PXRA2 request ID rejected: {error}")
+                    }),
                 carrier,
                 target: TARGET,
                 expected_runtime_store_instance_id: STORE_INSTANCE_ID,
@@ -8730,6 +8716,7 @@ mod tests {
     ) -> ControllerAuthenticatedRemoteAgentAccessRequestV2<'request> {
         request
             .verify_controller_apply_request(
+                expected_carrier,
                 |principal, key, algorithm, version, transcript, signature| {
                     let Ok(signature) = Signature::from_slice(signature) else {
                         return false;
@@ -8784,7 +8771,7 @@ mod tests {
                     MonotonicInstant::from_ticks(1_000_000_000),
                 ),
             )
-            .unwrap_or_else(|error| panic!("fresh PXRA2 admission rejected: {error}"))
+            .unwrap_or_else(|error| panic!("fresh PXRA2 admission rejected: {error:?}"))
     }
 
     fn managed_fabric_active_request(
@@ -9970,14 +9957,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn current_final_three_axis_replays_are_pure_and_reconstruct_every_authority() {
         let socket_directory = TestSocketDirectory::create();
-        let (
-            state_directory,
-            mut control,
-            dependencies,
-            intended_client,
-            stack_request,
-            current,
-        ) = managed_control_with_current_final_v2(socket_directory.socket_path.clone()).await;
+        let (state_directory, mut control, dependencies, intended_client, stack_request, current) =
+            managed_control_with_current_final_v2(socket_directory.socket_path.clone()).await;
         let current_final = current.current_final_for_test();
         let retained_s0_cas = current_final.current_retained_s0_cas_for_test();
         let expected_s1_cas = current_final.current_s1_cas_for_test();
@@ -10261,8 +10242,7 @@ mod tests {
                     pending_failpoint,
                     access_failpoint,
                     stable_failpoint,
-                )
-            {
+                ) {
                 Ok(_) => panic!("{stage:?} failpoint unexpectedly returned a joint lease"),
                 Err(error) => error,
             };
@@ -10297,7 +10277,10 @@ mod tests {
                     assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
                     assert_eq!(disk_pxrs, initial_pxrs);
                     assert_eq!(disk_pxrs_inode, initial_pxrs_inode);
-                    assert_eq!(pxrs.phase(), RemoteAgentAccessDurablePhaseV2::InitializedAbsent);
+                    assert_eq!(
+                        pxrs.phase(),
+                        RemoteAgentAccessDurablePhaseV2::InitializedAbsent
+                    );
                     assert_eq!(pxrs.sequence(), 1);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
                     assert_eq!(pxrj.revision(), 2);
@@ -10308,7 +10291,10 @@ mod tests {
                     assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
                     assert_ne!(disk_pxrs, initial_pxrs);
                     assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
-                    assert_eq!(pxrs.phase(), RemoteAgentAccessDurablePhaseV2::PreparedNoEffects);
+                    assert_eq!(
+                        pxrs.phase(),
+                        RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+                    );
                     assert_eq!(pxrs.sequence(), 2);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
                     assert_eq!(pxrj.revision(), 2);
@@ -10318,7 +10304,10 @@ mod tests {
                 Stage::StableJournal => {
                     assert_ne!(disk_pxrs, initial_pxrs);
                     assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
-                    assert_eq!(pxrs.phase(), RemoteAgentAccessDurablePhaseV2::PreparedNoEffects);
+                    assert_eq!(
+                        pxrs.phase(),
+                        RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
+                    );
                     assert_eq!(pxrs.sequence(), 2);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
                     assert_eq!(pxrj.revision(), 3);

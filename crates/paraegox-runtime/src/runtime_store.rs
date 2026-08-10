@@ -29,18 +29,17 @@ use sha2::{Digest as ShaDigest, Sha256};
 use crate::distributed_agent_stack_state::MAX_DISTRIBUTED_AGENT_STACK_SNAPSHOT_BYTES;
 use crate::managed_agent_stack_state::MAX_MANAGED_AGENT_STACK_SNAPSHOT_BYTES;
 use crate::managed_model_agent_stack_state::MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES;
-use crate::remote_agent_access_state::{
-    MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_V2_BYTES,
-    MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES, RemoteAgentAccessGenesisCandidateV2,
-    RemoteAgentAccessSnapshotV2, RemoteAgentAccessStateErrorV2,
-    RemoteAgentAccessStaticIdentityPinsV2, RemoteAgentReplayFreshPreflightV2,
-    RemoteAgentReplayJournalGenesisCandidateV2, RemoteAgentReplayJournalIdentityPinsV2,
-    RemoteAgentReplayJournalPhaseV2, RemoteAgentReplayJournalSnapshotV2,
-    RemoteAgentReplayJournalStateErrorV2, RemoteAgentReplayStartupPairClassificationV2,
-    classify_remote_agent_replay_startup_pair_v2,
-};
 #[cfg(test)]
 use crate::remote_agent_access_state::RemoteAgentPendingAccessSnapshotV2;
+use crate::remote_agent_access_state::{
+    MAX_REMOTE_AGENT_ACCESS_SNAPSHOT_V2_BYTES, MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES,
+    RemoteAgentAccessGenesisCandidateV2, RemoteAgentAccessSnapshotV2,
+    RemoteAgentAccessStateErrorV2, RemoteAgentAccessStaticIdentityPinsV2,
+    RemoteAgentReplayFreshPreflightV2, RemoteAgentReplayJournalGenesisCandidateV2,
+    RemoteAgentReplayJournalIdentityPinsV2, RemoteAgentReplayJournalPhaseV2,
+    RemoteAgentReplayJournalSnapshotV2, RemoteAgentReplayJournalStateErrorV2,
+    RemoteAgentReplayStartupPairClassificationV2, classify_remote_agent_replay_startup_pair_v2,
+};
 use crate::remote_agent_descriptor_evidence::{
     MAX_REMOTE_AGENT_DESCRIPTOR_EVIDENCE_BYTES, RemoteAgentDescriptorEvidenceError,
     RemoteAgentDescriptorEvidenceV1,
@@ -2709,9 +2708,7 @@ impl ManagedFabricStore {
             .remote_agent_replay_journal_startup_adjudication
             .is_some()
         {
-            return Err(
-                ManagedFabricStoreError::RemoteAgentReplayJournalStartupAlreadyAdjudicated,
-            );
+            return Err(ManagedFabricStoreError::RemoteAgentReplayJournalStartupAlreadyAdjudicated);
         }
         self.validate_remote_agent_access_startup_inputs(
             static_identity,
@@ -2790,12 +2787,12 @@ impl ManagedFabricStore {
                 ))
             }
             RemoteAgentReplayStartupPairClassificationV2::SameEpochStable => {
-                let active = self.remote_agent_replay_journal_active.as_ref().ok_or(
-                    ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing,
-                )?;
-                let snapshot = journal.ok_or(
-                    ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing,
-                )?;
+                let active = self
+                    .remote_agent_replay_journal_active
+                    .as_ref()
+                    .ok_or(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing)?;
+                let snapshot = journal
+                    .ok_or(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing)?;
                 Ok(RemoteAgentReplayJournalStartupSlotV2::Stable(Box::new(
                     RemoteAgentReplayJournalStableLeaseV2 {
                         exact: RemoteAgentReplayJournalExactLeaseV2 {
@@ -2811,12 +2808,12 @@ impl ManagedFabricStore {
             }
             RemoteAgentReplayStartupPairClassificationV2::SameEpochPendingAtSource
             | RemoteAgentReplayStartupPairClassificationV2::SameEpochPendingDestinationObserved => {
-                let active = self.remote_agent_replay_journal_active.as_ref().ok_or(
-                    ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing,
-                )?;
-                let snapshot = journal.ok_or(
-                    ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing,
-                )?;
+                let active = self
+                    .remote_agent_replay_journal_active
+                    .as_ref()
+                    .ok_or(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing)?;
+                let snapshot = journal
+                    .ok_or(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMissing)?;
                 Ok(RemoteAgentReplayJournalStartupSlotV2::Pending(Box::new(
                     RemoteAgentReplayJournalPendingLeaseV2 {
                         exact: RemoteAgentReplayJournalExactLeaseV2 {
@@ -2838,7 +2835,9 @@ impl ManagedFabricStore {
                 Ok(RemoteAgentReplayJournalStartupSlotV2::ReconcileRequired(
                     RemoteAgentReplayJournalReconcileRequiredV2 {
                         classification,
-                        pxrs_snapshot_sequence: pxrs.as_ref().map(RemoteAgentAccessSnapshotV2::sequence),
+                        pxrs_snapshot_sequence: pxrs
+                            .as_ref()
+                            .map(RemoteAgentAccessSnapshotV2::sequence),
                         pxrs_snapshot_digest: pxrs
                             .as_ref()
                             .map(RemoteAgentAccessSnapshotV2::snapshot_digest),
@@ -2983,12 +2982,9 @@ impl ManagedFabricStore {
         if self.remote_agent_replay_journal_temp_present {
             classification = RemoteAgentReplayStartupPairClassificationV2::ReconcileRequired;
         }
-        if pxrs
-            .as_ref()
-            .is_some_and(|snapshot| {
-                snapshot.writer_runtime_host_epoch() > current_runtime_host_epoch
-            })
-        {
+        if pxrs.as_ref().is_some_and(|snapshot| {
+            snapshot.writer_runtime_host_epoch() > current_runtime_host_epoch
+        }) {
             self.stopped = true;
             return Err(ManagedFabricStoreError::RemoteAgentAccessWriterEpochAhead);
         }
@@ -3008,9 +3004,10 @@ impl ManagedFabricStore {
             }
             (None, _) => Err(ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch),
             (Some(snapshot), RemoteAgentReplayStartupPairClassificationV2::SameEpochStable) => {
-                let active = self.remote_agent_access_active.as_ref().ok_or(
-                    ManagedFabricStoreError::RemoteAgentAccessSnapshotMissing,
-                )?;
+                let active = self
+                    .remote_agent_access_active
+                    .as_ref()
+                    .ok_or(ManagedFabricStoreError::RemoteAgentAccessSnapshotMissing)?;
                 let lease = RemoteAgentAccessSameEpochLeaseV2 {
                     snapshot,
                     encoded: active.encoded.clone(),
@@ -3023,9 +3020,10 @@ impl ManagedFabricStore {
                 Ok(RemoteAgentAccessStartupSlotV2::SameEpoch(Box::new(lease)))
             }
             (Some(snapshot), _) => {
-                let active = self.remote_agent_access_active.as_ref().ok_or(
-                    ManagedFabricStoreError::RemoteAgentAccessSnapshotMissing,
-                )?;
+                let active = self
+                    .remote_agent_access_active
+                    .as_ref()
+                    .ok_or(ManagedFabricStoreError::RemoteAgentAccessSnapshotMissing)?;
                 let marker = RestartReconcileRequiredV2 {
                     snapshot_sequence: snapshot.sequence(),
                     snapshot_digest: snapshot.snapshot_digest(),
@@ -3120,9 +3118,7 @@ impl ManagedFabricStore {
     ) -> Result<RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessGenesisInitializeCommitErrorV2>
     {
         if let Err(cause) = self.ensure_operational() {
-            return Err(
-                RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(cause),
-            );
+            return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(cause));
         }
         if self.remote_agent_access_startup_adjudication
             != Some(RemoteAgentAccessStartupAdjudicationV2 {
@@ -3137,8 +3133,7 @@ impl ManagedFabricStore {
                 })
             || replay_journal_absent.lock_identity != self.lock_identity
             || replay_journal_absent.static_identity != absent.static_identity
-            || replay_journal_absent.current_runtime_host_epoch
-                != absent.current_runtime_host_epoch
+            || replay_journal_absent.current_runtime_host_epoch != absent.current_runtime_host_epoch
             || self.remote_agent_access_active.is_some()
             || self.remote_agent_replay_journal_active.is_some()
             || self.remote_agent_replay_journal_temp_present
@@ -3185,32 +3180,29 @@ impl ManagedFabricStore {
                     ));
                 }
             };
-        let journal_identity =
-            RemoteAgentReplayJournalIdentityPinsV2::from(absent.static_identity);
+        let journal_identity = RemoteAgentReplayJournalIdentityPinsV2::from(absent.static_identity);
         let journal_wire = journal_candidate.canonical_wire().to_vec();
-        let expected_journal =
-            match Self::validate_remote_agent_replay_journal_candidate(
-                &journal_wire,
-                journal_identity,
-            ) {
-                Ok(snapshot)
-                    if snapshot == *journal_candidate.snapshot()
-                        && snapshot.phase()
-                            == RemoteAgentReplayJournalPhaseV2::Stable =>
-                {
-                    snapshot
-                }
-                Ok(_) => {
-                    return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(
-                        ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
-                    ));
-                }
-                Err(cause) => {
-                    return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(
-                        cause,
-                    ));
-                }
-            };
+        let expected_journal = match Self::validate_remote_agent_replay_journal_candidate(
+            &journal_wire,
+            journal_identity,
+        ) {
+            Ok(snapshot)
+                if snapshot == *journal_candidate.snapshot()
+                    && snapshot.phase() == RemoteAgentReplayJournalPhaseV2::Stable =>
+            {
+                snapshot
+            }
+            Ok(_) => {
+                return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(
+                    ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
+                ));
+            }
+            Err(cause) => {
+                return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::Rejected(
+                    cause,
+                ));
+            }
+        };
         let encoded = recovered.canonical_wire().to_vec();
         match (
             self.reopen_remote_agent_access_exact(None),
@@ -3225,9 +3217,11 @@ impl ManagedFabricStore {
             }
             _ => {
                 self.stopped = true;
-                return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(
-                    ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch,
-                ));
+                return Err(
+                    RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(
+                        ManagedFabricStoreError::RemoteAgentReplayJournalPairMismatch,
+                    ),
+                );
             }
         }
         match self.publish_remote_agent_access_v2(
@@ -3241,9 +3235,11 @@ impl ManagedFabricStore {
                 let committed_candidate = candidate.into_snapshot();
                 if lease.snapshot() != &committed_candidate {
                     self.stopped = true;
-                    return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(
-                        ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
-                    ));
+                    return Err(
+                        RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(
+                            ManagedFabricStoreError::RemoteAgentAccessSnapshotMismatch,
+                        ),
+                    );
                 }
                 let journal_exact = match self.publish_remote_agent_replay_journal_v2(
                     &journal_wire,
@@ -3263,13 +3259,14 @@ impl ManagedFabricStore {
                     }
                 };
                 if journal_exact.snapshot != expected_journal
-                    || journal_exact.snapshot.phase()
-                        != RemoteAgentReplayJournalPhaseV2::Stable
+                    || journal_exact.snapshot.phase() != RemoteAgentReplayJournalPhaseV2::Stable
                 {
                     self.stopped = true;
-                    return Err(RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(
-                        ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
-                    ));
+                    return Err(
+                        RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(
+                            ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
+                        ),
+                    );
                 }
                 self.remote_agent_replay_journal_startup_adjudication =
                     Some(RemoteAgentReplayJournalStartupAdjudicationV2 {
@@ -3363,14 +3360,16 @@ impl ManagedFabricStore {
                 current.static_identity,
             )?;
             if &destination != preflight.pending_snapshot_for_store_precommit()
-                || destination.sequence() != current.snapshot.sequence().checked_add(1).ok_or(
-                    ManagedFabricStoreError::RemoteAgentAccessChainMismatch,
-                )?
+                || destination.sequence()
+                    != current
+                        .snapshot
+                        .sequence()
+                        .checked_add(1)
+                        .ok_or(ManagedFabricStoreError::RemoteAgentAccessChainMismatch)?
                 || destination.previous_snapshot_digest()
                     != Some(current.snapshot.snapshot_digest())
                 || destination.writer_runtime_host_epoch() != current.current_runtime_host_epoch
-                || destination.snapshot_digest()
-                    != preflight.pending_candidate_snapshot_digest()
+                || destination.snapshot_digest() != preflight.pending_candidate_snapshot_digest()
             {
                 return Err(ManagedFabricStoreError::RemoteAgentAccessChainMismatch);
             }
@@ -3380,22 +3379,19 @@ impl ManagedFabricStore {
                 .map_err(ManagedFabricStoreError::RemoteAgentReplayJournalState)?;
             let pending_wire = pending_candidate.canonical_wire().to_vec();
             let stable_wire = stable_candidate.canonical_wire().to_vec();
-            let expected_pending =
-                Self::validate_remote_agent_replay_journal_candidate(
-                    &pending_wire,
-                    stable_exact.journal_identity,
-                )?;
+            let expected_pending = Self::validate_remote_agent_replay_journal_candidate(
+                &pending_wire,
+                stable_exact.journal_identity,
+            )?;
             if expected_pending != *pending_candidate.snapshot()
-                || expected_pending.phase()
-                    != RemoteAgentReplayJournalPhaseV2::PendingEdge
+                || expected_pending.phase() != RemoteAgentReplayJournalPhaseV2::PendingEdge
                 || expected_pending.pending_source_snapshot_sequence()
                     != Some(preflight.source_snapshot_sequence())
                 || expected_pending.pending_source_snapshot_digest()
                     != Some(preflight.source_snapshot_digest())
                 || expected_pending.pending_candidate_snapshot_digest()
                     != Some(preflight.pending_candidate_snapshot_digest())
-                || expected_pending.pending_last_operation_id()
-                    != Some(preflight.operation_id())
+                || expected_pending.pending_last_operation_id() != Some(preflight.operation_id())
                 || expected_pending.pending_last_tenure_nonce_identity()
                     != Some(preflight.tenure_nonce_identity())
                 || expected_pending.pending_last_request_nonce_identity()
@@ -3469,17 +3465,18 @@ impl ManagedFabricStore {
                 ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
             ));
         }
-        let authority = match RemoteAgentReplayJournalPendingAuthorityV2::try_from_exact_pending_readback(
-            &pending_exact.snapshot,
-        ) {
-            Ok(authority) => authority,
-            Err(cause) => {
-                self.stopped = true;
-                drop(current);
-                drop(preflight);
-                return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause));
-            }
-        };
+        let authority =
+            match RemoteAgentReplayJournalPendingAuthorityV2::try_from_exact_pending_readback(
+                &pending_exact.snapshot,
+            ) {
+                Ok(authority) => authority,
+                Err(cause) => {
+                    self.stopped = true;
+                    drop(current);
+                    drop(preflight);
+                    return Err(RemoteAgentAccessFreshCommitErrorV2::OutcomeUncertain(cause));
+                }
+            };
         let authorized = match preflight.try_authorize_from_replay_journal_v2(authority) {
             Ok(authorized) => authorized,
             Err(cause) => {
@@ -3509,8 +3506,10 @@ impl ManagedFabricStore {
             access_failpoint,
         ) {
             Ok(lease) => lease,
-            Err(RemoteAgentAccessPublishErrorV2::ProvenNotCommitted(cause)
-            | RemoteAgentAccessPublishErrorV2::OutcomeUncertain(cause)) => {
+            Err(
+                RemoteAgentAccessPublishErrorV2::ProvenNotCommitted(cause)
+                | RemoteAgentAccessPublishErrorV2::OutcomeUncertain(cause),
+            ) => {
                 self.stopped = true;
                 drop(current);
                 drop(authorized);
@@ -3695,34 +3694,31 @@ impl ManagedFabricStore {
                     });
                 }
             };
-        let journal_identity =
-            RemoteAgentReplayJournalIdentityPinsV2::from(absent.static_identity);
+        let journal_identity = RemoteAgentReplayJournalIdentityPinsV2::from(absent.static_identity);
         let journal_wire = journal_candidate.canonical_wire().to_vec();
-        let expected_journal =
-            match Self::validate_remote_agent_replay_journal_candidate(
-                &journal_wire,
-                journal_identity,
-            ) {
-                Ok(snapshot)
-                    if snapshot == *journal_candidate.snapshot()
-                        && snapshot.phase()
-                            == RemoteAgentReplayJournalPhaseV2::Stable =>
-                {
-                    snapshot
-                }
-                Ok(_) => {
-                    return Err(RemoteAgentAccessCommitErrorV2::Rejected {
-                        cause: ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
-                        candidate: Box::new(snapshot),
-                    });
-                }
-                Err(cause) => {
-                    return Err(RemoteAgentAccessCommitErrorV2::Rejected {
-                        cause,
-                        candidate: Box::new(snapshot),
-                    });
-                }
-            };
+        let expected_journal = match Self::validate_remote_agent_replay_journal_candidate(
+            &journal_wire,
+            journal_identity,
+        ) {
+            Ok(snapshot)
+                if snapshot == *journal_candidate.snapshot()
+                    && snapshot.phase() == RemoteAgentReplayJournalPhaseV2::Stable =>
+            {
+                snapshot
+            }
+            Ok(_) => {
+                return Err(RemoteAgentAccessCommitErrorV2::Rejected {
+                    cause: ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch,
+                    candidate: Box::new(snapshot),
+                });
+            }
+            Err(cause) => {
+                return Err(RemoteAgentAccessCommitErrorV2::Rejected {
+                    cause,
+                    candidate: Box::new(snapshot),
+                });
+            }
+        };
         let encoded = candidate.canonical_wire().to_vec();
         if self.remote_agent_replay_journal_active.is_some()
             || self.remote_agent_replay_journal_temp_present
@@ -4018,8 +4014,7 @@ impl ManagedFabricStore {
                     .sequence()
                     .checked_add(1)
                     .ok_or(ManagedFabricStoreError::RemoteAgentAccessChainMismatch)?
-            || destination.previous_snapshot_digest()
-                != Some(current.snapshot.snapshot_digest())
+            || destination.previous_snapshot_digest() != Some(current.snapshot.snapshot_digest())
             || destination.writer_runtime_host_epoch() != current.current_runtime_host_epoch
             || destination.snapshot_digest() != preflight.pending_candidate_snapshot_digest()
         {
@@ -4058,8 +4053,7 @@ impl ManagedFabricStore {
             || expected_stable.phase() != RemoteAgentReplayJournalPhaseV2::Stable
             || expected_stable.applied_burn_ordinal()
                 != stable_exact.snapshot.applied_burn_ordinal()
-            || stable_exact.snapshot.revision().checked_add(2)
-                != Some(expected_stable.revision())
+            || stable_exact.snapshot.revision().checked_add(2) != Some(expected_stable.revision())
             || stable_exact.snapshot.burn_count().checked_add(1)
                 != Some(expected_stable.burn_count())
             || classify_remote_agent_replay_startup_pair_v2(
@@ -4400,9 +4394,7 @@ impl ManagedFabricStore {
         encoded: &[u8],
         journal_identity: RemoteAgentReplayJournalIdentityPinsV2,
     ) -> Result<RemoteAgentReplayJournalSnapshotV2, ManagedFabricStoreError> {
-        if encoded.is_empty()
-            || encoded.len() > MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES
-        {
+        if encoded.is_empty() || encoded.len() > MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES {
             return Err(ManagedFabricStoreError::InvalidRemoteAgentReplayJournalSnapshotLength);
         }
         let snapshot = RemoteAgentReplayJournalSnapshotV2::decode(encoded, journal_identity)
@@ -4532,9 +4524,7 @@ impl ManagedFabricStore {
         }
         self.remote_agent_replay_journal_temp_present = false;
         #[cfg(test)]
-        if failpoint
-            == RemoteAgentReplayJournalCommitFailpointV2::AfterRenameBeforeDirectorySync
-        {
+        if failpoint == RemoteAgentReplayJournalCommitFailpointV2::AfterRenameBeforeDirectorySync {
             self.stopped = true;
             return Err(ManagedFabricStoreError::Io(RuntimeIoFailure::new(
                 RuntimeFileStage::SyncDirectory,
@@ -4550,8 +4540,7 @@ impl ManagedFabricStore {
             )));
         }
         #[cfg(test)]
-        if failpoint
-            == RemoteAgentReplayJournalCommitFailpointV2::AfterDirectorySyncBeforeReadBack
+        if failpoint == RemoteAgentReplayJournalCommitFailpointV2::AfterDirectorySyncBeforeReadBack
         {
             self.stopped = true;
             return Err(ManagedFabricStoreError::RemoteAgentReplayJournalSnapshotMismatch);
@@ -5998,13 +5987,18 @@ impl fmt::Display for ManagedFabricStoreError {
             Self::RemoteAgentAccessSnapshotMismatch => {
                 formatter.write_str("remote Agent access PXRS v2 exact read-back mismatch")
             }
-            Self::InvalidRemoteAgentReplayJournalSnapshotLength => formatter
-                .write_str("invalid remote Agent replay PXRJ v2 snapshot length"),
-            Self::RemoteAgentReplayJournalState(error) => {
-                write!(formatter, "invalid remote Agent replay PXRJ v2 snapshot: {error}")
+            Self::InvalidRemoteAgentReplayJournalSnapshotLength => {
+                formatter.write_str("invalid remote Agent replay PXRJ v2 snapshot length")
             }
-            Self::RemoteAgentReplayJournalStartupAlreadyAdjudicated => formatter
-                .write_str("remote Agent replay PXRJ v2 startup was already adjudicated"),
+            Self::RemoteAgentReplayJournalState(error) => {
+                write!(
+                    formatter,
+                    "invalid remote Agent replay PXRJ v2 snapshot: {error}"
+                )
+            }
+            Self::RemoteAgentReplayJournalStartupAlreadyAdjudicated => {
+                formatter.write_str("remote Agent replay PXRJ v2 startup was already adjudicated")
+            }
             Self::RemoteAgentReplayJournalLeaseMismatch => {
                 formatter.write_str("remote Agent replay PXRJ v2 exact lease mismatch")
             }
@@ -6016,11 +6010,11 @@ impl fmt::Display for ManagedFabricStoreError {
             Self::RemoteAgentReplayJournalSnapshotMismatch => {
                 formatter.write_str("remote Agent replay PXRJ v2 exact read-back mismatch")
             }
-            Self::RemoteAgentReplayJournalTempResidue => formatter.write_str(
-                "remote Agent replay PXRJ v2 temporary residue requires reconciliation",
-            ),
-            Self::TooManyRemoteAgentReplayJournalTemps => formatter
-                .write_str("too many remote Agent replay PXRJ v2 temporary files"),
+            Self::RemoteAgentReplayJournalTempResidue => formatter
+                .write_str("remote Agent replay PXRJ v2 temporary residue requires reconciliation"),
+            Self::TooManyRemoteAgentReplayJournalTemps => {
+                formatter.write_str("too many remote Agent replay PXRJ v2 temporary files")
+            }
             Self::ManagedAgentStackAuthorityActive => {
                 formatter.write_str("managed Agent-stack sibling authority is active")
             }
@@ -8371,9 +8365,7 @@ fn validate_managed_fabric_directory_entries(
             remote_agent_replay_journal_temp_count = remote_agent_replay_journal_temp_count
                 .checked_add(1)
                 .ok_or(ManagedFabricStoreError::TooManyRemoteAgentReplayJournalTemps)?;
-            if remote_agent_replay_journal_temp_count
-                > MAX_REMOTE_AGENT_REPLAY_JOURNAL_TEMP_FILES
-            {
+            if remote_agent_replay_journal_temp_count > MAX_REMOTE_AGENT_REPLAY_JOURNAL_TEMP_FILES {
                 return Err(ManagedFabricStoreError::TooManyRemoteAgentReplayJournalTemps);
             }
             let temp = open_existing_regular(
@@ -8994,9 +8986,8 @@ fn remote_agent_access_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
 
 fn remote_agent_replay_journal_temp_name(token: [u8; TEMP_TOKEN_BYTES]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::with_capacity(
-        REMOTE_AGENT_REPLAY_JOURNAL_TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES,
-    );
+    let mut name =
+        String::with_capacity(REMOTE_AGENT_REPLAY_JOURNAL_TEMP_FILE_PREFIX.len() + TEMP_HEX_BYTES);
     name.push_str(REMOTE_AGENT_REPLAY_JOURNAL_TEMP_FILE_PREFIX);
     for byte in token {
         name.push(char::from(HEX[usize::from(byte >> 4)]));
@@ -9752,13 +9743,12 @@ pub(crate) mod tests {
         PRIVATE_FILE_MODE_MASK, REMOTE_AGENT_ACCESS_ACTIVE_FILE_NAME,
         REMOTE_AGENT_ACCESS_TEMP_FILE_PREFIX, REMOTE_AGENT_DESCRIPTOR_EVIDENCE_ACTIVE_FILE_NAME,
         REMOTE_AGENT_DESCRIPTOR_EVIDENCE_TEMP_FILE_PREFIX,
-        REMOTE_AGENT_REPLAY_JOURNAL_ACTIVE_FILE_NAME,
-        REMOTE_AGENT_REPLAY_JOURNAL_TEMP_FILE_PREFIX, RemoteAgentAccessAbsentLeaseV2,
-        RemoteAgentAccessCommitErrorV2, RemoteAgentAccessCommitFailpointV2,
-        RemoteAgentAccessGenesisInitializeCommitErrorV2, RemoteAgentAccessSameEpochLeaseV2,
-        RemoteAgentAccessStartupSlotV2, RemoteAgentDescriptorEvidenceCommitFailpoint,
-        RemoteAgentReplayJournalAbsentLeaseV2, RemoteAgentReplayJournalCommitFailpointV2,
-        RemoteAgentReplayJournalStartupSlotV2,
+        REMOTE_AGENT_REPLAY_JOURNAL_ACTIVE_FILE_NAME, REMOTE_AGENT_REPLAY_JOURNAL_TEMP_FILE_PREFIX,
+        RemoteAgentAccessAbsentLeaseV2, RemoteAgentAccessCommitErrorV2,
+        RemoteAgentAccessCommitFailpointV2, RemoteAgentAccessGenesisInitializeCommitErrorV2,
+        RemoteAgentAccessSameEpochLeaseV2, RemoteAgentAccessStartupSlotV2,
+        RemoteAgentDescriptorEvidenceCommitFailpoint, RemoteAgentReplayJournalAbsentLeaseV2,
+        RemoteAgentReplayJournalCommitFailpointV2, RemoteAgentReplayJournalStartupSlotV2,
         RuntimeCommitFailpoint, RuntimeFileStage, RuntimeFilesystemPolicy,
         RuntimeInitializerBeginError, RuntimeInitializerGuard, RuntimeInitializerPreflight,
         RuntimeInitializerPublishError, RuntimeJournalMigrationKind, RuntimeMigrationFailpoints,
@@ -10555,9 +10545,7 @@ pub(crate) mod tests {
             );
             assert!(matches!(
                 store.initialize_remote_agent_access_v2_at_journal_failpoint(
-                    absent,
-                    snapshot,
-                    failpoint,
+                    absent, snapshot, failpoint,
                 ),
                 Err(RemoteAgentAccessCommitErrorV2::OutcomeUncertain(_))
             ));
@@ -10662,8 +10650,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remote_agent_replay_journal_v2_inode_and_byte_drift_stop_joint_revalidation() {
-        let (directory, mut store, current, _, _, _) =
-            remote_agent_access_live_store_fixture_v2();
+        let (directory, mut store, current, _, _, _) = remote_agent_access_live_store_fixture_v2();
         let final_path = directory
             .path()
             .join(REMOTE_AGENT_REPLAY_JOURNAL_ACTIVE_FILE_NAME);
@@ -10681,8 +10668,7 @@ pub(crate) mod tests {
             Err(ManagedFabricStoreError::Stopped)
         ));
 
-        let (directory, mut store, current, _, _, _) =
-            remote_agent_access_live_store_fixture_v2();
+        let (directory, mut store, current, _, _, _) = remote_agent_access_live_store_fixture_v2();
         let final_path = directory
             .path()
             .join(REMOTE_AGENT_REPLAY_JOURNAL_ACTIVE_FILE_NAME);
@@ -10809,9 +10795,9 @@ pub(crate) mod tests {
             .find("    /// Raw structural fixture seam")
             .expect("production PXRS2 genesis store seam must remain bounded");
         let production = &production_tail[..production_end];
-        assert!(production.contains(
-            "replay_journal_absent: RemoteAgentReplayJournalAbsentLeaseV2"
-        ));
+        assert!(
+            production.contains("replay_journal_absent: RemoteAgentReplayJournalAbsentLeaseV2")
+        );
         assert!(production.contains("candidate: RemoteAgentAccessGenesisCandidateV2"));
         assert!(!production.contains("snapshot: RemoteAgentAccessSnapshotV2"));
         let operational_gate = production
@@ -10821,8 +10807,10 @@ pub(crate) mod tests {
                     .map(|(gate, _)| gate)
             })
             .expect("production genesis operational gate must remain explicit");
-        assert!(operational_gate
-            .contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain"));
+        assert!(
+            operational_gate
+                .contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain")
+        );
         assert!(!operational_gate.contains("candidate: Box::new(candidate)"));
         assert!(!production.contains("RemoteAgentAccessCommitErrorV2"));
         assert!(!production.contains("candidate: Box::new(candidate)"));
@@ -10837,8 +10825,11 @@ pub(crate) mod tests {
                     .map(|(arm, _)| arm)
             })
             .expect("stopped PXRS publish classification must remain bounded");
-        assert!(pxrs_proven_not_committed
-            .contains("RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(cause)"));
+        assert!(
+            pxrs_proven_not_committed.contains(
+                "RemoteAgentAccessGenesisInitializeCommitErrorV2::OutcomeUncertain(cause)"
+            )
+        );
         assert!(!pxrs_proven_not_committed.contains("candidate: Box::new(candidate)"));
 
         let production_error = source
@@ -10855,8 +10846,9 @@ pub(crate) mod tests {
         let raw_retry_error = source
             .find("pub(crate) enum RemoteAgentAccessCommitErrorV2")
             .expect("raw retry error must remain available to fixtures");
-        assert!(source[raw_retry_error.saturating_sub(80)..raw_retry_error]
-            .contains("#[cfg(test)]"));
+        assert!(
+            source[raw_retry_error.saturating_sub(80)..raw_retry_error].contains("#[cfg(test)]")
+        );
 
         for raw_seam in [
             "pub(crate) fn initialize_remote_agent_access_v2(",
@@ -10886,14 +10878,8 @@ pub(crate) mod tests {
             .find("    /// Raw structural fixture seam")
             .expect("production PXRJ store section must remain bounded");
         let production = &source[..production_end];
-        let fresh_seam = concat!(
-            "pub(crate) fn commit_remote_agent_access_",
-            "fresh_v2"
-        );
-        let superseded_seam = concat!(
-            "commit_remote_agent_access_fresh_v2_",
-            "superseded"
-        );
+        let fresh_seam = concat!("pub(crate) fn commit_remote_agent_access_", "fresh_v2");
+        let superseded_seam = concat!("commit_remote_agent_access_fresh_v2_", "superseded");
         assert_eq!(
             production.matches(fresh_seam).count(),
             1,
@@ -10903,10 +10889,7 @@ pub(crate) mod tests {
         let start = production
             .find(fresh_seam)
             .expect("fresh PXRJ store transaction must exist");
-        let helper_name = concat!(
-            "fn commit_remote_agent_access_fresh_v2_",
-            "with_failpoints"
-        );
+        let helper_name = concat!("fn commit_remote_agent_access_fresh_v2_", "with_failpoints");
         let helper_start = production[start..]
             .find(helper_name)
             .map(|offset| start + offset)
@@ -11004,7 +10987,9 @@ pub(crate) mod tests {
             "pub(crate) fn seed_remote_agent_replay_",
             "unapplied_stable_for_test"
         );
-        let start = source.find(seam_name).expect("unapplied seed seam must exist");
+        let start = source
+            .find(seam_name)
+            .expect("unapplied seed seam must exist");
         assert!(source[start.saturating_sub(160)..start].contains("#[cfg(test)]"));
         let tail = &source[start..];
         let end = tail

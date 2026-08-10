@@ -3038,7 +3038,9 @@ impl RemoteAgentReplayBurnV2 {
         snapshot: &RemoteAgentAccessSnapshotV2,
     ) -> Result<Option<Self>, RemoteAgentReplayJournalStateErrorV2> {
         match (&snapshot.operation_request, snapshot.admission) {
-            (None, None) if snapshot.phase == RemoteAgentAccessDurablePhaseV2::InitializedAbsent => {
+            (None, None)
+                if snapshot.phase == RemoteAgentAccessDurablePhaseV2::InitializedAbsent =>
+            {
                 Ok(None)
             }
             (Some(request), Some(admission)) => {
@@ -3172,13 +3174,12 @@ impl<'request, 'running> RemoteAgentReplayFreshPreflightV2<'request, 'running> {
         seen_tenure_nonce_identities: &[Digest32],
         seen_request_nonce_identities: &[Digest32],
     ) -> Result<RemoteAgentPendingAccessSnapshotV2, RemoteAgentAccessStateErrorV2> {
-        let durable_replay_checked =
-            RemoteAgentDurableReplayCheckedV2::from_preflight_for_test(
-                &self,
-                seen_operation_ids,
-                seen_tenure_nonce_identities,
-                seen_request_nonce_identities,
-            )?;
+        let durable_replay_checked = RemoteAgentDurableReplayCheckedV2::from_preflight_for_test(
+            &self,
+            seen_operation_ids,
+            seen_tenure_nonce_identities,
+            seen_request_nonce_identities,
+        )?;
         durable_replay_checked.validate_preflight(&self)?;
         let Self {
             current_final,
@@ -3316,9 +3317,7 @@ impl RemoteAgentReplayJournalSnapshotV2 {
         if frame.len() > MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES {
             return Err(RemoteAgentReplayJournalStateErrorV2::FrameTooLarge);
         }
-        if frame.len()
-            < REPLAY_JOURNAL_HEADER_BYTES_V2 + REPLAY_JOURNAL_DIGEST_BYTES_V2
-        {
+        if frame.len() < REPLAY_JOURNAL_HEADER_BYTES_V2 + REPLAY_JOURNAL_DIGEST_BYTES_V2 {
             return Err(RemoteAgentReplayJournalStateErrorV2::Truncated);
         }
         let payload_bytes = frame
@@ -3405,9 +3404,7 @@ impl RemoteAgentReplayJournalSnapshotV2 {
         Ok(snapshot)
     }
 
-    fn encode(
-        &self,
-    ) -> Result<(Box<[u8]>, Digest32), RemoteAgentReplayJournalStateErrorV2> {
+    fn encode(&self) -> Result<(Box<[u8]>, Digest32), RemoteAgentReplayJournalStateErrorV2> {
         self.validate_shape()?;
         let total_length = REPLAY_JOURNAL_HEADER_BYTES_V2
             .checked_add(
@@ -3458,8 +3455,17 @@ impl RemoteAgentReplayJournalSnapshotV2 {
     }
 
     fn validate_shape(&self) -> Result<(), RemoteAgentReplayJournalStateErrorV2> {
-        if self.identity.target.as_bytes().iter().all(|byte| *byte == 0)
-            || self.identity.store_instance_id.iter().all(|byte| *byte == 0)
+        if self
+            .identity
+            .target
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+            || self
+                .identity
+                .store_instance_id
+                .iter()
+                .all(|byte| *byte == 0)
             || digest_is_zero(self.identity.owner_target_fingerprint)
             || digest_is_zero(self.identity.transition_projection_digest)
             || self.writer_runtime_host_epoch == 0
@@ -3536,10 +3542,7 @@ impl RemoteAgentReplayJournalSnapshotV2 {
         {
             return Err(RemoteAgentReplayJournalStateErrorV2::SourceMismatch);
         }
-        validate_replay_journal_applied_pxrs_v2(
-            self,
-            &preflight.current_final.snapshot,
-        )?;
+        validate_replay_journal_applied_pxrs_v2(self, &preflight.current_final.snapshot)?;
         if self.burns.iter().any(|burn| {
             burn.operation_id == preflight.burn.operation_id
                 || burn.tenure_nonce_identity == preflight.burn.tenure_nonce_identity
@@ -3684,7 +3687,6 @@ impl RemoteAgentReplayJournalSnapshotV2 {
     pub(crate) const fn snapshot_digest(&self) -> Digest32 {
         self.snapshot_digest
     }
-
 }
 
 impl RemoteAgentReplayJournalGenesisCandidateV2 {
@@ -3703,8 +3705,8 @@ impl RemoteAgentReplayJournalGenesisCandidateV2 {
         {
             return Err(RemoteAgentReplayJournalStateErrorV2::PxrsMismatch);
         }
-        let snapshot = RemoteAgentReplayJournalSnapshotV2::try_build(
-            RemoteAgentReplayJournalSnapshotV2 {
+        let snapshot =
+            RemoteAgentReplayJournalSnapshotV2::try_build(RemoteAgentReplayJournalSnapshotV2 {
                 identity: replay_journal_identity_for_pxrs_v2(pxrs),
                 writer_runtime_host_epoch: pxrs.writer_runtime_host_epoch,
                 phase: RemoteAgentReplayJournalPhaseV2::Stable,
@@ -3716,8 +3718,7 @@ impl RemoteAgentReplayJournalGenesisCandidateV2 {
                 burns: Box::new([]),
                 canonical_wire: Box::new([]),
                 snapshot_digest: zero_digest(),
-            },
-        )?;
+            })?;
         Ok(Self { snapshot })
     }
 
@@ -3778,8 +3779,8 @@ impl RemoteAgentReplayJournalPendingCandidateV2 {
             return Err(RemoteAgentReplayJournalStateErrorV2::InvalidPendingShape);
         }
         let snapshot = self.snapshot;
-        let stable = RemoteAgentReplayJournalSnapshotV2::try_build(
-            RemoteAgentReplayJournalSnapshotV2 {
+        let stable =
+            RemoteAgentReplayJournalSnapshotV2::try_build(RemoteAgentReplayJournalSnapshotV2 {
                 identity: snapshot.identity,
                 writer_runtime_host_epoch: snapshot.writer_runtime_host_epoch,
                 phase: RemoteAgentReplayJournalPhaseV2::Stable,
@@ -3794,8 +3795,7 @@ impl RemoteAgentReplayJournalPendingCandidateV2 {
                 burns: snapshot.burns,
                 canonical_wire: Box::new([]),
                 snapshot_digest: zero_digest(),
-            },
-        )?;
+            })?;
         Ok(RemoteAgentReplayJournalStableCandidateV2 { snapshot: stable })
     }
 }
@@ -3884,9 +3884,7 @@ fn validate_replay_journal_applied_pxrs_v2(
     let operation = RemoteAgentReplayBurnV2::from_snapshot_operation(pxrs)?;
     match (applied, operation) {
         (0, None) => Ok(()),
-        (1.., Some(operation))
-            if journal.burns.get(applied - 1).copied() == Some(operation) =>
-        {
+        (1.., Some(operation)) if journal.burns.get(applied - 1).copied() == Some(operation) => {
             Ok(())
         }
         _ => Err(RemoteAgentReplayJournalStateErrorV2::PxrsMismatch),
@@ -3937,10 +3935,7 @@ impl<'a> RemoteAgentReplayJournalCursorV2<'a> {
         Self { bytes, offset: 0 }
     }
 
-    fn take(
-        &mut self,
-        length: usize,
-    ) -> Result<&'a [u8], RemoteAgentReplayJournalStateErrorV2> {
+    fn take(&mut self, length: usize) -> Result<&'a [u8], RemoteAgentReplayJournalStateErrorV2> {
         let end = self
             .offset
             .checked_add(length)
@@ -3953,9 +3948,7 @@ impl<'a> RemoteAgentReplayJournalCursorV2<'a> {
         Ok(value)
     }
 
-    fn array<const N: usize>(
-        &mut self,
-    ) -> Result<[u8; N], RemoteAgentReplayJournalStateErrorV2> {
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], RemoteAgentReplayJournalStateErrorV2> {
         self.take(N)?
             .try_into()
             .map_err(|_| RemoteAgentReplayJournalStateErrorV2::Truncated)
@@ -9969,9 +9962,13 @@ mod tests {
                 .find("> {")
                 .unwrap_or_else(|| panic!("PXRS2 fresh preflight signature must terminate"));
             let signature = &signature_tail[..signature_end];
-            assert!(signature.contains("VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>"));
+            assert!(
+                signature.contains("VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>")
+            );
             assert!(signature.contains("RemoteAgentReplayFreshPreflightV2<'request, 'running>"));
-            assert!(signature.contains("RemoteAgentReplayFreshPreflightErrorV2<'request, 'running>"));
+            assert!(
+                signature.contains("RemoteAgentReplayFreshPreflightErrorV2<'request, 'running>")
+            );
             assert!(!signature.contains("RemoteAgentPendingAccessSnapshotV2"));
             assert!(!signature.contains("ControllerAuthenticatedRemoteAgentAccessRequestV2"));
             assert!(!signature.contains("ClockReading"));
@@ -10148,13 +10145,9 @@ mod tests {
                 .unwrap_or_else(|error| panic!("first CurrentFinal rejected: {error}"))
                 .try_preflight_fresh(marker)
                 .unwrap_or_else(|error| panic!("first fresh preflight rejected: {error}"));
-            let mismatched_replay = RemoteAgentDurableReplayCheckedV2::from_preflight_for_test(
-                &first,
-                &[],
-                &[],
-                &[],
-            )
-            .unwrap_or_else(|error| panic!("durable replay marker rejected: {error}"));
+            let mismatched_replay =
+                RemoteAgentDurableReplayCheckedV2::from_preflight_for_test(&first, &[], &[], &[])
+                    .unwrap_or_else(|error| panic!("durable replay marker rejected: {error}"));
             let other = current_final_v2(initial, |_| {})
                 .unwrap_or_else(|error| panic!("other CurrentFinal rejected: {error}"))
                 .try_preflight_fresh(other_marker)
@@ -11205,16 +11198,17 @@ mod tests {
                     &initial,
                 )
                 .unwrap_or_else(|error| panic!("PXRJ genesis rejected: {error}"));
-            assert_eq!(genesis.snapshot().phase(), RemoteAgentReplayJournalPhaseV2::Stable);
+            assert_eq!(
+                genesis.snapshot().phase(),
+                RemoteAgentReplayJournalPhaseV2::Stable
+            );
             assert_eq!(genesis.snapshot().revision(), 1);
             assert_eq!(genesis.snapshot().applied_burn_ordinal(), 0);
             assert_eq!(genesis.snapshot().burn_count(), 0);
             assert_eq!(genesis.canonical_wire().len(), 256);
-            let stable = RemoteAgentReplayJournalSnapshotV2::decode(
-                genesis.canonical_wire(),
-                identity,
-            )
-            .unwrap_or_else(|error| panic!("empty PXRJ readback rejected: {error}"));
+            let stable =
+                RemoteAgentReplayJournalSnapshotV2::decode(genesis.canonical_wire(), identity)
+                    .unwrap_or_else(|error| panic!("empty PXRJ readback rejected: {error}"));
             assert_eq!(stable, genesis.into_snapshot());
             assert_eq!(
                 classify_remote_agent_replay_startup_pair_v2(
@@ -11256,7 +11250,10 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("PXRJ PendingEdge readback rejected: {error}"));
             assert_eq!(pending, pending_candidate.into_snapshot());
-            assert_eq!(pending.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
+            assert_eq!(
+                pending.phase(),
+                RemoteAgentReplayJournalPhaseV2::PendingEdge
+            );
             assert_eq!(pending.revision(), 2);
             assert_eq!(pending.applied_burn_ordinal(), 0);
             assert_eq!(pending.burn_count(), 1);
@@ -11272,7 +11269,10 @@ mod tests {
                 pending.pending_candidate_snapshot_digest(),
                 Some(preflight.pending_candidate_snapshot_digest())
             );
-            assert_eq!(pending.pending_last_operation_id(), Some(preflight.operation_id()));
+            assert_eq!(
+                pending.pending_last_operation_id(),
+                Some(preflight.operation_id())
+            );
             assert_eq!(
                 pending.pending_last_tenure_nonce_identity(),
                 Some(preflight.tenure_nonce_identity()),
@@ -11528,8 +11528,8 @@ mod tests {
                     Digest32::from_bytes(request),
                 ));
             }
-            let full = RemoteAgentReplayJournalSnapshotV2::try_build(
-                RemoteAgentReplayJournalSnapshotV2 {
+            let full =
+                RemoteAgentReplayJournalSnapshotV2::try_build(RemoteAgentReplayJournalSnapshotV2 {
                     identity,
                     writer_runtime_host_epoch: RUNTIME_EPOCH,
                     phase: RemoteAgentReplayJournalPhaseV2::Stable,
@@ -11541,9 +11541,8 @@ mod tests {
                     burns: burns.into_boxed_slice(),
                     canonical_wire: Box::new([]),
                     snapshot_digest: zero_digest(),
-                },
-            )
-            .unwrap_or_else(|error| panic!("full PXRJ rejected: {error}"));
+                })
+                .unwrap_or_else(|error| panic!("full PXRJ rejected: {error}"));
             assert_eq!(
                 full.canonical_wire().len(),
                 MAX_REMOTE_AGENT_REPLAY_JOURNAL_SNAPSHOT_V2_BYTES
@@ -11701,22 +11700,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("journal-authorized fresh wrapper missing"));
             assert!(authorized.contains("verified_ingress:"));
             assert!(authorized.contains("pending: RemoteAgentPendingAccessSnapshotV2"));
-            assert!(source.contains(
-                "pub(crate) fn pending_snapshot_for_store_precommit(\n        &self,"
-            ));
+            assert!(
+                source.contains(
+                    "pub(crate) fn pending_snapshot_for_store_precommit(\n        &self,"
+                )
+            );
             assert!(source.contains(
                 "pub(crate) fn pending_canonical_wire_for_store_precommit(&self) -> &[u8]"
             ));
             assert!(source.contains("pub(crate) fn pending_last_operation_id(&self)"));
-            assert!(source.contains(
-                "pub(crate) fn pending_last_tenure_nonce_identity(&self)"
-            ));
-            assert!(source.contains(
-                "pub(crate) fn pending_last_request_nonce_identity(&self)"
-            ));
-            assert!(source.contains(
-                "pub(crate) fn try_authorize_from_replay_journal_v2(\n        self,"
-            ));
+            assert!(source.contains("pub(crate) fn pending_last_tenure_nonce_identity(&self)"));
+            assert!(source.contains("pub(crate) fn pending_last_request_nonce_identity(&self)"));
+            assert!(
+                source
+                    .contains("pub(crate) fn try_authorize_from_replay_journal_v2(\n        self,")
+            );
             assert!(source.contains(concat!(
                 "#[cfg(test)]\nimpl RemoteAgentReplayJournalPendingCandidateV2 {\n",
                 "    pub(crate) fn into_unapplied_stable_for_test("
@@ -11726,10 +11724,7 @@ mod tests {
                 "pub(crate) fn authorize_from_",
                 "replay_journal_v2"
             )));
-            assert!(!source.contains(concat!(
-                "pub(crate) fn into_pending_",
-                "for_store"
-            )));
+            assert!(!source.contains(concat!("pub(crate) fn into_pending_", "for_store")));
         }
 
         fn reseal_replay_journal_v2(wire: &mut [u8]) {
