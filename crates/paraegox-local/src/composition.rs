@@ -6054,12 +6054,17 @@ mod tests {
             .rfind("\n#[cfg(test)]\nmod tests {")
             .expect("composition test module");
         let production = &source[..tests_start];
+        let prepared_doc_start = production
+            .find("/// Single-use inputs for the hidden headless chat owner.")
+            .expect("prepared headless owner documentation");
         let prepared_start = production
             .find("pub(crate) struct PreparedHeadlessChatV1")
             .expect("prepared headless owner");
-        let projection_start = production
-            .find("pub(crate) struct VerifiedLocalDeploymentProjectionV1")
-            .expect("verified local deployment projection");
+        let prepared_end = prepared_start
+            + production[prepared_start..]
+                .find("\n}\n")
+                .expect("prepared headless owner closing brace")
+            + 3;
         let prepare_start = production
             .find("pub(crate) fn prepare_headless_chat(")
             .expect("headless preparation entrypoint");
@@ -6070,7 +6075,7 @@ mod tests {
             .find("pub(crate) fn run_deployment(")
             .expect("next public composition entrypoint");
 
-        let prepared_type = &production[prepared_start..projection_start];
+        let prepared_type = &production[prepared_doc_start..prepared_end];
         assert!(!prepared_type.contains("#[derive"));
         assert!(!prepared_type.contains("impl Clone for PreparedHeadlessChatV1"));
         assert!(!prepared_type.contains("impl Debug for PreparedHeadlessChatV1"));
