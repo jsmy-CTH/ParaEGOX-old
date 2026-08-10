@@ -2051,9 +2051,7 @@ impl ConfigError {
             Self::InvalidInspectionSnapshotGrammar => {
                 "inspection snapshot requires exactly --config <absolute-paraegox.toml> --json"
             }
-            Self::InvalidTuiGrammar => {
-                "tui requires exactly --config <absolute-paraegox.toml>"
-            }
+            Self::InvalidTuiGrammar => "tui requires exactly --config <absolute-paraegox.toml>",
             Self::MissingStateRoot => "the selected DeveloperLocal mode requires --state-root",
             Self::MissingFabricListenA => "internal distributed fixture requires --fabric-listen-a",
             Self::MissingFabricListenB => "internal distributed fixture requires --fabric-listen-b",
@@ -5656,14 +5654,14 @@ client_private_key_file = "{root}/node/controller-key.pem"
         assert_ne!(config.config_commitment(), [0; 32]);
 
         let relative = tui_attach_arguments(OsString::from("paraegox.toml"));
-        assert_eq!(parse_tui_attach(&relative), Err(ConfigError::InvalidConfigPath));
+        assert_eq!(
+            parse_tui_attach(&relative),
+            Err(ConfigError::InvalidConfigPath)
+        );
 
         for malformed in [
             vec![OsString::from(TUI_COMMAND)],
-            vec![
-                OsString::from(TUI_COMMAND),
-                OsString::from("--help"),
-            ],
+            vec![OsString::from(TUI_COMMAND), OsString::from("--help")],
             vec![
                 OsString::from(TUI_COMMAND),
                 OsString::from(CONFIG_OPTION),

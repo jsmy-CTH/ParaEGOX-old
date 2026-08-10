@@ -671,10 +671,7 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
         let tui_attach_locators = inspection_bootstrap_path
             .as_deref()
             .map(|inspection_path| {
-                capture_tui_attach_bootstrap_pair(
-                    &conversation_bootstrap_path,
-                    inspection_path,
-                )
+                capture_tui_attach_bootstrap_pair(&conversation_bootstrap_path, inspection_path)
             })
             .transpose()?;
         self.events
@@ -2291,10 +2288,7 @@ async fn query_local_tui_attach_async(
     {
         return Err(LocalProcessError::LocalTuiLocator);
     }
-    let request = encode_internal_tui_attach_query(
-        config.config_commitment(),
-        expected_generation,
-    );
+    let request = encode_internal_tui_attach_query(config.config_commitment(), expected_generation);
     timeout(CLIENT_IO_TIMEOUT, stream.write_all(&request))
         .await
         .map_err(|_| LocalProcessError::LocalTuiLocator)?
@@ -2608,8 +2602,7 @@ fn encode_tui_attach_frame(
         error,
     )?;
     let conversation_end = TUI_ATTACH_FRAME_HEADER_BYTES + conversation_path.len();
-    frame[TUI_ATTACH_FRAME_HEADER_BYTES..conversation_end]
-        .copy_from_slice(conversation_path);
+    frame[TUI_ATTACH_FRAME_HEADER_BYTES..conversation_end].copy_from_slice(conversation_path);
     frame[conversation_end..].copy_from_slice(inspection_path);
     let digest = tui_attach_frame_digest(
         frame_kind.digest_domain(),
@@ -2631,8 +2624,10 @@ fn validate_tui_attach_pin<'a>(
     let path = pin.path.to_str().ok_or(error)?.as_bytes();
     let content_bounds = match expected_kind {
         b'C' => CONVERSATION_BOOTSTRAP_MIN_BYTES..=CONVERSATION_BOOTSTRAP_MAX_BYTES,
-        b'I' => DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES
-            ..=MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES,
+        b'I' => {
+            DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES
+                ..=MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES
+        }
         _ => return Err(error),
     };
     if pin.kind != expected_kind
@@ -2668,11 +2663,7 @@ fn encode_tui_attach_pin_record(
             .map_err(|_| error)?
             .to_be_bytes(),
     );
-    record[4..8].copy_from_slice(
-        &u32::try_from(path_length)
-            .map_err(|_| error)?
-            .to_be_bytes(),
-    );
+    record[4..8].copy_from_slice(&u32::try_from(path_length).map_err(|_| error)?.to_be_bytes());
     record[8..12].copy_from_slice(&pin.content_length.to_be_bytes());
     record[12..16].copy_from_slice(&pin.uid.to_be_bytes());
     record[16..20].copy_from_slice(&pin.gid.to_be_bytes());
@@ -2714,8 +2705,7 @@ fn decode_tui_attach_frame(
     }
     let conversation_path_length =
         usize::try_from(read_u32_be(frame, 64 + 4)).map_err(|_| error)?;
-    let inspection_path_length =
-        usize::try_from(read_u32_be(frame, 160 + 4)).map_err(|_| error)?;
+    let inspection_path_length = usize::try_from(read_u32_be(frame, 160 + 4)).map_err(|_| error)?;
     if !(1..=MAX_TUI_ATTACH_PATH_BYTES).contains(&conversation_path_length)
         || !(1..=MAX_TUI_ATTACH_PATH_BYTES).contains(&inspection_path_length)
         || TUI_ATTACH_FRAME_HEADER_BYTES
@@ -2726,12 +2716,10 @@ fn decode_tui_attach_frame(
         return Err(error);
     }
     let conversation_end = TUI_ATTACH_FRAME_HEADER_BYTES + conversation_path_length;
-    let conversation_path = std::str::from_utf8(
-        &frame[TUI_ATTACH_FRAME_HEADER_BYTES..conversation_end],
-    )
-    .map_err(|_| error)?;
-    let inspection_path =
-        std::str::from_utf8(&frame[conversation_end..]).map_err(|_| error)?;
+    let conversation_path =
+        std::str::from_utf8(&frame[TUI_ATTACH_FRAME_HEADER_BYTES..conversation_end])
+            .map_err(|_| error)?;
+    let inspection_path = std::str::from_utf8(&frame[conversation_end..]).map_err(|_| error)?;
     let conversation = decode_tui_attach_pin_record(
         &frame[64..160],
         b'C',
@@ -2960,8 +2948,7 @@ async fn write_internal_tui_attach_locator_response(
     stream: &mut UnixStream,
     response: &[u8],
 ) -> Result<(), LocalProcessError> {
-    if response.len() < TUI_ATTACH_FRAME_HEADER_BYTES
-        || response.len() > MAX_TUI_ATTACH_FRAME_BYTES
+    if response.len() < TUI_ATTACH_FRAME_HEADER_BYTES || response.len() > MAX_TUI_ATTACH_FRAME_BYTES
     {
         return Err(LocalProcessError::LifecycleControl);
     }
@@ -3641,21 +3628,11 @@ mod tests {
         assert_ne!(&pxlt[256..288], &pxth[256..288]);
         assert_eq!(&pxlt[288..], &pxth[288..]);
         assert_eq!(
-            decode_tui_attach_frame(
-                &pxlt,
-                TuiAttachFrameKindV1::Locator,
-                generation,
-                commitment,
-            ),
+            decode_tui_attach_frame(&pxlt, TuiAttachFrameKindV1::Locator, generation, commitment,),
             Ok(locator.clone())
         );
         assert_eq!(
-            decode_tui_attach_frame(
-                &pxth,
-                TuiAttachFrameKindV1::Handoff,
-                generation,
-                commitment,
-            ),
+            decode_tui_attach_frame(&pxth, TuiAttachFrameKindV1::Handoff, generation, commitment,),
             Ok(locator.clone())
         );
 
@@ -3671,24 +3648,16 @@ mod tests {
             Err(LocalProcessError::LocalTuiLocator)
         );
         assert_eq!(
-            decode_tui_attach_frame(
-                &pxlt,
-                TuiAttachFrameKindV1::Locator,
-                [0x32; 16],
-                commitment,
-            ),
+            decode_tui_attach_frame(&pxlt, TuiAttachFrameKindV1::Locator, [0x32; 16], commitment,),
             Err(LocalProcessError::LocalTuiLocator)
         );
         assert_eq!(
-            decode_tui_attach_frame(
-                &pxlt,
-                TuiAttachFrameKindV1::Locator,
-                generation,
-                [0x43; 32],
-            ),
+            decode_tui_attach_frame(&pxlt, TuiAttachFrameKindV1::Locator, generation, [0x43; 32],),
             Err(LocalProcessError::LocalTuiLocator)
         );
-        for offset in [0, 4, 6, 7, 8, 10, 12, 64, 65, 66, 80, 160, 161, 162, 176, 256] {
+        for offset in [
+            0, 4, 6, 7, 8, 10, 12, 64, 65, 66, 80, 160, 161, 162, 176, 256,
+        ] {
             let mut invalid = pxlt.clone();
             invalid[offset] ^= 1;
             assert_eq!(
@@ -4108,8 +4077,7 @@ mod tests {
         let conversation_path = directory.join("c.pxab");
         let inspection_path = directory.join("i.pxib");
         let conversation_content = vec![0x61; CONVERSATION_BOOTSTRAP_MIN_BYTES];
-        let inspection_content =
-            vec![0x62; DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES];
+        let inspection_content = vec![0x62; DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES];
         fs::write(&conversation_path, &conversation_content).expect("write PXAB fixture");
         fs::write(&inspection_path, &inspection_content).expect("write PXIB fixture");
         fs::set_permissions(&conversation_path, fs::Permissions::from_mode(0o600))

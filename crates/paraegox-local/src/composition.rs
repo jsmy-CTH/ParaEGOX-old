@@ -2580,8 +2580,8 @@ fn build_tui_attach_command(
     command
 }
 
-fn validated_tui_child_environment(
-) -> Result<Vec<(&'static str, std::ffi::OsString)>, LocalProcessError> {
+fn validated_tui_child_environment()
+-> Result<Vec<(&'static str, std::ffi::OsString)>, LocalProcessError> {
     validated_tui_child_environment_with(|name| env::var_os(name))
 }
 
@@ -2597,9 +2597,7 @@ fn validated_tui_child_environment_with(
         let Some(value) = value else {
             continue;
         };
-        let text = value
-            .to_str()
-            .ok_or(LocalProcessError::LocalTuiHandoff)?;
+        let text = value.to_str().ok_or(LocalProcessError::LocalTuiHandoff)?;
         let maximum_length = if name == "PATH" { 4_096 } else { 128 };
         if text.len() > maximum_length || text.chars().any(|value| value.is_ascii_control()) {
             return Err(LocalProcessError::LocalTuiHandoff);
@@ -2662,7 +2660,10 @@ impl TuiPresentationChildV1 {
     }
 
     fn signal(&self, signal_value: Signal) -> Result<(), LocalProcessError> {
-        let child = self.child.as_ref().ok_or(LocalProcessError::LocalTuiChild)?;
+        let child = self
+            .child
+            .as_ref()
+            .ok_or(LocalProcessError::LocalTuiChild)?;
         let pid = i32::try_from(child.id()).map_err(|_| LocalProcessError::LocalTuiChild)?;
         kill(Pid::from_raw(pid), signal_value).map_err(|_| LocalProcessError::LocalTuiChild)
     }
@@ -2682,9 +2683,7 @@ impl TuiPresentationChildV1 {
 
     fn kill_and_reap(&mut self) -> Result<(), LocalProcessError> {
         let mut child = self.child.take().ok_or(LocalProcessError::LocalTuiChild)?;
-        let killed = child
-            .kill()
-            .map_err(|_| LocalProcessError::LocalTuiChild);
+        let killed = child.kill().map_err(|_| LocalProcessError::LocalTuiChild);
         let reaped = child
             .wait()
             .map(|_| ())
@@ -2710,9 +2709,7 @@ struct SavedTuiTerminalStateV1 {
 
 impl SavedTuiTerminalStateV1 {
     fn capture() -> Result<Self, LocalProcessError> {
-        if !io::stdin().is_terminal()
-            || !io::stdout().is_terminal()
-            || !io::stderr().is_terminal()
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal()
         {
             return Err(LocalProcessError::LocalTuiTerminal);
         }
@@ -5255,7 +5252,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(actual_environment.len(), TUI_ATTACH_ALLOWED_ENVIRONMENT.len());
+        assert_eq!(
+            actual_environment.len(),
+            TUI_ATTACH_ALLOWED_ENVIRONMENT.len()
+        );
         for forbidden in [
             "OPENAI_API_KEY",
             "DEEPSEEK_API_KEY",
@@ -5317,10 +5317,7 @@ mod tests {
     fn tui_attach_private_child_statuses_map_to_one_public_taxonomy() {
         use std::os::unix::process::ExitStatusExt;
 
-        assert_eq!(
-            classify_tui_child_status(ExitStatus::from_raw(0)),
-            Ok(())
-        );
+        assert_eq!(classify_tui_child_status(ExitStatus::from_raw(0)), Ok(()));
         for (private_status, expected) in [
             (20, LocalProcessError::LocalTuiHandoff),
             (21, LocalProcessError::LocalTuiBootstrap),

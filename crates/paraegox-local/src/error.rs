@@ -394,7 +394,10 @@ mod tests {
         }
 
         for (failure, code) in [
-            (LocalProcessError::LocalTuiNotRunning, "PXLC-TUI-NOT-RUNNING"),
+            (
+                LocalProcessError::LocalTuiNotRunning,
+                "PXLC-TUI-NOT-RUNNING",
+            ),
             (LocalProcessError::LocalTuiTerminal, "PXLC-TUI-TERMINAL"),
             (LocalProcessError::LocalTuiLocator, "PXLC-TUI-LOCATOR"),
             (LocalProcessError::LocalTuiHandoff, "PXLC-TUI-HANDOFF"),
