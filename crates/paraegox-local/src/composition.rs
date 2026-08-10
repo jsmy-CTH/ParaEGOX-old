@@ -2269,11 +2269,14 @@ struct ConversationInspectionInput {
 /// no mutation or current-health authority; those remain owned by the
 /// composition above. For the deterministic profile it may carry one verified
 /// terminal deployment projection for read-only D0a queries. Implementations
-/// must not report readiness until this module calls `mark_ready`.
+/// may synchronously pin the already-created Inspection bootstrap before
+/// accepting readiness, but must not report readiness until this module calls
+/// `mark_ready`.
 pub(crate) trait HeadlessLifecycleControlV1 {
     fn mark_ready(
         &mut self,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        inspection_bootstrap_path: Option<PathBuf>,
     ) -> Result<(), LocalProcessError>;
 
     fn wait_for_shutdown(&mut self) -> Result<(), LocalProcessError>;
@@ -2336,10 +2339,16 @@ where
                 return Err::<(), LocalProcessError>(primary).and(cleanup);
             }
         };
+        let inspection_bootstrap_path = inspection_endpoint.as_ref().and_then(|_| {
+            input
+                .inspection
+                .as_ref()
+                .map(|inspection| inspection.ipc_bootstrap_path.clone())
+        });
 
         let lifecycle_result = self
             .control
-            .mark_ready(input.local_deployment_projection)
+            .mark_ready(input.local_deployment_projection, inspection_bootstrap_path)
             .and_then(|()| self.control.wait_for_shutdown());
         let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
             endpoint
@@ -4239,18 +4248,21 @@ mod tests {
         ready: bool,
         shutdown_waited: bool,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        inspection_bootstrap_path: Option<PathBuf>,
     }
 
     impl HeadlessLifecycleControlV1 for ImmediateHeadlessControl {
         fn mark_ready(
             &mut self,
             deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+            inspection_bootstrap_path: Option<PathBuf>,
         ) -> Result<(), LocalProcessError> {
             if self.ready || self.shutdown_waited {
                 return Err(LocalProcessError::LifecycleStartup);
             }
             self.ready = true;
             self.deployment = deployment;
+            self.inspection_bootstrap_path = inspection_bootstrap_path;
             Ok(())
         }
 
@@ -6030,6 +6042,13 @@ mod tests {
                 .expect("prepared provisioned headless owner");
             assert!(control.ready);
             assert!(control.shutdown_waited);
+            assert_eq!(
+                control
+                    .inspection_bootstrap_path
+                    .as_deref()
+                    .and_then(Path::file_name),
+                Some(OsStr::new("i.pxib"))
+            );
             assert_eq!(environment_reads.load(Ordering::Acquire), 1);
 
             let manifest = identity::load_or_create_provisioned(&config)

@@ -45,6 +45,8 @@ use zeroize::Zeroizing;
 const CHAT_COMMAND: &str = "chat";
 const INIT_COMMAND: &str = "init";
 const DEPLOY_COMMAND: &str = "deploy";
+const INSPECTION_COMMAND: &str = "inspection";
+const INSPECTION_SNAPSHOT_COMMAND: &str = "snapshot";
 const NODE_COMMAND: &str = "node";
 const DEPLOYMENT_COMMAND: &str = "deployment";
 const VERSION_COMMAND: &str = "version";
@@ -238,6 +240,22 @@ pub(crate) struct LocalLifecycleCommandV1 {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LocalDeployCommandV1 {
     config: LocalManagedChatConfigV1,
+}
+
+/// Parsed input for one read-only local Inspection snapshot.
+///
+/// The exact chat configuration remains the sole authority for selecting the
+/// current managed-local generation. This value carries no bootstrap path,
+/// capability token, retry policy, or lifecycle mutation authority.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct LocalInspectionSnapshotCommandV1 {
+    config: LocalManagedChatConfigV1,
+}
+
+impl LocalInspectionSnapshotCommandV1 {
+    pub(crate) fn into_config(self) -> LocalManagedChatConfigV1 {
+        self.config
+    }
 }
 
 impl LocalDeployCommandV1 {
@@ -1824,6 +1842,7 @@ pub(crate) enum ConfigError {
     InvalidInitDirectory,
     InvalidLocalDeployGrammar,
     UnsupportedLocalDeployProfile,
+    InvalidInspectionSnapshotGrammar,
     MissingStateRoot,
     MissingFabricListenA,
     MissingFabricListenB,
@@ -1907,6 +1926,7 @@ impl ConfigError {
             Self::InvalidInitDirectory => "PXLC-INIT-DIRECTORY-INVALID",
             Self::InvalidLocalDeployGrammar => "PXLC-DEPLOY-GRAMMAR",
             Self::UnsupportedLocalDeployProfile => "PXLC-DEPLOY-PROFILE-UNSUPPORTED",
+            Self::InvalidInspectionSnapshotGrammar => "PXLC-INSPECTION-GRAMMAR",
             Self::MissingStateRoot => "PXLC-STATE-ROOT-MISSING",
             Self::MissingFabricListenA => "PXLC-FABRIC-LISTEN-A-MISSING",
             Self::MissingFabricListenB => "PXLC-FABRIC-LISTEN-B-MISSING",
@@ -2007,6 +2027,9 @@ impl ConfigError {
             }
             Self::UnsupportedLocalDeployProfile => {
                 "local deploy supports only the deterministic-echo-v1 profile"
+            }
+            Self::InvalidInspectionSnapshotGrammar => {
+                "inspection snapshot requires exactly --config <absolute-paraegox.toml> --json"
             }
             Self::MissingStateRoot => "the selected DeveloperLocal mode requires --state-root",
             Self::MissingFabricListenA => "internal distributed fixture requires --fabric-listen-a",
@@ -2195,6 +2218,14 @@ pub(crate) fn local_deploy_json_intent(arguments: &[OsString]) -> bool {
         .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(DEPLOY_COMMAND))
 }
 
+/// Recognizes every invocation of the public `inspection` namespace before
+/// grammar validation so failures remain on its path-free JSON channel.
+pub(crate) fn inspection_snapshot_json_intent(arguments: &[OsString]) -> bool {
+    arguments
+        .first()
+        .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(INSPECTION_COMMAND))
+}
+
 /// Parses the one exact public initializer grammar without opening the
 /// filesystem, resolving a Secret, accessing the network, or starting an
 /// owner.
@@ -2244,6 +2275,29 @@ pub(crate) fn parse_local_deploy(
         return Err(ConfigError::UnsupportedLocalDeployProfile);
     }
     Ok(Some(LocalDeployCommandV1 { config }))
+}
+
+/// Parses the sole public local Inspection grammar without resolving a
+/// Secret, starting or stopping an owner, or touching lifecycle/domain state.
+pub(crate) fn parse_inspection_snapshot(
+    arguments: &[OsString],
+) -> Result<LocalInspectionSnapshotCommandV1, ConfigError> {
+    if !inspection_snapshot_json_intent(arguments)
+        || arguments.len() != 5
+        || arguments.get(1).and_then(|value| value.to_str()) != Some(INSPECTION_SNAPSHOT_COMMAND)
+        || arguments.get(2).and_then(|value| value.to_str()) != Some(CONFIG_OPTION)
+        || arguments.get(4).and_then(|value| value.to_str()) != Some(JSON_OPTION)
+    {
+        return Err(ConfigError::InvalidInspectionSnapshotGrammar);
+    }
+    ensure_unix_developer_local()?;
+    let config = parse_managed_chat_config_file(
+        arguments
+            .get(3)
+            .cloned()
+            .ok_or(ConfigError::InvalidInspectionSnapshotGrammar)?,
+    )?;
+    Ok(LocalInspectionSnapshotCommandV1 { config })
 }
 
 /// Parses one public managed-local lifecycle command without starting owners.
@@ -4233,6 +4287,16 @@ limits_profile = "developer-agent-bootstrap-v1"
         ]
     }
 
+    fn inspection_snapshot_arguments(config_path: OsString) -> Vec<OsString> {
+        vec![
+            OsString::from(INSPECTION_COMMAND),
+            OsString::from(INSPECTION_SNAPSHOT_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            config_path,
+            OsString::from(JSON_OPTION),
+        ]
+    }
+
     #[cfg(unix)]
     fn unresolved_deployment_document(root: &Path) -> String {
         let root = root.to_str().expect("UTF-8 unresolved Deployment root");
@@ -5457,6 +5521,63 @@ client_private_key_file = "{root}/node/controller-key.pem"
                 config.into_owner_config(),
                 LocalManagedChatOwnerConfigV1::Fixture(_)
             ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_snapshot_requires_exact_grammar_and_absolute_config() {
+        let chat = valid_arguments();
+        let config_path = chat[2].clone();
+        let arguments = inspection_snapshot_arguments(config_path.clone());
+        assert!(inspection_snapshot_json_intent(&arguments));
+        let command = parse_inspection_snapshot(&arguments).expect("Inspection command");
+        let config = command.into_config();
+        assert_eq!(config.source_path(), Path::new(&config_path));
+        assert_eq!(config.state_root(), Path::new("/tmp/paraegox-local-test"));
+        assert_ne!(config.config_commitment(), [0; 32]);
+
+        let relative = inspection_snapshot_arguments(OsString::from("paraegox.toml"));
+        assert_eq!(
+            parse_inspection_snapshot(&relative),
+            Err(ConfigError::InvalidConfigPath)
+        );
+
+        for malformed in [
+            vec![
+                OsString::from(INSPECTION_COMMAND),
+                OsString::from(INSPECTION_SNAPSHOT_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+            ],
+            vec![
+                OsString::from(INSPECTION_COMMAND),
+                OsString::from(INSPECTION_SNAPSHOT_COMMAND),
+                OsString::from(JSON_OPTION),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+            ],
+            vec![
+                OsString::from(INSPECTION_COMMAND),
+                OsString::from("watch"),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+                OsString::from(JSON_OPTION),
+            ],
+            vec![
+                OsString::from(INSPECTION_COMMAND),
+                OsString::from(INSPECTION_SNAPSHOT_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                config_path,
+                OsString::from(JSON_OPTION),
+                OsString::from("--retry"),
+            ],
+        ] {
+            assert!(inspection_snapshot_json_intent(&malformed));
+            assert_eq!(
+                parse_inspection_snapshot(&malformed),
+                Err(ConfigError::InvalidInspectionSnapshotGrammar)
+            );
         }
     }
 

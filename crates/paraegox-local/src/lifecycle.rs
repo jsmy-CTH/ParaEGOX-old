@@ -19,7 +19,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use nix::unistd::{Gid, Uid, chown, setsid};
+use paraegox_inspection::developer_local::{
+    DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES,
+    MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -52,6 +57,11 @@ const RECORD_SCHEMA_VERSION: u16 = 1;
 const INTERNAL_PROTOCOL_VERSION: u8 = 1;
 const INTERNAL_REQUEST_BYTES: usize = 38;
 const INTERNAL_DEPLOY_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
+const INTERNAL_INSPECTION_LOCATOR_QUERY_BYTES: usize = INTERNAL_REQUEST_BYTES + 16;
+const INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES: usize = 160;
+const MAX_INSPECTION_LOCATOR_PATH_BYTES: usize = 4_096;
+const MAX_INSPECTION_LOCATOR_RESPONSE_BYTES: usize =
+    INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES + MAX_INSPECTION_LOCATOR_PATH_BYTES;
 const MAX_RECORD_BYTES: u64 = 4 * 1024;
 const MAX_INTERNAL_RESPONSE_BYTES: usize = 4 * 1024;
 const MAX_DOWN_WAITERS: usize = 16;
@@ -64,6 +74,11 @@ const START_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONCURRENT_DIRECTORY_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
 const LOCAL_OWNER_STACK_BYTES: usize = 16 * 1024 * 1024;
 const INTERNAL_MAGIC: [u8; 4] = *b"PXLO";
+const INSPECTION_LOCATOR_RESPONSE_MAGIC: [u8; 4] = *b"PXIL";
+const INSPECTION_LOCATOR_RESPONSE_VERSION: u16 = 1;
+const INSPECTION_LOCATOR_READY_OUTCOME: u8 = b'R';
+const INSPECTION_LOCATOR_RESPONSE_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.local.inspection-locator-response.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -384,6 +399,7 @@ enum InternalActionV1 {
     Status,
     Down,
     Deploy,
+    Inspection,
 }
 
 impl InternalActionV1 {
@@ -392,6 +408,7 @@ impl InternalActionV1 {
             Self::Status => b'S',
             Self::Down => b'D',
             Self::Deploy => b'P',
+            Self::Inspection => b'I',
         }
     }
 
@@ -400,6 +417,7 @@ impl InternalActionV1 {
             b'S' => Some(Self::Status),
             b'D' => Some(Self::Down),
             b'P' => Some(Self::Deploy),
+            b'I' => Some(Self::Inspection),
             _ => None,
         }
     }
@@ -409,6 +427,66 @@ impl InternalActionV1 {
 struct InternalRequestV1 {
     action: InternalActionV1,
     expected_generation: Option<[u8; 16]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InternalInspectionLocatorResponseV1 {
+    generation: [u8; 16],
+    config_commitment: [u8; 32],
+    locator: LocalInspectionBootstrapLocatorV1,
+}
+
+/// Exact PXIB file generation pinned by the current lifecycle supervisor.
+///
+/// This is transient request evidence only. It is never persisted or projected
+/// into public JSON, and the consumer must verify every field before decoding
+/// the owner-private bootstrap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalInspectionBootstrapLocatorV1 {
+    path: PathBuf,
+    content_length: u32,
+    content_sha256: [u8; 32],
+    device: u64,
+    inode: u64,
+}
+
+impl LocalInspectionBootstrapLocatorV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        path: PathBuf,
+        content_length: u32,
+        content_sha256: [u8; 32],
+        device: u64,
+        inode: u64,
+    ) -> Self {
+        Self {
+            path,
+            content_length,
+            content_sha256,
+            device,
+            inode,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) const fn content_length(&self) -> u32 {
+        self.content_length
+    }
+
+    pub(crate) const fn content_sha256(&self) -> [u8; 32] {
+        self.content_sha256
+    }
+
+    pub(crate) const fn device(&self) -> u64 {
+        self.device
+    }
+
+    pub(crate) const fn inode(&self) -> u64 {
+        self.inode
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -508,9 +586,17 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
     fn mark_ready(
         &mut self,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        inspection_bootstrap_path: Option<PathBuf>,
     ) -> Result<(), LocalProcessError> {
+        let inspection_bootstrap_locator = inspection_bootstrap_path
+            .as_deref()
+            .map(capture_inspection_bootstrap_locator)
+            .transpose()?;
         self.events
-            .send(SupervisorEventV1::Ready(deployment))
+            .send(SupervisorEventV1::Ready {
+                deployment,
+                inspection_bootstrap_locator,
+            })
             .map_err(|_| LocalProcessError::LifecycleControl)
     }
 
@@ -522,7 +608,10 @@ impl HeadlessLifecycleControlV1 for HeadlessControlV1 {
 }
 
 enum SupervisorEventV1 {
-    Ready(Option<VerifiedLocalDeploymentProjectionV1>),
+    Ready {
+        deployment: Option<VerifiedLocalDeploymentProjectionV1>,
+        inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
+    },
     Exited(Result<(), LocalProcessError>),
 }
 
@@ -718,6 +807,43 @@ pub(crate) fn run_down(
             }
         }
         Err(error) => config_drift_after_control_failure(config, error),
+    }
+}
+
+/// Resolves the owner-private PXIB locator for exactly the current Running
+/// generation. This performs one read-only lifecycle status observation and
+/// one generation-bound locator query; it never starts, recovers, or retries an
+/// owner.
+pub(crate) fn locate_local_inspection_bootstrap(
+    config: &LocalManagedChatConfigV1,
+) -> Result<LocalInspectionBootstrapLocatorV1, LocalProcessError> {
+    validate_execution_identity()?;
+    let status = observe(config)?;
+    if status.diagnostic().is_some_and(|diagnostic| {
+        diagnostic.code() == LocalProcessError::LifecycleConfiguration.code()
+    }) {
+        return Err(LocalProcessError::LifecycleConfiguration);
+    }
+    if !status.ok()
+        || status.state() != LocalLifecycleStateV1::Running
+        || !status.owner_readiness_observed()
+    {
+        return Err(LocalProcessError::LocalInspectionNotRunning);
+    }
+    let generation = status
+        .generation()
+        .ok_or(LocalProcessError::LocalInspectionLocator)?;
+    let expected_generation =
+        decode_generation(generation).map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    match query_local_inspection_locator(config, expected_generation) {
+        Ok(response) => Ok(response.locator),
+        Err(error) => match config_authority_drift(config) {
+            Ok(Some(_)) => Err(LocalProcessError::LifecycleConfiguration),
+            Ok(None) if error == LocalProcessError::LifecycleConfiguration => {
+                Err(LocalProcessError::LifecycleConfiguration)
+            }
+            Ok(None) | Err(_) => Err(LocalProcessError::LocalInspectionLocator),
+        },
     }
 }
 
@@ -1075,6 +1201,7 @@ async fn supervise(
     let mut stopping = false;
     let mut failure = None;
     let mut deployment_projection = None;
+    let mut inspection_bootstrap_locator = None;
 
     loop {
         tokio::select! {
@@ -1125,16 +1252,41 @@ async fn supervise(
                         };
                         let _ = write_internal_deploy_response(&mut stream, &response).await;
                     }
+                    InternalActionV1::Inspection => {
+                        let Some(expected_generation) = request.expected_generation else {
+                            continue;
+                        };
+                        let Some(response) = inspection_locator_response_for_request(
+                            record,
+                            stopping,
+                            expected_generation,
+                            commitment,
+                            inspection_bootstrap_locator.as_ref(),
+                        ) else {
+                            continue;
+                        };
+                        let _ = write_internal_inspection_locator_response(&mut stream, &response)
+                            .await;
+                    }
                 }
             }
             event = events.recv() => {
                 match event {
-                    Some(SupervisorEventV1::Ready(deployment)) => {
+                    Some(SupervisorEventV1::Ready {
+                        deployment,
+                        inspection_bootstrap_locator: ready_inspection_bootstrap_locator,
+                    }) => {
                         // Readiness is a monotonic historical latch even when
                         // shutdown won the race. Keep Stopping, but durably
                         // remember that this generation crossed the boundary.
-                        deployment_projection = deployment;
-                        apply_ready_observation(record, stopping);
+                        apply_supervisor_ready_event(
+                            record,
+                            stopping,
+                            &mut deployment_projection,
+                            &mut inspection_bootstrap_locator,
+                            deployment,
+                            ready_inspection_bootstrap_locator,
+                        );
                         publish_record(paths, record)?;
                     }
                     Some(SupervisorEventV1::Exited(owner_result)) => {
@@ -1190,6 +1342,21 @@ async fn supervise(
     }
 }
 
+fn apply_supervisor_ready_event(
+    record: &mut LifecycleRecordV1,
+    stopping: bool,
+    deployment_projection: &mut Option<VerifiedLocalDeploymentProjectionV1>,
+    inspection_bootstrap_locator: &mut Option<LocalInspectionBootstrapLocatorV1>,
+    ready_deployment_projection: Option<VerifiedLocalDeploymentProjectionV1>,
+    ready_inspection_bootstrap_locator: Option<LocalInspectionBootstrapLocatorV1>,
+) {
+    *deployment_projection = ready_deployment_projection;
+    if !stopping {
+        *inspection_bootstrap_locator = ready_inspection_bootstrap_locator;
+    }
+    apply_ready_observation(record, stopping);
+}
+
 fn apply_ready_observation(record: &mut LifecycleRecordV1, stopping: bool) {
     if !stopping {
         record.state = LocalLifecycleStateV1::Running;
@@ -1212,6 +1379,115 @@ fn deployment_response_for_request(
     }
     projection
         .map(|projection| InternalDeployResponseV1::from_verified(&record.generation, projection))
+}
+
+fn inspection_locator_response_for_request(
+    record: &LifecycleRecordV1,
+    stopping: bool,
+    expected_generation: [u8; 16],
+    config_commitment: [u8; 32],
+    locator: Option<&LocalInspectionBootstrapLocatorV1>,
+) -> Option<Vec<u8>> {
+    if stopping
+        || record.state != LocalLifecycleStateV1::Running
+        || !record.owner_readiness_observed
+        || decode_generation(&record.generation).ok()? != expected_generation
+        || decode_lower_hex_32(&record.config_commitment).ok()? != config_commitment
+    {
+        return None;
+    }
+    encode_internal_inspection_locator_response(&InternalInspectionLocatorResponseV1 {
+        generation: expected_generation,
+        config_commitment,
+        locator: locator?.clone(),
+    })
+    .ok()
+}
+
+fn capture_inspection_bootstrap_locator(
+    path: &Path,
+) -> Result<LocalInspectionBootstrapLocatorV1, LocalProcessError> {
+    let path_bytes = path
+        .to_str()
+        .ok_or(LocalProcessError::LifecycleStartup)?
+        .as_bytes();
+    if !is_lexically_absolute_file(path)
+        || path_bytes.is_empty()
+        || path_bytes.len() > MAX_INSPECTION_LOCATOR_PATH_BYTES
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let expected_uid = Uid::effective().as_raw();
+    let expected_gid = Gid::effective().as_raw();
+    let before = fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_inspection_bootstrap_metadata(&before, expected_uid, expected_gid)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let after = fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_inspection_bootstrap_metadata(&opened, expected_uid, expected_gid)?;
+    validate_inspection_bootstrap_metadata(&after, expected_uid, expected_gid)?;
+    if before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let content_length =
+        usize::try_from(opened.len()).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    if !(DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES
+        ..=MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES)
+        .contains(&content_length)
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    let read_limit = u64::try_from(MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES + 1)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let mut content = Vec::with_capacity(content_length);
+    (&file)
+        .take(read_limit)
+        .read_to_end(&mut content)
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let final_metadata =
+        fs::symlink_metadata(path).map_err(|_| LocalProcessError::LifecycleStartup)?;
+    validate_inspection_bootstrap_metadata(&final_metadata, expected_uid, expected_gid)?;
+    if content.len() != content_length
+        || final_metadata.dev() != opened.dev()
+        || final_metadata.ino() != opened.ino()
+        || final_metadata.len() != opened.len()
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    Ok(LocalInspectionBootstrapLocatorV1 {
+        path: path.to_path_buf(),
+        content_length: u32::try_from(content_length)
+            .map_err(|_| LocalProcessError::LifecycleStartup)?,
+        content_sha256: Sha256::digest(&content).into(),
+        device: opened.dev(),
+        inode: opened.ino(),
+    })
+}
+
+fn validate_inspection_bootstrap_metadata(
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), LocalProcessError> {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_gid
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(LocalProcessError::LifecycleStartup);
+    }
+    Ok(())
 }
 
 async fn sleep_until_deadline(deadline: Instant) {
@@ -1628,6 +1904,67 @@ async fn query_local_deployment_async(
     serde_json::from_slice(&response).map_err(|_| LocalProcessError::LocalDeployEvidence)
 }
 
+fn query_local_inspection_locator(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<InternalInspectionLocatorResponseV1, LocalProcessError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    runtime.block_on(query_local_inspection_locator_async(
+        config,
+        expected_generation,
+    ))
+}
+
+async fn query_local_inspection_locator_async(
+    config: &LocalManagedChatConfigV1,
+    expected_generation: [u8; 16],
+) -> Result<InternalInspectionLocatorResponseV1, LocalProcessError> {
+    let paths = LifecyclePathsV1::from_state_root(config.state_root())
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let mut stream = timeout(CLIENT_IO_TIMEOUT, UnixStream::connect(&paths.socket))
+        .await
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let credentials = stream
+        .peer_cred()
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    if credentials.uid() != Uid::effective().as_raw()
+        || credentials.gid() != Gid::effective().as_raw()
+    {
+        return Err(LocalProcessError::LocalInspectionLocator);
+    }
+    let request =
+        encode_internal_inspection_locator_query(config.config_commitment(), expected_generation);
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(&request))
+        .await
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let mut response = Vec::new();
+    let response_limit = u64::try_from(MAX_INSPECTION_LOCATOR_RESPONSE_BYTES + 1)
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    timeout(
+        CLIENT_IO_TIMEOUT,
+        (&mut stream)
+            .take(response_limit)
+            .read_to_end(&mut response),
+    )
+    .await
+    .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+    .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    decode_internal_inspection_locator_response(
+        &response,
+        expected_generation,
+        config.config_commitment(),
+    )
+}
+
 fn encode_internal_request(action: InternalActionV1, commitment: [u8; 32]) -> [u8; 38] {
     let mut request = [0_u8; INTERNAL_REQUEST_BYTES];
     request[..4].copy_from_slice(&INTERNAL_MAGIC);
@@ -1650,6 +1987,207 @@ fn encode_internal_deploy_query(
     request
 }
 
+fn encode_internal_inspection_locator_query(
+    commitment: [u8; 32],
+    expected_generation: [u8; 16],
+) -> [u8; INTERNAL_INSPECTION_LOCATOR_QUERY_BYTES] {
+    let mut request = [0_u8; INTERNAL_INSPECTION_LOCATOR_QUERY_BYTES];
+    request[..INTERNAL_REQUEST_BYTES].copy_from_slice(&encode_internal_request(
+        InternalActionV1::Inspection,
+        commitment,
+    ));
+    request[INTERNAL_REQUEST_BYTES..].copy_from_slice(&expected_generation);
+    request
+}
+
+fn encode_internal_inspection_locator_response(
+    response: &InternalInspectionLocatorResponseV1,
+) -> Result<Vec<u8>, LocalProcessError> {
+    let path = response
+        .locator
+        .path
+        .to_str()
+        .ok_or(LocalProcessError::LocalInspectionLocator)?
+        .as_bytes();
+    if response.generation.iter().all(|byte| *byte == 0)
+        || response.config_commitment.iter().all(|byte| *byte == 0)
+        || response
+            .locator
+            .content_sha256
+            .iter()
+            .all(|byte| *byte == 0)
+        || !(u32::try_from(DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES)
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+            ..=u32::try_from(MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES)
+                .map_err(|_| LocalProcessError::LocalInspectionLocator)?)
+            .contains(&response.locator.content_length)
+        || !is_lexically_absolute_file(&response.locator.path)
+        || path.is_empty()
+        || path.len() > MAX_INSPECTION_LOCATOR_PATH_BYTES
+    {
+        return Err(LocalProcessError::LocalInspectionLocator);
+    }
+    let frame_length = INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES
+        .checked_add(path.len())
+        .ok_or(LocalProcessError::LocalInspectionLocator)?;
+    let mut frame = vec![0_u8; frame_length];
+    frame[..4].copy_from_slice(&INSPECTION_LOCATOR_RESPONSE_MAGIC);
+    frame[4..6].copy_from_slice(&INSPECTION_LOCATOR_RESPONSE_VERSION.to_be_bytes());
+    frame[6] = InternalActionV1::Inspection.wire();
+    frame[7] = INSPECTION_LOCATOR_READY_OUTCOME;
+    frame[8..10].copy_from_slice(
+        &u16::try_from(INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES)
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+            .to_be_bytes(),
+    );
+    frame[12..16].copy_from_slice(
+        &u32::try_from(frame_length)
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+            .to_be_bytes(),
+    );
+    frame[16..20].copy_from_slice(
+        &u32::try_from(path.len())
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+            .to_be_bytes(),
+    );
+    frame[20..24].copy_from_slice(&response.locator.content_length.to_be_bytes());
+    frame[24..40].copy_from_slice(&response.generation);
+    frame[40..72].copy_from_slice(&response.config_commitment);
+    frame[72..104].copy_from_slice(&response.locator.content_sha256);
+    frame[104..112].copy_from_slice(&response.locator.device.to_be_bytes());
+    frame[112..120].copy_from_slice(&response.locator.inode.to_be_bytes());
+    frame[INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES..].copy_from_slice(path);
+    let digest = inspection_locator_response_digest(
+        &frame[..128],
+        &frame[INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES..],
+    );
+    frame[128..INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES].copy_from_slice(&digest);
+    Ok(frame)
+}
+
+fn decode_internal_inspection_locator_response(
+    frame: &[u8],
+    expected_generation: [u8; 16],
+    expected_config_commitment: [u8; 32],
+) -> Result<InternalInspectionLocatorResponseV1, LocalProcessError> {
+    if frame.len() < INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES
+        || frame.len() > MAX_INSPECTION_LOCATOR_RESPONSE_BYTES
+        || frame[..4] != INSPECTION_LOCATOR_RESPONSE_MAGIC
+        || u16::from_be_bytes([frame[4], frame[5]]) != INSPECTION_LOCATOR_RESPONSE_VERSION
+        || frame[6] != InternalActionV1::Inspection.wire()
+        || frame[7] != INSPECTION_LOCATOR_READY_OUTCOME
+        || usize::from(u16::from_be_bytes([frame[8], frame[9]]))
+            != INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES
+        || frame[10..12].iter().any(|byte| *byte != 0)
+        || frame[120..128].iter().any(|byte| *byte != 0)
+    {
+        return Err(LocalProcessError::LocalInspectionLocator);
+    }
+    let frame_length = usize::try_from(u32::from_be_bytes(
+        frame[12..16]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?,
+    ))
+    .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let path_length = usize::try_from(u32::from_be_bytes(
+        frame[16..20]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?,
+    ))
+    .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let content_length = u32::from_be_bytes(
+        frame[20..24]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?,
+    );
+    if frame_length != frame.len()
+        || !(1..=MAX_INSPECTION_LOCATOR_PATH_BYTES).contains(&path_length)
+        || INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES.checked_add(path_length) != Some(frame.len())
+        || !(u32::try_from(DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES)
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?
+            ..=u32::try_from(MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES)
+                .map_err(|_| LocalProcessError::LocalInspectionLocator)?)
+            .contains(&content_length)
+    {
+        return Err(LocalProcessError::LocalInspectionLocator);
+    }
+    let generation: [u8; 16] = frame[24..40]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let config_commitment: [u8; 32] = frame[40..72]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let content_sha256: [u8; 32] = frame[72..104]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let device = u64::from_be_bytes(
+        frame[104..112]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?,
+    );
+    let inode = u64::from_be_bytes(
+        frame[112..120]
+            .try_into()
+            .map_err(|_| LocalProcessError::LocalInspectionLocator)?,
+    );
+    let declared_digest: [u8; 32] = frame[128..INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES]
+        .try_into()
+        .map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let path = &frame[INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES..];
+    if generation != expected_generation
+        || config_commitment != expected_config_commitment
+        || content_sha256.iter().all(|byte| *byte == 0)
+        || declared_digest != inspection_locator_response_digest(&frame[..128], path)
+    {
+        return Err(LocalProcessError::LocalInspectionLocator);
+    }
+    let path = std::str::from_utf8(path).map_err(|_| LocalProcessError::LocalInspectionLocator)?;
+    let response = InternalInspectionLocatorResponseV1 {
+        generation,
+        config_commitment,
+        locator: LocalInspectionBootstrapLocatorV1 {
+            path: PathBuf::from(path),
+            content_length,
+            content_sha256,
+            device,
+            inode,
+        },
+    };
+    if !is_lexically_absolute_file(&response.locator.path)
+        || encode_internal_inspection_locator_response(&response)?.as_slice() != frame
+    {
+        return Err(LocalProcessError::LocalInspectionLocator);
+    }
+    Ok(response)
+}
+
+fn inspection_locator_response_digest(prefix: &[u8], path: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(INSPECTION_LOCATOR_RESPONSE_DIGEST_DOMAIN);
+    digest.update(prefix);
+    digest.update(path);
+    digest.finalize().into()
+}
+
+fn is_lexically_absolute_file(path: &Path) -> bool {
+    if !path.is_absolute() || path.file_name().is_none() || path.as_os_str().as_bytes().contains(&0)
+    {
+        return false;
+    }
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return false;
+    }
+    let mut canonical = PathBuf::from("/");
+    for component in components {
+        let Component::Normal(value) = component else {
+            return false;
+        };
+        canonical.push(value);
+    }
+    canonical.as_os_str().as_bytes() == path.as_os_str().as_bytes()
+}
+
 async fn read_internal_request(
     stream: &mut UnixStream,
     expected_commitment: [u8; 32],
@@ -1666,7 +2204,10 @@ async fn read_internal_request(
         return Err(LocalProcessError::LifecycleConfiguration);
     }
     let action = InternalActionV1::decode(request[5]).ok_or(LocalProcessError::LifecycleControl)?;
-    let expected_generation = if action == InternalActionV1::Deploy {
+    let expected_generation = if matches!(
+        action,
+        InternalActionV1::Deploy | InternalActionV1::Inspection
+    ) {
         let mut generation = [0_u8; 16];
         timeout(CLIENT_IO_TIMEOUT, stream.read_exact(&mut generation))
             .await
@@ -1679,6 +2220,15 @@ async fn read_internal_request(
     } else {
         None
     };
+    let mut trailing = [0_u8; 1];
+    if timeout(CLIENT_IO_TIMEOUT, stream.read(&mut trailing))
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)?
+        .map_err(|_| LocalProcessError::LifecycleControl)?
+        != 0
+    {
+        return Err(LocalProcessError::LifecycleControl);
+    }
     Ok(InternalRequestV1 {
         action,
         expected_generation,
@@ -1712,6 +2262,25 @@ async fn write_internal_deploy_response(
         return Err(LocalProcessError::LifecycleControl);
     }
     timeout(CLIENT_IO_TIMEOUT, stream.write_all(&wire))
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)?
+        .map_err(|_| LocalProcessError::LifecycleControl)?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|_| LocalProcessError::LifecycleControl)
+}
+
+async fn write_internal_inspection_locator_response(
+    stream: &mut UnixStream,
+    response: &[u8],
+) -> Result<(), LocalProcessError> {
+    if response.len() < INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES
+        || response.len() > MAX_INSPECTION_LOCATOR_RESPONSE_BYTES
+    {
+        return Err(LocalProcessError::LifecycleControl);
+    }
+    timeout(CLIENT_IO_TIMEOUT, stream.write_all(response))
         .await
         .map_err(|_| LocalProcessError::LifecycleControl)?
         .map_err(|_| LocalProcessError::LifecycleControl)?;
@@ -2188,6 +2757,344 @@ mod tests {
         assert_eq!(deploy[5], b'P');
         assert_eq!(&deploy[6..INTERNAL_REQUEST_BYTES], &commitment);
         assert_eq!(&deploy[INTERNAL_REQUEST_BYTES..], &expected_generation);
+    }
+
+    #[test]
+    fn inspection_locator_frame_is_strict_generation_and_config_bound() {
+        let generation = [0x31; 16];
+        let commitment = [0x42; 32];
+        let query = encode_internal_inspection_locator_query(commitment, generation);
+        assert_eq!(query.len(), 54);
+        assert_eq!(&query[..4], b"PXLO");
+        assert_eq!(query[4], 1);
+        assert_eq!(query[5], b'I');
+        assert_eq!(&query[6..38], &commitment);
+        assert_eq!(&query[38..54], &generation);
+
+        let locator = LocalInspectionBootstrapLocatorV1 {
+            path: PathBuf::from("/private/tmp/paraegox-m3a/i.pxib"),
+            content_length: u32::try_from(DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES)
+                .expect("PXIB header length"),
+            content_sha256: [0x53; 32],
+            device: 0x0102_0304_0506_0708,
+            inode: 0x1112_1314_1516_1718,
+        };
+        let response = InternalInspectionLocatorResponseV1 {
+            generation,
+            config_commitment: commitment,
+            locator: locator.clone(),
+        };
+        let frame = encode_internal_inspection_locator_response(&response)
+            .expect("canonical Inspection locator response");
+        let path = locator.path().to_str().expect("UTF-8 locator path");
+        assert_eq!(frame.len(), 160 + path.len());
+        assert_eq!(&frame[..4], b"PXIL");
+        assert_eq!(u16::from_be_bytes([frame[4], frame[5]]), 1);
+        assert_eq!(frame[6], b'I');
+        assert_eq!(frame[7], b'R');
+        assert_eq!(u16::from_be_bytes([frame[8], frame[9]]), 160);
+        assert_eq!(&frame[10..12], &[0_u8; 2]);
+        assert_eq!(
+            u32::from_be_bytes(frame[12..16].try_into().expect("frame length")),
+            u32::try_from(frame.len()).expect("bounded frame length")
+        );
+        assert_eq!(
+            u32::from_be_bytes(frame[16..20].try_into().expect("path length")),
+            u32::try_from(path.len()).expect("bounded path length")
+        );
+        assert_eq!(
+            u32::from_be_bytes(frame[20..24].try_into().expect("content length")),
+            locator.content_length()
+        );
+        assert_eq!(&frame[24..40], &generation);
+        assert_eq!(&frame[40..72], &commitment);
+        assert_eq!(&frame[72..104], &locator.content_sha256());
+        assert_eq!(
+            u64::from_be_bytes(frame[104..112].try_into().expect("device")),
+            locator.device()
+        );
+        assert_eq!(
+            u64::from_be_bytes(frame[112..120].try_into().expect("inode")),
+            locator.inode()
+        );
+        assert_eq!(&frame[120..128], &[0_u8; 8]);
+        assert_eq!(&frame[160..], path.as_bytes());
+        assert_eq!(
+            decode_internal_inspection_locator_response(&frame, generation, commitment),
+            Ok(response.clone())
+        );
+
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_internal_inspection_locator_response(&trailing, generation, commitment),
+            Err(LocalProcessError::LocalInspectionLocator)
+        );
+        assert_eq!(
+            decode_internal_inspection_locator_response(&frame, [0x32; 16], commitment),
+            Err(LocalProcessError::LocalInspectionLocator)
+        );
+        assert_eq!(
+            decode_internal_inspection_locator_response(&frame, generation, [0x43; 32]),
+            Err(LocalProcessError::LocalInspectionLocator)
+        );
+        let mut tampered = frame.clone();
+        tampered[72] ^= 1;
+        assert_eq!(
+            decode_internal_inspection_locator_response(&tampered, generation, commitment),
+            Err(LocalProcessError::LocalInspectionLocator)
+        );
+        for offset in [0, 4, 6, 7, 8, 10, 120, 128] {
+            let mut invalid = frame.clone();
+            invalid[offset] ^= 1;
+            assert_eq!(
+                decode_internal_inspection_locator_response(&invalid, generation, commitment),
+                Err(LocalProcessError::LocalInspectionLocator),
+                "unexpectedly accepted locator mutation at offset {offset}"
+            );
+        }
+
+        let mut invalid_utf8 = frame.clone();
+        let last = invalid_utf8.len() - 1;
+        invalid_utf8[last] = 0xff;
+        let digest = inspection_locator_response_digest(
+            &invalid_utf8[..128],
+            &invalid_utf8[INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES..],
+        );
+        invalid_utf8[128..INSPECTION_LOCATOR_RESPONSE_HEADER_BYTES].copy_from_slice(&digest);
+        assert_eq!(
+            decode_internal_inspection_locator_response(&invalid_utf8, generation, commitment),
+            Err(LocalProcessError::LocalInspectionLocator)
+        );
+
+        for invalid_path in [
+            PathBuf::from("relative/i.pxib"),
+            PathBuf::from("/private/tmp/../tmp/i.pxib"),
+            PathBuf::from("/private//tmp/i.pxib"),
+            PathBuf::from("/private/tmp/i.pxib/"),
+            PathBuf::from("/private/tmp/i\0.pxib"),
+        ] {
+            let mut invalid = response.clone();
+            invalid.locator.path = invalid_path;
+            assert_eq!(
+                encode_internal_inspection_locator_response(&invalid),
+                Err(LocalProcessError::LocalInspectionLocator)
+            );
+        }
+
+        let maximum_path = format!("/{}", "a".repeat(MAX_INSPECTION_LOCATOR_PATH_BYTES - 1));
+        let mut maximum = response.clone();
+        maximum.locator.path = PathBuf::from(maximum_path);
+        let maximum_frame = encode_internal_inspection_locator_response(&maximum)
+            .expect("maximum locator path frame");
+        assert_eq!(maximum_frame.len(), MAX_INSPECTION_LOCATOR_RESPONSE_BYTES);
+        assert_eq!(
+            decode_internal_inspection_locator_response(&maximum_frame, generation, commitment,),
+            Ok(maximum)
+        );
+        let mut oversized = response.clone();
+        oversized.locator.path = PathBuf::from(format!(
+            "/{}",
+            "a".repeat(MAX_INSPECTION_LOCATOR_PATH_BYTES)
+        ));
+        assert_eq!(
+            encode_internal_inspection_locator_response(&oversized),
+            Err(LocalProcessError::LocalInspectionLocator)
+        );
+
+        let record = LifecycleRecordV1 {
+            schema_version: RECORD_SCHEMA_VERSION,
+            config_commitment: lower_hex(&commitment).into_boxed_str(),
+            generation: lower_hex(&generation).into_boxed_str(),
+            state: LocalLifecycleStateV1::Running,
+            owner_readiness_observed: true,
+        };
+        assert_eq!(
+            inspection_locator_response_for_request(
+                &record,
+                false,
+                generation,
+                commitment,
+                Some(&locator),
+            ),
+            Some(frame)
+        );
+        assert!(
+            inspection_locator_response_for_request(
+                &record,
+                true,
+                generation,
+                commitment,
+                Some(&locator),
+            )
+            .is_none()
+        );
+        assert!(
+            inspection_locator_response_for_request(
+                &record,
+                false,
+                [0x32; 16],
+                commitment,
+                Some(&locator),
+            )
+            .is_none()
+        );
+        assert!(
+            inspection_locator_response_for_request(
+                &record,
+                false,
+                generation,
+                [0x43; 32],
+                Some(&locator),
+            )
+            .is_none()
+        );
+
+        let source = include_str!("lifecycle.rs");
+        let locator_read = source
+            .split("pub(crate) fn locate_local_inspection_bootstrap(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn run_local_deploy(").next())
+            .expect("bounded locator read source");
+        assert_eq!(
+            locator_read
+                .matches("query_local_inspection_locator(")
+                .count(),
+            1
+        );
+        assert!(!locator_read.contains("run_up("));
+        assert!(!locator_read.contains("loop {"));
+        assert!(!locator_read.contains("retry"));
+    }
+
+    #[test]
+    fn inspection_ready_pin_precedes_event_and_down_wins_queued_ready_cleanly() {
+        let locator = LocalInspectionBootstrapLocatorV1 {
+            path: PathBuf::from("/private/tmp/paraegox-m3a/i.pxib"),
+            content_length: u32::try_from(DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES)
+                .expect("PXIB header length"),
+            content_sha256: [0x61; 32],
+            device: 7,
+            inode: 11,
+        };
+        let mut record = LifecycleRecordV1 {
+            schema_version: RECORD_SCHEMA_VERSION,
+            config_commitment: lower_hex(&[0x62; 32]).into_boxed_str(),
+            generation: lower_hex(&[0x63; 16]).into_boxed_str(),
+            state: LocalLifecycleStateV1::Stopping,
+            owner_readiness_observed: false,
+        };
+        let mut deployment = None;
+        let mut cached_locator = None;
+        apply_supervisor_ready_event(
+            &mut record,
+            true,
+            &mut deployment,
+            &mut cached_locator,
+            None,
+            Some(locator),
+        );
+        assert_eq!(record.state, LocalLifecycleStateV1::Stopping);
+        assert!(record.owner_readiness_observed);
+        assert!(cached_locator.is_none());
+        assert!(
+            inspection_locator_response_for_request(
+                &record,
+                true,
+                [0x63; 16],
+                [0x62; 32],
+                cached_locator.as_ref(),
+            )
+            .is_none()
+        );
+
+        let source = include_str!("lifecycle.rs");
+        let ready = source
+            .split("impl HeadlessLifecycleControlV1 for HeadlessControlV1")
+            .nth(1)
+            .and_then(|tail| tail.split("enum SupervisorEventV1").next())
+            .expect("bounded headless ready source");
+        let capture = ready
+            .find("capture_inspection_bootstrap_locator")
+            .expect("PXIB pin capture");
+        let send = ready
+            .find(".send(SupervisorEventV1::Ready")
+            .expect("Ready send");
+        assert!(capture < send);
+    }
+
+    #[test]
+    fn inspection_ready_pin_rejects_unsafe_or_replaced_pxib_files() {
+        let parent = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+        let directory = parent.join(format!(
+            "paraegox-inspection-pin-test-{}",
+            new_generation().expect("unique test generation")
+        ));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .expect("private test directory");
+        let path = directory.join("i.pxib");
+        let first_content = vec![0x71; DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES];
+        fs::write(&path, &first_content).expect("write bounded PXIB fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private PXIB mode");
+
+        let first = capture_inspection_bootstrap_locator(&path).expect("verified PXIB pin");
+        let metadata = fs::symlink_metadata(&path).expect("PXIB metadata");
+        assert_eq!(first.path(), path);
+        assert_eq!(
+            first.content_length(),
+            u32::try_from(first_content.len()).expect("bounded PXIB length")
+        );
+        let expected_digest: [u8; 32] = Sha256::digest(&first_content).into();
+        assert_eq!(first.content_sha256(), expected_digest);
+        assert_eq!(first.device(), metadata.dev());
+        assert_eq!(first.inode(), metadata.ino());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("insecure PXIB mode");
+        assert_eq!(
+            capture_inspection_bootstrap_locator(&path),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore PXIB mode");
+
+        let hardlink = directory.join("i-hardlink.pxib");
+        fs::hard_link(&path, &hardlink).expect("PXIB hardlink fixture");
+        assert_eq!(
+            capture_inspection_bootstrap_locator(&path),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+        fs::remove_file(&hardlink).expect("remove PXIB hardlink fixture");
+
+        let symlink = directory.join("i-symlink.pxib");
+        std::os::unix::fs::symlink(&path, &symlink).expect("PXIB symlink fixture");
+        assert_eq!(
+            capture_inspection_bootstrap_locator(&symlink),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+        fs::remove_file(&symlink).expect("remove PXIB symlink fixture");
+
+        let oversized = vec![0x72; MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES + 1];
+        fs::write(&path, oversized).expect("write oversized PXIB fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("private oversized PXIB mode");
+        assert_eq!(
+            capture_inspection_bootstrap_locator(&path),
+            Err(LocalProcessError::LifecycleStartup)
+        );
+
+        fs::remove_file(&path).expect("remove old PXIB generation");
+        let replacement_content = vec![0x73; DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES];
+        fs::write(&path, &replacement_content).expect("write replacement PXIB fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("private replacement PXIB mode");
+        let replacement =
+            capture_inspection_bootstrap_locator(&path).expect("replacement PXIB pin");
+        assert_ne!(replacement.content_sha256(), first.content_sha256());
+        assert_ne!(replacement, first);
+
+        fs::remove_file(&path).expect("remove PXIB fixture");
+        fs::remove_dir(&directory).expect("remove PXIB fixture directory");
     }
 
     #[test]

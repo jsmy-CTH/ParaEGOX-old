@@ -13,8 +13,12 @@ use config::{
     OfflineCommandV1, OfflineConfigSummaryV1, OfflineJsonIntentV1,
 };
 #[cfg(unix)]
-use config::{LocalDeployCommandV1, LocalLifecycleCommandV1, LocalManagedChatConfigV1};
+use config::{
+    LocalDeployCommandV1, LocalInspectionSnapshotCommandV1, LocalLifecycleCommandV1,
+    LocalManagedChatConfigV1,
+};
 use error::LocalProcessError;
+use serde::Serialize;
 use serde_json::json;
 
 #[cfg(unix)]
@@ -28,6 +32,8 @@ mod initializer;
 #[cfg(unix)]
 mod inspection;
 #[cfg(unix)]
+mod inspection_client;
+#[cfg(unix)]
 mod layout;
 #[cfg(unix)]
 mod lifecycle;
@@ -39,6 +45,7 @@ const OFFLINE_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const LIFECYCLE_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const INIT_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const LOCAL_DEPLOY_OUTPUT_SCHEMA_VERSION: u16 = 1;
+const LOCAL_INSPECTION_OUTPUT_SCHEMA_VERSION: u16 = 1;
 #[cfg(unix)]
 const LOCAL_DEPLOY_PROFILE: &str = "deterministic-echo-v1";
 
@@ -89,6 +96,33 @@ struct LifecycleJsonLineV1<'a> {
     diagnostic: Option<(&'a str, &'a str)>,
 }
 
+#[derive(Serialize)]
+struct LocalInspectionDiagnosticJsonV1<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+#[cfg(unix)]
+#[derive(Serialize)]
+struct LocalInspectionSuccessJsonLineV1<'a, Snapshot> {
+    schema_version: u16,
+    command: &'static str,
+    ok: bool,
+    changed: bool,
+    snapshot: &'a Snapshot,
+    diagnostics: [LocalInspectionDiagnosticJsonV1<'a>; 0],
+}
+
+#[derive(Serialize)]
+struct LocalInspectionErrorJsonLineV1<'a> {
+    schema_version: u16,
+    command: &'static str,
+    ok: bool,
+    changed: bool,
+    snapshot: Option<()>,
+    diagnostics: [LocalInspectionDiagnosticJsonV1<'a>; 1],
+}
+
 #[cfg(unix)]
 struct LocalChatSupervisorInvocationV1 {
     config: LocalManagedChatConfigV1,
@@ -100,6 +134,9 @@ fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if config::init_json_intent(&arguments) {
         return dispatch_init_to(&mut io::stdout().lock(), &arguments).exit_code();
+    }
+    if config::inspection_snapshot_json_intent(&arguments) {
+        return dispatch_inspection_snapshot_to(&mut io::stdout().lock(), &arguments).exit_code();
     }
     if config::local_deploy_json_intent(&arguments) {
         return dispatch_local_deploy_to(&mut io::stdout().lock(), &arguments).exit_code();
@@ -133,6 +170,112 @@ fn main() -> ExitCode {
             }
         },
     }
+}
+
+fn dispatch_inspection_snapshot_to(
+    output: &mut impl Write,
+    arguments: &[OsString],
+) -> DispatchOutcome {
+    let command = match config::parse_inspection_snapshot(arguments) {
+        Ok(command) => command,
+        Err(error) => {
+            return finish_inspection_snapshot_result(
+                output,
+                LocalProcessError::Configuration(error),
+            );
+        }
+    };
+    #[cfg(unix)]
+    {
+        match run_inspection_snapshot_command(command) {
+            Ok(snapshot) => {
+                let snapshot = inspection_client::snapshot_json(&snapshot);
+                if write_inspection_snapshot_success_json_line(output, &snapshot).is_ok() {
+                    DispatchOutcome::Success
+                } else {
+                    DispatchOutcome::DiagnosticFailure
+                }
+            }
+            Err(error) => finish_inspection_snapshot_result(output, error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        unreachable!("local Inspection parser rejects the unsupported non-Unix platform")
+    }
+}
+
+#[cfg(unix)]
+fn run_inspection_snapshot_command(
+    command: LocalInspectionSnapshotCommandV1,
+) -> Result<paraegox_inspection::LocalInspectionSnapshotV2, LocalProcessError> {
+    let config = command.into_config();
+    let locator = lifecycle::locate_local_inspection_bootstrap(&config)?;
+    inspection_client::read_latest_snapshot(&locator)
+}
+
+fn finish_inspection_snapshot_result(
+    output: &mut impl Write,
+    error: LocalProcessError,
+) -> DispatchOutcome {
+    if matches!(error, LocalProcessError::LocalInspectionJsonOutput) {
+        return DispatchOutcome::DiagnosticFailure;
+    }
+    if write_inspection_snapshot_error_json_line(output, error).is_err() {
+        return DispatchOutcome::DiagnosticFailure;
+    }
+    if error.exit_code() == 2 {
+        DispatchOutcome::ConfigurationFailure
+    } else {
+        DispatchOutcome::DiagnosticFailure
+    }
+}
+
+#[cfg(unix)]
+fn write_inspection_snapshot_success_json_line<Snapshot: Serialize>(
+    output: &mut impl Write,
+    snapshot: &Snapshot,
+) -> Result<(), LocalProcessError> {
+    serde_json::to_writer(
+        &mut *output,
+        &LocalInspectionSuccessJsonLineV1 {
+            schema_version: LOCAL_INSPECTION_OUTPUT_SCHEMA_VERSION,
+            command: "inspection.snapshot",
+            ok: true,
+            changed: false,
+            snapshot,
+            diagnostics: [],
+        },
+    )
+    .map_err(|_| LocalProcessError::LocalInspectionJsonOutput)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| LocalProcessError::LocalInspectionJsonOutput)
+}
+
+fn write_inspection_snapshot_error_json_line(
+    output: &mut impl Write,
+    error: LocalProcessError,
+) -> Result<(), LocalProcessError> {
+    serde_json::to_writer(
+        &mut *output,
+        &LocalInspectionErrorJsonLineV1 {
+            schema_version: LOCAL_INSPECTION_OUTPUT_SCHEMA_VERSION,
+            command: "inspection.snapshot",
+            ok: false,
+            changed: false,
+            snapshot: None,
+            diagnostics: [LocalInspectionDiagnosticJsonV1 {
+                code: error.code(),
+                message: error.message(),
+            }],
+        },
+    )
+    .map_err(|_| LocalProcessError::LocalInspectionJsonOutput)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| LocalProcessError::LocalInspectionJsonOutput)
 }
 
 fn dispatch_local_deploy_to(output: &mut impl Write, arguments: &[OsString]) -> DispatchOutcome {
@@ -1049,6 +1192,7 @@ fn usage() -> &'static str {
        paraegox status --config <absolute-paraegox.toml> --json
        paraegox down --config <absolute-paraegox.toml> --json
        paraegox deploy --local --config <absolute-paraegox.toml> --json
+       paraegox inspection snapshot --config <absolute-paraegox.toml> --json
        paraegox node --config <absolute-paraegox-node.toml>
        paraegox deployment --config <absolute-paraegox-deployment.toml>
        paraegox version --json
@@ -1078,6 +1222,11 @@ deploy --local ensures the sole compiled-in deterministic-echo-v1 profile is
 running through that same lifecycle owner, then returns one generation-bound
 point-in-time ActiveReady deployment projection. It does not install Artifact
 bytes, check current health, retry, replace, restart, or roll back.
+
+inspection snapshot performs one generation-bound read-only PXIQ-v2 Latest
+exchange against the existing managed-local Inspection endpoint. It does not
+start, stop, recover, or mutate an owner; retry, watch, and health inference
+are outside this command.
 
 chat starts the configured ParaEGOX conversation owner chain and Textual console.
 The absolute versioned configuration is the sole public input for provider and
@@ -1172,6 +1321,113 @@ mod tests {
             OsString::from("--json"),
         ])
         .expect("recognized lifecycle JSON command")
+    }
+
+    #[test]
+    fn inspection_snapshot_error_json_has_exact_six_path_safe_fields() {
+        let mut output = Vec::new();
+        write_inspection_snapshot_error_json_line(
+            &mut output,
+            LocalProcessError::LocalInspectionNotRunning,
+        )
+        .expect("Inspection error JSON");
+        assert_eq!(output.last(), Some(&b'\n'));
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let text = String::from_utf8(output.clone()).expect("UTF-8 Inspection JSON");
+        assert_eq!(
+            text,
+            concat!(
+                "{\"schema_version\":1,\"command\":\"inspection.snapshot\",",
+                "\"ok\":false,\"changed\":false,\"snapshot\":null,",
+                "\"diagnostics\":[{\"code\":\"PXLC-INSPECTION-NOT-RUNNING\",",
+                "\"message\":\"local Inspection requires the current owner generation to be running\"}]}\n"
+            )
+        );
+        let parsed: Value = serde_json::from_slice(&output).expect("Inspection error object");
+        assert_eq!(parsed.as_object().expect("JSON object").len(), 6);
+        assert_eq!(
+            parsed["schema_version"],
+            LOCAL_INSPECTION_OUTPUT_SCHEMA_VERSION
+        );
+        assert_eq!(parsed["command"], "inspection.snapshot");
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["changed"], false);
+        assert_eq!(parsed["snapshot"], Value::Null);
+        assert_eq!(
+            parsed["diagnostics"].as_array().map(|values| values.len()),
+            Some(1)
+        );
+        assert!(!text.contains("private/tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_snapshot_success_json_has_exact_order_and_false_changed() {
+        #[derive(Serialize)]
+        struct SnapshotVersionOnly {
+            snapshot_version: u16,
+        }
+
+        let mut output = Vec::new();
+        write_inspection_snapshot_success_json_line(
+            &mut output,
+            &SnapshotVersionOnly {
+                snapshot_version: 2,
+            },
+        )
+        .expect("Inspection success JSON");
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8 Inspection JSON"),
+            concat!(
+                "{\"schema_version\":1,\"command\":\"inspection.snapshot\",",
+                "\"ok\":true,\"changed\":false,",
+                "\"snapshot\":{\"snapshot_version\":2},\"diagnostics\":[]}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_inspection_snapshot_stays_on_json_and_exit_two() {
+        let mut output = Vec::new();
+        let outcome = dispatch_inspection_snapshot_to(
+            &mut output,
+            &[
+                OsString::from("inspection"),
+                OsString::from("snapshot"),
+                OsString::from("--config"),
+                OsString::from("/private/tmp/must-not-appear.toml"),
+                OsString::from("--json"),
+                OsString::from("--watch"),
+            ],
+        );
+        assert_eq!(outcome, DispatchOutcome::ConfigurationFailure);
+        let parsed: Value = serde_json::from_slice(&output).expect("Inspection grammar JSON");
+        assert_eq!(parsed.as_object().map(|object| object.len()), Some(6));
+        assert_eq!(parsed["snapshot"], Value::Null);
+        assert_eq!(parsed["changed"], false);
+        assert_eq!(parsed["diagnostics"][0]["code"], "PXLC-INSPECTION-GRAMMAR");
+        assert!(
+            !String::from_utf8(output)
+                .expect("UTF-8 JSON")
+                .contains("must-not-appear")
+        );
+    }
+
+    #[test]
+    fn partial_inspection_json_failure_never_attempts_a_second_object() {
+        let mut output = FaultingJsonOutput::with_successful_byte_budget(31);
+        let error = write_inspection_snapshot_error_json_line(
+            &mut output,
+            LocalProcessError::LocalInspectionLocator,
+        )
+        .expect_err("partial Inspection JSON must fail closed");
+        let attempts = output.write_attempts;
+        assert_eq!(error, LocalProcessError::LocalInspectionJsonOutput);
+        assert_eq!(
+            finish_inspection_snapshot_result(&mut output, error),
+            DispatchOutcome::DiagnosticFailure
+        );
+        assert_eq!(output.write_attempts, attempts);
     }
 
     #[test]
@@ -1840,7 +2096,7 @@ mod tests {
     fn usage_exposes_runtime_and_offline_commands_without_internal_modes() {
         let text = usage();
         assert_eq!(
-            text.lines().take(12).collect::<Vec<_>>(),
+            text.lines().take(13).collect::<Vec<_>>(),
             [
                 "Usage: paraegox chat --config <absolute-paraegox.toml>",
                 "       paraegox init --directory <absolute-directory> --json",
@@ -1848,6 +2104,7 @@ mod tests {
                 "       paraegox status --config <absolute-paraegox.toml> --json",
                 "       paraegox down --config <absolute-paraegox.toml> --json",
                 "       paraegox deploy --local --config <absolute-paraegox.toml> --json",
+                "       paraegox inspection snapshot --config <absolute-paraegox.toml> --json",
                 "       paraegox node --config <absolute-paraegox-node.toml>",
                 "       paraegox deployment --config <absolute-paraegox-deployment.toml>",
                 "       paraegox version --json",
@@ -1863,11 +2120,16 @@ mod tests {
         assert!(text.contains("paraegox status --config <absolute-paraegox.toml> --json"));
         assert!(text.contains("paraegox down --config <absolute-paraegox.toml> --json"));
         assert!(text.contains("paraegox deploy --local --config <absolute-paraegox.toml> --json"));
+        assert!(
+            text.contains("paraegox inspection snapshot --config <absolute-paraegox.toml> --json")
+        );
         assert!(text.contains("reports only the authenticated local lifecycle state"));
         assert!(text.contains("never use a PID as control authority"));
         assert!(text.contains("restart and crash recovery are not part"));
         assert!(text.contains("one generation-bound\npoint-in-time ActiveReady"));
         assert!(text.contains("does not install Artifact\nbytes"));
+        assert!(text.contains("one generation-bound read-only PXIQ-v2 Latest"));
+        assert!(text.contains("retry, watch, and health inference\nare outside"));
         assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));
         assert!(text.contains("paraegox deployment --config <absolute-paraegox-deployment.toml>"));
         assert!(text.contains("paraegox version --json"));

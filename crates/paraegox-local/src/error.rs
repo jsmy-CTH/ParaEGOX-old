@@ -21,6 +21,14 @@ pub(crate) enum LocalProcessError {
     LocalDeployQuery,
     LocalDeployEvidence,
     LocalDeployJsonOutput,
+    LocalInspectionNotRunning,
+    LocalInspectionLocator,
+    LocalInspectionBootstrap,
+    LocalInspectionPeer,
+    LocalInspectionProtocol,
+    LocalInspectionNotFound,
+    LocalInspectionIo,
+    LocalInspectionJsonOutput,
     UnsafeExecutionIdentity,
     SignalHandling,
     IdentityManifest,
@@ -82,6 +90,14 @@ impl LocalProcessError {
             Self::LocalDeployQuery => "PXLC-DEPLOY-QUERY",
             Self::LocalDeployEvidence => "PXLC-DEPLOY-EVIDENCE",
             Self::LocalDeployJsonOutput => "PXLC-DEPLOY-JSON-OUTPUT",
+            Self::LocalInspectionNotRunning => "PXLC-INSPECTION-NOT-RUNNING",
+            Self::LocalInspectionLocator => "PXLC-INSPECTION-LOCATOR",
+            Self::LocalInspectionBootstrap => "PXLC-INSPECTION-BOOTSTRAP",
+            Self::LocalInspectionPeer => "PXLC-INSPECTION-PEER",
+            Self::LocalInspectionProtocol => "PXLC-INSPECTION-PROTOCOL",
+            Self::LocalInspectionNotFound => "PXLC-INSPECTION-NOT-FOUND",
+            Self::LocalInspectionIo => "PXLC-INSPECTION-IO",
+            Self::LocalInspectionJsonOutput => "PXLC-INSPECTION-JSON-OUTPUT",
             Self::UnsafeExecutionIdentity => "PXLC-EXECUTION-IDENTITY",
             Self::SignalHandling => "PXLC-SIGNAL-HANDLING",
             Self::IdentityManifest => "PXLC-IDENTITY-MANIFEST",
@@ -157,6 +173,22 @@ impl LocalProcessError {
                 "compiled local deployment terminal evidence failed strict validation"
             }
             Self::LocalDeployJsonOutput => "compiled local deployment JSON output failed",
+            Self::LocalInspectionNotRunning => {
+                "local Inspection requires the current owner generation to be running"
+            }
+            Self::LocalInspectionLocator => "local Inspection owner locator query failed closed",
+            Self::LocalInspectionBootstrap => "local Inspection bootstrap failed strict validation",
+            Self::LocalInspectionPeer => {
+                "local Inspection endpoint identity failed strict validation"
+            }
+            Self::LocalInspectionProtocol => {
+                "local Inspection response failed strict protocol validation"
+            }
+            Self::LocalInspectionNotFound => {
+                "local Inspection projection is not available for this generation"
+            }
+            Self::LocalInspectionIo => "local Inspection one-shot exchange failed closed",
+            Self::LocalInspectionJsonOutput => "local Inspection machine-readable output failed",
             Self::UnsafeExecutionIdentity => {
                 "DeveloperLocal commands require a non-root user and group"
             }
@@ -295,13 +327,54 @@ mod tests {
             assert!(!failure.message().is_empty());
         }
 
+        for (failure, code) in [
+            (
+                LocalProcessError::LocalInspectionNotRunning,
+                "PXLC-INSPECTION-NOT-RUNNING",
+            ),
+            (
+                LocalProcessError::LocalInspectionLocator,
+                "PXLC-INSPECTION-LOCATOR",
+            ),
+            (
+                LocalProcessError::LocalInspectionBootstrap,
+                "PXLC-INSPECTION-BOOTSTRAP",
+            ),
+            (
+                LocalProcessError::LocalInspectionPeer,
+                "PXLC-INSPECTION-PEER",
+            ),
+            (
+                LocalProcessError::LocalInspectionProtocol,
+                "PXLC-INSPECTION-PROTOCOL",
+            ),
+            (
+                LocalProcessError::LocalInspectionNotFound,
+                "PXLC-INSPECTION-NOT-FOUND",
+            ),
+            (LocalProcessError::LocalInspectionIo, "PXLC-INSPECTION-IO"),
+            (
+                LocalProcessError::LocalInspectionJsonOutput,
+                "PXLC-INSPECTION-JSON-OUTPUT",
+            ),
+        ] {
+            assert_eq!(failure.exit_code(), 1);
+            assert_eq!(failure.code(), code);
+            assert!(!failure.message().is_empty());
+            assert!(!failure.message().contains('/'));
+        }
+
         for failure in [
             ConfigError::InvalidLocalDeployGrammar,
             ConfigError::UnsupportedLocalDeployProfile,
+            ConfigError::InvalidInspectionSnapshotGrammar,
         ] {
             let failure = LocalProcessError::Configuration(failure);
             assert_eq!(failure.exit_code(), 2);
-            assert!(failure.code().starts_with("PXLC-DEPLOY-"));
+            assert!(
+                failure.code().starts_with("PXLC-DEPLOY-")
+                    || failure.code() == "PXLC-INSPECTION-GRAMMAR"
+            );
         }
 
         let init_conflict = LocalProcessError::InitWorkspaceConflict;
