@@ -48,6 +48,8 @@ const INIT_COMMAND: &str = "init";
 const DEPLOY_COMMAND: &str = "deploy";
 const INSPECTION_COMMAND: &str = "inspection";
 const INSPECTION_SNAPSHOT_COMMAND: &str = "snapshot";
+const RECEIPT_COMMAND: &str = "receipt";
+const RECEIPT_SNAPSHOT_COMMAND: &str = "snapshot";
 const NODE_COMMAND: &str = "node";
 const DEPLOYMENT_COMMAND: &str = "deployment";
 const VERSION_COMMAND: &str = "version";
@@ -253,6 +255,16 @@ pub(crate) struct LocalInspectionSnapshotCommandV1 {
     config: LocalManagedChatConfigV1,
 }
 
+/// Parsed input for one current-Running verified Runtime Receipt snapshot.
+///
+/// The exact chat configuration is the only public selector; lifecycle
+/// generation, owner bootstrap, capability token, retry policy, and raw PXMT
+/// access remain private to the typed read chain.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct LocalReceiptSnapshotCommandV1 {
+    config: LocalManagedChatConfigV1,
+}
+
 /// Parsed input for one foreground TUI attachment to an already-running
 /// managed-local generation.
 ///
@@ -271,6 +283,12 @@ impl LocalTuiAttachCommandV1 {
 }
 
 impl LocalInspectionSnapshotCommandV1 {
+    pub(crate) fn into_config(self) -> LocalManagedChatConfigV1 {
+        self.config
+    }
+}
+
+impl LocalReceiptSnapshotCommandV1 {
     pub(crate) fn into_config(self) -> LocalManagedChatConfigV1 {
         self.config
     }
@@ -1861,6 +1879,7 @@ pub(crate) enum ConfigError {
     InvalidLocalDeployGrammar,
     UnsupportedLocalDeployProfile,
     InvalidInspectionSnapshotGrammar,
+    InvalidReceiptSnapshotGrammar,
     InvalidTuiGrammar,
     MissingStateRoot,
     MissingFabricListenA,
@@ -1946,6 +1965,7 @@ impl ConfigError {
             Self::InvalidLocalDeployGrammar => "PXLC-DEPLOY-GRAMMAR",
             Self::UnsupportedLocalDeployProfile => "PXLC-DEPLOY-PROFILE-UNSUPPORTED",
             Self::InvalidInspectionSnapshotGrammar => "PXLC-INSPECTION-GRAMMAR",
+            Self::InvalidReceiptSnapshotGrammar => "PXLC-RECEIPT-GRAMMAR",
             Self::InvalidTuiGrammar => "PXLC-TUI-GRAMMAR",
             Self::MissingStateRoot => "PXLC-STATE-ROOT-MISSING",
             Self::MissingFabricListenA => "PXLC-FABRIC-LISTEN-A-MISSING",
@@ -2050,6 +2070,9 @@ impl ConfigError {
             }
             Self::InvalidInspectionSnapshotGrammar => {
                 "inspection snapshot requires exactly --config <absolute-paraegox.toml> --json"
+            }
+            Self::InvalidReceiptSnapshotGrammar => {
+                "receipt snapshot requires exactly --config <absolute-paraegox.toml> --json"
             }
             Self::InvalidTuiGrammar => "tui requires exactly --config <absolute-paraegox.toml>",
             Self::MissingStateRoot => "the selected DeveloperLocal mode requires --state-root",
@@ -2247,6 +2270,14 @@ pub(crate) fn inspection_snapshot_json_intent(arguments: &[OsString]) -> bool {
         .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(INSPECTION_COMMAND))
 }
 
+/// Recognizes every invocation of the public `receipt` namespace before
+/// grammar validation so all failures remain on its path-free JSON channel.
+pub(crate) fn receipt_snapshot_json_intent(arguments: &[OsString]) -> bool {
+    arguments
+        .first()
+        .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(RECEIPT_COMMAND))
+}
+
 /// Recognizes every invocation of the public `tui` command before grammar
 /// validation. Its human diagnostic surface is exactly one path-free line and
 /// must not fall through to global usage output.
@@ -2328,6 +2359,29 @@ pub(crate) fn parse_inspection_snapshot(
             .ok_or(ConfigError::InvalidInspectionSnapshotGrammar)?,
     )?;
     Ok(LocalInspectionSnapshotCommandV1 { config })
+}
+
+/// Parses the sole public Receipt grammar without resolving a Secret, opening
+/// lifecycle/domain state, or starting/stopping an owner.
+pub(crate) fn parse_receipt_snapshot(
+    arguments: &[OsString],
+) -> Result<LocalReceiptSnapshotCommandV1, ConfigError> {
+    if !receipt_snapshot_json_intent(arguments)
+        || arguments.len() != 5
+        || arguments.get(1).and_then(|value| value.to_str()) != Some(RECEIPT_SNAPSHOT_COMMAND)
+        || arguments.get(2).and_then(|value| value.to_str()) != Some(CONFIG_OPTION)
+        || arguments.get(4).and_then(|value| value.to_str()) != Some(JSON_OPTION)
+    {
+        return Err(ConfigError::InvalidReceiptSnapshotGrammar);
+    }
+    ensure_unix_developer_local()?;
+    let config = parse_managed_chat_config_file(
+        arguments
+            .get(3)
+            .cloned()
+            .ok_or(ConfigError::InvalidReceiptSnapshotGrammar)?,
+    )?;
+    Ok(LocalReceiptSnapshotCommandV1 { config })
 }
 
 /// Parses the sole public TUI attach grammar without reading lifecycle state,
@@ -4348,6 +4402,16 @@ limits_profile = "developer-agent-bootstrap-v1"
         ]
     }
 
+    fn receipt_snapshot_arguments(config_path: OsString) -> Vec<OsString> {
+        vec![
+            OsString::from(RECEIPT_COMMAND),
+            OsString::from(RECEIPT_SNAPSHOT_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            config_path,
+            OsString::from(JSON_OPTION),
+        ]
+    }
+
     fn tui_attach_arguments(config_path: OsString) -> Vec<OsString> {
         vec![
             OsString::from(TUI_COMMAND),
@@ -5638,6 +5702,66 @@ client_private_key_file = "{root}/node/controller-key.pem"
                 Err(ConfigError::InvalidInspectionSnapshotGrammar)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_snapshot_requires_exact_grammar_and_absolute_config() {
+        let chat = valid_arguments();
+        let config_path = chat[2].clone();
+        let arguments = receipt_snapshot_arguments(config_path.clone());
+        assert!(receipt_snapshot_json_intent(&arguments));
+        let command = parse_receipt_snapshot(&arguments).expect("Receipt command");
+        let config = command.into_config();
+        assert_eq!(config.source_path(), Path::new(&config_path));
+        assert_eq!(config.state_root(), Path::new("/tmp/paraegox-local-test"));
+        assert_ne!(config.config_commitment(), [0; 32]);
+
+        let relative = receipt_snapshot_arguments(OsString::from("paraegox.toml"));
+        assert_eq!(
+            parse_receipt_snapshot(&relative),
+            Err(ConfigError::InvalidConfigPath)
+        );
+
+        for malformed in [
+            vec![
+                OsString::from(RECEIPT_COMMAND),
+                OsString::from(RECEIPT_SNAPSHOT_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+            ],
+            vec![
+                OsString::from(RECEIPT_COMMAND),
+                OsString::from(RECEIPT_SNAPSHOT_COMMAND),
+                OsString::from(JSON_OPTION),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+            ],
+            vec![
+                OsString::from(RECEIPT_COMMAND),
+                OsString::from("latest"),
+                OsString::from(CONFIG_OPTION),
+                config_path.clone(),
+                OsString::from(JSON_OPTION),
+            ],
+            vec![
+                OsString::from(RECEIPT_COMMAND),
+                OsString::from(RECEIPT_SNAPSHOT_COMMAND),
+                OsString::from(CONFIG_OPTION),
+                config_path,
+                OsString::from(JSON_OPTION),
+                OsString::from("--retry"),
+            ],
+        ] {
+            assert!(receipt_snapshot_json_intent(&malformed));
+            assert_eq!(
+                parse_receipt_snapshot(&malformed),
+                Err(ConfigError::InvalidReceiptSnapshotGrammar)
+            );
+        }
+        assert!(!receipt_snapshot_json_intent(&[OsString::from(
+            CHAT_COMMAND
+        )]));
     }
 
     #[cfg(unix)]
@@ -7012,6 +7136,7 @@ client_private_key_file = "{root}/node/controller-key.pem"
             ConfigError::InvalidLocalDeployGrammar,
             ConfigError::UnsupportedLocalDeployProfile,
             ConfigError::InvalidInspectionSnapshotGrammar,
+            ConfigError::InvalidReceiptSnapshotGrammar,
             ConfigError::InvalidTuiGrammar,
             ConfigError::MissingStateRoot,
             ConfigError::MissingFabricListenA,

@@ -149,6 +149,12 @@ use crate::inspection::{
     DeveloperLocalDeploymentOutcomeV1, DeveloperLocalInspectionSourcesV2,
     start_developer_local_inspection_v2,
 };
+#[cfg(test)]
+use crate::receipt_snapshot::LocalReceiptRetirementHandleV1;
+use crate::receipt_snapshot::{
+    LocalReceiptActivationInputV1, LocalReceiptAdapterReadyLeaseV1, LocalReceiptOwnerBindingV1,
+    start_developer_local_receipt_snapshot_v1,
+};
 #[cfg(not(test))]
 use crate::{
     NODE_BOOTSTRAP_FILE_OPTION, NODE_DAEMON_CHILD_MODE, NODE_OBSERVATION_BOOTSTRAP_FILE_OPTION,
@@ -1333,6 +1339,7 @@ pub(crate) fn run_distributed(
                 .agent_ipc_bootstrap_path()
                 .to_path_buf(),
             inspection: None,
+            receipt: None,
             local_deployment_projection: None,
             expected_uid: Uid::effective().as_raw(),
             expected_gid: Gid::effective().as_raw(),
@@ -1492,6 +1499,33 @@ fn run_prepared(
     };
     let local_deployment_projection =
         VerifiedLocalDeploymentProjectionV1::try_from_outcome(&deployment)?;
+    let receipt_activation = if runner.enables_receipt_snapshot() {
+        let runtime_ready = stack.runtime().ready();
+        let (expected_request_digest, expected_receipt_digest) = match &deployment {
+            DeveloperLocalDeploymentOutcomeV1::Fixture(outcome) => (
+                outcome.model_agent_request_digest().into_bytes(),
+                outcome.model_agent_receipt_digest().into_bytes(),
+            ),
+            DeveloperLocalDeploymentOutcomeV1::Provisioned(outcome) => (
+                outcome.model_agent_request_digest().into_bytes(),
+                outcome.model_agent_receipt_digest().into_bytes(),
+            ),
+        };
+        Some(LocalReceiptActivationInputV1::try_new(
+            deployment
+                .agent_terminal_receipt()
+                .to_vec()
+                .into_boxed_slice(),
+            expected_request_digest,
+            expected_receipt_digest,
+            runtime_ready.target(),
+            runtime_ready.runtime_store_instance_id(),
+            runtime_ready.runtime_response_key_ref(),
+            runtime_ready.runtime_response_public_key(),
+        )?)
+    } else {
+        None
+    };
     let conversation_result = (|| {
         let conversation_handle = stack
             .runtime()
@@ -1515,6 +1549,11 @@ fn run_prepared(
                 sources: stack.inspection_sources(deployment),
                 ipc_socket_path: layout.inspection_ipc_socket_path().to_path_buf(),
                 ipc_bootstrap_path: layout.inspection_ipc_bootstrap_path().to_path_buf(),
+            }),
+            receipt: receipt_activation.map(|activation| ConversationReceiptInput {
+                activation,
+                ipc_socket_path: layout.receipt_ipc_socket_path().to_path_buf(),
+                ipc_bootstrap_path: layout.receipt_ipc_bootstrap_path().to_path_buf(),
             }),
             local_deployment_projection,
             expected_uid: Uid::effective().as_raw(),
@@ -2265,6 +2304,7 @@ struct ConversationRunInput {
     ipc_socket_path: PathBuf,
     ipc_bootstrap_path: PathBuf,
     inspection: Option<ConversationInspectionInput>,
+    receipt: Option<ConversationReceiptInput>,
     local_deployment_projection: Option<VerifiedLocalDeploymentProjectionV1>,
     expected_uid: u32,
     expected_gid: u32,
@@ -2272,6 +2312,12 @@ struct ConversationRunInput {
 
 struct ConversationInspectionInput {
     sources: DeveloperLocalInspectionSourcesV2,
+    ipc_socket_path: PathBuf,
+    ipc_bootstrap_path: PathBuf,
+}
+
+struct ConversationReceiptInput {
+    activation: LocalReceiptActivationInputV1,
     ipc_socket_path: PathBuf,
     ipc_bootstrap_path: PathBuf,
 }
@@ -2284,17 +2330,22 @@ struct ConversationInspectionInput {
 /// bootstraps before accepting readiness, but must not report readiness until
 /// this module calls `mark_ready`.
 pub(crate) trait HeadlessLifecycleControlV1 {
+    fn receipt_owner_binding(&self) -> Result<LocalReceiptOwnerBindingV1, LocalProcessError>;
+
     fn mark_ready(
         &mut self,
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
         conversation_bootstrap_path: PathBuf,
         inspection_bootstrap_path: Option<PathBuf>,
+        receipt_ready: LocalReceiptAdapterReadyLeaseV1,
     ) -> Result<(), LocalProcessError>;
 
     fn wait_for_shutdown(&mut self) -> Result<(), LocalProcessError>;
 }
 
 trait ConversationRunner {
+    fn enables_receipt_snapshot(&self) -> bool;
+
     fn run(&mut self, input: ConversationRunInput) -> Result<(), LocalProcessError>;
 }
 
@@ -2305,6 +2356,10 @@ struct HeadlessConversationRunner<'a, Control> {
 }
 
 impl ConversationRunner for ChildProcessConversationRunner {
+    fn enables_receipt_snapshot(&self) -> bool {
+        false
+    }
+
     fn run(&mut self, input: ConversationRunInput) -> Result<(), LocalProcessError> {
         let conversation_endpoint = start_conversation_ipc(&input)?;
         let inspection_endpoint = input
@@ -2335,7 +2390,11 @@ impl<Control> ConversationRunner for HeadlessConversationRunner<'_, Control>
 where
     Control: HeadlessLifecycleControlV1,
 {
-    fn run(&mut self, input: ConversationRunInput) -> Result<(), LocalProcessError> {
+    fn enables_receipt_snapshot(&self) -> bool {
+        true
+    }
+
+    fn run(&mut self, mut input: ConversationRunInput) -> Result<(), LocalProcessError> {
         let conversation_endpoint = start_conversation_ipc(&input)?;
         let inspection_endpoint = match input
             .inspection
@@ -2357,6 +2416,61 @@ where
                 .as_ref()
                 .map(|inspection| inspection.ipc_bootstrap_path.clone())
         });
+        let receipt = match input.receipt.take() {
+            Some(receipt) => receipt,
+            None => {
+                let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
+                    endpoint
+                        .shutdown_and_join()
+                        .map_err(|_| LocalProcessError::InspectionIpc)
+                });
+                let conversation_result = conversation_endpoint
+                    .shutdown_and_join()
+                    .map_err(|_| LocalProcessError::ConversationIpc);
+                return Err::<(), LocalProcessError>(LocalProcessError::LifecycleStartup)
+                    .and(inspection_result)
+                    .and(conversation_result);
+            }
+        };
+        let receipt_binding = match self.control.receipt_owner_binding() {
+            Ok(binding) => binding,
+            Err(primary) => {
+                let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
+                    endpoint
+                        .shutdown_and_join()
+                        .map_err(|_| LocalProcessError::InspectionIpc)
+                });
+                let conversation_result = conversation_endpoint
+                    .shutdown_and_join()
+                    .map_err(|_| LocalProcessError::ConversationIpc);
+                return Err::<(), LocalProcessError>(primary)
+                    .and(inspection_result)
+                    .and(conversation_result);
+            }
+        };
+        let (receipt_endpoint, receipt_ready) = match start_developer_local_receipt_snapshot_v1(
+            receipt.activation,
+            receipt_binding,
+            receipt.ipc_socket_path,
+            receipt.ipc_bootstrap_path,
+            input.expected_uid,
+            input.expected_gid,
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(primary) => {
+                let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
+                    endpoint
+                        .shutdown_and_join()
+                        .map_err(|_| LocalProcessError::InspectionIpc)
+                });
+                let conversation_result = conversation_endpoint
+                    .shutdown_and_join()
+                    .map_err(|_| LocalProcessError::ConversationIpc);
+                return Err::<(), LocalProcessError>(primary)
+                    .and(inspection_result)
+                    .and(conversation_result);
+            }
+        };
 
         let lifecycle_result = self
             .control
@@ -2364,8 +2478,10 @@ where
                 input.local_deployment_projection,
                 input.ipc_bootstrap_path.clone(),
                 inspection_bootstrap_path,
+                receipt_ready,
             )
             .and_then(|()| self.control.wait_for_shutdown());
+        let receipt_result = receipt_endpoint.shutdown_and_join();
         let inspection_result = inspection_endpoint.map_or(Ok(()), |endpoint| {
             endpoint
                 .shutdown_and_join()
@@ -2375,6 +2491,7 @@ where
             .shutdown_and_join()
             .map_err(|_| LocalProcessError::ConversationIpc);
         lifecycle_result
+            .and(receipt_result)
             .and(inspection_result)
             .and(conversation_result)
     }
@@ -4559,14 +4676,21 @@ mod tests {
         deployment: Option<VerifiedLocalDeploymentProjectionV1>,
         conversation_bootstrap_path: Option<PathBuf>,
         inspection_bootstrap_path: Option<PathBuf>,
+        receipt_bootstrap_path: Option<PathBuf>,
+        receipt_retirement: Option<LocalReceiptRetirementHandleV1>,
     }
 
     impl HeadlessLifecycleControlV1 for ImmediateHeadlessControl {
+        fn receipt_owner_binding(&self) -> Result<LocalReceiptOwnerBindingV1, LocalProcessError> {
+            LocalReceiptOwnerBindingV1::try_new([0x51; 16], [0x52; 32])
+        }
+
         fn mark_ready(
             &mut self,
             deployment: Option<VerifiedLocalDeploymentProjectionV1>,
             conversation_bootstrap_path: PathBuf,
             inspection_bootstrap_path: Option<PathBuf>,
+            receipt_ready: LocalReceiptAdapterReadyLeaseV1,
         ) -> Result<(), LocalProcessError> {
             if self.ready || self.shutdown_waited {
                 return Err(LocalProcessError::LifecycleStartup);
@@ -4575,6 +4699,9 @@ mod tests {
             self.deployment = deployment;
             self.conversation_bootstrap_path = Some(conversation_bootstrap_path);
             self.inspection_bootstrap_path = inspection_bootstrap_path;
+            let (receipt_bootstrap_path, receipt_retirement) = receipt_ready.into_parts();
+            self.receipt_bootstrap_path = Some(receipt_bootstrap_path);
+            self.receipt_retirement = Some(receipt_retirement);
             Ok(())
         }
 
@@ -4582,9 +4709,61 @@ mod tests {
             if !self.ready || self.shutdown_waited {
                 return Err(LocalProcessError::LifecycleShutdown);
             }
+            drop(self.receipt_retirement.take());
             self.shutdown_waited = true;
             Ok(())
         }
+    }
+
+    #[test]
+    fn receipt_snapshot_adapter_is_enabled_only_by_the_headless_runner() {
+        let child = ChildProcessConversationRunner;
+        assert!(!child.enables_receipt_snapshot());
+        let mut control = ImmediateHeadlessControl::default();
+        let headless = HeadlessConversationRunner {
+            control: &mut control,
+        };
+        assert!(headless.enables_receipt_snapshot());
+
+        let source = include_str!("composition.rs");
+        let tests_start = source
+            .rfind("\n#[cfg(test)]\nmod tests {")
+            .expect("composition test module");
+        let production = &source[..tests_start];
+        let activation_start = production
+            .find("let receipt_activation = if runner.enables_receipt_snapshot() {")
+            .expect("headless-only activation guard");
+        let activation_end = activation_start
+            + production[activation_start..]
+                .find("\n    let conversation_result")
+                .expect("activation guard boundary");
+        let activation = &production[activation_start..activation_end];
+        assert!(activation.contains("LocalReceiptActivationInputV1::try_new("));
+
+        let child_start = production
+            .find("impl ConversationRunner for ChildProcessConversationRunner {")
+            .expect("child runner");
+        let headless_start = production
+            .find("impl<Control> ConversationRunner for HeadlessConversationRunner")
+            .expect("headless runner");
+        let headless_end = production
+            .find("\nfn start_inspection_ipc(")
+            .expect("headless runner boundary");
+        let child_runner = &production[child_start..headless_start];
+        let headless_runner = &production[headless_start..headless_end];
+        assert!(
+            child_runner.contains("fn enables_receipt_snapshot(&self) -> bool {\n        false")
+        );
+        assert!(!child_runner.contains("start_developer_local_receipt_snapshot_v1("));
+        assert!(
+            headless_runner.contains("fn enables_receipt_snapshot(&self) -> bool {\n        true")
+        );
+        assert_eq!(
+            headless_runner
+                .matches("start_developer_local_receipt_snapshot_v1(")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5821,6 +6000,10 @@ mod tests {
     }
 
     impl ConversationRunner for NonInteractiveConversationRunner {
+        fn enables_receipt_snapshot(&self) -> bool {
+            false
+        }
+
         fn run(&mut self, launch: ConversationRunInput) -> Result<(), LocalProcessError> {
             self.retired_probe = Some(launch.handle.clone());
             self.retired_config = Some(launch.config);
@@ -5987,6 +6170,10 @@ mod tests {
     }
 
     impl ConversationRunner for IpcSubprocessConversationRunner {
+        fn enables_receipt_snapshot(&self) -> bool {
+            false
+        }
+
         fn run(&mut self, launch: ConversationRunInput) -> Result<(), LocalProcessError> {
             let inspection = launch
                 .inspection
@@ -6529,6 +6716,13 @@ mod tests {
                     .and_then(Path::file_name),
                 Some(OsStr::new("i.pxib"))
             );
+            assert_eq!(
+                control
+                    .receipt_bootstrap_path
+                    .as_deref()
+                    .and_then(Path::file_name),
+                Some(OsStr::new("receipt.pxrb"))
+            );
             assert_eq!(environment_reads.load(Ordering::Acquire), 1);
 
             let manifest = identity::load_or_create_provisioned(&config)
@@ -6717,6 +6911,8 @@ mod tests {
             let inspection_bootstrap = prepared_layout
                 .inspection_ipc_bootstrap_path()
                 .to_path_buf();
+            let receipt_socket = prepared_layout.receipt_ipc_socket_path().to_path_buf();
+            let receipt_bootstrap = prepared_layout.receipt_ipc_bootstrap_path().to_path_buf();
             drop(prepared_layout);
             drop(manifest);
 
@@ -6731,6 +6927,8 @@ mod tests {
             assert!(!ipc_bootstrap.exists());
             assert!(!inspection_socket.exists());
             assert!(!inspection_bootstrap.exists());
+            assert!(!receipt_socket.exists());
+            assert!(!receipt_bootstrap.exists());
             let rebound = TcpListener::bind(("127.0.0.1", port))
                 .expect("Fabric port must be released after joined shutdown");
             drop(rebound);

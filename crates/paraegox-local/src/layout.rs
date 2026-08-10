@@ -40,6 +40,8 @@ const AGENT_IPC_SOCKET_FILE: &str = "c.sock";
 const AGENT_IPC_BOOTSTRAP_FILE: &str = "c.pxab";
 const INSPECTION_IPC_SOCKET_FILE: &str = "i.sock";
 const INSPECTION_IPC_BOOTSTRAP_FILE: &str = "i.pxib";
+const RECEIPT_IPC_SOCKET_FILE: &str = "receipt.sock";
+const RECEIPT_IPC_BOOTSTRAP_FILE: &str = "receipt.pxrb";
 const SOCKET_DIRECTORY_PREFIX: &str = "pxl-";
 const DISTRIBUTED_STATE_DIRECTORY: &str = "developer-distributed-layout-v1";
 const DISTRIBUTED_COORDINATOR_DIRECTORY: &str = "coord";
@@ -115,6 +117,8 @@ pub(crate) struct DeveloperLocalLayoutV1 {
     agent_ipc_bootstrap_path: PathBuf,
     inspection_ipc_socket_path: PathBuf,
     inspection_ipc_bootstrap_path: PathBuf,
+    receipt_ipc_socket_path: PathBuf,
+    receipt_ipc_bootstrap_path: PathBuf,
 }
 
 /// Minimal filesystem ownership for `paraegox node`: one Runtime owner, one
@@ -410,12 +414,15 @@ fn prepare_state_root(
     let agent_ipc_bootstrap_path = socket_directory.join(AGENT_IPC_BOOTSTRAP_FILE);
     let inspection_ipc_socket_path = socket_directory.join(INSPECTION_IPC_SOCKET_FILE);
     let inspection_ipc_bootstrap_path = socket_directory.join(INSPECTION_IPC_BOOTSTRAP_FILE);
+    let receipt_ipc_socket_path = socket_directory.join(RECEIPT_IPC_SOCKET_FILE);
+    let receipt_ipc_bootstrap_path = socket_directory.join(RECEIPT_IPC_BOOTSTRAP_FILE);
     for path in [
         &authority_socket_path,
         &runtime_socket_path,
         &node_management_socket_path,
         &agent_ipc_socket_path,
         &inspection_ipc_socket_path,
+        &receipt_ipc_socket_path,
     ] {
         if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
             return Err(DeveloperLocalLayoutError::SocketPathTooLong);
@@ -441,6 +448,8 @@ fn prepare_state_root(
         agent_ipc_bootstrap_path,
         inspection_ipc_socket_path,
         inspection_ipc_bootstrap_path,
+        receipt_ipc_socket_path,
+        receipt_ipc_bootstrap_path,
     };
     layout.validate(uid, gid)?;
     Ok(layout)
@@ -613,8 +622,16 @@ impl DeveloperLocalLayoutV1 {
         &self.inspection_ipc_bootstrap_path
     }
 
+    pub(crate) fn receipt_ipc_socket_path(&self) -> &Path {
+        &self.receipt_ipc_socket_path
+    }
+
+    pub(crate) fn receipt_ipc_bootstrap_path(&self) -> &Path {
+        &self.receipt_ipc_bootstrap_path
+    }
+
     #[cfg(test)]
-    fn owned_paths(&self) -> [&Path; 18] {
+    fn owned_paths(&self) -> [&Path; 20] {
         [
             self.canonical_state_root(),
             self.controller_state_directory(),
@@ -634,6 +651,8 @@ impl DeveloperLocalLayoutV1 {
             self.agent_ipc_bootstrap_path(),
             self.inspection_ipc_socket_path(),
             self.inspection_ipc_bootstrap_path(),
+            self.receipt_ipc_socket_path(),
+            self.receipt_ipc_bootstrap_path(),
         ]
     }
 
@@ -690,6 +709,7 @@ impl DeveloperLocalLayoutV1 {
             self.runtime_socket_path(),
             self.agent_ipc_socket_path(),
             self.inspection_ipc_socket_path(),
+            self.receipt_ipc_socket_path(),
         ] {
             validate_reserved_path(path, self.socket_directory())?;
             if path.as_os_str().as_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
@@ -712,6 +732,7 @@ impl DeveloperLocalLayoutV1 {
         for path in [
             self.agent_ipc_bootstrap_path(),
             self.inspection_ipc_bootstrap_path(),
+            self.receipt_ipc_bootstrap_path(),
         ] {
             validate_reserved_path(path, self.socket_directory())?;
         }
@@ -725,6 +746,8 @@ impl DeveloperLocalLayoutV1 {
             self.agent_ipc_bootstrap_path(),
             self.inspection_ipc_socket_path(),
             self.inspection_ipc_bootstrap_path(),
+            self.receipt_ipc_socket_path(),
+            self.receipt_ipc_bootstrap_path(),
         ];
         if leaf_paths
             .iter()
@@ -1610,6 +1633,22 @@ mod tests {
                 .len()
                 <= MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES
         );
+        assert_eq!(
+            first.receipt_ipc_socket_path().parent(),
+            Some(first.socket_directory())
+        );
+        assert_eq!(
+            first.receipt_ipc_bootstrap_path().parent(),
+            Some(first.socket_directory())
+        );
+        assert_ne!(
+            first.receipt_ipc_socket_path(),
+            first.receipt_ipc_bootstrap_path()
+        );
+        assert!(
+            first.receipt_ipc_socket_path().as_os_str().as_bytes().len()
+                <= MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES
+        );
 
         let second = prepare(&config, &identities).expect("stable fixture filesystem reopen");
         assert_eq!(first.owned_paths(), second.owned_paths());
@@ -1665,6 +1704,18 @@ mod tests {
             !first
                 .socket_directory()
                 .join(INSPECTION_IPC_SOCKET_FILE)
+                .exists()
+        );
+        assert!(
+            !first
+                .socket_directory()
+                .join(RECEIPT_IPC_SOCKET_FILE)
+                .exists()
+        );
+        assert!(
+            !first
+                .socket_directory()
+                .join(RECEIPT_IPC_BOOTSTRAP_FILE)
                 .exists()
         );
         assert!(

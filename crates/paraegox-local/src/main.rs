@@ -15,7 +15,7 @@ use config::{
 #[cfg(unix)]
 use config::{
     LocalDeployCommandV1, LocalInspectionSnapshotCommandV1, LocalLifecycleCommandV1,
-    LocalManagedChatConfigV1, LocalTuiAttachCommandV1,
+    LocalManagedChatConfigV1, LocalReceiptSnapshotCommandV1, LocalTuiAttachCommandV1,
 };
 use error::LocalProcessError;
 use serde::Serialize;
@@ -37,6 +37,8 @@ mod inspection_client;
 mod layout;
 #[cfg(unix)]
 mod lifecycle;
+#[cfg(unix)]
+mod receipt_snapshot;
 
 pub(crate) const NODE_DAEMON_CHILD_MODE: &str = "__node-daemon-child-v1";
 pub(crate) const NODE_BOOTSTRAP_FILE_OPTION: &str = "--node-bootstrap-file";
@@ -46,6 +48,7 @@ const LIFECYCLE_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const INIT_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const LOCAL_DEPLOY_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const LOCAL_INSPECTION_OUTPUT_SCHEMA_VERSION: u16 = 1;
+const LOCAL_RECEIPT_OUTPUT_SCHEMA_VERSION: u16 = 1;
 #[cfg(unix)]
 const LOCAL_DEPLOY_PROFILE: &str = "deterministic-echo-v1";
 
@@ -123,6 +126,35 @@ struct LocalInspectionErrorJsonLineV1<'a> {
     diagnostics: [LocalInspectionDiagnosticJsonV1<'a>; 1],
 }
 
+#[derive(Serialize)]
+struct LocalReceiptDiagnosticJsonV1<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+#[cfg(unix)]
+#[derive(Serialize)]
+struct LocalReceiptSuccessJsonLineV1<'a, Snapshot> {
+    schema_version: u16,
+    command: &'static str,
+    ok: bool,
+    changed: bool,
+    generation: &'a str,
+    snapshot: &'a Snapshot,
+    diagnostics: [LocalReceiptDiagnosticJsonV1<'a>; 0],
+}
+
+#[derive(Serialize)]
+struct LocalReceiptErrorJsonLineV1<'a> {
+    schema_version: u16,
+    command: &'static str,
+    ok: bool,
+    changed: bool,
+    generation: Option<()>,
+    snapshot: Option<()>,
+    diagnostics: [LocalReceiptDiagnosticJsonV1<'a>; 1],
+}
+
 #[cfg(unix)]
 struct LocalChatSupervisorInvocationV1 {
     config: LocalManagedChatConfigV1,
@@ -150,6 +182,9 @@ fn main() -> ExitCode {
     }
     if config::inspection_snapshot_json_intent(&arguments) {
         return dispatch_inspection_snapshot_to(&mut io::stdout().lock(), &arguments).exit_code();
+    }
+    if config::receipt_snapshot_json_intent(&arguments) {
+        return dispatch_receipt_snapshot_to(&mut io::stdout().lock(), &arguments).exit_code();
     }
     if config::local_deploy_json_intent(&arguments) {
         return dispatch_local_deploy_to(&mut io::stdout().lock(), &arguments).exit_code();
@@ -311,6 +346,114 @@ fn write_inspection_snapshot_error_json_line(
     output
         .write_all(b"\n")
         .map_err(|_| LocalProcessError::LocalInspectionJsonOutput)
+}
+
+fn dispatch_receipt_snapshot_to(
+    output: &mut impl Write,
+    arguments: &[OsString],
+) -> DispatchOutcome {
+    let command = match config::parse_receipt_snapshot(arguments) {
+        Ok(command) => command,
+        Err(error) => {
+            return finish_receipt_snapshot_result(output, LocalProcessError::Configuration(error));
+        }
+    };
+    #[cfg(unix)]
+    {
+        match run_receipt_snapshot_command(command) {
+            Ok(read) => {
+                let generation = lower_hex(&read.generation());
+                if write_receipt_snapshot_success_json_line(output, &generation, read.snapshot())
+                    .is_ok()
+                {
+                    DispatchOutcome::Success
+                } else {
+                    DispatchOutcome::DiagnosticFailure
+                }
+            }
+            Err(error) => finish_receipt_snapshot_result(output, error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        unreachable!("local Receipt parser rejects the unsupported non-Unix platform")
+    }
+}
+
+#[cfg(unix)]
+fn run_receipt_snapshot_command(
+    command: LocalReceiptSnapshotCommandV1,
+) -> Result<receipt_snapshot::LocalReceiptSnapshotReadV1, LocalProcessError> {
+    let config = command.into_config();
+    let locator = lifecycle::locate_local_receipt_bootstrap(&config)?;
+    receipt_snapshot::read_latest_receipt_snapshot(&locator)
+}
+
+fn finish_receipt_snapshot_result(
+    output: &mut impl Write,
+    error: LocalProcessError,
+) -> DispatchOutcome {
+    if matches!(error, LocalProcessError::LocalReceiptJsonOutput) {
+        return DispatchOutcome::DiagnosticFailure;
+    }
+    if write_receipt_snapshot_error_json_line(output, error).is_err() {
+        return DispatchOutcome::DiagnosticFailure;
+    }
+    if error.exit_code() == 2 {
+        DispatchOutcome::ConfigurationFailure
+    } else {
+        DispatchOutcome::DiagnosticFailure
+    }
+}
+
+#[cfg(unix)]
+fn write_receipt_snapshot_success_json_line<Snapshot: Serialize>(
+    output: &mut impl Write,
+    generation: &str,
+    snapshot: &Snapshot,
+) -> Result<(), LocalProcessError> {
+    serde_json::to_writer(
+        &mut *output,
+        &LocalReceiptSuccessJsonLineV1 {
+            schema_version: LOCAL_RECEIPT_OUTPUT_SCHEMA_VERSION,
+            command: "receipt.snapshot",
+            ok: true,
+            changed: false,
+            generation,
+            snapshot,
+            diagnostics: [],
+        },
+    )
+    .map_err(|_| LocalProcessError::LocalReceiptJsonOutput)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| LocalProcessError::LocalReceiptJsonOutput)
+}
+
+fn write_receipt_snapshot_error_json_line(
+    output: &mut impl Write,
+    error: LocalProcessError,
+) -> Result<(), LocalProcessError> {
+    serde_json::to_writer(
+        &mut *output,
+        &LocalReceiptErrorJsonLineV1 {
+            schema_version: LOCAL_RECEIPT_OUTPUT_SCHEMA_VERSION,
+            command: "receipt.snapshot",
+            ok: false,
+            changed: false,
+            generation: None,
+            snapshot: None,
+            diagnostics: [LocalReceiptDiagnosticJsonV1 {
+                code: error.code(),
+                message: error.message(),
+            }],
+        },
+    )
+    .map_err(|_| LocalProcessError::LocalReceiptJsonOutput)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| LocalProcessError::LocalReceiptJsonOutput)
 }
 
 fn dispatch_local_deploy_to(output: &mut impl Write, arguments: &[OsString]) -> DispatchOutcome {
@@ -1228,6 +1371,7 @@ fn usage() -> &'static str {
        paraegox down --config <absolute-paraegox.toml> --json
        paraegox deploy --local --config <absolute-paraegox.toml> --json
        paraegox inspection snapshot --config <absolute-paraegox.toml> --json
+       paraegox receipt snapshot --config <absolute-paraegox.toml> --json
        paraegox tui --config <absolute-paraegox.toml>
        paraegox node --config <absolute-paraegox-node.toml>
        paraegox deployment --config <absolute-paraegox-deployment.toml>
@@ -1263,6 +1407,11 @@ inspection snapshot performs one generation-bound read-only PXIQ-v2 Latest
 exchange against the existing managed-local Inspection endpoint. It does not
 start, stop, recover, or mutate an owner; retry, watch, and health inference
 are outside this command.
+
+receipt snapshot performs one generation-bound owner-locator query and one
+typed Latest exchange for the current verified Runtime PXMT. It does not read
+durable history, inspect current health, start or stop owners, retry, or expose
+raw Receipt, capability, key, signature, or owner path material.
 
 tui performs one generation-bound atomic attachment to the existing managed-
 local conversation and Inspection endpoints. It never starts, stops, recovers,
@@ -1466,6 +1615,106 @@ mod tests {
         assert_eq!(error, LocalProcessError::LocalInspectionJsonOutput);
         assert_eq!(
             finish_inspection_snapshot_result(&mut output, error),
+            DispatchOutcome::DiagnosticFailure
+        );
+        assert_eq!(output.write_attempts, attempts);
+    }
+
+    #[test]
+    fn receipt_snapshot_error_json_has_exact_seven_path_safe_fields() {
+        let mut output = Vec::new();
+        write_receipt_snapshot_error_json_line(
+            &mut output,
+            LocalProcessError::LocalReceiptNotRunning,
+        )
+        .expect("Receipt error JSON");
+        assert_eq!(output.last(), Some(&b'\n'));
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let text = String::from_utf8(output.clone()).expect("UTF-8 Receipt JSON");
+        assert_eq!(
+            text,
+            concat!(
+                "{\"schema_version\":1,\"command\":\"receipt.snapshot\",",
+                "\"ok\":false,\"changed\":false,\"generation\":null,\"snapshot\":null,",
+                "\"diagnostics\":[{\"code\":\"PXLC-RECEIPT-NOT-RUNNING\",",
+                "\"message\":\"local Receipt snapshot requires the current owner generation to be running\"}]}\n"
+            )
+        );
+        let parsed: Value = serde_json::from_slice(&output).expect("Receipt error object");
+        assert_eq!(parsed.as_object().expect("JSON object").len(), 7);
+        assert_eq!(parsed["generation"], Value::Null);
+        assert_eq!(parsed["snapshot"], Value::Null);
+        assert_eq!(parsed["changed"], false);
+        assert!(!text.contains("private/tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_snapshot_success_json_has_exact_order_and_generation() {
+        #[derive(Serialize)]
+        struct SnapshotVersionOnly {
+            snapshot_version: u16,
+        }
+
+        let mut output = Vec::new();
+        write_receipt_snapshot_success_json_line(
+            &mut output,
+            "51515151515151515151515151515151",
+            &SnapshotVersionOnly {
+                snapshot_version: 1,
+            },
+        )
+        .expect("Receipt success JSON");
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8 Receipt JSON"),
+            concat!(
+                "{\"schema_version\":1,\"command\":\"receipt.snapshot\",",
+                "\"ok\":true,\"changed\":false,",
+                "\"generation\":\"51515151515151515151515151515151\",",
+                "\"snapshot\":{\"snapshot_version\":1},\"diagnostics\":[]}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_receipt_snapshot_stays_on_json_and_exit_two() {
+        let mut output = Vec::new();
+        let outcome = dispatch_receipt_snapshot_to(
+            &mut output,
+            &[
+                OsString::from("receipt"),
+                OsString::from("snapshot"),
+                OsString::from("--config"),
+                OsString::from("/private/tmp/must-not-appear.toml"),
+                OsString::from("--json"),
+                OsString::from("--retry"),
+            ],
+        );
+        assert_eq!(outcome, DispatchOutcome::ConfigurationFailure);
+        let parsed: Value = serde_json::from_slice(&output).expect("Receipt grammar JSON");
+        assert_eq!(parsed.as_object().map(|object| object.len()), Some(7));
+        assert_eq!(parsed["generation"], Value::Null);
+        assert_eq!(parsed["snapshot"], Value::Null);
+        assert_eq!(parsed["diagnostics"][0]["code"], "PXLC-RECEIPT-GRAMMAR");
+        assert!(
+            !String::from_utf8(output)
+                .expect("UTF-8 JSON")
+                .contains("must-not-appear")
+        );
+    }
+
+    #[test]
+    fn partial_receipt_json_failure_never_attempts_a_second_object() {
+        let mut output = FaultingJsonOutput::with_successful_byte_budget(31);
+        let error = write_receipt_snapshot_error_json_line(
+            &mut output,
+            LocalProcessError::LocalReceiptLocator,
+        )
+        .expect_err("partial Receipt JSON must fail closed");
+        let attempts = output.write_attempts;
+        assert_eq!(error, LocalProcessError::LocalReceiptJsonOutput);
+        assert_eq!(
+            finish_receipt_snapshot_result(&mut output, error),
             DispatchOutcome::DiagnosticFailure
         );
         assert_eq!(output.write_attempts, attempts);
@@ -2158,7 +2407,7 @@ mod tests {
     fn usage_exposes_runtime_and_offline_commands_without_internal_modes() {
         let text = usage();
         assert_eq!(
-            text.lines().take(14).collect::<Vec<_>>(),
+            text.lines().take(15).collect::<Vec<_>>(),
             [
                 "Usage: paraegox chat --config <absolute-paraegox.toml>",
                 "       paraegox init --directory <absolute-directory> --json",
@@ -2167,6 +2416,7 @@ mod tests {
                 "       paraegox down --config <absolute-paraegox.toml> --json",
                 "       paraegox deploy --local --config <absolute-paraegox.toml> --json",
                 "       paraegox inspection snapshot --config <absolute-paraegox.toml> --json",
+                "       paraegox receipt snapshot --config <absolute-paraegox.toml> --json",
                 "       paraegox tui --config <absolute-paraegox.toml>",
                 "       paraegox node --config <absolute-paraegox-node.toml>",
                 "       paraegox deployment --config <absolute-paraegox-deployment.toml>",
@@ -2186,6 +2436,9 @@ mod tests {
         assert!(
             text.contains("paraegox inspection snapshot --config <absolute-paraegox.toml> --json")
         );
+        assert!(
+            text.contains("paraegox receipt snapshot --config <absolute-paraegox.toml> --json")
+        );
         assert!(text.contains("paraegox tui --config <absolute-paraegox.toml>"));
         assert!(text.contains("reports only the authenticated local lifecycle state"));
         assert!(text.contains("never use a PID as control authority"));
@@ -2194,6 +2447,7 @@ mod tests {
         assert!(text.contains("does not install Artifact\nbytes"));
         assert!(text.contains("one generation-bound read-only PXIQ-v2 Latest"));
         assert!(text.contains("retry, watch, and health inference\nare outside"));
+        assert!(text.contains("typed Latest exchange for the current verified Runtime PXMT"));
         assert!(text.contains("never starts, stops, recovers,\nretries, reconnects"));
         assert!(text.contains("leaves the owner and\nits Running generation intact"));
         assert!(text.contains("paraegox node --config <absolute-paraegox-node.toml>"));

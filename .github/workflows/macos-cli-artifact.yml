@@ -88,6 +88,7 @@ jobs:
           grep -Fqx '       paraegox down --config <absolute-paraegox.toml> --json' "$help_output"
           grep -Fqx '       paraegox deploy --local --config <absolute-paraegox.toml> --json' "$help_output"
           grep -Fqx '       paraegox inspection snapshot --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox receipt snapshot --config <absolute-paraegox.toml> --json' "$help_output"
           grep -Fqx '       paraegox tui --config <absolute-paraegox.toml>' "$help_output"
           grep -Fqx '       paraegox node --config <absolute-paraegox-node.toml>' "$help_output"
           grep -Fqx '       paraegox deployment --config <absolute-paraegox-deployment.toml>' "$help_output"
@@ -95,7 +96,7 @@ jobs:
           grep -Fqx '       paraegox config check <chat|node|deployment> --config <absolute-config.toml> --json' "$help_output"
           grep -Fqx '       paraegox doctor <chat|node|deployment> --config <absolute-config.toml> --offline --json' "$help_output"
           grep -Fqx '       paraegox --help' "$help_output"
-          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 14
+          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 15
 
           version_json="$RUNNER_TEMP/paraegox-version.json"
           init_first_json="$RUNNER_TEMP/paraegox-init-first.json"
@@ -105,6 +106,8 @@ jobs:
           deploy_grammar_json="$RUNNER_TEMP/paraegox-deploy-grammar.json"
           inspection_not_running_json="$RUNNER_TEMP/paraegox-inspection-not-running.json"
           inspection_grammar_json="$RUNNER_TEMP/paraegox-inspection-grammar.json"
+          receipt_not_running_json="$RUNNER_TEMP/paraegox-receipt-not-running.json"
+          receipt_grammar_json="$RUNNER_TEMP/paraegox-receipt-grammar.json"
           tui_not_running_stdout="$RUNNER_TEMP/paraegox-tui-not-running.stdout"
           tui_grammar_stdout="$RUNNER_TEMP/paraegox-tui-grammar.stdout"
           config_json="$RUNNER_TEMP/paraegox-config-check.json"
@@ -116,6 +119,8 @@ jobs:
           deploy_grammar_stderr="$RUNNER_TEMP/paraegox-deploy-grammar.stderr"
           inspection_not_running_stderr="$RUNNER_TEMP/paraegox-inspection-not-running.stderr"
           inspection_grammar_stderr="$RUNNER_TEMP/paraegox-inspection-grammar.stderr"
+          receipt_not_running_stderr="$RUNNER_TEMP/paraegox-receipt-not-running.stderr"
+          receipt_grammar_stderr="$RUNNER_TEMP/paraegox-receipt-grammar.stderr"
           tui_not_running_stderr="$RUNNER_TEMP/paraegox-tui-not-running.stderr"
           tui_grammar_stderr="$RUNNER_TEMP/paraegox-tui-grammar.stderr"
           config_stderr="$RUNNER_TEMP/paraegox-config-check.stderr"
@@ -223,6 +228,32 @@ jobs:
           test ! -s "$inspection_grammar_stderr"
           test ! -e "$offline_state_root"
           set +e
+          OPENAI_API_KEY='receipt poison Secret value' \
+            DEEPSEEK_API_KEY='receipt poison Secret value' \
+            PARAEGOX_M4A_UNLISTED_CANARY='receipt environment canary value' \
+            "$binary" receipt snapshot \
+              --config "$offline_config" \
+              --json > "$receipt_not_running_json" \
+              2> "$receipt_not_running_stderr"
+          receipt_not_running_status=$?
+          set -e
+          test "$receipt_not_running_status" -eq 1
+          test ! -s "$receipt_not_running_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='receipt poison Secret value' \
+            DEEPSEEK_API_KEY='receipt poison Secret value' \
+            PARAEGOX_M4A_UNLISTED_CANARY='receipt environment canary value' \
+            "$binary" receipt snapshot \
+              --config "$offline_config" \
+              --json --watch > "$receipt_grammar_json" \
+              2> "$receipt_grammar_stderr"
+          receipt_grammar_status=$?
+          set -e
+          test "$receipt_grammar_status" -eq 2
+          test ! -s "$receipt_grammar_stderr"
+          test ! -e "$offline_state_root"
+          set +e
           OPENAI_API_KEY='tui poison Secret value' \
             DEEPSEEK_API_KEY='tui poison Secret value' \
             PARAEGOX_M5A_UNLISTED_CANARY='tui environment canary value' \
@@ -282,6 +313,8 @@ jobs:
           test ! -s "$deploy_grammar_stderr"
           test ! -s "$inspection_not_running_stderr"
           test ! -s "$inspection_grammar_stderr"
+          test ! -s "$receipt_not_running_stderr"
+          test ! -s "$receipt_grammar_stderr"
           test ! -s "$config_stderr"
           test ! -s "$doctor_stderr"
           test ! -s "$invalid_stderr"
@@ -295,6 +328,8 @@ jobs:
             DEPLOY_GRAMMAR_JSON="$deploy_grammar_json" \
             INSPECTION_NOT_RUNNING_JSON="$inspection_not_running_json" \
             INSPECTION_GRAMMAR_JSON="$inspection_grammar_json" \
+            RECEIPT_NOT_RUNNING_JSON="$receipt_not_running_json" \
+            RECEIPT_GRAMMAR_JSON="$receipt_grammar_json" \
             CONFIG_JSON="$config_json" \
             DOCTOR_JSON="$doctor_json" \
             INVALID_JSON="$invalid_json" \
@@ -324,6 +359,8 @@ jobs:
           deploy_grammar = load_one("DEPLOY_GRAMMAR_JSON")
           inspection_not_running = load_one("INSPECTION_NOT_RUNNING_JSON")
           inspection_grammar = load_one("INSPECTION_GRAMMAR_JSON")
+          receipt_not_running = load_one("RECEIPT_NOT_RUNNING_JSON")
+          receipt_grammar = load_one("RECEIPT_GRAMMAR_JSON")
           config = load_one("CONFIG_JSON")
           doctor = load_one("DOCTOR_JSON")
           invalid = load_one("INVALID_JSON")
@@ -491,6 +528,56 @@ jobs:
               ):
                   raise SystemExit(
                       "rejected Inspection leaked config, state, or Secret material"
+                  )
+          expected_receipt_fields = [
+              "schema_version",
+              "command",
+              "ok",
+              "changed",
+              "generation",
+              "snapshot",
+              "diagnostics",
+          ]
+          expected_receipt_diagnostics = (
+              (
+                  receipt_not_running,
+                  "PXLC-RECEIPT-NOT-RUNNING",
+                  "local Receipt snapshot requires the current owner generation to be running",
+              ),
+              (
+                  receipt_grammar,
+                  "PXLC-RECEIPT-GRAMMAR",
+                  "receipt snapshot requires exactly --config "
+                  "<absolute-paraegox.toml> --json",
+              ),
+          )
+          for result, code, message in expected_receipt_diagnostics:
+              if list(result) != expected_receipt_fields:
+                  raise SystemExit(f"unexpected Receipt field order: {result!r}")
+              if (
+                  result["schema_version"],
+                  result["command"],
+                  result["ok"],
+                  result["changed"],
+                  result["generation"],
+                  result["snapshot"],
+              ) != (1, "receipt.snapshot", False, False, None, None):
+                  raise SystemExit(f"unexpected rejected Receipt envelope: {result!r}")
+              if result["diagnostics"] != [{"code": code, "message": message}]:
+                  raise SystemExit(f"unexpected Receipt diagnostic: {result!r}")
+              rejected_text = str(result)
+              if any(
+                  forbidden in rejected_text
+                  for forbidden in (
+                      os.environ["OFFLINE_CONFIG"],
+                      os.environ["OFFLINE_STATE_ROOT"],
+                      "DEEPSEEK_API_KEY",
+                      "receipt poison Secret value",
+                      "receipt environment canary value",
+                  )
+              ):
+                  raise SystemExit(
+                      "rejected Receipt leaked config, state, or Secret material"
                   )
           if (config["command"], config["kind"], config["ok"]) != (
               "config.check",
@@ -890,6 +977,20 @@ jobs:
               --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
               --json 2> "$relocated_stderr" \
             | cmp - "$RUNNER_TEMP/paraegox-inspection-not-running.json"
+          relocated_statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${relocated_statuses[0]}" -eq 1
+          test "${relocated_statuses[1]}" -eq 0
+          test ! -s "$relocated_stderr"
+          test ! -e "$RUNNER_TEMP/paraegox-offline-state"
+          set +e
+          OPENAI_API_KEY='receipt poison Secret value' \
+            DEEPSEEK_API_KEY='receipt poison Secret value' \
+            PARAEGOX_M4A_UNLISTED_CANARY='receipt environment canary value' \
+            "$relocated_bundle/paraegox" receipt snapshot \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-receipt-not-running.json"
           relocated_statuses=("${PIPESTATUS[@]}")
           set -e
           test "${relocated_statuses[0]}" -eq 1
