@@ -11209,6 +11209,7 @@ mod tests {
             let stable =
                 RemoteAgentReplayJournalSnapshotV2::decode(genesis.canonical_wire(), identity)
                     .unwrap_or_else(|error| panic!("empty PXRJ readback rejected: {error}"));
+            assert_eq!(stable.identity(), identity);
             assert_eq!(stable, genesis.into_snapshot());
             assert_eq!(
                 classify_remote_agent_replay_startup_pair_v2(
