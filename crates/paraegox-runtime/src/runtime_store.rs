@@ -9778,9 +9778,9 @@ pub(crate) mod tests {
         RuntimeMigrationFailpoints, RuntimeMigrationRequest, RuntimeMigrationTokens,
         RuntimePublishFailure, RuntimeStore, RuntimeStoreError, RuntimeStoreMigrationDisposition,
         RuntimeStoreMigrationError, RuntimeStoreMigrationReceipt, RuntimeStoreOpenError,
-        TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES,
-        migration_evidence_temp_name, migration_receipt_file_name, migration_receipt_file_name_for,
-        migration_source_file_name, migration_source_file_name_for, parse_linux_fdinfo_mount_id,
+        TEMP_FILE_PREFIX, TEMP_TOKEN_BYTES, migration_evidence_temp_name,
+        migration_receipt_file_name, migration_receipt_file_name_for, migration_source_file_name,
+        migration_source_file_name_for, parse_linux_fdinfo_mount_id,
         parse_linux_mountinfo_exact_ext4, remote_agent_access_temp_name,
         remote_agent_descriptor_evidence_temp_name, remote_agent_replay_journal_temp_name,
         temp_name, validate_runtime_service_identity,
@@ -11712,7 +11712,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn remote_agent_access_v2_replacement_postpublish_failure_reopens_pair_for_reconcile_without_candidate() {
+    fn remote_agent_access_v2_replacement_postpublish_failure_reopens_pair_for_reconcile_without_candidate()
+    {
         let (directory, mut store, initial, pending, static_identity, runtime_host_epoch) =
             remote_agent_access_prepared_store_fixture_v2();
         let absent = remote_agent_access_absent_lease_v2(
