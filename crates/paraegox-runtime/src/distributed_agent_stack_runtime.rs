@@ -3102,17 +3102,25 @@ mod tests {
     use paraegox_fabric::{FabricServiceConfig, SessionEndpoint};
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::identity::PrincipalRef;
-    use paraegox_kernel::time::{ClockDomainRef, ClockGeneration, ClockReading, MonotonicInstant};
+    use paraegox_kernel::time::{
+        BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicInstant,
+    };
     use paraegox_runtime_contracts::distributed_agent_stack_plan::{
-        DistributedAgentStackApplyRequestV1, DistributedAgentStackProjectionV1,
+        DistributedAgentStackApplyRequestDraftV1, DistributedAgentStackApplyRequestV1,
+        DistributedAgentStackProjectionV1, DistributedAgentStackTargetExecutionV1,
         DistributedAgentStackTerminalAuthClaimV1, DistributedAgentStackTerminalEvidenceFieldsV1,
         DistributedAgentStackTerminalFactsV1, DistributedAgentStackTerminalObservationsV1,
         DistributedAgentStackTerminalOutcomeV1, DistributedAgentStackTerminalReceiptDraftV1,
         DistributedAgentStackTerminalReceiptV1, DistributedFabricObservedTransportProofV1,
         DistributedFabricSessionEpochV1, distributed_agent_stack_installed_binding_set_digest_v1,
     };
-    use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentProviderSelectionV1;
-    use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
+    use paraegox_runtime_contracts::managed_agent_stack_plan::{
+        ManagedAgentProviderSelectionV1, ManagedAgentServicePlanV1,
+        ManagedAgentStackTargetExecutionV1,
+    };
+    use paraegox_runtime_contracts::managed_service::{
+        ManagedServiceGeneration, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
+    };
     use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
     use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
     use tokio::time::Instant;
@@ -3276,6 +3284,74 @@ mod tests {
     fn fixture_request() -> DistributedAgentStackApplyRequestV1 {
         DistributedAgentStackApplyRequestV1::decode(&fixture_hex("request"))
             .unwrap_or_else(|error| panic!("distributed request fixture rejected: {error}"))
+    }
+
+    fn activation_fixture_request() -> DistributedAgentStackApplyRequestV1 {
+        // The language-neutral golden deliberately freezes 1/2/3/4/5 ms
+        // Agent lifecycle values for codec evidence. Those values are not a
+        // stable budget for a real durable journal plus two live Fabric lanes
+        // while the complete crate test suite is running in parallel. Keep
+        // the golden unchanged and sign a separate, fully canonical request
+        // for this real-I/O vertical.
+        let fixture = fixture_request();
+        let fixture_execution = fixture.target_execution();
+        let fixture_predecessor = fixture_execution.predecessor();
+        let fixture_agent = fixture_predecessor
+            .agent()
+            .unwrap_or_else(|| panic!("distributed activation fixture lost its Agent plan"));
+        let lifecycle_budget = BoundedDuration::from_nanos(5_000_000_000);
+        let lifecycle_budgets = ManagedServiceLifecycleBudgetsV1::try_new(
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+            lifecycle_budget,
+        )
+        .unwrap_or_else(|error| panic!("activation lifecycle budgets rejected: {error}"));
+        let service =
+            ManagedServiceSpecV1::new(fixture_agent.service().service_id(), lifecycle_budgets);
+        let agent = ManagedAgentServicePlanV1::try_new(
+            service,
+            fixture_agent.semantic_limits(),
+            fixture_agent.port().clone(),
+            fixture_agent.provider(),
+        )
+        .unwrap_or_else(|error| panic!("activation Agent plan rejected: {error}"));
+        let predecessor = ManagedAgentStackTargetExecutionV1::try_fabric_and_agent(
+            fixture_predecessor.projection().clone(),
+            fixture_predecessor.fabric().clone(),
+            agent,
+        )
+        .unwrap_or_else(|error| panic!("activation predecessor rejected: {error}"));
+        let execution = DistributedAgentStackTargetExecutionV1::try_distributed_fabric_and_agent(
+            fixture_execution.projection().clone(),
+            predecessor,
+            fixture_execution
+                .topology()
+                .cloned()
+                .unwrap_or_else(|| panic!("distributed activation fixture lost its topology")),
+        )
+        .unwrap_or_else(|error| panic!("activation target rejected: {error}"));
+        let draft = DistributedAgentStackApplyRequestDraftV1::try_new(
+            execution,
+            fixture.provenance(),
+            fixture.control_commitment().control().clone(),
+            fixture.temporal(),
+            fixture.expected_runtime_store_instance_id(),
+            fixture.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("activation request draft rejected: {error}"));
+        let signature = SigningKey::from_bytes(&[0x41; 32])
+            .sign(
+                draft
+                    .signing_transcript()
+                    .unwrap_or_else(|error| panic!("activation transcript rejected: {error}"))
+                    .as_bytes(),
+            )
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("activation request rejected: {error}"))
     }
 
     fn fixture_transport_proof() -> DistributedFabricObservedTransportProofV1 {
@@ -4077,7 +4153,7 @@ mod tests {
 
     async fn activation_vertical_after_validated_snapshot_commits_ready_and_serves_echo_inner() {
         let projection = fixture_projection();
-        let request = fixture_request();
+        let request = activation_fixture_request();
         let channel = response_channel(&projection);
         let fabric_generation = generation(FABRIC_GENERATION);
         let agent_generation = generation(AGENT_GENERATION);

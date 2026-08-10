@@ -10641,16 +10641,26 @@ mod tests {
             let pxrj_path = state_directory
                 .path()
                 .join("remote-agent-access-replay-journal.snapshot-v2");
+            // Retain the exact initial files across the complete transaction.
+            // PXRJ is atomically replaced twice (Stable -> Pending -> Stable),
+            // so a bare inode number from the first name can otherwise be
+            // released and legitimately reused by the second replacement.
+            let initial_pxrs_file = File::open(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRS open failed: {error}"));
+            let initial_pxrj_file = File::open(&pxrj_path)
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRJ open failed: {error}"));
             let initial_pxrs = fs::read(&pxrs_path)
                 .unwrap_or_else(|error| panic!("{stage:?} initial PXRS read failed: {error}"));
             let initial_pxrj = fs::read(&pxrj_path)
                 .unwrap_or_else(|error| panic!("{stage:?} initial PXRJ read failed: {error}"));
-            let initial_pxrs_inode = fs::metadata(&pxrs_path)
-                .unwrap_or_else(|error| panic!("{stage:?} initial PXRS metadata failed: {error}"))
-                .ino();
-            let initial_pxrj_inode = fs::metadata(&pxrj_path)
-                .unwrap_or_else(|error| panic!("{stage:?} initial PXRJ metadata failed: {error}"))
-                .ino();
+            let initial_pxrs_metadata = initial_pxrs_file
+                .metadata()
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRS metadata failed: {error}"));
+            let initial_pxrj_metadata = initial_pxrj_file
+                .metadata()
+                .unwrap_or_else(|error| panic!("{stage:?} initial PXRJ metadata failed: {error}"));
+            let initial_pxrs_identity = (initial_pxrs_metadata.dev(), initial_pxrs_metadata.ino());
+            let initial_pxrj_identity = (initial_pxrj_metadata.dev(), initial_pxrj_metadata.ino());
             let request_fixture = ManagedRemoteAgentAccessRequestFixtureV2 {
                 stack_request: &stack_request,
                 retained_s0_cas,
@@ -10716,19 +10726,19 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{stage:?} disk PXRS read failed: {error}"));
             let disk_pxrj = fs::read(&pxrj_path)
                 .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ read failed: {error}"));
-            let disk_pxrs_inode = fs::metadata(&pxrs_path)
-                .unwrap_or_else(|error| panic!("{stage:?} disk PXRS metadata failed: {error}"))
-                .ino();
-            let disk_pxrj_inode = fs::metadata(&pxrj_path)
-                .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ metadata failed: {error}"))
-                .ino();
+            let disk_pxrs_metadata = fs::metadata(&pxrs_path)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRS metadata failed: {error}"));
+            let disk_pxrj_metadata = fs::metadata(&pxrj_path)
+                .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ metadata failed: {error}"));
+            let disk_pxrs_identity = (disk_pxrs_metadata.dev(), disk_pxrs_metadata.ino());
+            let disk_pxrj_identity = (disk_pxrj_metadata.dev(), disk_pxrj_metadata.ino());
             let pxrs = RemoteAgentAccessSnapshotV2::decode(&disk_pxrs, static_identity)
                 .unwrap_or_else(|error| panic!("{stage:?} disk PXRS decode failed: {error}"));
             let pxrj = RemoteAgentReplayJournalSnapshotV2::decode(&disk_pxrj, journal_identity)
                 .unwrap_or_else(|error| panic!("{stage:?} disk PXRJ decode failed: {error}"));
             if pxrs_published {
                 assert_ne!(disk_pxrs, initial_pxrs);
-                assert_ne!(disk_pxrs_inode, initial_pxrs_inode);
+                assert_ne!(disk_pxrs_identity, initial_pxrs_identity);
                 assert_eq!(
                     pxrs.phase(),
                     RemoteAgentAccessDurablePhaseV2::PreparedNoEffects
@@ -10736,7 +10746,7 @@ mod tests {
                 assert_eq!(pxrs.sequence(), 2);
             } else {
                 assert_eq!(disk_pxrs, initial_pxrs);
-                assert_eq!(disk_pxrs_inode, initial_pxrs_inode);
+                assert_eq!(disk_pxrs_identity, initial_pxrs_identity);
                 assert_eq!(
                     pxrs.phase(),
                     RemoteAgentAccessDurablePhaseV2::InitializedAbsent
@@ -10746,7 +10756,7 @@ mod tests {
             match journal_expectation {
                 JournalExpectation::InitialStable => {
                     assert_eq!(disk_pxrj, initial_pxrj);
-                    assert_eq!(disk_pxrj_inode, initial_pxrj_inode);
+                    assert_eq!(disk_pxrj_identity, initial_pxrj_identity);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
                     assert_eq!(pxrj.revision(), 1);
                     assert_eq!(pxrj.applied_burn_ordinal(), 0);
@@ -10755,7 +10765,7 @@ mod tests {
                 }
                 JournalExpectation::Pending => {
                     assert_ne!(disk_pxrj, initial_pxrj);
-                    assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
+                    assert_ne!(disk_pxrj_identity, initial_pxrj_identity);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::PendingEdge);
                     assert_eq!(pxrj.revision(), 2);
                     assert_eq!(pxrj.applied_burn_ordinal(), 0);
@@ -10764,7 +10774,7 @@ mod tests {
                 }
                 JournalExpectation::CommittedStable => {
                     assert_ne!(disk_pxrj, initial_pxrj);
-                    assert_ne!(disk_pxrj_inode, initial_pxrj_inode);
+                    assert_ne!(disk_pxrj_identity, initial_pxrj_identity);
                     assert_eq!(pxrj.phase(), RemoteAgentReplayJournalPhaseV2::Stable);
                     assert_eq!(pxrj.revision(), 3);
                     assert_eq!(pxrj.applied_burn_ordinal(), 1);
@@ -10772,6 +10782,8 @@ mod tests {
                     assert_eq!(pxrj.pending_source_snapshot_sequence(), None);
                 }
             }
+            drop(initial_pxrs_file);
+            drop(initial_pxrj_file);
             drop(control);
         }
     }
