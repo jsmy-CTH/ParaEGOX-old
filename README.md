@@ -303,6 +303,23 @@ upgrading Zenoh requires rerunning this matrix. A wrong-CN peer can occupy the s
 ACL denial, so `max_sessions = 1` remains an availability risk rather than an authentication bypass.
 The evidence is a single-Ubuntu-host network test, not proof from a real two-host Mac process.
 
+## T2-B1 internal independent S1 start substrate (not activated)
+
+The crate-private Fabric lifecycle prepares one independent TLS-only S1 without touching the
+existing S0 session. Its move-only prepared owner builds the private Zenoh config and reserves a
+nonzero session epoch without reading credential files, binding a socket, declaring a queryable, or
+spawning a worker. Consuming start is the first transport effect. The resulting internal live token
+exposes only the reserved epoch and consuming shutdown, while the general `FabricService::start`
+rejects this private profile.
+
+The focused single-Ubuntu real-network test exercises S0 before, during, and after the separate S1
+lifecycle, including an unbound S1 endpoint after prepare, the same reserved/live epoch, and port
+reuse after shutdown. It does not install either S1 queryable or send an S1 request. Runtime
+owner/orchestration, S1 queryable installation, PXRA dispatch, and the Mac connector are not
+implemented, so this is not remote-Agent activation and provides no conversation/Echo, restart
+recovery, or two-host proof. This candidate must be consumed by one real Runtime owner with semantic
+lifecycle and cleanup evidence in the next bounded batch, or be folded back or removed.
+
 ## T2-C0 durable PXAG/PXAH descriptor evidence
 
 Exact r176 `9eb8e6a7e61d0ba6149d4313dd66bce1b2f2ff3f` adds a crate-private, bounded

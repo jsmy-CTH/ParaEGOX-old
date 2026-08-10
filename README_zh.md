@@ -260,6 +260,21 @@ T1 本地结果依赖精确锁定的 Zenoh 1.9 中 same-session local-face 边�
 该矩阵。错误 CN peer 可在 ACL 拒绝前占用唯一 session，因此 `max_sessions = 1` 仍有可用性风险，
 但这不是认证绕过。现有证据只是单 Ubuntu 主机上的网络测试，并非真实双机 Mac process 证明。
 
+## T2-B1 内部独立 S1 启动底座（未激活）
+
+crate-private Fabric lifecycle 可以在不触碰既有 S0 session 的前提下准备一条独立、仅 TLS 的 S1。其
+不可 clone 的内部 prepared owner 只构建私有 Zenoh config 并预留一个非零 session epoch，不读取
+credential 文件、不绑定 socket、不声明 queryable，也不启动 worker。消耗式 start 才是第一个传输
+effect；随后得到的内部 live token 只暴露预留 epoch 与消耗式 shutdown。通用
+`FabricService::start` 会拒绝这个 private profile。
+
+聚焦的单 Ubuntu 真实网络测试覆盖独立 S1 生命周期前、中、后的 S0，并检查 prepare 后 S1 endpoint
+仍未绑定、预留 epoch 与 live epoch 一致，以及 shutdown 后端口可复用；它没有安装任何 S1 queryable，
+也没有发送 S1 请求。Runtime owner/orchestration、S1 queryable 安装、PXRA dispatch 与 Mac connector
+均未实现，所以这不是 remote-Agent activation，也不提供 conversation/Echo、restart recovery 或双机
+证明。这个 candidate 必须在下一有界批次由一个真实 Runtime owner 消费，并取得语义 lifecycle/cleanup
+证据；否则就要折回唯一 owner 或删除。
+
 ## T2-C0 持久 PXAG/PXAH descriptor evidence
 
 精确 r176 `9eb8e6a7e61d0ba6149d4313dd66bce1b2f2ff3f` 在既有 Runtime store 与同一
