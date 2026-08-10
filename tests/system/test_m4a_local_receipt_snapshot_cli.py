@@ -690,13 +690,30 @@ def _socket_paths(root: Path) -> list[Path]:
     return sockets
 
 
-def _local_runtime_paths() -> frozenset[Path]:
-    paths: set[Path] = set()
-    for directory in Path("/tmp").glob("pxl-*"):
-        paths.add(directory)
-        if directory.is_dir():
-            paths.update(directory.rglob("*"))
-    return frozenset(paths)
+def _local_runtime_directories() -> frozenset[Path]:
+    directories: set[Path] = set()
+    for path in Path("/tmp").glob("pxl-*"):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.add(path)
+    return frozenset(directories)
+
+
+def _assert_inert_failed_runtime_directory(root: Path) -> None:
+    metadata = root.lstat()
+    assert stat.S_ISDIR(metadata.st_mode)
+    entries = sorted(root.rglob("*"), key=lambda item: os.fsencode(item))
+    assert [entry.relative_to(root) for entry in entries] == [Path("node")]
+    node_metadata = entries[0].lstat()
+    assert stat.S_ISDIR(node_metadata.st_mode)
+    assert _socket_paths(root) == []
+    assert not any(
+        stat.S_ISREG(entry.lstat().st_mode) or entry.suffix == ".pxrb"
+        for entry in entries
+    )
 
 
 def _tree_fingerprint(root: Path) -> tuple[tuple[object, ...], ...]:
@@ -1089,6 +1106,8 @@ static const unsigned char status_prefix[6] = {'P', 'X', 'L', 'O', 1, 'S'};
 static const unsigned char locator_prefix[6] = {'P', 'X', 'L', 'O', 1, 'R'};
 static __thread int inside_interposer = 0;
 static int bootstrap_open_observed = 0;
+static int bootstrap_close_observed = 0;
+static int tracked_bootstrap_fd = -1;
 
 static int configured_fd(const char *name) {
     const char *raw = getenv(name);
@@ -1206,6 +1225,7 @@ static int after_open(int fd, int flags) {
         || (
             strcmp(mode, "barrier_bootstrap_open") != 0
             && strcmp(mode, "barrier_startup_bootstrap_open") != 0
+            && strcmp(mode, "barrier_bootstrap_close") != 0
         )
         || (flags & O_CREAT) != 0
         || (flags & O_ACCMODE) != O_RDONLY
@@ -1220,6 +1240,11 @@ static int after_open(int fd, int flags) {
     }
     inside_interposer = 1;
     bootstrap_open_observed = 1;
+    if (strcmp(mode, "barrier_bootstrap_close") == 0) {
+        tracked_bootstrap_fd = fd;
+        inside_interposer = 0;
+        return fd;
+    }
     report_marker('O');
     if (await_release() != 0) {
         int saved = errno;
@@ -1229,6 +1254,35 @@ static int after_open(int fd, int flags) {
     }
     inside_interposer = 0;
     return fd;
+}
+
+int close(int fd) {
+    static int (*real_close)(int) = NULL;
+    if (real_close == NULL) {
+        real_close = dlsym(RTLD_NEXT, "close");
+    }
+    if (
+        fd != tracked_bootstrap_fd
+        || bootstrap_close_observed
+        || inside_interposer
+    ) {
+        return real_close(fd);
+    }
+    tracked_bootstrap_fd = -1;
+    bootstrap_close_observed = 1;
+    int result = real_close(fd);
+    int close_errno = errno;
+    inside_interposer = 1;
+    report_marker('B');
+    int release_result = await_release();
+    int release_errno = errno;
+    inside_interposer = 0;
+    if (release_result != 0) {
+        errno = release_errno;
+        return -1;
+    }
+    errno = close_errno;
+    return result;
 }
 
 ssize_t write(int fd, const void *buffer, size_t count) {
@@ -1303,32 +1357,30 @@ int connect(int fd, const struct sockaddr *address, socklen_t address_length) {
     if (real_connect == NULL) {
         real_connect = dlsym(RTLD_NEXT, "connect");
     }
-    if (address == NULL || address->sa_family != AF_UNIX) {
-        return real_connect(fd, address, address_length);
-    }
-    const struct sockaddr_un *original = (const struct sockaddr_un *)address;
-    const char *mode = getenv("PARAEGOX_M4A_INTERPOSE_MODE");
-    const char *barrier_path = getenv("PARAEGOX_M4A_BARRIER_CONNECT_PATH");
     if (
-        !inside_interposer
-        && mode != NULL
-        && strcmp(mode, "barrier_connect") == 0
-        && barrier_path != NULL
-        && strcmp(original->sun_path, barrier_path) == 0
+        address != NULL
+        && address->sa_family == AF_UNIX
+        && !inside_interposer
+        && bootstrap_close_observed
     ) {
-        inside_interposer = 1;
-        report_marker('C');
-        int failure = await_release();
-        inside_interposer = 0;
-        if (failure != 0) {
-            return -1;
+        const char *mode = getenv("PARAEGOX_M4A_INTERPOSE_MODE");
+        if (mode != NULL && strcmp(mode, "barrier_bootstrap_close") == 0) {
+            inside_interposer = 1;
+            report_marker('C');
+            inside_interposer = 0;
         }
     }
     const char *from = getenv("PARAEGOX_M4A_REDIRECT_FROM");
     const char *to = getenv("PARAEGOX_M4A_REDIRECT_TO");
-    if (from == NULL || to == NULL) {
+    if (
+        address == NULL
+        || address->sa_family != AF_UNIX
+        || from == NULL
+        || to == NULL
+    ) {
         return real_connect(fd, address, address_length);
     }
+    const struct sockaddr_un *original = (const struct sockaddr_un *)address;
     if (strcmp(original->sun_path, from) != 0) {
         return real_connect(fd, address, address_length);
     }
@@ -1452,7 +1504,6 @@ def _spawn_interposed_receipt(
     mode: str,
     redirect_from: Path | None = None,
     redirect_to: Path | None = None,
-    barrier_connect_path: Path | None = None,
 ) -> tuple[subprocess.Popen[bytes], int, int]:
     audit_read, audit_write = os.pipe()
     release_read, release_write = os.pipe()
@@ -1469,11 +1520,6 @@ def _spawn_interposed_receipt(
         assert redirect_from is not None and redirect_to is not None
         injected["PARAEGOX_M4A_REDIRECT_FROM"] = os.fspath(redirect_from)
         injected["PARAEGOX_M4A_REDIRECT_TO"] = os.fspath(redirect_to)
-    if barrier_connect_path is not None:
-        assert mode == "barrier_connect"
-        injected["PARAEGOX_M4A_BARRIER_CONNECT_PATH"] = os.fspath(
-            barrier_connect_path
-        )
     try:
         process = _spawn_receipt(
             binary,
@@ -2073,6 +2119,7 @@ def test_receipt_single_status_locator_latest_and_generation_races_fail_closed()
     failed_state = created / "occupied-port-state"
     failed_config = created / "occupied-port.toml"
     interposer = _compile_receipt_interposer(created)
+    replacement_socket_fd: int | None = None
     try:
         up = _invoke_lifecycle(binary, "up", config_path, environment)
         assert up["ok"] is True and up["state"] == "running"
@@ -2170,18 +2217,31 @@ def test_receipt_single_status_locator_latest_and_generation_races_fail_closed()
             expected_commitment=_managed_chat_config_commitment(document),
         )
         replacement_bootstrap = _decode_bootstrap(replacement_locator)
+        replacement_socket_fd = os.open(
+            replacement_bootstrap.socket_path,
+            os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        old_socket_metadata = os.fstat(replacement_socket_fd)
+        assert stat.S_ISSOCK(old_socket_metadata.st_mode)
+        old_socket_path_metadata = replacement_bootstrap.socket_path.lstat()
+        assert (
+            old_socket_metadata.st_dev,
+            old_socket_metadata.st_ino,
+        ) == (
+            old_socket_path_metadata.st_dev,
+            old_socket_path_metadata.st_ino,
+        )
         replacement_process, replacement_fd, replacement_release = (
             _spawn_interposed_receipt(
                 binary,
                 config_path,
                 environment,
                 interposer,
-                mode="barrier_connect",
-                barrier_connect_path=replacement_bootstrap.socket_path,
+                mode="barrier_bootstrap_close",
             )
         )
-        replacement_observed = _wait_for_audit_marker(replacement_fd, b"C")
-        assert replacement_observed == b"SLC"
+        replacement_observed = _wait_for_audit_marker(replacement_fd, b"B")
+        assert replacement_observed == b"SLB"
         replacement_client = frozenset({replacement_process.pid})
         old_down = _invoke_lifecycle(binary, "down", config_path, environment)
         assert old_down["ok"] is True and old_down["state"] == "stopped"
@@ -2204,6 +2264,15 @@ def test_receipt_single_status_locator_latest_and_generation_races_fail_closed()
         )
         successor_bootstrap = _decode_bootstrap(successor_locator)
         assert successor_bootstrap.socket_path == replacement_bootstrap.socket_path
+        successor_socket_metadata = successor_bootstrap.socket_path.lstat()
+        assert stat.S_ISSOCK(successor_socket_metadata.st_mode)
+        assert (
+            old_socket_metadata.st_dev,
+            old_socket_metadata.st_ino,
+        ) != (
+            successor_socket_metadata.st_dev,
+            successor_socket_metadata.st_ino,
+        )
         os.write(replacement_release, b"1")
         os.close(replacement_release)
         replacement_failure = _finish_receipt(
@@ -2219,9 +2288,11 @@ def test_receipt_single_status_locator_latest_and_generation_races_fail_closed()
         )
         os.close(replacement_fd)
         assert replacement_failure.envelope is not None
-        assert replacement_markers == b"SLC", (
+        assert replacement_markers == b"SLBC", (
             "bootstrap-pinned old query attempted Latest against the successor socket"
         )
+        os.close(replacement_socket_fd)
+        replacement_socket_fd = None
         assert _matching_processes(binary) == replacement_processes
         successor = _invoke_receipt(
             binary,
@@ -2373,7 +2444,7 @@ def test_receipt_single_status_locator_latest_and_generation_races_fail_closed()
         )
         assert startup_receipt.envelope is not None
 
-        local_runtime_before = _local_runtime_paths()
+        local_runtime_before = _local_runtime_directories()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied_listener:
             occupied_listener.bind(("127.0.0.1", 0))
             occupied_listener.listen(1)
@@ -2394,8 +2465,15 @@ def test_receipt_single_status_locator_latest_and_generation_races_fail_closed()
             assert failed_up["owner_readiness_observed"] is False
             _wait_for_no_matching_processes(binary)
             assert _socket_paths(failed_state) == []
-            assert _local_runtime_paths() == local_runtime_before
+            failed_runtime_directories = _local_runtime_directories()
+            created_runtime_directories = (
+                failed_runtime_directories - local_runtime_before
+            )
+            assert len(created_runtime_directories) == 1
+            failed_runtime_directory = next(iter(created_runtime_directories))
+            _assert_inert_failed_runtime_directory(failed_runtime_directory)
             failed_before = _tree_fingerprint(failed_state)
+            failed_runtime_before = _tree_fingerprint(failed_runtime_directory)
             failed_receipt = _invoke_receipt(
                 binary,
                 failed_config,
@@ -2408,9 +2486,16 @@ def test_receipt_single_status_locator_latest_and_generation_races_fail_closed()
             assert failed_receipt.envelope["snapshot"] is None
             assert _tree_fingerprint(failed_state) == failed_before
             assert _socket_paths(failed_state) == []
-            assert _local_runtime_paths() == local_runtime_before
+            assert _local_runtime_directories() == failed_runtime_directories
+            assert (
+                _tree_fingerprint(failed_runtime_directory)
+                == failed_runtime_before
+            )
+            _assert_inert_failed_runtime_directory(failed_runtime_directory)
             assert _matching_processes(binary) == set()
     finally:
+        if replacement_socket_fd is not None:
+            os.close(replacement_socket_fd)
         for candidate in (config_path, startup_config, failed_config):
             with contextlib.suppress(
                 AssertionError,
