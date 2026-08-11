@@ -17,8 +17,7 @@ use crate::{
     artifact,
     config::{
         self, ArtifactExternalDeployCommandV1, ArtifactExternalDeploymentJsonIntentV1,
-        ArtifactExternalDeploymentOperationIdInputV1,
-        ArtifactExternalDeploymentQueryCommandV1,
+        ArtifactExternalDeploymentOperationIdInputV1, ArtifactExternalDeploymentQueryCommandV1,
     },
     error::LocalProcessError,
 };
@@ -169,17 +168,16 @@ fn run_deploy_preflight(command: ArtifactExternalDeployCommandV1) -> ProjectionV
             );
         }
     };
-    let receipt_ref = match MaterializationReceiptRefV1::from_str(
-        command.materialization_receipt_ref(),
-    ) {
-        Ok(value) => value,
-        Err(_) => {
-            return ProjectionV1::error(
-                Some(operation_id),
-                LocalProcessError::ArtifactExternalDeployMaterializationReceipt,
-            );
-        }
-    };
+    let receipt_ref =
+        match MaterializationReceiptRefV1::from_str(command.materialization_receipt_ref()) {
+            Ok(value) => value,
+            Err(_) => {
+                return ProjectionV1::error(
+                    Some(operation_id),
+                    LocalProcessError::ArtifactExternalDeployMaterializationReceipt,
+                );
+            }
+        };
     let bundle = match artifact::read_verified_materialization_for_deployment(
         command.config(),
         object_ref,
@@ -264,9 +262,7 @@ fn write_projection(
             controller_snapshot_sequence: projection.controller_snapshot_sequence.as_deref(),
             deployment_receipt_ref: projection.deployment_receipt_ref.as_deref(),
             runtime_apply_request_digest: projection.runtime_apply_request_digest.as_deref(),
-            runtime_terminal_receipt_digest: projection
-                .runtime_terminal_receipt_digest
-                .as_deref(),
+            runtime_terminal_receipt_digest: projection.runtime_terminal_receipt_digest.as_deref(),
             terminal_outcome: projection.terminal_outcome,
             current_health_checked: false,
             diagnostics: vec![DiagnosticJsonV1 {
@@ -364,9 +360,9 @@ mod tests {
     #[test]
     fn json_output_failure_never_reuses_compiled_deploy_diagnostic() {
         let projection = ProjectionV1::error(
-            Some(ArtifactExternalDeploymentOperationIdInputV1::for_test([
-                0xd1; 16
-            ])),
+            Some(ArtifactExternalDeploymentOperationIdInputV1::for_test(
+                [0xd1; 16],
+            )),
             LocalProcessError::ArtifactExternalDeployJsonOutput,
         );
         let mut output = Vec::new();

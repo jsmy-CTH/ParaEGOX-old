@@ -2136,9 +2136,7 @@ impl ConfigError {
             Self::InvalidInitDirectory => "PXLC-INIT-DIRECTORY-INVALID",
             Self::InvalidLocalDeployGrammar => "PXLC-DEPLOY-GRAMMAR",
             Self::InvalidArtifactExternalDeployGrammar => "PXLC-DEPLOY-EXTERNAL-GRAMMAR",
-            Self::InvalidArtifactExternalDeploymentQueryGrammar => {
-                "PXLC-DEPLOYMENT-QUERY-GRAMMAR"
-            }
+            Self::InvalidArtifactExternalDeploymentQueryGrammar => "PXLC-DEPLOYMENT-QUERY-GRAMMAR",
             Self::UnsupportedLocalDeployProfile => "PXLC-DEPLOY-PROFILE-UNSUPPORTED",
             Self::InvalidInspectionSnapshotGrammar => "PXLC-INSPECTION-GRAMMAR",
             Self::InvalidReceiptSnapshotGrammar => "PXLC-RECEIPT-GRAMMAR",
@@ -2599,8 +2597,7 @@ pub(crate) fn artifact_external_deployment_json_intent(
     if first == std::ffi::OsStr::new(DEPLOY_COMMAND) {
         let owns_external_option = arguments.iter().any(|argument| {
             argument.as_os_str() == std::ffi::OsStr::new(ARTIFACT_OBJECT_REF_OPTION)
-                || argument.as_os_str()
-                    == std::ffi::OsStr::new(MATERIALIZATION_RECEIPT_REF_OPTION)
+                || argument.as_os_str() == std::ffi::OsStr::new(MATERIALIZATION_RECEIPT_REF_OPTION)
                 || argument.as_os_str() == std::ffi::OsStr::new(OPERATION_ID_OPTION)
         });
         return owns_external_option.then_some(ArtifactExternalDeploymentJsonIntentV1::Deploy);
@@ -2749,9 +2746,15 @@ pub(crate) fn artifact_external_preparsed_operation_id(
 ) -> Option<ArtifactExternalDeploymentOperationIdInputV1> {
     let index = match intent {
         ArtifactExternalDeploymentJsonIntentV1::Deploy
-            if artifact_external_deploy_fixed_shape(arguments) => 9,
+            if artifact_external_deploy_fixed_shape(arguments) =>
+        {
+            9
+        }
         ArtifactExternalDeploymentJsonIntentV1::Query
-            if artifact_external_deployment_query_fixed_shape(arguments) => 6,
+            if artifact_external_deployment_query_fixed_shape(arguments) =>
+        {
+            6
+        }
         ArtifactExternalDeploymentJsonIntentV1::Deploy
         | ArtifactExternalDeploymentJsonIntentV1::Query => return None,
     };
@@ -6195,10 +6198,7 @@ client_private_key_file = "{root}/node/controller-key.pem"
             MATERIALIZATION_RECEIPT_REF_OPTION,
             OPERATION_ID_OPTION,
         ] {
-            let malformed = vec![
-                OsString::from(DEPLOY_COMMAND),
-                OsString::from(reserved),
-            ];
+            let malformed = vec![OsString::from(DEPLOY_COMMAND), OsString::from(reserved)];
             assert_eq!(
                 artifact_external_deployment_json_intent(&malformed),
                 Some(ArtifactExternalDeploymentJsonIntentV1::Deploy)
