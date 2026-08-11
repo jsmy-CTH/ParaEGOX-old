@@ -1639,10 +1639,12 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "nix",
+ "paraegox-artifact",
  "paraegox-fabric",
  "paraegox-kernel",
  "paraegox-node",
  "paraegox-runtime-contracts",
+ "sha2",
  "tokio",
  "zeroize",
 ]
