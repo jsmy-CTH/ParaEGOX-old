@@ -5081,4 +5081,71 @@ mod tests {
         trailing.push(0);
         assert!(ArtifactExternalControllerStateV2::decode(&trailing).is_err());
     }
+
+    #[test]
+    fn artifact_external_controller_state_v2_matches_independent_shared_initial_goldens() {
+        for (wire, phase, sequence, record_state) in [
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_admitted.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Admitted,
+                1,
+                None,
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_failed_pre_c.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Failed,
+                2,
+                Some(ArtifactExternalDeploymentRecordStateV1::Failed),
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_uncertain_pre_c.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Uncertain,
+                2,
+                Some(ArtifactExternalDeploymentRecordStateV1::Uncertain),
+            ),
+        ] {
+            let state = ArtifactExternalControllerStateV2::decode(&wire)
+                .expect("independent shared PXMJ2 fixture");
+            assert_eq!(state.phase(), phase);
+            assert_eq!(state.controller_snapshot_sequence().get(), sequence);
+            assert_eq!(state.request().operation_id().as_bytes(), &[0xd1; 16]);
+            assert_eq!(
+                state.request().config_commitment().as_bytes(),
+                &[0xa1; 32],
+            );
+            assert_eq!(state.admission().controller_store_instance(), &[0xd0; 32]);
+            assert_eq!(state.admission().admission_sequence().get(), 1);
+            assert!(state.runtime_request().is_none());
+            assert!(state.runtime_terminal().is_none());
+            assert_eq!(
+                state.encode().expect("canonical PXMJ2 re-encode").as_ref(),
+                wire.as_slice(),
+            );
+
+            match record_state {
+                None => {
+                    assert!(state.records().is_empty());
+                    assert!(state.receipt().is_none());
+                }
+                Some(expected) => {
+                    let record = state.records().last().expect("pre-C terminal PXDM");
+                    assert_eq!(state.records().len(), 1);
+                    assert_eq!(record.state(), expected);
+                    assert_eq!(record.progress().deployment_revision, 0);
+                    assert_eq!(record.progress().controller_snapshot_sequence, 0);
+                    assert_eq!(record.progress().lifecycle_generation, [0xd2; 16]);
+                    assert_eq!(
+                        state.receipt().expect("pre-C PXDO").receipt_sequence().get(),
+                        1,
+                    );
+                }
+            }
+        }
+    }
 }
