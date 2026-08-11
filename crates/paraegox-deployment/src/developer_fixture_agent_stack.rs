@@ -40,8 +40,7 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricApplyTerminalOutcomeV1, ManagedFabricListenEndpointV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
-    ManagedModelAdapterBindingV1, ManagedModelAdapterVersionV1,
-    ManagedModelAgentStackTargetModeV1,
+    ManagedModelAdapterBindingV1, ManagedModelAdapterVersionV1, ManagedModelAgentStackTargetModeV1,
     ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
     ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
 };
