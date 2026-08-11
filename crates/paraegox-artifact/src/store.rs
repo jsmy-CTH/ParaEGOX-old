@@ -58,6 +58,9 @@ enum InitialMutationPhase {
 }
 
 fn classify_initial_phase_error(phase: InitialMutationPhase, error: StoreError) -> StoreError {
+    if error == StoreError::ConfigurationMismatch || error == StoreError::AuthorityIo {
+        return error;
+    }
     match phase {
         InitialMutationPhase::StateRootScaffold
             if matches!(error, StoreError::Owner | StoreError::UnsafePath) =>
@@ -386,6 +389,7 @@ enum StoreError {
     AlreadyExists,
     Contended,
     PublicationUncertain(Option<Box<MaterializationOperationV1>>),
+    AuthorityIo,
     AuthorityOwnerEffectUnknown,
     OwnerEffectUnknown,
     Owner,
@@ -408,7 +412,7 @@ impl StoreError {
             Self::AuthorityOwnerEffectUnknown | Self::OwnerEffectUnknown | Self::Owner => {
                 ArtifactStoreFailureV1::Owner
             }
-            Self::Io => ArtifactStoreFailureV1::Io,
+            Self::AuthorityIo | Self::Io => ArtifactStoreFailureV1::Io,
         }
     }
 
@@ -426,7 +430,7 @@ impl StoreError {
             | Self::OwnerEffectUnknown
             | Self::Owner
             | Self::PublicationUncertain(_) => ArtifactStoreReadFailureV1::Owner,
-            Self::Io => ArtifactStoreReadFailureV1::Io,
+            Self::AuthorityIo | Self::Io => ArtifactStoreReadFailureV1::Io,
         }
     }
 
@@ -497,6 +501,34 @@ struct StateRootHandle {
     leaf: DirectoryHandle,
 }
 
+fn merge_primary_release<T>(
+    primary: Result<T, StoreError>,
+    release: Result<(), StoreError>,
+) -> Result<T, StoreError> {
+    match primary {
+        Err(error) => Err(error),
+        Ok(value) => release.map(|()| value),
+    }
+}
+
+fn release_file_observed<T>(
+    lock: File,
+    primary: Result<T, StoreError>,
+    observer: &mut dyn StoreFaultObserver,
+) -> Result<T, StoreError> {
+    let injected = observer
+        .checkpoint(StoreFaultPoint::BeforeUnlock)
+        .map_err(|_| StoreError::Io);
+    let unlock = lock.unlock().map_err(|_| StoreError::Io);
+    drop(lock);
+    merge_primary_release(primary, injected.and(unlock))
+}
+
+fn release_file<T>(lock: File, primary: Result<T, StoreError>) -> Result<T, StoreError> {
+    let mut observer = NoStoreFaultObserver;
+    release_file_observed(lock, primary, &mut observer)
+}
+
 struct LockedStore {
     state_root: StateRootHandle,
     root: DirectoryHandle,
@@ -515,17 +547,9 @@ impl LockedStore {
     }
 
     fn release_observed(mut self, observer: &mut dyn StoreFaultObserver) -> Result<(), StoreError> {
-        let injected = observer
-            .checkpoint(StoreFaultPoint::BeforeUnlock)
-            .map_err(|_| StoreError::Io);
-        let unlock_result = self
-            .lock
-            .as_ref()
-            .ok_or(StoreError::Owner)
-            .and_then(|lock| lock.unlock().map_err(|_| StoreError::Io));
-        self.lock.take();
+        let lock = self.lock.take().ok_or(StoreError::Owner);
         drop(self);
-        injected.and(unlock_result)
+        release_file_observed(lock?, Ok(()), observer)
     }
 }
 
@@ -602,6 +626,22 @@ fn classify_owner_authority_error(error: StoreError) -> StoreError {
         StoreError::Owner
     } else {
         error
+    }
+}
+
+fn classify_initial_effect_authority_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::UnsafePath | StoreError::Owner => StoreError::OwnerEffectUnknown,
+        StoreError::Io => StoreError::AuthorityIo,
+        other => other,
+    }
+}
+
+fn classify_pair_effect_authority_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::UnsafePath | StoreError::Owner => StoreError::AuthorityOwnerEffectUnknown,
+        StoreError::Io => StoreError::AuthorityIo,
+        other => other,
     }
 }
 
@@ -912,10 +952,7 @@ fn acquire_lock(
     })?;
     if let Err(error) = validate_named_regular(root, OsStr::new(STORE_LOCK_NAME), identity, Some(0))
     {
-        let unlock = lock.unlock().map_err(|_| StoreError::Io);
-        drop(lock);
-        unlock?;
-        return Err(error);
+        return release_file(lock, Err(error));
     }
     Ok((lock, identity))
 }
@@ -935,15 +972,9 @@ fn finish_locked_observed(
     result: Result<MaterializationOperationV1, StoreError>,
     observer: &mut dyn StoreFaultObserver,
 ) -> ArtifactStoreInvocationV1 {
-    let release = store.release_observed(observer);
-    match (result, release) {
-        (Ok(operation), Ok(())) => ArtifactStoreInvocationV1::success(tracker.change(), operation),
-        (Err(error), Ok(())) => {
-            ArtifactStoreInvocationV1::failure(tracker.change(), error.into_public())
-        }
-        (_, Err(error)) => {
-            ArtifactStoreInvocationV1::failure(tracker.change(), error.into_public())
-        }
+    match merge_primary_release(result, store.release_observed(observer)) {
+        Ok(operation) => ArtifactStoreInvocationV1::success(tracker.change(), operation),
+        Err(error) => ArtifactStoreInvocationV1::failure(tracker.change(), error.into_public()),
     }
 }
 
@@ -1271,12 +1302,7 @@ fn open_final_locked(
     let (public_root, objects, snapshot, snapshot_bytes, snapshot_identity) = match opened {
         Ok(opened) => opened,
         Err(error) => {
-            let unlock = lock.unlock().map_err(|_| StoreError::Io);
-            drop(lock);
-            if unlock.is_err() {
-                return Err(StoreError::Io);
-            }
-            return Err(error);
+            return release_file(lock, Err(error));
         }
     };
     drop(root);
@@ -1466,12 +1492,23 @@ enum InitialStagingInspection {
     FinalAppeared,
 }
 
-fn inspect_initial_staging(
+fn inspect_initial_staging_observed(
     state_root: &StateRootHandle,
     binding: &ArtifactStoreAuthorityBindingV1,
     operation_id: ArtifactOperationIdV1,
+    observer: &mut dyn StoreFaultObserver,
 ) -> Result<InitialStagingInspection, StoreError> {
-    let staging = open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?;
+    observer
+        .checkpoint(StoreFaultPoint::InitialQueryBeforeStagingOpen)
+        .map_err(|_| StoreError::Io)?;
+    let staging = match open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME)) {
+        Ok(staging) => staging,
+        Err(error) => match root_selection(&state_root.leaf)? {
+            (true, false) => return Ok(InitialStagingInspection::FinalAppeared),
+            (true, true) => return Err(StoreError::Owner),
+            (false, true) | (false, false) => return Err(error),
+        },
+    };
     let staging_identity = staging.identity;
     let names = scan_names(&staging)?;
     if names.is_empty() {
@@ -1537,27 +1574,19 @@ fn inspect_initial_staging(
             Err(StoreError::Owner)
         }
     })();
-    let unlock = lock.unlock().map_err(|_| StoreError::Io);
-    drop(lock);
     drop(staging);
-    unlock?;
-    result
+    release_file(lock, result)
 }
 
 fn readonly_finish(
     store: LockedStore,
     result: Result<MaterializationOperationV1, StoreError>,
 ) -> ArtifactStoreInvocationV1 {
-    let release = store.release();
-    match (result, release) {
-        (Ok(operation), Ok(())) => {
+    match merge_primary_release(result, store.release()) {
+        Ok(operation) => {
             ArtifactStoreInvocationV1::success(ArtifactStoreChangeV1::Unchanged, operation)
         }
-        (Err(error), Ok(())) => ArtifactStoreInvocationV1::failure(
-            ArtifactStoreChangeV1::Unchanged,
-            error.into_public(),
-        ),
-        (_, Err(error)) => ArtifactStoreInvocationV1::failure(
+        Err(error) => ArtifactStoreInvocationV1::failure(
             ArtifactStoreChangeV1::Unchanged,
             error.into_public(),
         ),
@@ -1567,6 +1596,15 @@ fn readonly_finish(
 fn run_query(
     authority: &mut dyn ArtifactStoreAuthorityV1,
     operation_id: ArtifactOperationIdV1,
+) -> ArtifactStoreInvocationV1 {
+    let mut observer = NoStoreFaultObserver;
+    run_query_observed(authority, operation_id, &mut observer)
+}
+
+fn run_query_observed(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    operation_id: ArtifactOperationIdV1,
+    observer: &mut dyn StoreFaultObserver,
 ) -> ArtifactStoreInvocationV1 {
     let binding = match authority_binding(authority) {
         Ok(binding) => binding,
@@ -1603,7 +1641,12 @@ fn run_query(
     }
     if !has_final {
         if has_staging {
-            match inspect_initial_staging(&state_root, &binding, operation_id) {
+            match inspect_initial_staging_observed(
+                &state_root,
+                &binding,
+                operation_id,
+                observer,
+            ) {
                 Ok(InitialStagingInspection::Operation(operation)) => {
                     return ArtifactStoreInvocationV1::failure(
                         ArtifactStoreChangeV1::Unchanged,
@@ -1712,12 +1755,7 @@ fn run_read_verified(
             .verified_read_bundle(receipt_ref, object_ref, pair)
             .map_err(|_| StoreError::ReferenceMismatch)
     })();
-    let release = store.release();
-    match (result, release) {
-        (Ok(bundle), Ok(())) => Ok(bundle),
-        (Err(error), Ok(())) => Err(error.into_read()),
-        (_, Err(error)) => Err(error.into_read()),
-    }
+    merge_primary_release(result, store.release()).map_err(StoreError::into_read)
 }
 
 fn pin_or_create_state_root(
@@ -1743,6 +1781,7 @@ fn pin_or_create_state_root(
         }
         Err(StoreError::NotFound) => {
             revalidate_directory(&parent)?;
+            let state_root_checkpoint = *tracker;
             match mkdirat(&parent.file, leaf_name.as_os_str(), DIRECTORY_MODE) {
                 Ok(()) => {}
                 Err(nix::errno::Errno::EEXIST) => {
@@ -1774,6 +1813,7 @@ fn pin_or_create_state_root(
                 }
                 Err(_) => return Err(StoreError::Io),
             }
+            tracker.ambiguous();
             let mut durability_proven = false;
             let result = (|| {
                 parent.file.sync_all().map_err(|_| StoreError::Io)?;
@@ -1801,8 +1841,8 @@ fn pin_or_create_state_root(
                     .map_err(classify_owner_authority_error)?;
                 Ok(state_root)
             })();
-            if result.is_err() && !durability_proven {
-                tracker.ambiguous();
+            if result.is_ok() {
+                tracker.restore(state_root_checkpoint);
             }
             result.map_err(|error| {
                 if durability_proven {
@@ -1927,7 +1967,10 @@ fn write_new_exact(
     Ok(identity)
 }
 
-fn create_and_lock_staging(staging: &DirectoryHandle) -> Result<(File, FileIdentity), StoreError> {
+fn create_and_lock_staging_observed(
+    staging: &DirectoryHandle,
+    observer: &mut dyn StoreFaultObserver,
+) -> Result<(File, FileIdentity), StoreError> {
     let (lock, identity) = create_regular(staging, STORE_LOCK_NAME, OFlag::O_RDWR)?;
     let durable_prefix = (|| {
         lock.sync_all().map_err(|_| StoreError::Io)?;
@@ -1941,9 +1984,152 @@ fn create_and_lock_staging(staging: &DirectoryHandle) -> Result<(File, FileIdent
         drop(lock);
         return Err(StoreError::OwnerEffectUnknown);
     }
-    lock.try_lock()
+    observer
+        .checkpoint(StoreFaultPoint::BootstrapNewLockBeforeTryLock)
         .map_err(|_| StoreError::OwnerEffectUnknown)?;
+    lock.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => StoreError::Contended,
+        TryLockError::Error(_) => StoreError::Io,
+    })?;
     Ok((lock, identity))
+}
+
+fn validate_held_initial_lock(
+    staging: &DirectoryHandle,
+    lock: &File,
+    lock_identity: FileIdentity,
+) -> Result<(), StoreError> {
+    let metadata = lock.metadata().map_err(|_| StoreError::Io)?;
+    validate_regular_metadata(&metadata, staging.owner_uid, staging.owner_gid)?;
+    if FileIdentity::from_metadata(&metadata) != lock_identity || metadata.len() != 0 {
+        return Err(StoreError::Owner);
+    }
+    validate_named_regular(
+        staging,
+        OsStr::new(STORE_LOCK_NAME),
+        lock_identity,
+        Some(0),
+    )
+}
+
+fn seal_locked_initial_prefix(
+    mut state_root: StateRootHandle,
+    staging: DirectoryHandle,
+    lock: &File,
+    lock_identity: FileIdentity,
+) -> Result<(StateRootHandle, DirectoryHandle, BTreeSet<OsString>), StoreError> {
+    if root_selection(&state_root.leaf)? != (false, true) {
+        return Err(StoreError::Owner);
+    }
+    exact_names(&state_root.leaf, &[STORE_STAGING_NAME])?;
+    let staging_identity = staging.identity;
+    let public_staging = reopen_named_directory(
+        &state_root.leaf,
+        OsStr::new(STORE_STAGING_NAME),
+        staging_identity,
+    )?;
+    drop(staging);
+    validate_held_initial_lock(&public_staging, lock, lock_identity)?;
+    let names = scan_names(&public_staging)?;
+    let lock_only = [STORE_LOCK_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let lock_objects = [STORE_LOCK_NAME, OBJECTS_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let complete = [STORE_LOCK_NAME, OBJECTS_NAME, STORE_SNAPSHOT_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    if names != lock_only && names != lock_objects && names != complete {
+        return Err(StoreError::Owner);
+    }
+
+    lock.sync_all().map_err(|_| StoreError::Io)?;
+    let objects_claim = if names.contains(OsStr::new(OBJECTS_NAME)) {
+        let objects = open_directory_at(&public_staging, OsStr::new(OBJECTS_NAME))?;
+        exact_names(&objects, &[])?;
+        objects.file.sync_all().map_err(|_| StoreError::Io)?;
+        let identity = objects.identity;
+        drop(objects);
+        Some(identity)
+    } else {
+        None
+    };
+    let snapshot_claim = if names.contains(OsStr::new(STORE_SNAPSHOT_NAME)) {
+        let (snapshot, identity) = read_regular_bounded(
+            &public_staging,
+            OsStr::new(STORE_SNAPSHOT_NAME),
+            MAX_SNAPSHOT_BYTES,
+            false,
+        )?;
+        let (file, opened_identity) = open_regular_at(
+            &public_staging,
+            OsStr::new(STORE_SNAPSHOT_NAME),
+            OFlag::O_RDONLY,
+        )?;
+        if opened_identity != identity {
+            return Err(StoreError::Owner);
+        }
+        file.sync_all().map_err(|_| StoreError::Io)?;
+        drop(file);
+        Some((identity, snapshot))
+    } else {
+        None
+    };
+    public_staging
+        .file
+        .sync_all()
+        .map_err(|_| StoreError::Io)?;
+    state_root
+        .leaf
+        .file
+        .sync_all()
+        .map_err(|_| StoreError::Io)?;
+
+    let reopened_leaf = reopen_named_directory(
+        &state_root.parent,
+        &state_root.leaf_name,
+        state_root.leaf.identity,
+    )?;
+    drop(state_root.leaf);
+    state_root.leaf = reopened_leaf;
+    if root_selection(&state_root.leaf)? != (false, true) {
+        return Err(StoreError::Owner);
+    }
+    exact_names(&state_root.leaf, &[STORE_STAGING_NAME])?;
+    let reopened_staging = reopen_named_directory(
+        &state_root.leaf,
+        OsStr::new(STORE_STAGING_NAME),
+        staging_identity,
+    )?;
+    if scan_names(&reopened_staging)? != names {
+        return Err(StoreError::Owner);
+    }
+    validate_held_initial_lock(&reopened_staging, lock, lock_identity)?;
+    if let Some(identity) = objects_claim {
+        let objects = reopen_named_directory(
+            &reopened_staging,
+            OsStr::new(OBJECTS_NAME),
+            identity,
+        )?;
+        exact_names(&objects, &[])?;
+        drop(objects);
+    }
+    if let Some((snapshot_identity, snapshot_bytes)) = snapshot_claim {
+        let (reopened, identity) = read_regular_bounded(
+            &reopened_staging,
+            OsStr::new(STORE_SNAPSHOT_NAME),
+            MAX_SNAPSHOT_BYTES,
+            false,
+        )?;
+        if identity != snapshot_identity || reopened != snapshot_bytes {
+            return Err(StoreError::Owner);
+        }
+    }
+    Ok((state_root, reopened_staging, names))
 }
 
 fn classify_bootstrap_lock_collision(error: StoreError) -> StoreError {
@@ -2171,10 +2357,11 @@ fn classify_initial_rename_error(
 }
 
 fn classify_initial_post_rename_error(error: StoreError) -> StoreError {
-    if error == StoreError::Io {
-        StoreError::PublicationUncertain(None)
-    } else {
-        StoreError::OwnerEffectUnknown
+    match error {
+        StoreError::Io => StoreError::PublicationUncertain(None),
+        StoreError::ConfigurationMismatch => StoreError::ConfigurationMismatch,
+        StoreError::UnsafePath | StoreError::Owner => StoreError::OwnerEffectUnknown,
+        other => other,
     }
 }
 
@@ -2240,7 +2427,7 @@ fn publish_initial_staging(
         drop(objects);
         drop(staging);
         revalidate_current_authority(authority, binding, &state_root)
-            .map_err(|_| StoreError::OwnerEffectUnknown)?;
+            .map_err(classify_initial_effect_authority_error)?;
         revalidate_directory(&state_root.leaf)?;
         let (has_final, has_staging) = root_selection(&state_root.leaf)?;
         if has_final || !has_staging {
@@ -2345,14 +2532,10 @@ fn publish_initial_staging(
             error
         }
     });
-    if result.is_err()
-        && let Some(lock) = lock.take()
-    {
-        let unlock = lock.unlock().map_err(|_| StoreError::Io);
-        drop(lock);
-        unlock?;
+    match lock.take() {
+        Some(lock) => release_file(lock, result),
+        None => result,
     }
-    result
 }
 
 fn open_or_initialize_store(
@@ -2360,6 +2543,17 @@ fn open_or_initialize_store(
     binding: &ArtifactStoreAuthorityBindingV1,
     request: &MaterializationRequestV1,
     tracker: &mut ChangeTracker,
+) -> Result<LockedStore, StoreError> {
+    let mut observer = NoStoreFaultObserver;
+    open_or_initialize_store_observed(authority, binding, request, tracker, &mut observer)
+}
+
+fn open_or_initialize_store_observed(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    request: &MaterializationRequestV1,
+    tracker: &mut ChangeTracker,
+    observer: &mut dyn StoreFaultObserver,
 ) -> Result<LockedStore, StoreError> {
     let state_root = pin_or_create_state_root(authority, binding, tracker)?;
     let (has_final, has_staging) = root_selection(&state_root.leaf)?;
@@ -2434,6 +2628,8 @@ fn open_or_initialize_store(
                 .map_err(|error| {
                     classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
                 })?;
+                revalidate_current_authority(authority, binding, &state_root)
+                    .map_err(classify_owner_authority_error)?;
                 tracker.restore(staging_checkpoint);
                 created
             }
@@ -2444,12 +2640,13 @@ fn open_or_initialize_store(
         return Err(StoreError::Owner);
     }
 
+    let mut fresh_lock_checkpoint = None;
     let (lock, lock_identity) = if names_before_lock.is_empty() {
         let lock_checkpoint = *tracker;
         tracker.ambiguous();
-        match create_and_lock_staging(&staging) {
+        match create_and_lock_staging_observed(&staging, observer) {
             Ok(locked) => {
-                tracker.restore(lock_checkpoint);
+                fresh_lock_checkpoint = Some(lock_checkpoint);
                 locked
             }
             Err(StoreError::AlreadyExists) => {
@@ -2467,49 +2664,52 @@ fn open_or_initialize_store(
     } else {
         acquire_lock(&staging, LockMode::Exclusive)?
     };
-
-    let (final_after_lock, staging_after_lock) = match root_selection(&state_root.leaf) {
+    if let Err(error) = observer.checkpoint(StoreFaultPoint::BootstrapAfterExclusiveAcquire) {
+        return release_file(lock, Err(error));
+    }
+    let selection = match root_selection(&state_root.leaf) {
         Ok(selection) => selection,
         Err(error) => {
-            let unlock = lock.unlock().map_err(|_| StoreError::Io);
-            drop(lock);
             drop(staging);
-            unlock?;
-            return Err(error);
+            return release_file(lock, Err(error));
         }
     };
-    if final_after_lock && !staging_after_lock {
-        let unlock = lock.unlock().map_err(|_| StoreError::Io);
-        drop(lock);
-        drop(staging);
-        unlock?;
-        return open_final_locked(state_root, binding, LockMode::Exclusive);
+    match selection {
+        (true, false) => {
+            drop(staging);
+            release_file(lock, Ok(()))?;
+            return open_final_locked(state_root, binding, LockMode::Exclusive);
+        }
+        (false, true) => {}
+        (true, true) => {
+            drop(staging);
+            return release_file(lock, Err(StoreError::Owner));
+        }
+        (false, false) => {
+            drop(staging);
+            return release_file(lock, Err(StoreError::PublicationUncertain(None)));
+        }
     }
-    if final_after_lock && staging_after_lock {
-        let unlock = lock.unlock().map_err(|_| StoreError::Io);
-        drop(lock);
-        drop(staging);
-        unlock?;
-        return Err(StoreError::Owner);
-    }
-    if !staging_after_lock {
-        let unlock = lock.unlock().map_err(|_| StoreError::Io);
-        drop(lock);
-        drop(staging);
-        unlock?;
-        return Err(StoreError::PublicationUncertain(None));
-    }
-
-    let names = match scan_names(&staging) {
-        Ok(names) => names,
+    let sealed = seal_locked_initial_prefix(state_root, staging, &lock, lock_identity);
+    let (state_root, staging, names) = match sealed {
+        Ok(sealed) => sealed,
         Err(error) => {
-            let unlock = lock.unlock().map_err(|_| StoreError::Io);
-            drop(lock);
-            drop(staging);
-            unlock?;
-            return Err(error);
+            let error = if fresh_lock_checkpoint.is_some() {
+                classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
+            } else {
+                error
+            };
+            return release_file(lock, Err(error));
         }
     };
+    if let Err(error) = revalidate_current_authority(authority, binding, &state_root)
+        .map_err(classify_owner_authority_error)
+    {
+        return release_file(lock, Err(error));
+    }
+    if let Some(checkpoint) = fresh_lock_checkpoint {
+        tracker.restore(checkpoint);
+    }
     let lock_only = [STORE_LOCK_NAME]
         .into_iter()
         .map(OsString::from)
@@ -2522,13 +2722,6 @@ fn open_or_initialize_store(
         .into_iter()
         .map(OsString::from)
         .collect::<BTreeSet<_>>();
-    if names != lock_only && names != lock_objects && names != complete {
-        let unlock = lock.unlock().map_err(|_| StoreError::Io);
-        drop(lock);
-        drop(staging);
-        unlock?;
-        return Err(StoreError::Owner);
-    }
     continue_initialization(ContinueInitializationInput {
         authority,
         binding,
@@ -2702,9 +2895,9 @@ fn continue_initialization(
         .map_err(|error| {
             classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
         })?;
-        tracker.restore(prefix_checkpoint);
         revalidate_current_authority(authority, binding, &state_root)
             .map_err(classify_owner_authority_error)?;
+        tracker.restore(prefix_checkpoint);
         let instance = draw_store_instance()?;
         let sequence = NonZeroU64::new(1).expect("one is nonzero");
         let admission = MaterializationAdmissionV1::new(instance, sequence, request);
@@ -2749,14 +2942,10 @@ fn continue_initialization(
             tracker,
         )
     })();
-    if result.is_err()
-        && let Some(lock) = lock.take()
-    {
-        let unlock = lock.unlock().map_err(|_| StoreError::Io);
-        drop(lock);
-        unlock?;
+    match lock.take() {
+        Some(lock) => release_file(lock, result),
+        None => result,
     }
-    result
 }
 
 fn cleanup_owned_next(
@@ -3178,6 +3367,9 @@ enum PairPublication {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreFaultPoint {
     BeforeUnlock,
+    BootstrapAfterExclusiveAcquire,
+    BootstrapNewLockBeforeTryLock,
+    InitialQueryBeforeStagingOpen,
     InitialSnapshotBeforeStagingSync,
     ExistingChildBeforeObjectsSync,
     ExistingChildBeforeObjectsReopen,
@@ -3423,7 +3615,7 @@ fn publish_pair_file(
 ) -> Result<(), StoreError> {
     publish_pair_file_with_recheck(child, temporary_name, final_name, bytes, || {
         revalidate_current_authority(authority, binding, &store.state_root)
-            .map_err(|_| StoreError::AuthorityOwnerEffectUnknown)
+            .map_err(classify_pair_effect_authority_error)
     })
 }
 
@@ -3535,9 +3727,9 @@ fn publish_or_recover_pair_observed(
     })();
     match publication {
         Ok(verified) => Ok(PairPublication::Complete(Box::new(verified))),
-        Err(StoreError::AuthorityOwnerEffectUnknown) => {
-            Err(StoreError::AuthorityOwnerEffectUnknown)
-        }
+        Err(error @ StoreError::AuthorityOwnerEffectUnknown)
+        | Err(error @ StoreError::AuthorityIo)
+        | Err(error @ StoreError::ConfigurationMismatch) => Err(error),
         Err(_) => recover_pair_from_existing_child(store, pair, tracker, observer),
     }
 }
@@ -4149,6 +4341,47 @@ mod tests {
         }
     }
 
+    struct NewLockContenderObserver {
+        lock_path: PathBuf,
+        held: Option<File>,
+    }
+
+    impl StoreFaultObserver for NewLockContenderObserver {
+        fn checkpoint(&mut self, point: StoreFaultPoint) -> Result<(), StoreError> {
+            if point == StoreFaultPoint::BootstrapNewLockBeforeTryLock && self.held.is_none() {
+                let lock = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.lock_path)
+                    .map_err(|_| StoreError::Io)?;
+                lock.try_lock().map_err(|_| StoreError::Io)?;
+                self.held = Some(lock);
+            }
+            Ok(())
+        }
+    }
+
+    struct RenameAtFaultObserver {
+        point: StoreFaultPoint,
+        source: PathBuf,
+        destination: PathBuf,
+        replace_with_regular: bool,
+        fired: bool,
+    }
+
+    impl StoreFaultObserver for RenameAtFaultObserver {
+        fn checkpoint(&mut self, point: StoreFaultPoint) -> Result<(), StoreError> {
+            if point == self.point && !self.fired {
+                fs::rename(&self.source, &self.destination).map_err(|_| StoreError::Io)?;
+                if self.replace_with_regular {
+                    drop(create_test_regular(&self.source, &[]));
+                }
+                self.fired = true;
+            }
+            Ok(())
+        }
+    }
+
     struct TestTempDir {
         canonical_base: PathBuf,
         path: PathBuf,
@@ -4258,6 +4491,66 @@ mod tests {
                 create_test_directory(self.binding.state_root());
             }
             Ok(self.binding.clone())
+        }
+    }
+
+    struct SwapWhenPathExistsAuthority {
+        binding: ArtifactStoreAuthorityBindingV1,
+        trigger: PathBuf,
+        displaced: PathBuf,
+        swapped: bool,
+    }
+
+    impl ArtifactStoreAuthorityV1 for SwapWhenPathExistsAuthority {
+        fn revalidate(
+            &mut self,
+        ) -> Result<ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1>
+        {
+            if !self.swapped && self.trigger.exists() {
+                fs::rename(self.binding.state_root(), &self.displaced)
+                    .expect("displace state root after owner filesystem effect");
+                create_test_directory(self.binding.state_root());
+                self.swapped = true;
+            }
+            Ok(self.binding.clone())
+        }
+    }
+
+    enum ConfigDriftTrigger {
+        InitialObjects(PathBuf),
+        PublishedChild(PathBuf),
+    }
+
+    struct ConfigDriftAuthority {
+        binding: ArtifactStoreAuthorityBindingV1,
+        trigger: ConfigDriftTrigger,
+        changed_config: ArtifactConfigCommitmentV1,
+    }
+
+    impl ConfigDriftAuthority {
+        fn triggered(&self) -> bool {
+            match &self.trigger {
+                ConfigDriftTrigger::InitialObjects(path) => path.is_dir(),
+                ConfigDriftTrigger::PublishedChild(path) => fs::read_dir(path)
+                    .ok()
+                    .is_some_and(|mut entries| entries.next().is_some()),
+            }
+        }
+    }
+
+    impl ArtifactStoreAuthorityV1 for ConfigDriftAuthority {
+        fn revalidate(
+            &mut self,
+        ) -> Result<ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1>
+        {
+            if self.triggered() {
+                ArtifactStoreAuthorityBindingV1::try_new(
+                    self.binding.state_root().to_path_buf(),
+                    self.changed_config,
+                )
+            } else {
+                Ok(self.binding.clone())
+            }
         }
     }
 
@@ -4594,6 +4887,65 @@ mod tests {
     }
 
     #[test]
+    fn unix_new_bootstrap_lock_would_block_is_contended_and_unchanged() {
+        let mut fixture = TestStoreFixture::new(b"new-bootstrap-contention ", 0x5a);
+        let binding = fixture.authority.binding.clone();
+        let mut tracker = ChangeTracker::default();
+        let mut observer = NewLockContenderObserver {
+            lock_path: fixture
+                .state_root()
+                .join(STORE_STAGING_NAME)
+                .join(STORE_LOCK_NAME),
+            held: None,
+        };
+
+        let result = open_or_initialize_store_observed(
+            &mut fixture.authority,
+            &binding,
+            &fixture.request,
+            &mut tracker,
+            &mut observer,
+        );
+        assert!(matches!(result, Err(StoreError::Contended)));
+        assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unchanged);
+        let held = observer.held.take().expect("observer held new lock");
+        held.unlock().expect("release observer lock");
+        drop(held);
+    }
+
+    #[test]
+    fn unix_named_bootstrap_lock_replacement_after_acquire_is_owner() {
+        let mut fixture = TestStoreFixture::new(b"bootstrap-lock-replacement ", 0x5b);
+        create_test_directory(fixture.state_root());
+        let staging_path = fixture.state_root().join(STORE_STAGING_NAME);
+        create_test_directory(&staging_path);
+        let lock_path = staging_path.join(STORE_LOCK_NAME);
+        drop(create_test_regular(&lock_path, &[]));
+        let binding = fixture.authority.binding.clone();
+        let mut tracker = ChangeTracker::default();
+        let mut observer = RenameAtFaultObserver {
+            point: StoreFaultPoint::BootstrapAfterExclusiveAcquire,
+            source: lock_path,
+            destination: fixture
+                .state_root()
+                .with_file_name("displaced-bootstrap-lock"),
+            replace_with_regular: true,
+            fired: false,
+        };
+
+        let result = open_or_initialize_store_observed(
+            &mut fixture.authority,
+            &binding,
+            &fixture.request,
+            &mut tracker,
+            &mut observer,
+        );
+        assert!(observer.fired);
+        assert!(matches!(result, Err(StoreError::Owner)));
+        assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unchanged);
+    }
+
+    #[test]
     fn unix_noreplace_preserves_directory_and_pair_destinations() {
         let temp = TestTempDir::new();
         let source = temp.path().join("source");
@@ -4796,6 +5148,40 @@ mod tests {
     }
 
     #[test]
+    fn unix_query_follows_final_appearing_between_selection_and_staging_open() {
+        let mut fixture = TestStoreFixture::new(b"query-initial-final-race ", 0x60);
+        let materialized =
+            ArtifactStoreV1::materialize(&mut fixture.authority, &fixture.request, &fixture.pair);
+        let expected = materialized
+            .into_result()
+            .expect("prepare final store")
+            .operation()
+            .clone();
+        let final_path = fixture.state_root().join(STORE_ROOT_NAME);
+        let staging_path = fixture.state_root().join(STORE_STAGING_NAME);
+        fs::rename(&final_path, &staging_path).expect("present final as selected staging");
+        let mut observer = RenameAtFaultObserver {
+            point: StoreFaultPoint::InitialQueryBeforeStagingOpen,
+            source: staging_path,
+            destination: final_path,
+            replace_with_regular: false,
+            fired: false,
+        };
+
+        let query = run_query_observed(
+            &mut fixture.authority,
+            fixture.request.operation_id(),
+            &mut observer,
+        );
+        assert!(observer.fired);
+        assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
+        assert_eq!(
+            query.result().expect("query follows appeared final").operation(),
+            &expected,
+        );
+    }
+
+    #[test]
     fn unix_current_authority_inode_swap_is_rejected_before_effect() {
         let fixture = TestStoreFixture::new(b"authority-inode-swap ", 0x57);
         create_test_directory(fixture.state_root());
@@ -4824,6 +5210,120 @@ mod tests {
         );
         drop(authority);
         drop(fixture);
+    }
+
+    #[test]
+    fn unix_absent_state_leaf_swap_after_create_is_owner_unknown() {
+        let fixture = TestStoreFixture::new(b"state-leaf-post-create-swap ", 0x5c);
+        let binding = fixture.authority.binding.clone();
+        let mut authority = SwapWhenPathExistsAuthority {
+            trigger: fixture.state_root().to_path_buf(),
+            displaced: fixture.state_root().with_file_name("state-created-displaced"),
+            binding,
+            swapped: false,
+        };
+
+        let invocation = ArtifactStoreV1::materialize(
+            &mut authority,
+            &fixture.request,
+            &fixture.pair,
+        );
+        assert!(authority.swapped);
+        assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
+        assert_eq!(
+            invocation
+                .into_result()
+                .expect_err("post-create leaf swap is owner state"),
+            ArtifactStoreFailureV1::Owner,
+        );
+    }
+
+    #[test]
+    fn unix_initial_prefix_swap_after_objects_is_owner_unknown() {
+        let fixture = TestStoreFixture::new(b"initial-prefix-swap ", 0x5d);
+        let binding = fixture.authority.binding.clone();
+        let trigger = fixture
+            .state_root()
+            .join(STORE_STAGING_NAME)
+            .join(OBJECTS_NAME);
+        let mut authority = SwapWhenPathExistsAuthority {
+            trigger,
+            displaced: fixture.state_root().with_file_name("state-prefix-displaced"),
+            binding,
+            swapped: false,
+        };
+
+        let invocation = ArtifactStoreV1::materialize(
+            &mut authority,
+            &fixture.request,
+            &fixture.pair,
+        );
+        assert!(authority.swapped);
+        assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
+        assert_eq!(
+            invocation
+                .into_result()
+                .expect_err("post-prefix leaf swap is owner state"),
+            ArtifactStoreFailureV1::Owner,
+        );
+    }
+
+    #[test]
+    fn unix_post_prefix_configuration_drift_is_preserved_with_unknown_change() {
+        let fixture = TestStoreFixture::new(b"initial-prefix-config-drift ", 0x5e);
+        let binding = fixture.authority.binding.clone();
+        let mut authority = ConfigDriftAuthority {
+            trigger: ConfigDriftTrigger::InitialObjects(
+                fixture
+                    .state_root()
+                    .join(STORE_STAGING_NAME)
+                    .join(OBJECTS_NAME),
+            ),
+            binding,
+            changed_config: config(0x7e),
+        };
+
+        let invocation = ArtifactStoreV1::materialize(
+            &mut authority,
+            &fixture.request,
+            &fixture.pair,
+        );
+        assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
+        assert_eq!(
+            invocation
+                .into_result()
+                .expect_err("post-prefix config drift is preserved"),
+            ArtifactStoreFailureV1::ConfigurationMismatch,
+        );
+    }
+
+    #[test]
+    fn unix_post_child_configuration_drift_is_preserved_with_unknown_change() {
+        let fixture = TestStoreFixture::new(b"pair-child-config-drift ", 0x5f);
+        let binding = fixture.authority.binding.clone();
+        let mut authority = ConfigDriftAuthority {
+            trigger: ConfigDriftTrigger::PublishedChild(
+                fixture
+                    .state_root()
+                    .join(STORE_ROOT_NAME)
+                    .join(OBJECTS_NAME),
+            ),
+            binding,
+            changed_config: config(0x7f),
+        };
+
+        let invocation = ArtifactStoreV1::materialize(
+            &mut authority,
+            &fixture.request,
+            &fixture.pair,
+        );
+        assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
+        assert_eq!(
+            invocation
+                .into_result()
+                .expect_err("post-child config drift is preserved"),
+            ArtifactStoreFailureV1::ConfigurationMismatch,
+        );
     }
 
     #[test]
@@ -5191,6 +5691,73 @@ mod tests {
             invocation.into_result().expect_err("unlock failure is I/O"),
             ArtifactStoreFailureV1::Io,
         );
+    }
+
+    #[test]
+    fn injected_unlock_failure_never_overrides_known_primary_error() {
+        for primary in [StoreError::Owner, StoreError::Capacity, StoreError::NotFound] {
+            assert_eq!(
+                merge_primary_release::<()>(Err(primary.clone()), Err(StoreError::Io)),
+                Err(primary),
+            );
+        }
+        for (operation_byte, primary, expected) in [
+            (
+                0x72,
+                StoreError::Owner,
+                ArtifactStoreFailureV1::Owner,
+            ),
+            (
+                0x73,
+                StoreError::Capacity,
+                ArtifactStoreFailureV1::Capacity,
+            ),
+            (
+                0x74,
+                StoreError::NotFound,
+                ArtifactStoreFailureV1::NotFound,
+            ),
+        ] {
+            let mut fixture = TestStoreFixture::new(b"primary-before-unlock ", operation_byte);
+            let (store, _binding, _tracker) = open_materializing_fixture(&mut fixture);
+            let mut observer = FailingObserver {
+                target: StoreFaultPoint::BeforeUnlock,
+                seen: Vec::new(),
+                fired: false,
+            };
+            let invocation = finish_locked_observed(
+                store,
+                ChangeTracker::default(),
+                Err(primary),
+                &mut observer,
+            );
+            assert!(observer.fired);
+            assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unchanged);
+            assert_eq!(
+                invocation
+                    .into_result()
+                    .expect_err("known primary error survives unlock failure"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn validation_error_survives_injected_file_unlock_failure() {
+        let temp = TestTempDir::new();
+        let lock = create_test_regular(&temp.path().join("validation.lock"), &[]);
+        lock.try_lock().expect("lock validation seam file");
+        let mut observer = FailingObserver {
+            target: StoreFaultPoint::BeforeUnlock,
+            seen: Vec::new(),
+            fired: false,
+        };
+        assert_eq!(
+            release_file_observed::<()>(lock, Err(StoreError::Owner), &mut observer),
+            Err(StoreError::Owner),
+        );
+        assert!(observer.fired);
+        assert_eq!(observer.seen, vec![StoreFaultPoint::BeforeUnlock]);
     }
 
     #[test]
