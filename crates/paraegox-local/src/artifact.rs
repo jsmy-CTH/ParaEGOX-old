@@ -13,12 +13,12 @@ use std::{
 use paraegox_artifact::ArtifactOperationIdV1;
 use serde::Serialize;
 
+#[cfg(not(unix))]
+use crate::config::ConfigError;
 use crate::{
     config::{self, ArtifactCommandV1, ArtifactJsonIntentV1},
     error::LocalProcessError,
 };
-#[cfg(not(unix))]
-use crate::config::ConfigError;
 
 const ARTIFACT_OUTPUT_SCHEMA_VERSION: u16 = 1;
 const PROFILE: &str = "developer-local-echo-prefix-v1";
@@ -36,6 +36,26 @@ impl ArtifactFailureV1 {
     const fn new(changed: Option<bool>, error: LocalProcessError) -> Self {
         Self { changed, error }
     }
+}
+
+#[cfg(any(unix, test))]
+const fn map_existing_build_read_failure(error: LocalProcessError) -> ArtifactFailureV1 {
+    ArtifactFailureV1::new(Some(false), error)
+}
+
+#[cfg(any(unix, test))]
+const fn map_build_source_failure(
+    staging_exists: bool,
+    error: LocalProcessError,
+) -> ArtifactFailureV1 {
+    ArtifactFailureV1::new(
+        Some(false),
+        if staging_exists && matches!(error, LocalProcessError::ArtifactIo) {
+            LocalProcessError::ArtifactUncertain
+        } else {
+            error
+        },
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,19 +116,27 @@ pub(crate) fn dispatch_to(
     intent: ArtifactJsonIntentV1,
     arguments: &[OsString],
 ) -> u8 {
+    let preparsed_operation_id = config::artifact_preparsed_operation_id(intent, arguments);
     let command = match config::parse_artifact_command(intent, arguments) {
         Ok(command) => command,
         Err(error) => {
-            return write_preparse_error(output, intent, LocalProcessError::Configuration(error));
+            return write_preparse_error(
+                output,
+                intent,
+                preparsed_operation_id,
+                LocalProcessError::Configuration(error),
+            );
         }
     };
 
     #[cfg(not(unix))]
     {
+        let operation_id = command_operation_id(&command);
         let _ = command;
         write_preparse_error(
             output,
             intent,
+            operation_id,
             LocalProcessError::Configuration(ConfigError::UnsupportedPlatform),
         )
     }
@@ -122,15 +150,24 @@ pub(crate) fn dispatch_to(
 fn write_preparse_error(
     output: &mut impl Write,
     intent: ArtifactJsonIntentV1,
+    operation_id: Option<ArtifactOperationIdV1>,
     error: LocalProcessError,
 ) -> u8 {
     let exit_code = error.exit_code();
+    let operation_id = operation_id.map(operation_id_text);
     let result = match intent {
         ArtifactJsonIntentV1::Build | ArtifactJsonIntentV1::Inspect => {
             write_pair_error(output, intent.command(), Some(false), error)
         }
         ArtifactJsonIntentV1::Materialize | ArtifactJsonIntentV1::MaterializationQuery => {
-            write_materialization_error(output, intent.command(), Some(false), None, None, error)
+            write_materialization_error(
+                output,
+                intent.command(),
+                Some(false),
+                operation_id.as_deref(),
+                None,
+                error,
+            )
         }
     };
     if result.is_ok() { exit_code } else { 1 }
@@ -242,7 +279,8 @@ fn write_json_line(
     output: &mut impl Write,
     value: &impl Serialize,
 ) -> Result<(), LocalProcessError> {
-    serde_json::to_writer(&mut *output, value).map_err(|_| LocalProcessError::ArtifactJsonOutput)?;
+    serde_json::to_writer(&mut *output, value)
+        .map_err(|_| LocalProcessError::ArtifactJsonOutput)?;
     output
         .write_all(b"\n")
         .and_then(|()| output.flush())
@@ -256,11 +294,14 @@ fn dispatch_unix(
     command: ArtifactCommandV1,
 ) -> u8 {
     if let Err(error) = ensure_execution_identity() {
-        return write_preparse_error(output, intent, error);
+        return write_preparse_error(output, intent, command_operation_id(&command), error);
     }
 
     match command {
-        ArtifactCommandV1::Build { source, output: path } => {
+        ArtifactCommandV1::Build {
+            source,
+            output: path,
+        } => {
             let result = run_build(&source, &path);
             finish_pair_command(output, intent.command(), result)
         }
@@ -288,6 +329,14 @@ fn dispatch_unix(
             operation_id,
             run_query(&config, operation_id),
         ),
+    }
+}
+
+fn command_operation_id(command: &ArtifactCommandV1) -> Option<ArtifactOperationIdV1> {
+    match command {
+        ArtifactCommandV1::Materialize { operation_id, .. }
+        | ArtifactCommandV1::MaterializationQuery { operation_id, .. } => Some(*operation_id),
+        ArtifactCommandV1::Build { .. } | ArtifactCommandV1::Inspect { .. } => None,
     }
 }
 
@@ -324,9 +373,7 @@ fn finish_materialization_command(
     let operation_id = operation_id_text(operation_id);
     match result {
         Ok(projection) => {
-            let exit_code = projection
-                .error
-                .map_or(0, LocalProcessError::exit_code);
+            let exit_code = projection.error.map_or(0, LocalProcessError::exit_code);
             if write_materialization_projection(output, command, &projection).is_ok() {
                 exit_code
             } else {
@@ -387,9 +434,7 @@ fn lexical_absolute_path(path: &Path) -> Result<(), LocalProcessError> {
 }
 
 fn artifact_path_from_os(value: &OsStr) -> Result<PathBuf, LocalProcessError> {
-    let value = value
-        .to_str()
-        .ok_or(LocalProcessError::ArtifactPath)?;
+    let value = value.to_str().ok_or(LocalProcessError::ArtifactPath)?;
     let path = PathBuf::from(value);
     lexical_absolute_path(&path)?;
     Ok(path)
@@ -427,7 +472,8 @@ mod unix {
 
     use super::{
         ArtifactFailureV1, ArtifactMaterializationProjectionV1, ArtifactPairProjectionV1,
-        artifact_path_from_os, lexical_absolute_path, lower_hex, operation_id_text,
+        artifact_path_from_os, lexical_absolute_path, lower_hex, map_build_source_failure,
+        map_existing_build_read_failure, operation_id_text,
     };
     use crate::{
         config::{self, ConfigError, LocalArtifactStoreAuthorityConfigV1},
@@ -474,6 +520,12 @@ mod unix {
         parent: DirectoryHandle,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BuildPublicationPreconditionV1 {
+        Empty,
+        FinalAppeared,
+    }
+
     pub(super) fn ensure_execution_identity() -> Result<(), LocalProcessError> {
         if geteuid().is_root() || getegid().as_raw() == 0 {
             return Err(LocalProcessError::UnsafeExecutionIdentity);
@@ -514,7 +566,7 @@ mod unix {
         let staging_exists = named_directory_exists(&pinned.parent, OsStr::new(&staging_name))
             .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
         let payload = read_source(&source)
-            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
+            .map_err(|error| map_build_source_failure(staging_exists, error))?;
         let pair = VerifiedArtifactPairV1::from_payload(&payload).map_err(|_| {
             ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactCompatibility)
         })?;
@@ -532,20 +584,28 @@ mod unix {
                 &mut pinned,
                 &output,
                 output_leaf,
+                &staging_name,
                 expected_manifest,
                 pair.payload(),
             )?;
             return Ok(pair_projection(false, &pair));
         }
 
-        revalidate_parent_and_absence(&pinned, &output, output_leaf, &staging_name)
-            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
-        mkdirat(
-            &pinned.parent.file,
-            staging_name.as_str(),
-            directory_mode(),
-        )
-        .map_err(|error| {
+        if revalidate_parent_for_publication(&pinned, &output, output_leaf, &staging_name)
+            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?
+            == BuildPublicationPreconditionV1::FinalAppeared
+        {
+            settle_existing_final(
+                &mut pinned,
+                &output,
+                output_leaf,
+                &staging_name,
+                expected_manifest,
+                pair.payload(),
+            )?;
+            return Ok(pair_projection(false, &pair));
+        }
+        mkdirat(&pinned.parent.file, staging_name.as_str(), directory_mode()).map_err(|error| {
             ArtifactFailureV1::new(
                 Some(false),
                 if error == nix::errno::Errno::EEXIST {
@@ -641,7 +701,8 @@ mod unix {
     impl ArtifactStoreAuthorityV1 for RevalidatingArtifactAuthority {
         fn revalidate(
             &mut self,
-        ) -> Result<ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1> {
+        ) -> Result<ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1>
+        {
             let config = config::parse_artifact_store_authority_config(&self.config_path)
                 .map_err(map_authority_config_error)?;
             ArtifactStoreAuthorityBindingV1::try_new(
@@ -653,8 +714,9 @@ mod unix {
 
     fn map_authority_config_error(error: ConfigError) -> ArtifactStoreAuthorityRecheckFailureV1 {
         match error {
-            ConfigError::InvalidStateRoot
-            | ConfigError::StateRootTooLong => ArtifactStoreAuthorityRecheckFailureV1::UnsafePath,
+            ConfigError::InvalidStateRoot | ConfigError::StateRootTooLong => {
+                ArtifactStoreAuthorityRecheckFailureV1::UnsafePath
+            }
             ConfigError::ConfigFileRead => ArtifactStoreAuthorityRecheckFailureV1::Io,
             _ => ArtifactStoreAuthorityRecheckFailureV1::Configuration,
         }
@@ -688,9 +750,7 @@ mod unix {
             ArtifactStoreOperationStateV1::Failed => {
                 Some(LocalProcessError::ArtifactMaterializationFailed)
             }
-            ArtifactStoreOperationStateV1::Uncertain => {
-                Some(LocalProcessError::ArtifactUncertain)
-            }
+            ArtifactStoreOperationStateV1::Uncertain => Some(LocalProcessError::ArtifactUncertain),
             ArtifactStoreOperationStateV1::Admitted
             | ArtifactStoreOperationStateV1::Materializing
             | ArtifactStoreOperationStateV1::Materialized
@@ -718,12 +778,9 @@ mod unix {
                 None,
                 LocalProcessError::Configuration(ConfigError::InvalidStateRoot),
             ),
-            ArtifactStoreFailureV1::ConfigurationMismatch => (
-                None,
-                None,
-                None,
-                LocalProcessError::LifecycleConfiguration,
-            ),
+            ArtifactStoreFailureV1::ConfigurationMismatch => {
+                (None, None, None, LocalProcessError::LifecycleConfiguration)
+            }
             ArtifactStoreFailureV1::Conflict => {
                 (None, None, None, LocalProcessError::ArtifactConflict)
             }
@@ -751,9 +808,7 @@ mod unix {
                     LocalProcessError::ArtifactUncertain,
                 )
             }
-            ArtifactStoreFailureV1::Owner => {
-                (None, None, None, LocalProcessError::ArtifactOwner)
-            }
+            ArtifactStoreFailureV1::Owner => (None, None, None, LocalProcessError::ArtifactOwner),
             ArtifactStoreFailureV1::Io => (None, None, None, LocalProcessError::ArtifactIo),
         };
         ArtifactMaterializationProjectionV1 {
@@ -790,7 +845,11 @@ mod unix {
     fn build_staging_name(output: &str) -> String {
         let mut digest = Sha256::new();
         digest.update(BUILD_OUTPUT_DOMAIN);
-        digest.update(u64::try_from(output.len()).expect("path bound fits u64").to_be_bytes());
+        digest.update(
+            u64::try_from(output.len())
+                .expect("path bound fits u64")
+                .to_be_bytes(),
+        );
         digest.update(output.as_bytes());
         format!(
             "{STAGING_PREFIX}{}{STAGING_SUFFIX}",
@@ -832,9 +891,7 @@ mod unix {
             || (metadata.uid() != uid && metadata.uid() != 0)
             || mode & 0o022 != 0
             || (strict
-                && (metadata.uid() != uid
-                    || metadata.gid() != gid
-                    || mode != DIRECTORY_MODE_BITS))
+                && (metadata.uid() != uid || metadata.gid() != gid || mode != DIRECTORY_MODE_BITS))
         {
             return Err(LocalProcessError::ArtifactPath);
         }
@@ -974,11 +1031,7 @@ mod unix {
             || output.len() >= path_max
             || output
                 .rfind('/')
-                .and_then(|separator| {
-                    separator
-                        .checked_add(1)?
-                        .checked_add(staging.len())
-                })
+                .and_then(|separator| separator.checked_add(1)?.checked_add(staging.len()))
                 .map_or(true, |length| length >= path_max)
         {
             return Err(LocalProcessError::ArtifactPath);
@@ -1050,7 +1103,7 @@ mod unix {
         validate_regular_metadata(&metadata, strict_mode, None)?;
         let identity = FileIdentity::from_metadata(&metadata);
         let mut bytes = Vec::with_capacity(maximum.min(4096));
-        file.by_ref()
+        std::io::Read::by_ref(&mut file)
             .take(u64::try_from(maximum + 1).expect("small bound"))
             .read_to_end(&mut bytes)
             .map_err(|_| LocalProcessError::ArtifactIo)?;
@@ -1093,10 +1146,18 @@ mod unix {
         let payload_name = payload_path
             .file_name()
             .ok_or(LocalProcessError::ArtifactPath)?;
-        let (manifest, manifest_identity, manifest_file) =
-            read_regular_at(&manifest_parent.parent, manifest_name, MANIFEST_BYTES, false)?;
-        let (payload, payload_identity, payload_file) =
-            read_regular_at(&payload_parent.parent, payload_name, MAX_SOURCE_BYTES, false)?;
+        let (manifest, manifest_identity, manifest_file) = read_regular_at(
+            &manifest_parent.parent,
+            manifest_name,
+            MANIFEST_BYTES,
+            false,
+        )?;
+        let (payload, payload_identity, payload_file) = read_regular_at(
+            &payload_parent.parent,
+            payload_name,
+            MAX_SOURCE_BYTES,
+            false,
+        )?;
         drop(payload_file);
         drop(manifest_file);
 
@@ -1140,11 +1201,7 @@ mod unix {
         let owned = openat(
             &parent.file,
             name,
-            OFlag::O_WRONLY
-                | OFlag::O_CREAT
-                | OFlag::O_EXCL
-                | OFlag::O_CLOEXEC
-                | OFlag::O_NOFOLLOW,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             file_mode(),
         )
         .map_err(|_| LocalProcessError::ArtifactIo)?;
@@ -1166,13 +1223,13 @@ mod unix {
         name: &str,
         expected_identity: Option<FileIdentity>,
         expected: &[u8],
-    ) -> Result<File, LocalProcessError> {
+    ) -> Result<(File, FileIdentity), LocalProcessError> {
         let (bytes, identity, file) =
             read_regular_at(parent, OsStr::new(name), expected.len(), true)?;
         if bytes.as_ref() != expected || expected_identity.is_some_and(|value| value != identity) {
             return Err(LocalProcessError::ArtifactPath);
         }
-        Ok(file)
+        Ok((file, identity))
     }
 
     fn open_build_directory(
@@ -1184,19 +1241,35 @@ mod unix {
         Ok(directory)
     }
 
+    fn require_build_staging_absent(
+        parent: &DirectoryHandle,
+        staging_name: &str,
+    ) -> Result<(), LocalProcessError> {
+        if named_directory_exists(parent, OsStr::new(staging_name))? {
+            return Err(LocalProcessError::ArtifactUncertain);
+        }
+        Ok(())
+    }
+
     fn settle_existing_final(
         pinned: &mut PinnedParent,
         output: &Path,
         output_leaf: &OsStr,
+        staging_name: &str,
         manifest: &[u8],
         payload: &[u8],
     ) -> Result<(), ArtifactFailureV1> {
+        require_build_staging_absent(&pinned.parent, staging_name)
+            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
         let final_dir = open_build_directory(&pinned.parent, output_leaf)
             .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
-        let manifest_file = verify_named_bytes(&final_dir, MANIFEST_NAME, None, manifest)
-            .map_err(|_| ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath))?;
-        let payload_file = verify_named_bytes(&final_dir, PAYLOAD_NAME, None, payload)
-            .map_err(|_| ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath))?;
+        let final_identity = final_dir.identity;
+        let (manifest_file, manifest_identity) =
+            verify_named_bytes(&final_dir, MANIFEST_NAME, None, manifest)
+                .map_err(map_existing_build_read_failure)?;
+        let (payload_file, payload_identity) =
+            verify_named_bytes(&final_dir, PAYLOAD_NAME, None, payload)
+                .map_err(map_existing_build_read_failure)?;
         manifest_file
             .sync_all()
             .and_then(|()| payload_file.sync_all())
@@ -1205,8 +1278,31 @@ mod unix {
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         let reopened_parent = reopen_parent(pinned)
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
+        require_build_staging_absent(&reopened_parent, staging_name)
+            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
         let reopened_final = open_build_directory(&reopened_parent, output_leaf)
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
+        if reopened_final.identity != final_identity {
+            return Err(ArtifactFailureV1::new(
+                None,
+                LocalProcessError::ArtifactUncertain,
+            ));
+        }
+        verify_named_bytes(
+            &reopened_final,
+            MANIFEST_NAME,
+            Some(manifest_identity),
+            manifest,
+        )
+        .and_then(|_| {
+            verify_named_bytes(
+                &reopened_final,
+                PAYLOAD_NAME,
+                Some(payload_identity),
+                payload,
+            )
+        })
+        .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         let resolved_parent = open_pinned_parent(output, true)
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         if resolved_parent.parent.identity != reopened_parent.identity {
@@ -1215,39 +1311,56 @@ mod unix {
                 LocalProcessError::ArtifactUncertain,
             ));
         }
+        require_build_staging_absent(&resolved_parent.parent, staging_name)
+            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
         let current_final = open_build_directory(&resolved_parent.parent, output_leaf)
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
-        if current_final.identity != reopened_final.identity {
+        if current_final.identity != final_identity
+            || current_final.identity != reopened_final.identity
+        {
             return Err(ArtifactFailureV1::new(
                 None,
                 LocalProcessError::ArtifactUncertain,
             ));
         }
-        verify_named_bytes(&current_final, MANIFEST_NAME, None, manifest)
-            .and_then(|file| {
-                drop(file);
-                verify_named_bytes(&current_final, PAYLOAD_NAME, None, payload)
-            })
-            .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
+        verify_named_bytes(
+            &current_final,
+            MANIFEST_NAME,
+            Some(manifest_identity),
+            manifest,
+        )
+        .and_then(|_| {
+            verify_named_bytes(
+                &current_final,
+                PAYLOAD_NAME,
+                Some(payload_identity),
+                payload,
+            )
+        })
+        .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         pinned.parent = reopened_parent;
         Ok(())
     }
 
-    fn revalidate_parent_and_absence(
+    fn revalidate_parent_for_publication(
         pinned: &PinnedParent,
         output: &Path,
         output_leaf: &OsStr,
         staging_name: &str,
-    ) -> Result<(), LocalProcessError> {
+    ) -> Result<BuildPublicationPreconditionV1, LocalProcessError> {
         revalidate_directory(&pinned.parent, true)?;
         let path_parent = open_pinned_parent(output, true)?;
-        if path_parent.parent.identity != pinned.parent.identity
-            || named_directory_exists(&pinned.parent, output_leaf)?
-            || named_directory_exists(&pinned.parent, OsStr::new(staging_name))?
-        {
+        if path_parent.parent.identity != pinned.parent.identity {
             return Err(LocalProcessError::ArtifactPath);
         }
-        Ok(())
+        if named_directory_exists(&pinned.parent, OsStr::new(staging_name))? {
+            return Err(LocalProcessError::ArtifactUncertain);
+        }
+        if named_directory_exists(&pinned.parent, output_leaf)? {
+            Ok(BuildPublicationPreconditionV1::FinalAppeared)
+        } else {
+            Ok(BuildPublicationPreconditionV1::Empty)
+        }
     }
 
     fn revalidate_parent_for_rename(
@@ -1275,7 +1388,11 @@ mod unix {
         manifest: &[u8],
         payload: &[u8],
     ) -> Result<(), LocalProcessError> {
-        pinned.parent.file.sync_all().map_err(|_| LocalProcessError::ArtifactIo)?;
+        pinned
+            .parent
+            .file
+            .sync_all()
+            .map_err(|_| LocalProcessError::ArtifactIo)?;
         let staging = open_directory_at(&pinned.parent, OsStr::new(staging_name), true)?;
         exact_names(&staging, &[])?;
         let staging_identity = staging.identity;
@@ -1284,7 +1401,10 @@ mod unix {
         let payload_identity = write_new_exact(&staging, PAYLOAD_NAME, payload)?;
         verify_named_bytes(&staging, PAYLOAD_NAME, Some(payload_identity), payload)?;
         exact_names(&staging, &[MANIFEST_NAME, PAYLOAD_NAME])?;
-        staging.file.sync_all().map_err(|_| LocalProcessError::ArtifactIo)?;
+        staging
+            .file
+            .sync_all()
+            .map_err(|_| LocalProcessError::ArtifactIo)?;
         drop(staging);
         let reopened_staging = open_directory_at(&pinned.parent, OsStr::new(staging_name), true)?;
         if reopened_staging.identity != staging_identity {
@@ -1304,8 +1424,7 @@ mod unix {
             payload,
         )?;
         revalidate_parent_for_rename(pinned, output, output_leaf, staging_name)?;
-        let rename_candidate =
-            open_directory_at(&pinned.parent, OsStr::new(staging_name), true)?;
+        let rename_candidate = open_directory_at(&pinned.parent, OsStr::new(staging_name), true)?;
         if rename_candidate.identity != staging_identity {
             return Err(LocalProcessError::ArtifactPath);
         }
@@ -1330,8 +1449,13 @@ mod unix {
             RenameFlags::NOREPLACE,
         )
         .map_err(|_| LocalProcessError::ArtifactIo)?;
-        pinned.parent.file.sync_all().map_err(|_| LocalProcessError::ArtifactIo)?;
+        pinned
+            .parent
+            .file
+            .sync_all()
+            .map_err(|_| LocalProcessError::ArtifactIo)?;
         let reopened_parent = reopen_parent(pinned)?;
+        require_build_staging_absent(&reopened_parent, staging_name)?;
         let final_dir = open_build_directory(&reopened_parent, output_leaf)?;
         let resolved_parent = open_pinned_parent(output, true)?;
         if resolved_parent.parent.identity != reopened_parent.identity {
@@ -1340,6 +1464,7 @@ mod unix {
         if final_dir.identity != staging_identity {
             return Err(LocalProcessError::ArtifactPath);
         }
+        require_build_staging_absent(&resolved_parent.parent, staging_name)?;
         let current_final = open_build_directory(&resolved_parent.parent, output_leaf)?;
         if current_final.identity != staging_identity
             || current_final.identity != final_dir.identity
@@ -1369,6 +1494,38 @@ use unix::{ensure_execution_identity, run_build, run_inspect, run_materialize, r
 #[cfg(test)]
 mod json_tests {
     use super::*;
+
+    #[test]
+    fn existing_build_replay_preserves_pre_barrier_read_taxonomy() {
+        assert_eq!(
+            map_existing_build_read_failure(LocalProcessError::ArtifactIo),
+            ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactIo)
+        );
+        assert_eq!(
+            map_existing_build_read_failure(LocalProcessError::ArtifactPath),
+            ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath)
+        );
+    }
+
+    #[test]
+    fn existing_staging_only_masks_source_io_as_uncertain() {
+        assert_eq!(
+            map_build_source_failure(true, LocalProcessError::ArtifactIo),
+            ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactUncertain)
+        );
+        assert_eq!(
+            map_build_source_failure(true, LocalProcessError::ArtifactPath),
+            ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath)
+        );
+        assert_eq!(
+            map_build_source_failure(true, LocalProcessError::ArtifactCompatibility),
+            ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactCompatibility)
+        );
+        assert_eq!(
+            map_build_source_failure(false, LocalProcessError::ArtifactIo),
+            ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactIo)
+        );
+    }
 
     #[test]
     fn pair_error_keeps_exact_key_order() {
@@ -1402,5 +1559,69 @@ mod json_tests {
             String::from_utf8(output).expect("UTF-8 JSON"),
             "{\"schema_version\":1,\"command\":\"artifact.materialization.query\",\"ok\":false,\"changed\":false,\"operation_id\":\"a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2\",\"state\":null,\"artifact_object_ref\":null,\"materialization_receipt_ref\":null,\"diagnostics\":[{\"code\":\"PXLC-ARTIFACT-NOT-FOUND\",\"message\":\"artifact operation was not found\"}]}\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_materialization_shapes_preserve_operation_id_on_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const OPERATION_ID: &str = "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+        const MATERIALIZE_ERROR: &str = "{\"schema_version\":1,\"command\":\"artifact.materialize\",\"ok\":false,\"changed\":false,\"operation_id\":\"a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2\",\"state\":null,\"artifact_object_ref\":null,\"materialization_receipt_ref\":null,\"diagnostics\":[{\"code\":\"PXLC-ARG-NON-UTF8\",\"message\":\"arguments must be valid UTF-8\"}]}\n";
+        const QUERY_ERROR: &str = "{\"schema_version\":1,\"command\":\"artifact.materialization.query\",\"ok\":false,\"changed\":false,\"operation_id\":\"a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2\",\"state\":null,\"artifact_object_ref\":null,\"materialization_receipt_ref\":null,\"diagnostics\":[{\"code\":\"PXLC-ARG-NON-UTF8\",\"message\":\"arguments must be valid UTF-8\"}]}\n";
+
+        let materialize = [
+            "artifact",
+            "materialize",
+            "--config",
+            "/private/paraegox.toml",
+            "--manifest",
+            "/private/manifest.pxam",
+            "--payload",
+            "/private/payload.bin",
+            "--operation-id",
+            OPERATION_ID,
+            "--json",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        for index in [3, 5, 7] {
+            let mut arguments = materialize.clone();
+            arguments[index] = OsString::from_vec(vec![0xff]);
+            let mut output = Vec::new();
+            assert_eq!(
+                dispatch_to(
+                    &mut output,
+                    ArtifactJsonIntentV1::Materialize,
+                    &arguments,
+                ),
+                2
+            );
+            assert_eq!(String::from_utf8(output).expect("UTF-8 JSON"), MATERIALIZE_ERROR);
+        }
+
+        let mut query = [
+            "artifact",
+            "materialization",
+            "query",
+            "--config",
+            "/private/paraegox.toml",
+            "--operation-id",
+            OPERATION_ID,
+            "--json",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        query[4] = OsString::from_vec(vec![0xff]);
+        let mut output = Vec::new();
+        assert_eq!(
+            dispatch_to(
+                &mut output,
+                ArtifactJsonIntentV1::MaterializationQuery,
+                &query,
+            ),
+            2
+        );
+        assert_eq!(String::from_utf8(output).expect("UTF-8 JSON"), QUERY_ERROR);
     }
 }

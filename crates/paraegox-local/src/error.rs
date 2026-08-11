@@ -5,11 +5,9 @@ pub(crate) enum LocalProcessError {
     Configuration(ConfigError),
     OfflineJsonOutput,
     ArtifactPath,
-    ArtifactProfile,
     ArtifactCompatibility,
     ArtifactConflict,
     ArtifactCapacity,
-    ArtifactAdmissionRequired,
     ArtifactNotFound,
     ArtifactMaterializationFailed,
     ArtifactUncertain,
@@ -103,11 +101,9 @@ impl LocalProcessError {
             Self::Configuration(error) => error.code(),
             Self::OfflineJsonOutput => "PXLC-OFFLINE-JSON-OUTPUT",
             Self::ArtifactPath => "PXLC-ARTIFACT-PATH",
-            Self::ArtifactProfile => "PXLC-ARTIFACT-PROFILE",
             Self::ArtifactCompatibility => "PXLC-ARTIFACT-COMPATIBILITY",
             Self::ArtifactConflict => "PXLC-ARTIFACT-CONFLICT",
             Self::ArtifactCapacity => "PXLC-ARTIFACT-CAPACITY",
-            Self::ArtifactAdmissionRequired => "A0_APPLICATION_ADMISSION_REQUIRED",
             Self::ArtifactNotFound => "PXLC-ARTIFACT-NOT-FOUND",
             Self::ArtifactMaterializationFailed => "PXLC-ARTIFACT-MATERIALIZATION-FAILED",
             Self::ArtifactUncertain => "PXLC-ARTIFACT-UNCERTAIN",
@@ -201,13 +197,9 @@ impl LocalProcessError {
             Self::Configuration(error) => error.message(),
             Self::OfflineJsonOutput => "offline machine-readable output failed",
             Self::ArtifactPath => "artifact path is invalid or unsafe",
-            Self::ArtifactProfile => "artifact profile is unsupported",
             Self::ArtifactCompatibility => "artifact bytes are invalid or incompatible",
             Self::ArtifactConflict => "artifact operation conflicts with its durable request",
             Self::ArtifactCapacity => "artifact store capacity is exhausted",
-            Self::ArtifactAdmissionRequired => {
-                "application admission is required before this operation"
-            }
             Self::ArtifactNotFound => "artifact operation was not found",
             Self::ArtifactMaterializationFailed => "artifact materialization failed",
             Self::ArtifactUncertain => "artifact operation outcome is uncertain",
@@ -372,11 +364,9 @@ impl LocalProcessError {
         match self {
             Self::Configuration(_)
             | Self::ArtifactPath
-            | Self::ArtifactProfile
             | Self::ArtifactCompatibility
             | Self::ArtifactConflict
             | Self::ArtifactCapacity
-            | Self::ArtifactAdmissionRequired
             | Self::InitUnsafeExecutionIdentity
             | Self::InitWorkspaceConflict
             | Self::LifecycleConfiguration => 2,

@@ -2304,60 +2304,23 @@ pub(crate) fn parse_artifact_command(
     intent: ArtifactJsonIntentV1,
     arguments: &[OsString],
 ) -> Result<ArtifactCommandV1, ConfigError> {
-    let fixed = |index: usize, expected: &str| {
-        arguments
-            .get(index)
-            .is_some_and(|value| value.as_os_str() == std::ffi::OsStr::new(expected))
-    };
+    if !artifact_fixed_shape(intent, arguments) {
+        return Err(ConfigError::InvalidArtifactGrammar);
+    }
     match intent {
-        ArtifactJsonIntentV1::Build => {
-            if arguments.len() != 9
-                || !fixed(0, ARTIFACT_COMMAND)
-                || !fixed(1, ARTIFACT_BUILD_COMMAND)
-                || !fixed(2, PROFILE_OPTION)
-                || !fixed(3, ARTIFACT_PROFILE)
-                || !fixed(4, SOURCE_OPTION)
-                || !fixed(6, OUTPUT_OPTION)
-                || !fixed(8, JSON_OPTION)
-            {
-                return Err(ConfigError::InvalidArtifactGrammar);
-            }
-            Ok(ArtifactCommandV1::Build {
-                source: arguments[5].clone(),
-                output: arguments[7].clone(),
-            })
-        }
-        ArtifactJsonIntentV1::Inspect => {
-            if arguments.len() != 7
-                || !fixed(0, ARTIFACT_COMMAND)
-                || !fixed(1, ARTIFACT_INSPECT_COMMAND)
-                || !fixed(2, MANIFEST_OPTION)
-                || !fixed(4, PAYLOAD_OPTION)
-                || !fixed(6, JSON_OPTION)
-            {
-                return Err(ConfigError::InvalidArtifactGrammar);
-            }
-            Ok(ArtifactCommandV1::Inspect {
-                manifest: arguments[3].clone(),
-                payload: arguments[5].clone(),
-            })
-        }
+        ArtifactJsonIntentV1::Build => Ok(ArtifactCommandV1::Build {
+            source: arguments[5].clone(),
+            output: arguments[7].clone(),
+        }),
+        ArtifactJsonIntentV1::Inspect => Ok(ArtifactCommandV1::Inspect {
+            manifest: arguments[3].clone(),
+            payload: arguments[5].clone(),
+        }),
         ArtifactJsonIntentV1::Materialize => {
-            if arguments.len() != 11
-                || !fixed(0, ARTIFACT_COMMAND)
-                || !fixed(1, ARTIFACT_MATERIALIZE_COMMAND)
-                || !fixed(2, CONFIG_OPTION)
-                || !fixed(4, MANIFEST_OPTION)
-                || !fixed(6, PAYLOAD_OPTION)
-                || !fixed(8, OPERATION_ID_OPTION)
-                || !fixed(10, JSON_OPTION)
-            {
-                return Err(ConfigError::InvalidArtifactGrammar);
-            }
+            let operation_id = parse_artifact_operation_id(artifact_utf8_value(arguments, 9)?)?;
             let config = artifact_utf8_value(arguments, 3)?;
             let manifest = artifact_utf8_value(arguments, 5)?;
             let payload = artifact_utf8_value(arguments, 7)?;
-            let operation_id = parse_artifact_operation_id(artifact_utf8_value(arguments, 9)?)?;
             Ok(ArtifactCommandV1::Materialize {
                 config: PathBuf::from(config),
                 manifest: PathBuf::from(manifest),
@@ -2366,22 +2329,74 @@ pub(crate) fn parse_artifact_command(
             })
         }
         ArtifactJsonIntentV1::MaterializationQuery => {
-            if arguments.len() != 8
-                || !fixed(0, ARTIFACT_COMMAND)
-                || !fixed(1, ARTIFACT_MATERIALIZATION_COMMAND)
-                || !fixed(2, ARTIFACT_QUERY_COMMAND)
-                || !fixed(3, CONFIG_OPTION)
-                || !fixed(5, OPERATION_ID_OPTION)
-                || !fixed(7, JSON_OPTION)
-            {
-                return Err(ConfigError::InvalidArtifactGrammar);
-            }
-            let config = artifact_utf8_value(arguments, 4)?;
             let operation_id = parse_artifact_operation_id(artifact_utf8_value(arguments, 6)?)?;
+            let config = artifact_utf8_value(arguments, 4)?;
             Ok(ArtifactCommandV1::MaterializationQuery {
                 config: PathBuf::from(config),
                 operation_id,
             })
+        }
+    }
+}
+
+pub(crate) fn artifact_preparsed_operation_id(
+    intent: ArtifactJsonIntentV1,
+    arguments: &[OsString],
+) -> Option<ArtifactOperationIdV1> {
+    if !artifact_fixed_shape(intent, arguments) {
+        return None;
+    }
+    let index = match intent {
+        ArtifactJsonIntentV1::Materialize => 9,
+        ArtifactJsonIntentV1::MaterializationQuery => 6,
+        ArtifactJsonIntentV1::Build | ArtifactJsonIntentV1::Inspect => return None,
+    };
+    parse_artifact_operation_id(arguments.get(index)?.to_str()?).ok()
+}
+
+fn artifact_fixed_shape(intent: ArtifactJsonIntentV1, arguments: &[OsString]) -> bool {
+    let fixed = |index: usize, expected: &str| {
+        arguments
+            .get(index)
+            .is_some_and(|value| value.as_os_str() == std::ffi::OsStr::new(expected))
+    };
+    match intent {
+        ArtifactJsonIntentV1::Build => {
+            arguments.len() == 9
+                && fixed(0, ARTIFACT_COMMAND)
+                && fixed(1, ARTIFACT_BUILD_COMMAND)
+                && fixed(2, PROFILE_OPTION)
+                && fixed(3, ARTIFACT_PROFILE)
+                && fixed(4, SOURCE_OPTION)
+                && fixed(6, OUTPUT_OPTION)
+                && fixed(8, JSON_OPTION)
+        }
+        ArtifactJsonIntentV1::Inspect => {
+            arguments.len() == 7
+                && fixed(0, ARTIFACT_COMMAND)
+                && fixed(1, ARTIFACT_INSPECT_COMMAND)
+                && fixed(2, MANIFEST_OPTION)
+                && fixed(4, PAYLOAD_OPTION)
+                && fixed(6, JSON_OPTION)
+        }
+        ArtifactJsonIntentV1::Materialize => {
+            arguments.len() == 11
+                && fixed(0, ARTIFACT_COMMAND)
+                && fixed(1, ARTIFACT_MATERIALIZE_COMMAND)
+                && fixed(2, CONFIG_OPTION)
+                && fixed(4, MANIFEST_OPTION)
+                && fixed(6, PAYLOAD_OPTION)
+                && fixed(8, OPERATION_ID_OPTION)
+                && fixed(10, JSON_OPTION)
+        }
+        ArtifactJsonIntentV1::MaterializationQuery => {
+            arguments.len() == 8
+                && fixed(0, ARTIFACT_COMMAND)
+                && fixed(1, ARTIFACT_MATERIALIZATION_COMMAND)
+                && fixed(2, ARTIFACT_QUERY_COMMAND)
+                && fixed(3, CONFIG_OPTION)
+                && fixed(5, OPERATION_ID_OPTION)
+                && fixed(7, JSON_OPTION)
         }
     }
 }
@@ -7413,7 +7428,10 @@ client_private_key_file = "{root}/node/controller-key.pem"
             ),
         ];
         for (intent, arguments) in cases {
-            let arguments = arguments.into_iter().map(OsString::from).collect::<Vec<_>>();
+            let arguments = arguments
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
             assert!(parse_artifact_command(intent, &arguments).is_ok());
             let mut malformed = arguments.clone();
             malformed.push(OsString::from("--extra"));
