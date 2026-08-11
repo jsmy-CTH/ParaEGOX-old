@@ -951,6 +951,29 @@ pub(crate) struct ArtifactExternalControllerStateV2 {
 }
 
 impl ArtifactExternalControllerStateV2 {
+    pub(crate) fn admit(
+        request: ArtifactExternalDeploymentRequestV1,
+        controller_store_instance: [u8; 32],
+    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+        let admission = ArtifactExternalDeploymentAdmissionV1::try_new(
+            controller_store_instance,
+            NonZeroU64::new(1).expect("one is nonzero"),
+            &request,
+        )?;
+        Self::try_new(ArtifactExternalControllerStateInputV2 {
+            phase: ArtifactExternalControllerPhaseV2::Admitted,
+            controller_snapshot_sequence: NonZeroU64::new(1).expect("one is nonzero"),
+            request,
+            admission,
+            plan_content: None,
+            execution: None,
+            runtime_request: None,
+            runtime_terminal: None,
+            records: Vec::new(),
+            receipt: None,
+        })
+    }
+
     pub(crate) fn try_new(
         input: ArtifactExternalControllerStateInputV2,
     ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
@@ -991,6 +1014,20 @@ impl ArtifactExternalControllerStateV2 {
     }
 
     #[must_use]
+    pub(crate) const fn plan_content(
+        &self,
+    ) -> Option<&ArtifactBoundManagedModelAgentStackPlanContentV2> {
+        self.plan_content.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) const fn execution(
+        &self,
+    ) -> Option<&ArtifactBoundManagedModelAgentStackTargetExecutionV1> {
+        self.execution.as_ref()
+    }
+
+    #[must_use]
     pub(crate) const fn runtime_request(
         &self,
     ) -> Option<&ArtifactBoundManagedModelAgentStackApplyRequestV1> {
@@ -1012,6 +1049,193 @@ impl ArtifactExternalControllerStateV2 {
     #[must_use]
     pub(crate) const fn receipt(&self) -> Option<&ArtifactExternalDeploymentReceiptV1> {
         self.receipt.as_ref()
+    }
+
+    pub(crate) fn commit(
+        &self,
+        plan_content: ArtifactBoundManagedModelAgentStackPlanContentV2,
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        runtime_request: ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+        if self.phase != ArtifactExternalControllerPhaseV2::Admitted {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidPhase);
+        }
+        validate_artifact_runtime_prefix(
+            &self.request,
+            &self.admission,
+            &plan_content,
+            &execution,
+            &runtime_request,
+        )?;
+        let progress = ArtifactExternalDeploymentProgressV1::try_new(
+            NonZeroU64::new(1),
+            NonZeroU64::new(2),
+            Some(*runtime_request.target_slice_digest().value()),
+            None,
+            None,
+            None,
+        )?;
+        let committed = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Committed,
+            NonZeroU64::new(1).expect("one is nonzero"),
+            &self.request,
+            &self.admission,
+            progress,
+            None,
+        )?;
+        Self::try_new(ArtifactExternalControllerStateInputV2 {
+            phase: ArtifactExternalControllerPhaseV2::Committed,
+            controller_snapshot_sequence: NonZeroU64::new(2).expect("two is nonzero"),
+            request: self.request.clone(),
+            admission: self.admission.clone(),
+            plan_content: Some(plan_content),
+            execution: Some(execution),
+            runtime_request: Some(runtime_request),
+            runtime_terminal: None,
+            records: vec![committed],
+            receipt: None,
+        })
+    }
+
+    pub(crate) fn begin_apply(
+        &self,
+        lifecycle_generation: [u8; 16],
+    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+        if self.phase != ArtifactExternalControllerPhaseV2::Committed || self.records.len() != 1 {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidPhase);
+        }
+        let runtime_request = self
+            .runtime_request
+            .as_ref()
+            .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?;
+        let progress = ArtifactExternalDeploymentProgressV1::try_new(
+            NonZeroU64::new(1),
+            NonZeroU64::new(2),
+            Some(*runtime_request.target_slice_digest().value()),
+            Some(runtime_request.envelope_request_digest()),
+            None,
+            Some(lifecycle_generation),
+        )?;
+        let applying = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Applying,
+            NonZeroU64::new(2).expect("two is nonzero"),
+            &self.request,
+            &self.admission,
+            progress,
+            self.records.last(),
+        )?;
+        let mut records = self.records.clone();
+        records.push(applying);
+        Self::try_new(ArtifactExternalControllerStateInputV2 {
+            phase: ArtifactExternalControllerPhaseV2::Applying,
+            controller_snapshot_sequence: NonZeroU64::new(3).expect("three is nonzero"),
+            request: self.request.clone(),
+            admission: self.admission.clone(),
+            plan_content: self.plan_content.clone(),
+            execution: self.execution.clone(),
+            runtime_request: self.runtime_request.clone(),
+            runtime_terminal: None,
+            records,
+            receipt: None,
+        })
+    }
+
+    pub(crate) fn finish_apply(
+        &self,
+        runtime_terminal: Option<ManagedModelAgentStackTerminalReceiptV1>,
+        missing_terminal_phase: Option<ArtifactExternalControllerPhaseV2>,
+    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+        if self.phase != ArtifactExternalControllerPhaseV2::Applying || self.records.len() != 2 {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidPhase);
+        }
+        let phase = match runtime_terminal
+            .as_ref()
+            .map(|terminal| terminal.facts().state().outcome())
+        {
+            Some(ManagedModelAgentStackTerminalOutcomeV1::ActiveReady) => {
+                ArtifactExternalControllerPhaseV2::ActiveReady
+            }
+            Some(
+                ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected
+                | ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+            ) => ArtifactExternalControllerPhaseV2::Failed,
+            Some(ManagedModelAgentStackTerminalOutcomeV1::Uncertain) => {
+                ArtifactExternalControllerPhaseV2::Uncertain
+            }
+            Some(ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero) => {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+            None => match missing_terminal_phase {
+                Some(
+                    phase @ (ArtifactExternalControllerPhaseV2::Failed
+                    | ArtifactExternalControllerPhaseV2::Uncertain),
+                ) => phase,
+                _ => return Err(ManagedModelAgentStackApplyControllerError::InvalidState),
+            },
+        };
+        if runtime_terminal.is_some() && missing_terminal_phase.is_some() {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        let runtime_request = self
+            .runtime_request
+            .as_ref()
+            .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?;
+        let progress = ArtifactExternalDeploymentProgressV1::try_new(
+            NonZeroU64::new(1),
+            NonZeroU64::new(2),
+            Some(*runtime_request.target_slice_digest().value()),
+            Some(runtime_request.envelope_request_digest()),
+            runtime_terminal
+                .as_ref()
+                .map(ManagedModelAgentStackTerminalReceiptV1::receipt_digest),
+            self.records
+                .last()
+                .map(|record| record.progress.lifecycle_generation),
+        )?;
+        let record_state = match phase {
+            ArtifactExternalControllerPhaseV2::ActiveReady => {
+                ArtifactExternalDeploymentRecordStateV1::ActiveReady
+            }
+            ArtifactExternalControllerPhaseV2::Failed => {
+                ArtifactExternalDeploymentRecordStateV1::Failed
+            }
+            ArtifactExternalControllerPhaseV2::Uncertain => {
+                ArtifactExternalDeploymentRecordStateV1::Uncertain
+            }
+            ArtifactExternalControllerPhaseV2::Admitted
+            | ArtifactExternalControllerPhaseV2::Committed
+            | ArtifactExternalControllerPhaseV2::Applying => {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+        };
+        let terminal = ArtifactExternalDeploymentRecordV1::try_new(
+            record_state,
+            NonZeroU64::new(3).expect("three is nonzero"),
+            &self.request,
+            &self.admission,
+            progress,
+            self.records.last(),
+        )?;
+        let receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+            NonZeroU64::new(1).expect("one is nonzero"),
+            &self.request,
+            &self.admission,
+            &terminal,
+        )?;
+        let mut records = self.records.clone();
+        records.push(terminal);
+        Self::try_new(ArtifactExternalControllerStateInputV2 {
+            phase,
+            controller_snapshot_sequence: NonZeroU64::new(4).expect("four is nonzero"),
+            request: self.request.clone(),
+            admission: self.admission.clone(),
+            plan_content: self.plan_content.clone(),
+            execution: self.execution.clone(),
+            runtime_request: self.runtime_request.clone(),
+            runtime_terminal,
+            records,
+            receipt: Some(receipt),
+        })
     }
 
     pub(crate) fn cutover_marker_digest(
@@ -5316,6 +5540,62 @@ mod tests {
                 .expect("reopen U"),
             uncertain,
         );
+    }
+
+    #[test]
+    fn artifact_external_controller_owner_reducer_matches_primary_goldens() {
+        let (request, _, plan_content, execution, runtime_request) = artifact_runtime_prefix();
+        let admitted = ArtifactExternalControllerStateV2::admit(request, [0x46; 32])
+            .expect("owner admits PXMJ2-A");
+        assert_eq!(
+            admitted.encode().expect("A wire").as_ref(),
+            decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_admitted.hex"
+            )))
+        );
+
+        let committed = admitted
+            .commit(plan_content, execution, runtime_request.clone())
+            .expect("owner commits PXMJ2-C");
+        assert_eq!(
+            committed.encode().expect("C wire").as_ref(),
+            decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_committed.hex"
+            )))
+        );
+
+        let applying = committed
+            .begin_apply([0x54; 16])
+            .expect("owner commits PXMJ2-P");
+        assert_eq!(
+            applying.encode().expect("P wire").as_ref(),
+            decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_applying.hex"
+            )))
+        );
+
+        let terminal = signed_artifact_receipt(
+            &runtime_request,
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+        )
+        .expect("signed ActiveReady");
+        let active = applying
+            .finish_apply(Some(terminal), None)
+            .expect("owner commits PXMJ2-R");
+        assert_eq!(
+            active.encode().expect("R wire").as_ref(),
+            decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_active_ready.hex"
+            )))
+        );
+        assert!(matches!(
+            active.finish_apply(None, Some(ArtifactExternalControllerPhaseV2::Failed)),
+            Err(ManagedModelAgentStackApplyControllerError::InvalidPhase)
+        ));
     }
 
     #[test]
