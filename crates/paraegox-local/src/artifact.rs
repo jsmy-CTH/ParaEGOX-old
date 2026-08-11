@@ -1591,11 +1591,7 @@ mod unix {
                 &mut failures,
             )
         });
-        record_manifest_contract(
-            current_manifest.as_ref(),
-            classify_profile,
-            &mut failures,
-        );
+        record_manifest_contract(current_manifest.as_ref(), classify_profile, &mut failures);
         record_payload_contract(current_payload.as_ref(), &mut failures);
         let verified = record_pair_contract(
             current_manifest.as_ref(),
@@ -1826,7 +1822,7 @@ mod unix {
         let reopened_parent = reopen_parent(pinned)
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         require_build_staging_absent(&reopened_parent, staging_name)
-            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
+            .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         let reopened_final = open_build_directory(&reopened_parent, output_leaf)
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         if reopened_final.identity != final_identity {
@@ -1859,7 +1855,7 @@ mod unix {
             ));
         }
         require_build_staging_absent(&resolved_parent.parent, staging_name)
-            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
+            .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         let current_final = open_build_directory(&resolved_parent.parent, output_leaf)
             .map_err(|_| ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain))?;
         if current_final.identity != final_identity
