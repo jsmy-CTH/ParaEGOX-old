@@ -3293,9 +3293,24 @@ impl ManagedFabricControlService {
                 Err(error) => Err(map_managed_model_agent_stack_error(error)),
             };
         }
-        self.core
-            .require_remote_agent_access_s0_mutation_unfrozen_v2()
-            .map_err(map_managed_fabric_error)?;
+        let owner_config = ManagedModelAgentStackOwnerConfig {
+            state_directory: self.state_directory.clone(),
+            projection: self.model_stack_projection.clone(),
+            runtime_host_epoch: self.core.runtime_host_epoch(),
+            clock: self.core.stack_clock(),
+            response_key_ref: self.provisioning.runtime_response_key_ref(),
+            response_signer: self.provisioning.response_signer().clone(),
+            handle_broker: self.handle_broker.clone(),
+            model_backend_resolver: self.dependencies.model_backend_resolver(),
+        };
+        let predecessor = ArtifactManagedModelAgentStackRuntimeCore::preflight_cutover(
+            &self.core,
+            &owner_config,
+            &request,
+            self.channel,
+        )
+        .await
+        .map_err(map_managed_model_agent_stack_error)?;
         let reading = self
             .core
             .clock_reading()
@@ -3305,23 +3320,13 @@ impl ManagedFabricControlService {
             .admission_policy()
             .verify_artifact_managed_model_agent_stack_apply_request(&request, reading)
             .map_err(|_| RuntimeControlRequestError::Rejected)?;
-        let runtime_host_epoch = self.core.runtime_host_epoch();
-        let clock = self.core.stack_clock();
         let cutover = ArtifactManagedModelAgentStackRuntimeCore::cutover(
             &mut self.core,
-            ManagedModelAgentStackOwnerConfig {
-                state_directory: self.state_directory.clone(),
-                projection: self.model_stack_projection.clone(),
-                runtime_host_epoch,
-                clock,
-                response_key_ref: self.provisioning.runtime_response_key_ref(),
-                response_signer: self.provisioning.response_signer().clone(),
-                handle_broker: self.handle_broker.clone(),
-                model_backend_resolver: self.dependencies.model_backend_resolver(),
-            },
+            owner_config,
             request,
             verified,
             self.channel,
+            predecessor,
         )
         .await
         .map_err(map_managed_model_agent_stack_error)?;
@@ -15771,12 +15776,30 @@ mod tests {
             "    async fn handle_artifact_managed_model_agent_stack_apply(",
             "    async fn handle_distributed_agent_stack_apply(",
         );
-        assert_order(
-            "Artifact-bound managed Model+Agent stack",
-            artifact_model,
-            "authenticate_artifact_managed_model_agent_stack_apply_request",
-            "verify_artifact_managed_model_agent_stack_apply_request",
-            "ArtifactManagedModelAgentStackRuntimeCore::cutover(",
+        let authentication = artifact_model
+            .find("authenticate_artifact_managed_model_agent_stack_apply_request")
+            .expect("Artifact-bound authentication disappeared");
+        let replay = artifact_model
+            .find("authenticated_terminal_replay")
+            .expect("Artifact-bound terminal replay disappeared");
+        let predecessor = artifact_model
+            .find("ArtifactManagedModelAgentStackRuntimeCore::preflight_cutover(")
+            .expect("Artifact-bound predecessor preflight disappeared");
+        let fresh_clock = artifact_model
+            .find(".clock_reading()")
+            .expect("Artifact-bound admission clock disappeared");
+        let fresh_admission = artifact_model
+            .find("verify_artifact_managed_model_agent_stack_apply_request")
+            .expect("Artifact-bound fresh admission disappeared");
+        let cutover = artifact_model
+            .find("ArtifactManagedModelAgentStackRuntimeCore::cutover(")
+            .expect("Artifact-bound cutover disappeared");
+        assert!(
+            authentication < replay
+                && replay < predecessor
+                && predecessor < fresh_clock
+                && fresh_clock < fresh_admission
+                && fresh_admission < cutover
         );
         let install = artifact_model
             .find("self.artifact_model_stack = Some(*model_stack)")

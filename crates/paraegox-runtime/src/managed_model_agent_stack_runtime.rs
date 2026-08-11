@@ -201,6 +201,7 @@ struct UncertainTerminalInput<'a> {
 const _: fn() = artifact_runtime_compile_time_anchor;
 
 fn artifact_runtime_compile_time_anchor() {
+    let _ = ArtifactManagedModelAgentStackRuntimeCore::preflight_cutover;
     let _ = ArtifactManagedModelAgentStackRuntimeCore::cutover;
     let _ = ArtifactManagedModelAgentStackRuntimeCore::authenticated_terminal_replay;
     let _ = ArtifactManagedModelAgentStackRuntimeCore::retains_live_resources;
@@ -289,17 +290,28 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         )
     }
 
+    pub(crate) async fn preflight_cutover(
+        fabric: &ManagedFabricRuntimeCore,
+        config: &ManagedModelAgentStackOwnerConfig,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        response_channel: ReferenceChannelBindingV1,
+    ) -> Result<ManagedFabricStackCutoverObservation, ManagedModelAgentStackRuntimeError> {
+        validate_artifact_cutover_request(fabric, config, request, response_channel)?;
+        fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
+        Ok(fabric.stack_cutover_observation().await?)
+    }
+
     pub(crate) async fn cutover(
         fabric: &mut ManagedFabricRuntimeCore,
         config: ManagedModelAgentStackOwnerConfig,
         request: ArtifactBoundManagedModelAgentStackApplyRequestV1,
         verified: VerifiedArtifactManagedModelAgentStackApplyIngressV1,
         response_channel: ReferenceChannelBindingV1,
+        predecessor: ManagedFabricStackCutoverObservation,
     ) -> Result<ArtifactManagedModelAgentStackCutoverOutcome, ManagedModelAgentStackRuntimeError>
     {
         validate_artifact_cutover_request(fabric, &config, &request, response_channel)?;
         fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
-        let predecessor = fabric.stack_cutover_observation().await?;
         match observe_artifact_deadline(config.clock, verified) {
             Ok(()) => {}
             Err(ManagedModelAgentStackRuntimeError::DeadlineExpired) => {
@@ -3540,6 +3552,57 @@ mod tests {
                 "missing Model terminal check: {required}"
             );
         }
+
+        let artifact_owner = source
+            .split_once("impl ArtifactManagedModelAgentStackRuntimeCore {")
+            .and_then(|(_, tail)| tail.split_once("impl ManagedModelAgentStackRuntimeCore {"))
+            .map(|(owner, _)| owner)
+            .expect("missing Artifact-bound Runtime owner boundary");
+        let artifact_preflight = artifact_owner
+            .split_once("    pub(crate) async fn preflight_cutover(")
+            .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn cutover("))
+            .map(|(preflight, _)| preflight)
+            .expect("missing Artifact-bound predecessor preflight");
+        let artifact_validation = artifact_preflight
+            .find("validate_artifact_cutover_request")
+            .expect("missing Artifact-bound preflight validation");
+        let artifact_gate = artifact_preflight
+            .find("require_remote_agent_access_s0_mutation_unfrozen_v2")
+            .expect("missing Artifact-bound preflight freeze gate");
+        let artifact_predecessor = artifact_preflight
+            .find("stack_cutover_observation().await")
+            .expect("missing Artifact-bound predecessor observation");
+        assert!(artifact_validation < artifact_gate && artifact_gate < artifact_predecessor);
+
+        let artifact_cutover = artifact_owner
+            .split_once("    pub(crate) async fn cutover(")
+            .and_then(|(_, tail)| {
+                tail.split_once("    pub(crate) fn authenticated_terminal_replay(")
+            })
+            .map(|(cutover, _)| cutover)
+            .expect("missing Artifact-bound cutover boundary");
+        let artifact_validation = artifact_cutover
+            .find("validate_artifact_cutover_request")
+            .expect("missing Artifact-bound cutover validation");
+        let artifact_gate = artifact_cutover
+            .find("require_remote_agent_access_s0_mutation_unfrozen_v2")
+            .expect("missing Artifact-bound cutover freeze gate");
+        let artifact_deadline = artifact_cutover
+            .find("observe_artifact_deadline")
+            .expect("missing Artifact-bound deadline gate");
+        let artifact_initialize = artifact_cutover
+            .find("initialize_managed_model_agent_stack")
+            .expect("missing Artifact-bound PXMA initialization");
+        let artifact_model_start = artifact_cutover
+            .find(".start_model(")
+            .expect("missing Artifact-bound Model start");
+        assert!(
+            artifact_validation < artifact_gate
+                && artifact_gate < artifact_deadline
+                && artifact_deadline < artifact_initialize
+                && artifact_initialize < artifact_model_start
+        );
+        assert!(!artifact_cutover.contains("stack_cutover_observation().await"));
 
         let cutover = source
             .split_once("impl ManagedModelAgentStackRuntimeCore {")
