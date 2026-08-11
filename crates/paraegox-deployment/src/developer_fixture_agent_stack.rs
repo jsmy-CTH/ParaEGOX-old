@@ -12,7 +12,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use nix::fcntl::{OFlag, open};
@@ -1858,8 +1858,12 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
         EXCHANGE_TIMEOUT,
     )
     .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let exchange_started = Instant::now();
     let response =
         runtime.block_on(client.exchange_artifact(&runtime_request, fabric_context.channel()));
+    if let Err(error) = &response {
+        record_d0b_exchange_diagnostic(error, exchange_started.elapsed());
+    }
     let (runtime_terminal, missing_terminal_phase) = match response {
         Ok(wire) => (
             Some(
@@ -1940,6 +1944,23 @@ fn release_external_controller<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(release)) => Err(release.into()),
     }
+}
+
+#[cold]
+#[inline(never)]
+fn record_d0b_exchange_diagnostic(
+    error: &RuntimeManagedModelAgentStackExchangeError,
+    elapsed: Duration,
+) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH") else {
+        return;
+    };
+    let Ok(mut output) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(output, "client-error={error:?};elapsed-ms={}", elapsed.as_millis());
 }
 
 fn reopen_artifact_successor(
