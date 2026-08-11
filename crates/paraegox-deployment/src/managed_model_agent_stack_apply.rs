@@ -3270,6 +3270,8 @@ mod artifact_external_store {
     const LOCK_NAME: &str = "artifact-external.lock";
     const SNAPSHOT_NAME: &str = "artifact-external.pxmj";
     const NEXT_NAME: &str = ".artifact-external.pxmj.next";
+    const LIFECYCLE_ROOT_NAME: &str = "operator-v1";
+    const LIFECYCLE_OWNER_LOCK_NAME: &str = "owner.lock";
     const DIRECTORY_MODE_BITS: u32 = 0o700;
     const FILE_MODE_BITS: u32 = 0o600;
     const MODE_MASK: u32 = 0o7777;
@@ -3758,6 +3760,26 @@ mod artifact_external_store {
         directory_from_owned(owned, parent.owner_uid, parent.owner_gid, true)
     }
 
+    fn open_optional_directory_at(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> Result<Option<DirectoryHandle>, ArtifactExternalControllerStoreFailureV1> {
+        let owned = match openat(
+            &parent.file,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(owned) => owned,
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            Err(_) => return Err(ArtifactExternalControllerStoreFailureV1::Io),
+        };
+        directory_from_owned(owned, parent.owner_uid, parent.owner_gid, true).map(Some)
+    }
+
     fn open_state_leaf(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -3919,6 +3941,32 @@ mod artifact_external_store {
             .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
         validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
         Ok((file, FileIdentity::from_metadata(&metadata)))
+    }
+
+    fn open_optional_regular_at(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        access: OFlag,
+    ) -> Result<Option<(File, FileIdentity)>, ArtifactExternalControllerStoreFailureV1> {
+        let owned = match openat(
+            &parent.file,
+            name,
+            access | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(owned) => owned,
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            Err(_) => return Err(ArtifactExternalControllerStoreFailureV1::Io),
+        };
+        let file = File::from(owned);
+        let metadata = file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
+        Ok(Some((file, FileIdentity::from_metadata(&metadata))))
     }
 
     fn validate_named_regular(
@@ -4372,14 +4420,112 @@ mod artifact_external_store {
         };
         revalidate_current_authority(authority, &binding, &state_root)?;
         match root_selection(&state_root.leaf)? {
-            (false, false) => Err(ArtifactExternalControllerStoreFailureV1::NotFound),
             (true, false) => {
                 let store = open_final_locked(state_root, &binding, LockMode::Shared)?;
                 query_locked(store, operation_id)
             }
-            (false, true) => inspect_staging(&state_root, &binding, operation_id),
             (true, true) => Err(ArtifactExternalControllerStoreFailureV1::Owner),
+            (false, false) | (false, true) => query_after_lifecycle_gate(
+                authority,
+                &binding,
+                &state_root,
+                operation_id,
+            ),
         }
+    }
+
+    fn query_after_lifecycle_gate(
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+        state_root: &StateRootHandle,
+        operation_id: ArtifactDeploymentOperationIdV1,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        let lifecycle_root = match open_optional_directory_at(
+            &state_root.leaf,
+            OsStr::new(LIFECYCLE_ROOT_NAME),
+        )? {
+            Some(root) => root,
+            None => {
+                revalidate_current_authority(authority, binding, state_root)?;
+                if open_optional_directory_at(
+                    &state_root.leaf,
+                    OsStr::new(LIFECYCLE_ROOT_NAME),
+                )?
+                .is_some()
+                {
+                    return Err(ArtifactExternalControllerStoreFailureV1::Contended);
+                }
+                return match root_selection(&state_root.leaf)? {
+                    (false, false) => Err(ArtifactExternalControllerStoreFailureV1::NotFound),
+                    _ => Err(ArtifactExternalControllerStoreFailureV1::Owner),
+                };
+            }
+        };
+        let (lifecycle_lock, lifecycle_lock_identity) = match open_optional_regular_at(
+            &lifecycle_root,
+            OsStr::new(LIFECYCLE_OWNER_LOCK_NAME),
+            OFlag::O_RDWR,
+        )? {
+            Some(lock) => lock,
+            None => {
+                let reopened = reopen_named_directory(
+                    &state_root.leaf,
+                    OsStr::new(LIFECYCLE_ROOT_NAME),
+                    lifecycle_root.identity,
+                )?;
+                return if open_optional_regular_at(
+                    &reopened,
+                    OsStr::new(LIFECYCLE_OWNER_LOCK_NAME),
+                    OFlag::O_RDWR,
+                )?
+                .is_some()
+                {
+                    Err(ArtifactExternalControllerStoreFailureV1::Contended)
+                } else {
+                    Err(ArtifactExternalControllerStoreFailureV1::Owner)
+                };
+            }
+        };
+        if lifecycle_lock
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?
+            .len()
+            != 0
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        lifecycle_lock.try_lock_shared().map_err(|error| match error {
+            TryLockError::WouldBlock => ArtifactExternalControllerStoreFailureV1::Contended,
+            TryLockError::Error(_) => ArtifactExternalControllerStoreFailureV1::Io,
+        })?;
+        let result = (|| {
+            revalidate_current_authority(authority, binding, state_root)?;
+            let lifecycle_root = reopen_named_directory(
+                &state_root.leaf,
+                OsStr::new(LIFECYCLE_ROOT_NAME),
+                lifecycle_root.identity,
+            )?;
+            validate_named_regular(
+                &lifecycle_root,
+                OsStr::new(LIFECYCLE_OWNER_LOCK_NAME),
+                lifecycle_lock_identity,
+                0,
+            )?;
+            match root_selection(&state_root.leaf)? {
+                (false, false) => Err(ArtifactExternalControllerStoreFailureV1::NotFound),
+                (true, false) => {
+                    let store = open_final_locked(
+                        clone_state_root(state_root)?,
+                        binding,
+                        LockMode::Shared,
+                    )?;
+                    query_locked(store, operation_id)
+                }
+                (false, true) => inspect_staging(state_root, binding, operation_id),
+                (true, true) => Err(ArtifactExternalControllerStoreFailureV1::Owner),
+            }
+        })();
+        release_file(lifecycle_lock, result)
     }
 
     fn draw_store_instance() -> Result<[u8; 32], ArtifactExternalControllerStoreFailureV1> {
@@ -5034,7 +5180,9 @@ pub trait DeveloperArtifactExternalControllerAuthorityV1 {
     >;
 }
 
-/// Fully validated fixed-profile input to the external Controller admission.
+/// Canonical fixed-profile locator input to the external Controller admission.
+/// The Local caller separately supplies the verified materialization bundle
+/// before invoking the mutating owner path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeveloperArtifactExternalControllerRequestV1 {
     operation_id: ArtifactDeploymentOperationIdV1,
@@ -5462,6 +5610,7 @@ mod tests {
     use std::path::PathBuf;
 
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+    use fs2::FileExt as _;
     use paraegox_artifact::{
         ArtifactObjectRefV1, MaterializationReceiptRefV1, VerifiedArtifactPairV1,
     };
@@ -8202,6 +8351,55 @@ mod tests {
         assert_eq!(projection.runtime_apply_request_digest(), None);
         assert_eq!(projection.runtime_terminal_receipt_digest(), None);
         assert_eq!(projection.terminal_outcome(), None);
+    }
+
+    #[test]
+    fn external_query_uses_lifecycle_gate_only_when_final_is_absent() {
+        let request = artifact_external_request();
+        let test_root = ArtifactExternalStoreTestRoot::new();
+        let binding = ArtifactExternalControllerAuthorityBindingV1::try_new(
+            test_root.state_root(),
+            request.config_commitment(),
+        )
+        .expect("test authority binding");
+        let mut authority = FixedArtifactExternalAuthority {
+            binding: binding.clone(),
+        };
+        let absent = ArtifactExternalDeploymentControllerStoreV1::query(
+            &mut authority,
+            request.operation_id(),
+        );
+        assert_eq!(
+            absent.into_result(),
+            Err(ArtifactExternalControllerStoreFailureV1::NotFound),
+        );
+
+        let lifecycle_root = test_root.state_root().join("operator-v1");
+        fs::create_dir(&lifecycle_root).expect("create lifecycle root");
+        fs::set_permissions(&lifecycle_root, fs::Permissions::from_mode(0o700))
+            .expect("set lifecycle root mode");
+        let lifecycle_lock_path = lifecycle_root.join("owner.lock");
+        let lifecycle_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lifecycle_lock_path)
+            .expect("create lifecycle lock");
+        lifecycle_lock
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .expect("set lifecycle lock mode");
+        lifecycle_lock.try_lock().expect("hold lifecycle owner");
+
+        let contended = ArtifactExternalDeploymentControllerStoreV1::query(
+            &mut authority,
+            request.operation_id(),
+        );
+        assert_eq!(
+            contended.into_result(),
+            Err(ArtifactExternalControllerStoreFailureV1::Contended),
+        );
+        lifecycle_lock.unlock().expect("release lifecycle owner");
     }
 
     #[test]
