@@ -2629,7 +2629,7 @@ fn classify_snapshot_rename_error(
     next_bytes: &[u8],
     next_identity: FileIdentity,
 ) -> SnapshotRenameState {
-    let observed = (|| {
+    let observed: Result<SnapshotRenameState, StoreError> = (|| {
         let (active_bytes, active_identity) = read_regular_bounded(
             &store.root,
             OsStr::new(STORE_SNAPSHOT_NAME),
