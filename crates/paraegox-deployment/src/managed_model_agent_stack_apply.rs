@@ -3211,12 +3211,11 @@ mod tests {
 
     #[test]
     fn artifact_runtime_terminal_shared_goldens_decode_correlate_and_verify() {
-        let runtime_request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
-            &decode_fixture_hex(include_str!(
-                "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
-            )),
-        )
-        .expect("decoded shared PXAR12");
+        let runtime_request =
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(&decode_fixture_hex(
+                include_str!("../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"),
+            ))
+            .expect("decoded shared PXAR12");
         let fixtures = [
             (
                 include_str!("../../../tests/fixtures/wire/artifact_f0_pxmt_artifact_v1.hex"),
@@ -3331,15 +3330,21 @@ mod tests {
             let state = facts.state();
             assert_eq!(state.outcome(), expected_outcome);
             assert_eq!(
-                state.fabric_generation().map(ManagedServiceGeneration::value),
+                state
+                    .fabric_generation()
+                    .map(ManagedServiceGeneration::value),
                 expected_fabric_generation,
             );
             assert_eq!(
-                state.model_generation().map(ManagedServiceGeneration::value),
+                state
+                    .model_generation()
+                    .map(ManagedServiceGeneration::value),
                 expected_model_generation,
             );
             assert_eq!(
-                state.agent_generation().map(ManagedServiceGeneration::value),
+                state
+                    .agent_generation()
+                    .map(ManagedServiceGeneration::value),
                 expected_agent_generation,
             );
             let evidence = facts.evidence().fields();
@@ -5365,6 +5370,150 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn artifact_external_controller_state_v2_matches_all_shared_successor_goldens() {
+        for (
+            wire,
+            phase,
+            snapshot_sequence,
+            record_count,
+            expected_terminal_outcome,
+        ) in [
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_committed.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Committed,
+                2,
+                1,
+                None,
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_applying.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Applying,
+                3,
+                2,
+                None,
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_active_ready.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::ActiveReady,
+                4,
+                3,
+                Some(ManagedModelAgentStackTerminalOutcomeV1::ActiveReady),
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_failed_post_c.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Failed,
+                3,
+                2,
+                None,
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_uncertain_post_c.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Uncertain,
+                3,
+                2,
+                None,
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_failed_post_p.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Failed,
+                4,
+                3,
+                Some(ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected),
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_uncertain_post_p.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Uncertain,
+                4,
+                3,
+                Some(ManagedModelAgentStackTerminalOutcomeV1::Uncertain),
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_failed_quarantined_post_p.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Failed,
+                4,
+                3,
+                Some(ManagedModelAgentStackTerminalOutcomeV1::Quarantined),
+            ),
+            (
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_uncertain_post_p_no_pxmt.hex"
+                )),
+                ArtifactExternalControllerPhaseV2::Uncertain,
+                4,
+                3,
+                None,
+            ),
+        ] {
+            let state = ArtifactExternalControllerStateV2::decode(&wire)
+                .expect("independent shared PXMJ2 successor fixture");
+            assert_eq!(state.phase(), phase);
+            assert_eq!(
+                state.controller_snapshot_sequence().get(),
+                snapshot_sequence,
+            );
+            assert_eq!(state.records().len(), record_count);
+            assert_eq!(state.request().operation_id().as_bytes(), &[0xd1; 16]);
+            let runtime_request = state.runtime_request().expect("shared exact PXAR12");
+            assert_eq!(runtime_request.operation_id().as_bytes(), &[0xd4; 16]);
+            assert_eq!(
+                runtime_request.canonical_wire(),
+                decode_fixture_hex(include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
+                )),
+            );
+            let last = state.records().last().expect("shared terminal/progress record");
+            assert_eq!(last.progress().deployment_revision, 1);
+            assert_eq!(last.progress().controller_snapshot_sequence, 2);
+            assert_eq!(
+                last.progress().runtime_apply_request_digest,
+                if record_count == 1 || snapshot_sequence == 3 && phase != ArtifactExternalControllerPhaseV2::Applying {
+                    [0; 32]
+                } else {
+                    *runtime_request.envelope_request_digest().as_bytes()
+                },
+            );
+            match expected_terminal_outcome {
+                Some(outcome) => {
+                    let terminal = state.runtime_terminal().expect("shared exact PXMT");
+                    assert_eq!(terminal.facts().state().outcome(), outcome);
+                    terminal
+                        .validate_artifact_request_correlation(runtime_request)
+                        .expect("PXMJ2 PXMT correlation");
+                    assert_eq!(
+                        last.progress().runtime_terminal_receipt_digest,
+                        *terminal.receipt_digest().as_bytes(),
+                    );
+                }
+                None => {
+                    assert!(state.runtime_terminal().is_none());
+                    assert_eq!(last.progress().runtime_terminal_receipt_digest, [0; 32]);
+                }
+            }
+            assert_eq!(state.receipt().is_some(), !matches!(phase, ArtifactExternalControllerPhaseV2::Committed | ArtifactExternalControllerPhaseV2::Applying));
+            assert_eq!(
+                state.encode().expect("canonical PXMJ2 re-encode").as_ref(),
+                wire.as_slice(),
+            );
         }
     }
 }

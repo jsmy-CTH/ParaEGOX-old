@@ -967,6 +967,264 @@ def _decode_pxmj2_prefix(
         assert receipt == _encode_pre_c_terminal_receipt(phase, record, pxdq, pxdk)
 
 
+def _encode_external_record(
+    state: bytes,
+    sequence: int,
+    pxdq: bytes,
+    pxdk: bytes,
+    *,
+    deployment_revision: int,
+    controller_snapshot_sequence: int,
+    desired_head_digest: bytes,
+    runtime_request_digest: bytes,
+    runtime_terminal_digest: bytes,
+    lifecycle_generation: bytes,
+    previous: bytes | None,
+) -> bytes:
+    assert state in (b"C", b"P", b"R", b"F", b"U")
+    assert len(desired_head_digest) == 32
+    assert len(runtime_request_digest) == 32
+    assert len(runtime_terminal_digest) == 32
+    assert len(lifecycle_generation) == 16
+    outcome = b"N" if state in (b"C", b"P") else state
+    frame = bytearray()
+    frame += b"PXDM" + struct.pack(">H", 1) + state + outcome
+    frame += struct.pack(">H", 496) + bytes(2) + struct.pack(">I", 496)
+    frame += pxdk[16:48] + struct.pack(">Q", sequence)
+    frame += pxdq[16:32] + pxdq[256:288] + pxdk[208:240]
+    frame += pxdq[64:136] + pxdq[192:224]
+    frame += struct.pack(">QQ", deployment_revision, controller_snapshot_sequence)
+    frame += desired_head_digest + runtime_request_digest + runtime_terminal_digest
+    frame += lifecycle_generation + pxdq[224:256]
+    frame += bytes(32) if previous is None else previous[464:496]
+    frame += bytes(32)
+    assert len(frame) == 464
+    frame += _raw_digest(
+        b"paraegox.deployment.external-operation-record.sha256.v1", frame
+    )
+    assert len(frame) == 496
+    return bytes(frame)
+
+
+def _encode_external_receipt(
+    terminal: bytes,
+    pxdq: bytes,
+    pxdk: bytes,
+) -> bytes:
+    assert terminal[:4] == b"PXDM"
+    assert terminal[6:7] in (b"R", b"F", b"U")
+    frame = bytearray()
+    frame += b"PXDO" + struct.pack(">H", 1) + b"D" + terminal[7:8]
+    frame += struct.pack(">H", 432) + bytes(2) + struct.pack(">I", 432)
+    frame += pxdk[16:48] + struct.pack(">Q", 1)
+    frame += pxdq[16:32] + pxdq[256:288] + terminal[464:496]
+    frame += pxdq[64:136] + pxdq[192:224]
+    frame += terminal[240:368] + bytes(32)
+    assert len(frame) == 400
+    frame += _raw_digest(b"paraegox.deployment.external-receipt.sha256.v1", frame)
+    assert len(frame) == 432
+    return bytes(frame)
+
+
+def _encode_pxmj2_full_states() -> dict[str, bytes]:
+    pxdq = _fixture("artifact_f0_pxdq_v1.hex", 288)
+    pxdk = _fixture("artifact_f0_pxdk_v1.hex", 240)
+    plan_content = _fixture("artifact_f0_plan_content_v2.hex", 2_057)
+    execution = _fixture("artifact_f0_pxte_v11.hex", 1_805)
+    runtime_request = _fixture("artifact_f0_pxar_v12.hex", 2_780)
+    request = _encode_artifact_runtime_request()
+    terminals = _encode_artifact_terminals()
+    lifecycle_generation = bytes.fromhex(
+        LEDGER["deployment"]["lifecycle_generation_hex"]
+    )
+    desired = request["target_slice_digest"]
+    runtime_request_digest = request["request_digest"]
+    committed = _encode_external_record(
+        b"C",
+        1,
+        pxdq,
+        pxdk,
+        deployment_revision=1,
+        controller_snapshot_sequence=2,
+        desired_head_digest=desired,
+        runtime_request_digest=bytes(32),
+        runtime_terminal_digest=bytes(32),
+        lifecycle_generation=bytes(16),
+        previous=None,
+    )
+    applying = _encode_external_record(
+        b"P",
+        2,
+        pxdq,
+        pxdk,
+        deployment_revision=1,
+        controller_snapshot_sequence=2,
+        desired_head_digest=desired,
+        runtime_request_digest=runtime_request_digest,
+        runtime_terminal_digest=bytes(32),
+        lifecycle_generation=lifecycle_generation,
+        previous=committed,
+    )
+
+    def post_c(state: bytes) -> list[bytes]:
+        terminal = _encode_external_record(
+            state,
+            2,
+            pxdq,
+            pxdk,
+            deployment_revision=1,
+            controller_snapshot_sequence=2,
+            desired_head_digest=desired,
+            runtime_request_digest=bytes(32),
+            runtime_terminal_digest=bytes(32),
+            lifecycle_generation=lifecycle_generation,
+            previous=committed,
+        )
+        return [committed, terminal]
+
+    def post_p(state: bytes, terminal_name: str | None) -> list[bytes]:
+        receipt_digest = (
+            bytes(32)
+            if terminal_name is None
+            else terminals[terminal_name]["receipt_digest"]
+        )
+        terminal = _encode_external_record(
+            state,
+            3,
+            pxdq,
+            pxdk,
+            deployment_revision=1,
+            controller_snapshot_sequence=2,
+            desired_head_digest=desired,
+            runtime_request_digest=runtime_request_digest,
+            runtime_terminal_digest=receipt_digest,
+            lifecycle_generation=lifecycle_generation,
+            previous=applying,
+        )
+        return [committed, applying, terminal]
+
+    active_records = post_p(b"R", "active_ready")
+    shapes: dict[
+        str,
+        tuple[bytes, int, list[bytes], str | None],
+    ] = {
+        "committed": (b"C", 2, [committed], None),
+        "applying": (b"P", 3, [committed, applying], None),
+        "active_ready": (b"R", 4, active_records, "active_ready"),
+        "failed_post_c": (b"F", 3, post_c(b"F"), None),
+        "uncertain_post_c": (b"U", 3, post_c(b"U"), None),
+        "failed_post_p": (
+            b"F",
+            4,
+            post_p(b"F", "no_effect_rejected"),
+            "no_effect_rejected",
+        ),
+        "uncertain_post_p": (
+            b"U",
+            4,
+            post_p(b"U", "uncertain"),
+            "uncertain",
+        ),
+        "failed_quarantined_post_p": (
+            b"F",
+            4,
+            post_p(b"F", "quarantined"),
+            "quarantined",
+        ),
+        "uncertain_post_p_no_pxmt": (
+            b"U",
+            4,
+            post_p(b"U", None),
+            None,
+        ),
+    }
+    result: dict[str, bytes] = {}
+    predecessor = bytes.fromhex(
+        LEDGER["predecessor"]["active_target_slice_digest_hex"]
+    )
+    plan_digest = _canonical_digest(PLAN_CONTENT_DIGEST_DOMAIN, plan_content)
+    for name, (phase, snapshot_sequence, records, terminal_name) in shapes.items():
+        terminal = b"" if terminal_name is None else terminals[terminal_name]["wire"]
+        receipt = b"" if phase in (b"C", b"P") else _encode_external_receipt(
+            records[-1], pxdq, pxdk
+        )
+        body = (
+            pxdq
+            + pxdk
+            + plan_content
+            + execution
+            + runtime_request
+            + terminal
+            + b"".join(records)
+            + receipt
+        )
+        frame_length = 192 + len(body) + 32
+        header = bytearray()
+        header += b"PXMJ" + struct.pack(">HHI", 2, 192, frame_length)
+        header += phase + bytes(3) + struct.pack(">Q", snapshot_sequence)
+        header += pxdk[16:48] + struct.pack(">Q", 1)
+        header += struct.pack(">Q", int(bool(receipt)))
+        header += struct.pack(">Q", 1) + predecessor + plan_digest
+        header += struct.pack(
+            ">IIIIII",
+            288,
+            240,
+            len(plan_content),
+            len(execution),
+            len(runtime_request),
+            len(terminal),
+        )
+        header += struct.pack(">HHI", len(records), int(bool(receipt)), len(body))
+        header += bytes(16)
+        assert len(header) == 192
+        frame = bytes(header) + body
+        frame += _canonical_digest(
+            b"paraegox.deployment.artifact-bound-managed-model-agent-stack-state.sha256.v2",
+            frame,
+        )
+        assert len(frame) == frame_length
+        result[name] = frame
+    return result
+
+
+def _decode_pxmj2_full_state(frame: bytes, shape_name: str) -> None:
+    expected = _encode_pxmj2_full_states()[shape_name]
+    assert frame == expected
+    phase, snapshot_sequence, record_count, receipt_count, terminal_length = {
+        "committed": (b"C", 2, 1, 0, 0),
+        "applying": (b"P", 3, 2, 0, 0),
+        "active_ready": (b"R", 4, 3, 1, 591),
+        "failed_post_c": (b"F", 3, 2, 1, 0),
+        "uncertain_post_c": (b"U", 3, 2, 1, 0),
+        "failed_post_p": (b"F", 4, 3, 1, 591),
+        "uncertain_post_p": (b"U", 4, 3, 1, 591),
+        "failed_quarantined_post_p": (b"F", 4, 3, 1, 591),
+        "uncertain_post_p_no_pxmt": (b"U", 4, 3, 1, 0),
+    }[shape_name]
+    assert frame[:4] == b"PXMJ"
+    assert struct.unpack(">HHI", frame[4:12]) == (2, 192, len(frame))
+    assert frame[12:13] == phase and frame[13:16] == bytes(3)
+    assert struct.unpack(">Q", frame[16:24])[0] == snapshot_sequence
+    assert struct.unpack(">Q", frame[56:64])[0] == 1
+    assert struct.unpack(">Q", frame[64:72])[0] == receipt_count
+    assert struct.unpack(">Q", frame[72:80])[0] == 1
+    assert struct.unpack(">IIIIII", frame[144:168]) == (
+        288,
+        240,
+        2_057,
+        1_805,
+        2_780,
+        terminal_length,
+    )
+    assert struct.unpack(">HH", frame[168:172]) == (record_count, receipt_count)
+    assert struct.unpack(">I", frame[172:176])[0] == len(frame) - 224
+    assert frame[176:192] == bytes(16)
+    assert frame[-32:] == _canonical_digest(
+        b"paraegox.deployment.artifact-bound-managed-model-agent-stack-state.sha256.v2",
+        frame[:-32],
+    )
+
+
 def test_artifact_execution_binding_shared_golden_is_independently_derived() -> None:
     binding_wire = _fixture("artifact_f0_binding_v1.hex", 192)
     binding = _decode_artifact_binding(binding_wire)
@@ -1181,6 +1439,29 @@ def test_pxmj2_admitted_and_pre_c_terminal_goldens_are_independently_derived() -
         fixture = _fixture(name, size)
         assert fixture == _encode_pxmj2_prefix(phase, pxdq, pxdk)
         _decode_pxmj2_prefix(fixture, phase, pxdq, pxdk)
+
+
+def test_pxmj2_full_successor_goldens_are_independently_derived() -> None:
+    expected_sizes = {
+        "committed": 7_890,
+        "applying": 8_386,
+        "active_ready": 9_905,
+        "failed_post_c": 8_818,
+        "uncertain_post_c": 8_818,
+        "failed_post_p": 9_905,
+        "uncertain_post_p": 9_905,
+        "failed_quarantined_post_p": 9_905,
+        "uncertain_post_p_no_pxmt": 9_314,
+    }
+    expected = _encode_pxmj2_full_states()
+    for shape_name, size in expected_sizes.items():
+        fixture = _fixture(f"artifact_f0_pxmj_v2_{shape_name}.hex", size)
+        assert fixture == expected[shape_name]
+        _decode_pxmj2_full_state(fixture, shape_name)
+
+    assert expected["active_ready"] != expected["failed_post_p"]
+    assert expected["failed_post_p"] != expected["failed_quarantined_post_p"]
+    assert expected["uncertain_post_p"] != expected["uncertain_post_p_no_pxmt"]
 
 
 def test_pxmj2_pre_c_outer_checksum_and_terminal_pin_drift_are_rejected() -> None:
