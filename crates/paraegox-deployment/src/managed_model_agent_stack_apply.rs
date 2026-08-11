@@ -3950,7 +3950,7 @@ mod artifact_external_store {
             FILE_MODE,
         )
         .map_err(|error| match error {
-            nix::errno::Errno::EEXIST => ArtifactExternalControllerStoreFailureV1::Conflict,
+            nix::errno::Errno::EEXIST => ArtifactExternalControllerStoreFailureV1::Owner,
             _ => ArtifactExternalControllerStoreFailureV1::Io,
         })?;
         let file = File::from(owned);
@@ -4360,7 +4360,7 @@ mod artifact_external_store {
         name: &str,
     ) -> Result<DirectoryHandle, ArtifactExternalControllerStoreFailureV1> {
         mkdirat(&parent.file, name, DIRECTORY_MODE).map_err(|error| match error {
-            nix::errno::Errno::EEXIST => ArtifactExternalControllerStoreFailureV1::Conflict,
+            nix::errno::Errno::EEXIST => ArtifactExternalControllerStoreFailureV1::Owner,
             _ => ArtifactExternalControllerStoreFailureV1::Io,
         })?;
         let directory = open_directory_at(parent, OsStr::new(name))?;
@@ -4833,6 +4833,7 @@ mod artifact_external_store {
         next: ArtifactExternalControllerStateV2,
         next_bytes: Box<[u8]>,
         next_identity: FileIdentity,
+        owned_next: bool,
         tracker: &mut ChangeTracker,
     ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
         revalidate_current_authority(authority, binding, &store.state_root)?;
@@ -4841,6 +4842,13 @@ mod artifact_external_store {
         if renameat(&store.root.file, NEXT_NAME, &store.root.file, SNAPSHOT_NAME).is_err() {
             match classify_snapshot_rename(store, &next, &next_bytes, next_identity) {
                 SnapshotRenameState::Old => {
+                    if !owned_next {
+                        return Err(
+                            ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(
+                                Box::new(next),
+                            )),
+                        );
+                    }
                     cleanup_next(&store.root, next_identity)?;
                     tracker.0 = ArtifactExternalControllerStoreChangeV1::Unchanged;
                     return Err(ArtifactExternalControllerStoreFailureV1::Io);
@@ -4907,6 +4915,7 @@ mod artifact_external_store {
                 next,
                 existing.bytes,
                 existing.identity,
+                false,
                 tracker,
             );
         }
@@ -4916,7 +4925,9 @@ mod artifact_external_store {
             .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
         tracker.ambiguous();
         let identity = write_new_exact(&store.root, NEXT_NAME, &bytes)?;
-        settle_successor(store, authority, binding, next, bytes, identity, tracker)
+        settle_successor(
+            store, authority, binding, next, bytes, identity, true, tracker,
+        )
     }
 }
 
