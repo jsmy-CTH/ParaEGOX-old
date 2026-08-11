@@ -3153,10 +3153,9 @@ mod tests {
         let runtime_request_wire = decode_fixture_hex(include_str!(
             "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
         ));
-        let runtime_request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
-            &runtime_request_wire,
-        )
-        .expect("decoded shared PXAR12");
+        let runtime_request =
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(&runtime_request_wire)
+                .expect("decoded shared PXAR12");
         assert_eq!(runtime_request.canonical_wire(), runtime_request_wire);
         assert_eq!(runtime_request.canonical_slice_wire(), runtime_slice_wire);
         assert_eq!(runtime_request.target_execution(), &execution);
