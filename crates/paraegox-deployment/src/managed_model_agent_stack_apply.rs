@@ -4425,12 +4425,9 @@ mod artifact_external_store {
                 query_locked(store, operation_id)
             }
             (true, true) => Err(ArtifactExternalControllerStoreFailureV1::Owner),
-            (false, false) | (false, true) => query_after_lifecycle_gate(
-                authority,
-                &binding,
-                &state_root,
-                operation_id,
-            ),
+            (false, false) | (false, true) => {
+                query_after_lifecycle_gate(authority, &binding, &state_root, operation_id)
+            }
         }
     }
 
@@ -4440,27 +4437,25 @@ mod artifact_external_store {
         state_root: &StateRootHandle,
         operation_id: ArtifactDeploymentOperationIdV1,
     ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
-        let lifecycle_root = match open_optional_directory_at(
-            &state_root.leaf,
-            OsStr::new(LIFECYCLE_ROOT_NAME),
-        )? {
-            Some(root) => root,
-            None => {
-                revalidate_current_authority(authority, binding, state_root)?;
-                if open_optional_directory_at(
-                    &state_root.leaf,
-                    OsStr::new(LIFECYCLE_ROOT_NAME),
-                )?
-                .is_some()
-                {
-                    return Err(ArtifactExternalControllerStoreFailureV1::Contended);
+        let lifecycle_root =
+            match open_optional_directory_at(&state_root.leaf, OsStr::new(LIFECYCLE_ROOT_NAME))? {
+                Some(root) => root,
+                None => {
+                    revalidate_current_authority(authority, binding, state_root)?;
+                    if open_optional_directory_at(
+                        &state_root.leaf,
+                        OsStr::new(LIFECYCLE_ROOT_NAME),
+                    )?
+                    .is_some()
+                    {
+                        return Err(ArtifactExternalControllerStoreFailureV1::Contended);
+                    }
+                    return match root_selection(&state_root.leaf)? {
+                        (false, false) => Err(ArtifactExternalControllerStoreFailureV1::NotFound),
+                        _ => Err(ArtifactExternalControllerStoreFailureV1::Owner),
+                    };
                 }
-                return match root_selection(&state_root.leaf)? {
-                    (false, false) => Err(ArtifactExternalControllerStoreFailureV1::NotFound),
-                    _ => Err(ArtifactExternalControllerStoreFailureV1::Owner),
-                };
-            }
-        };
+            };
         let (lifecycle_lock, lifecycle_lock_identity) = match open_optional_regular_at(
             &lifecycle_root,
             OsStr::new(LIFECYCLE_OWNER_LOCK_NAME),
@@ -4494,10 +4489,12 @@ mod artifact_external_store {
         {
             return Err(ArtifactExternalControllerStoreFailureV1::Owner);
         }
-        lifecycle_lock.try_lock_shared().map_err(|error| match error {
-            TryLockError::WouldBlock => ArtifactExternalControllerStoreFailureV1::Contended,
-            TryLockError::Error(_) => ArtifactExternalControllerStoreFailureV1::Io,
-        })?;
+        lifecycle_lock
+            .try_lock_shared()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => ArtifactExternalControllerStoreFailureV1::Contended,
+                TryLockError::Error(_) => ArtifactExternalControllerStoreFailureV1::Io,
+            })?;
         let result = (|| {
             revalidate_current_authority(authority, binding, state_root)?;
             let lifecycle_root = reopen_named_directory(
