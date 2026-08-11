@@ -43,16 +43,15 @@ use crate::managed_fabric_runtime::{
     ManagedFabricStackCutoverObservation,
 };
 use crate::managed_model_agent_stack_state::{
-    ArtifactManagedModelAgentStackDurableActiveV2,
-    ArtifactManagedModelAgentStackDurablePendingV2,
-    ArtifactManagedModelAgentStackPendingKindV2, ArtifactManagedModelAgentStackSnapshotTransitionV2,
-    ArtifactManagedModelAgentStackSnapshotV2, ArtifactManagedModelAgentStackTerminalRecordV2,
-    ManagedModelAgentStackDurableActive, ManagedModelAgentStackDurablePending,
-    ManagedModelAgentStackDurablePhase, ManagedModelAgentStackPendingKind,
-    ManagedModelAgentStackReplayRecord, ManagedModelAgentStackRevisionHighWater,
-    ManagedModelAgentStackSnapshot, ManagedModelAgentStackSnapshotTransition,
-    ManagedModelAgentStackStateError, ManagedModelAgentStackTerminalRecord,
-    ManagedModelAgentStackWriterFence,
+    ArtifactManagedModelAgentStackDurableActiveV2, ArtifactManagedModelAgentStackDurablePendingV2,
+    ArtifactManagedModelAgentStackPendingKindV2,
+    ArtifactManagedModelAgentStackSnapshotTransitionV2, ArtifactManagedModelAgentStackSnapshotV2,
+    ArtifactManagedModelAgentStackTerminalRecordV2, ManagedModelAgentStackDurableActive,
+    ManagedModelAgentStackDurablePending, ManagedModelAgentStackDurablePhase,
+    ManagedModelAgentStackPendingKind, ManagedModelAgentStackReplayRecord,
+    ManagedModelAgentStackRevisionHighWater, ManagedModelAgentStackSnapshot,
+    ManagedModelAgentStackSnapshotTransition, ManagedModelAgentStackStateError,
+    ManagedModelAgentStackTerminalRecord, ManagedModelAgentStackWriterFence,
 };
 use crate::managed_model_runtime::{
     ManagedModelAssembly, ManagedModelAssemblyError, ManagedModelDependencyHandle,
@@ -398,7 +397,8 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         }) else {
             return Ok(None);
         };
-        if record.request != *request || record.request_digest != request.envelope_request_digest() {
+        if record.request != *request || record.request_digest != request.envelope_request_digest()
+        {
             return Err(ManagedModelAgentStackRuntimeError::OperationConflict);
         }
         record
@@ -476,10 +476,8 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         fabric: &mut ManagedFabricRuntimeCore,
         agent_generation: ManagedServiceGeneration,
     ) -> Result<(), ManagedModelAgentStackRuntimeError> {
-        let transition = artifact_agent_start_intent_transition(
-            self.snapshot.transition(),
-            agent_generation,
-        )?;
+        let transition =
+            artifact_agent_start_intent_transition(self.snapshot.transition(), agent_generation)?;
         self.commit_transition(fabric, transition)
     }
 
@@ -501,7 +499,8 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
             (
                 TerminalSelection {
                     outcome: ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
-                    lifecycle_effect: ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                    lifecycle_effect:
+                        ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
                     head: ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
                     fabric_generation: Some(fabric_generation),
                     model_generation: Some(model_generation),
@@ -524,7 +523,8 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
             (
                 TerminalSelection {
                     outcome: ManagedModelAgentStackTerminalOutcomeV1::Uncertain,
-                    lifecycle_effect: ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                    lifecycle_effect:
+                        ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
                     head: ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
                     fabric_generation: Some(fabric_generation),
                     model_generation: Some(model_generation),
@@ -556,10 +556,8 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         transition.fabric_ready = selection.fabric_ready;
         transition.model_ready = selection.model_ready;
         transition.agent_ready = selection.agent_ready;
-        transition.fabric_to_agent_dependency_ready =
-            selection.fabric_to_agent_dependency_ready;
-        transition.model_to_agent_dependency_ready =
-            selection.model_to_agent_dependency_ready;
+        transition.fabric_to_agent_dependency_ready = selection.fabric_to_agent_dependency_ready;
+        transition.model_to_agent_dependency_ready = selection.model_to_agent_dependency_ready;
         transition.quarantine_reason = quarantine_reason;
         insert_artifact_terminal(&mut transition.terminals, request, receipt.clone())?;
         self.commit_transition(fabric, transition)?;
@@ -2184,11 +2182,7 @@ fn artifact_model_intent_transition(
     transition.fabric_to_agent_dependency_ready = true;
     transition.model_to_agent_dependency_ready = false;
     transition.quarantine_reason = None;
-    insert_verified_artifact_replays(
-        &mut transition,
-        verified,
-        request.envelope_request_digest(),
-    )?;
+    insert_verified_artifact_replays(&mut transition, verified, request.envelope_request_digest())?;
     Ok(transition)
 }
 
@@ -2389,9 +2383,8 @@ fn build_artifact_pre_cutover_no_effect_terminal(
             selection_observed_at_nanos: reading.now().value(),
         },
     )?;
-    let facts = ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(
-        request, state, evidence,
-    )?;
+    let facts =
+        ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(request, state, evidence)?;
     let algorithm = ApplyAuthAlgorithm::try_new(1)
         .map_err(|_| ManagedModelAgentStackRuntimeError::SignerConfiguration)?;
     let auth_claim = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
@@ -3118,12 +3111,11 @@ mod tests {
 
     #[test]
     fn artifact_owner_constructs_exact_zero_model_and_agent_intents_without_v1_fallback() {
-        let request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
-            &decode_fixture_hex(include_str!(
-                "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
-            )),
-        )
-        .expect("shared PXAR12 fixture");
+        let request =
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(&decode_fixture_hex(
+                include_str!("../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"),
+            ))
+            .expect("shared PXAR12 fixture");
         let projection = request.target_execution().projection().clone();
         let projection_digest = stack_projection_digest(&projection).expect("projection digest");
         let fabric_generation = generation(7);
@@ -3151,8 +3143,7 @@ mod tests {
         let verified = VerifiedArtifactManagedModelAgentStackApplyIngressV1::for_test(
             100,
             6_000_183,
-            paraegox_kernel::time::ClockGeneration::try_new(3)
-                .expect("fixture clock generation"),
+            paraegox_kernel::time::ClockGeneration::try_new(3).expect("fixture clock generation"),
             0xd3,
         );
         let model_intent = initial
@@ -3171,11 +3162,17 @@ mod tests {
             )
             .expect("model-intent successor");
         assert_eq!(model_intent.sequence(), 2);
-        assert_eq!(model_intent.phase, ManagedModelAgentStackDurablePhase::ModelStartIntent);
+        assert_eq!(
+            model_intent.phase,
+            ManagedModelAgentStackDurablePhase::ModelStartIntent
+        );
         assert_eq!(model_intent.tenure_nonces.len(), 1);
         assert_eq!(model_intent.request_nonces.len(), 1);
         assert_eq!(model_intent.temporal_lineages.len(), 1);
-        let pending = model_intent.pending.as_ref().expect("retained pending request");
+        let pending = model_intent
+            .pending
+            .as_ref()
+            .expect("retained pending request");
         assert_eq!(pending.request, request);
         assert_eq!(pending.admitted_at_nanos, 100);
         assert_eq!(pending.deadline_nanos, 6_000_183);
@@ -3186,16 +3183,16 @@ mod tests {
         let agent_intent = model_intent
             .try_successor_at_epoch(
                 9,
-                artifact_agent_start_intent_transition(
-                    model_intent.transition(),
-                    agent_generation,
-                )
-                .expect("agent-intent transition"),
+                artifact_agent_start_intent_transition(model_intent.transition(), agent_generation)
+                    .expect("agent-intent transition"),
                 &projection,
             )
             .expect("agent-intent successor");
         assert_eq!(agent_intent.sequence(), 3);
-        assert_eq!(agent_intent.phase, ManagedModelAgentStackDurablePhase::AgentStartIntent);
+        assert_eq!(
+            agent_intent.phase,
+            ManagedModelAgentStackDurablePhase::AgentStartIntent
+        );
         assert_eq!(
             agent_intent
                 .pending
