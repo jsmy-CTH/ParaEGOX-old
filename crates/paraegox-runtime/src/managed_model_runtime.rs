@@ -15,12 +15,17 @@ use paraegox_agent_service::{
     AgentConversationModelOutcomeV1, AgentConversationModelProvider,
     AgentConversationModelServiceProviderV1,
 };
+use paraegox_artifact::{
+    MaterializationReceiptRefV1, MaterializationTerminalStateV1, VerifiedArtifactPairV1,
+    VerifiedMaterializationReadBundleV1,
+};
 use paraegox_kernel::time::MonotonicDeadline;
 use paraegox_model::{
     ModelBackendIdentityV1, ModelBackendV1, ModelServiceConfigV1, ModelServiceV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
-    ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
+    ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelCapabilityIdV1,
+    ManagedModelServicePlanV1,
 };
 use paraegox_runtime_contracts::managed_service::{
     ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleStage,
@@ -96,6 +101,74 @@ impl fmt::Debug for RuntimeResolvedModelBackendV1 {
     }
 }
 
+/// Resolver-owned readback plus backend for one exact Artifact-bound Slice.
+///
+/// Runtime still compares the returned execution and complete materialization
+/// chain with committed desired state before the backend can own capacity.
+/// Debug never traverses either the read bundle or backend.
+pub struct RuntimeResolvedArtifactModelBackendV1 {
+    execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    materialization: VerifiedMaterializationReadBundleV1,
+    backend: Arc<dyn ModelBackendV1>,
+}
+
+impl RuntimeResolvedArtifactModelBackendV1 {
+    #[must_use]
+    pub fn new<B>(
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        materialization: VerifiedMaterializationReadBundleV1,
+        backend: B,
+    ) -> Self
+    where
+        B: ModelBackendV1,
+    {
+        Self {
+            execution,
+            materialization,
+            backend: Arc::new(backend),
+        }
+    }
+
+    #[must_use]
+    pub fn from_shared(
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        materialization: VerifiedMaterializationReadBundleV1,
+        backend: Arc<dyn ModelBackendV1>,
+    ) -> Self {
+        Self {
+            execution,
+            materialization,
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub const fn execution(&self) -> &ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+        &self.execution
+    }
+
+    #[must_use]
+    pub const fn materialization(&self) -> &VerifiedMaterializationReadBundleV1 {
+        &self.materialization
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> &Arc<dyn ModelBackendV1> {
+        &self.backend
+    }
+}
+
+impl fmt::Debug for RuntimeResolvedArtifactModelBackendV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeResolvedArtifactModelBackendV1")
+            .field("execution", &self.execution)
+            .field("materialization", &"<verified-read-bundle>")
+            .field("backend", &"<redacted-backend>")
+            .finish()
+    }
+}
+
 /// Repeatable process-composition seam for one exact managed Model plan.
 ///
 /// A resolver may own Secret material, but it must return the complete plan it
@@ -105,6 +178,16 @@ pub trait RuntimeModelBackendResolverV1: Send + Sync + 'static {
         &self,
         plan: &ManagedModelServicePlanV1,
     ) -> Result<RuntimeResolvedModelBackendV1, RuntimeModelBackendResolveError>;
+
+    /// Resolves the exact external Artifact path. Existing resolvers fail
+    /// closed by default and therefore cannot reinterpret an Artifact Slice
+    /// as the compiled-in `resolve` path.
+    fn resolve_artifact(
+        &self,
+        _execution: &ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    ) -> Result<RuntimeResolvedArtifactModelBackendV1, RuntimeModelBackendResolveError> {
+        Err(RuntimeModelBackendResolveError::ResolutionFailed)
+    }
 }
 
 #[derive(Debug)]
@@ -224,6 +307,7 @@ enum ManagedModelSlotState {
 
 struct RuntimeManagedModelService {
     plan: ManagedModelServicePlanV1,
+    artifact_execution: Option<ArtifactBoundManagedModelAgentStackTargetExecutionV1>,
     generation: ManagedServiceGeneration,
     resolver: Arc<dyn RuntimeModelBackendResolverV1>,
     prepared: Option<RuntimeResolvedModelBackendV1>,
@@ -258,6 +342,42 @@ impl RuntimeManagedModelService {
     fn lock_state(&self) -> Option<std::sync::MutexGuard<'_, ManagedModelSlotState>> {
         self.slot.state.lock().ok()
     }
+
+    fn resolve_backend(
+        &self,
+    ) -> Result<RuntimeResolvedModelBackendV1, RuntimeModelBackendResolveError> {
+        let Some(execution) = self.artifact_execution.as_ref() else {
+            return self.resolver.resolve(&self.plan);
+        };
+        let resolved = self.resolver.resolve_artifact(execution)?;
+        if resolved.execution() != execution {
+            return Err(RuntimeModelBackendResolveError::ResolutionFailed);
+        }
+        let binding = execution.binding();
+        let materialization = resolved.materialization();
+        let Some(pair) = materialization.pair() else {
+            return Err(RuntimeModelBackendResolveError::ResolutionFailed);
+        };
+        if !matches!(
+            materialization.terminal().state(),
+            MaterializationTerminalStateV1::Materialized
+                | MaterializationTerminalStateV1::AlreadyMaterialized
+        ) || materialization.reverify().is_err()
+            || binding.object_ref() != materialization.request().object_ref()
+            || binding.object_ref() != pair.object_ref()
+            || binding.materialization_receipt_ref()
+                != MaterializationReceiptRefV1::from_receipt(materialization.receipt())
+            || VerifiedArtifactPairV1::verify(pair.manifest_bytes(), pair.payload()).as_ref()
+                != Ok(pair)
+            || !Self::backend_identity_matches(&self.plan, resolved.backend().identity())
+        {
+            return Err(RuntimeModelBackendResolveError::ResolutionFailed);
+        }
+        Ok(RuntimeResolvedModelBackendV1::from_shared(
+            self.plan,
+            Arc::clone(resolved.backend()),
+        ))
+    }
 }
 
 impl ManagedServiceImplementation for RuntimeManagedModelService {
@@ -274,7 +394,7 @@ impl ManagedServiceImplementation for RuntimeManagedModelService {
             {
                 return ManagedServiceCompletion::failed(attempt);
             }
-            let Ok(resolved) = self.resolver.resolve(&self.plan) else {
+            let Ok(resolved) = self.resolve_backend() else {
                 return ManagedServiceCompletion::failed(attempt);
             };
             if resolved.plan() != &self.plan
@@ -480,6 +600,7 @@ impl ManagedModelCleanupEvidenceV1 {
 pub(crate) enum ManagedModelAssemblyError {
     InvalidConsumerAgentIdentity,
     DependencyIdentityCollision,
+    InvalidArtifactExecution,
     StartupFailed {
         stage: ManagedServiceLifecycleStage,
         fact: ManagedServiceStageFact,
@@ -495,6 +616,9 @@ impl fmt::Display for ManagedModelAssemblyError {
             }
             Self::DependencyIdentityCollision => {
                 formatter.write_str("managed Model and consumer Agent identities collide")
+            }
+            Self::InvalidArtifactExecution => {
+                formatter.write_str("managed Model Artifact execution is invalid")
             }
             Self::StartupFailed { stage, fact, .. } => {
                 write!(
@@ -523,6 +647,52 @@ impl ManagedModelAssembly {
         clock: RuntimeClock,
         parent_cancellation: &CancellationSource,
     ) -> Result<(Self, ManagedModelDependencyHandle), ManagedModelAssemblyError> {
+        Self::start_inner(
+            plan,
+            None,
+            generation,
+            consumer_agent_service_id,
+            resolver,
+            clock,
+            parent_cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_artifact(
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        generation: ManagedServiceGeneration,
+        consumer_agent_service_id: ManagedServiceId,
+        resolver: Arc<dyn RuntimeModelBackendResolverV1>,
+        clock: RuntimeClock,
+        parent_cancellation: &CancellationSource,
+    ) -> Result<(Self, ManagedModelDependencyHandle), ManagedModelAssemblyError> {
+        let plan = execution
+            .embedded()
+            .model()
+            .copied()
+            .ok_or(ManagedModelAssemblyError::InvalidArtifactExecution)?;
+        Self::start_inner(
+            plan,
+            Some(execution),
+            generation,
+            consumer_agent_service_id,
+            resolver,
+            clock,
+            parent_cancellation,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        plan: ManagedModelServicePlanV1,
+        artifact_execution: Option<ArtifactBoundManagedModelAgentStackTargetExecutionV1>,
+        generation: ManagedServiceGeneration,
+        consumer_agent_service_id: ManagedServiceId,
+        resolver: Arc<dyn RuntimeModelBackendResolverV1>,
+        clock: RuntimeClock,
+        parent_cancellation: &CancellationSource,
+    ) -> Result<(Self, ManagedModelDependencyHandle), ManagedModelAssemblyError> {
         let model_service_id = plan.service().service_id();
         if consumer_agent_service_id
             .as_bytes()
@@ -544,6 +714,7 @@ impl ManagedModelAssembly {
         });
         let implementation = RuntimeManagedModelService {
             plan,
+            artifact_execution,
             generation,
             resolver,
             prepared: None,

@@ -12,6 +12,7 @@ ed25519-dalek.workspace = true
 getrandom.workspace = true
 paraegox-agent-contracts.workspace = true
 paraegox-agent-service.workspace = true
+paraegox-artifact.workspace = true
 paraegox-evidence.workspace = true
 paraegox-fabric.workspace = true
 paraegox-kernel.workspace = true

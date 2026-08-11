@@ -198,7 +198,8 @@ pub use distributed_fabric_runtime::{
 pub use managed_agent_runtime::{RuntimeAgentConversationError, RuntimeAgentConversationHandle};
 #[cfg(unix)]
 pub use managed_model_runtime::{
-    RuntimeModelBackendResolveError, RuntimeModelBackendResolverV1, RuntimeResolvedModelBackendV1,
+    RuntimeModelBackendResolveError, RuntimeModelBackendResolverV1,
+    RuntimeResolvedArtifactModelBackendV1, RuntimeResolvedModelBackendV1,
 };
 #[cfg(unix)]
 pub use runtime_agent_developer_local_ipc::{

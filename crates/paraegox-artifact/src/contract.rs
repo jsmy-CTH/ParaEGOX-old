@@ -1817,6 +1817,25 @@ impl VerifiedMaterializationReadBundleV1 {
     pub const fn pair(&self) -> Option<&VerifiedArtifactPairV1> {
         self.pair.as_ref()
     }
+
+    /// Repeats the complete Receipt-to-pair correlation without granting a
+    /// public constructor that could bypass validated snapshot history.
+    pub fn reverify(&self) -> Result<(), ArtifactContractError> {
+        let verified = Self::verify(
+            self.request.clone(),
+            self.admission.clone(),
+            self.materializing.clone(),
+            self.object.clone(),
+            self.terminal.clone(),
+            self.receipt.clone(),
+            self.pair.clone(),
+        )?;
+        if verified == *self {
+            Ok(())
+        } else {
+            Err(ArtifactContractError::CrossFrameMismatch)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3109,11 +3128,10 @@ mod tests {
     fn verified_read_bundle_requires_exact_receipt_and_object_locators() {
         let (snapshot, pair, _, receipt) = materialized();
         let reference = MaterializationReceiptRefV1::from_receipt(&receipt);
-        assert!(
-            snapshot
-                .verified_read_bundle(reference, pair.object_ref(), Some(pair.clone()))
-                .is_ok()
-        );
+        let bundle = snapshot
+            .verified_read_bundle(reference, pair.object_ref(), Some(pair.clone()))
+            .expect("complete verified read bundle");
+        assert_eq!(bundle.reverify(), Ok(()));
 
         let mut store_drift = reference;
         store_drift.store_instance =

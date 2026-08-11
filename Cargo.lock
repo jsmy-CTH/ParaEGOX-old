@@ -1754,6 +1754,7 @@ dependencies = [
  "nix",
  "paraegox-agent-contracts",
  "paraegox-agent-service",
+ "paraegox-artifact",
  "paraegox-evidence",
  "paraegox-fabric",
  "paraegox-kernel",
