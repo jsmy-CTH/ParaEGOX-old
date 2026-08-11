@@ -406,7 +406,7 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
             )
             .await
         {
-            record_d0b_runtime_diagnostic(&error);
+            record_d0b_runtime_diagnostic(&core.state_directory, &error);
             let model_exact = core.shutdown_model().await;
             let terminal = if model_exact {
                 Some(core.commit_agent_quarantined(
@@ -2641,11 +2641,20 @@ fn build_artifact_pre_cutover_no_effect_terminal(
 
 #[cold]
 #[inline(never)]
-fn record_d0b_runtime_diagnostic(error: &ManagedModelAgentStackRuntimeError) {
-    let Ok(path) = std::env::var("PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH") else {
+fn record_d0b_runtime_diagnostic(
+    runtime_state_directory: &std::path::Path,
+    error: &ManagedModelAgentStackRuntimeError,
+) {
+    let Some(test_home) = runtime_state_directory
+        .parent()
+        .and_then(std::path::Path::parent)
+    else {
         return;
     };
-    let _ = std::fs::write(path, format!("{error:?}\n"));
+    let _ = std::fs::write(
+        test_home.join("d0b-runtime-diagnostic.txt"),
+        format!("{error:?}\n"),
+    );
 }
 
 fn validate_artifact_cutover_request(

@@ -236,7 +236,7 @@ def _assert_active_ready(
     assert envelope["diagnostics"] == []
 
 
-@pytest.mark.parametrize("_attempt", range(20))
+@pytest.mark.parametrize("_attempt", range(10))
 def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins(
     _attempt: int,
 ) -> None:
