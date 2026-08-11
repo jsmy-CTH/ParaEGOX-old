@@ -3131,10 +3131,9 @@ mod tests {
         let execution_wire = decode_fixture_hex(include_str!(
             "../../../tests/fixtures/wire/artifact_f0_pxte_v11.hex"
         ));
-        let execution = ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(
-            &execution_wire,
-        )
-        .expect("decoded shared PXTE11");
+        let execution =
+            ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(&execution_wire)
+                .expect("decoded shared PXTE11");
         assert_eq!(execution.canonical_wire(), execution_wire);
         assert_eq!(execution.binding(), binding);
         let plan_content_wire = decode_fixture_hex(include_str!(
