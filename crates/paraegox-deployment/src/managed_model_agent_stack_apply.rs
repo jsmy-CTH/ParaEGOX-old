@@ -5358,7 +5358,9 @@ fn project_external_failure(
         artifact_external_store::ArtifactExternalControllerStoreFailureV1::PublicationUncertain(
             state,
         ) => match state.map(|state| project_external_state(&state)).transpose() {
-            Ok(state) => DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(state),
+            Ok(state) => DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(
+                state.map(Box::new),
+            ),
             Err(_) => DeveloperArtifactExternalControllerFailureV1::Owner,
         },
         artifact_external_store::ArtifactExternalControllerStoreFailureV1::Owner => {
