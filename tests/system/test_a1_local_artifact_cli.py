@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import stat
 import struct
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +24,8 @@ import pytest
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _FIXTURE_ROOT = _REPOSITORY_ROOT / "tests" / "fixtures" / "wire"
 _LEDGER_PATH = _FIXTURE_ROOT / "artifact_f0_semantic_ledger_v1.json"
+_CLI_ENVELOPES_PATH = _FIXTURE_ROOT / "artifact_f0_a1_cli_envelopes_v1.jsonl"
+_BINARY_ENVIRONMENT = "PARAEGOX_A1_ARTIFACT_CLI_BINARY"
 
 _ZERO32 = bytes(32)
 _PROFILE = b"developer-local-echo-prefix-v1"
@@ -1171,3 +1178,307 @@ def test_artifact_f0_a1_snapshot_decoder_rejects_short_and_trailing() -> None:
         _strict_snapshot_decode(frame[:-1])
     with pytest.raises(ValueError):
         _strict_snapshot_decode(frame + b"\x00")
+
+
+def _require_exact_cli_binary() -> Path:
+    configured = os.environ.get(_BINARY_ENVIRONMENT)
+    assert configured is not None, (
+        f"{_BINARY_ENVIRONMENT} must name the exact-revision binary under validation"
+    )
+    path = Path(configured)
+    assert path.is_absolute()
+    metadata = path.lstat()
+    assert stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
+    assert metadata.st_mode & 0o111 != 0
+    return path.resolve(strict=True)
+
+
+def _invoke_artifact(binary: Path, arguments: list[str]) -> tuple[int, bytes, dict[str, Any]]:
+    completed = subprocess.run(
+        [os.fspath(binary), *arguments],
+        cwd=binary.parent,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30.0,
+        check=False,
+    )
+    assert completed.stderr == b""
+    assert completed.stdout.endswith(b"\n") and completed.stdout.count(b"\n") == 1
+    envelope = json.loads(completed.stdout)
+    assert isinstance(envelope, dict)
+    assert completed.stdout == _compact_json(envelope)
+    return completed.returncode, completed.stdout, envelope
+
+
+def _filesystem_projection(root: Path) -> tuple[tuple[object, ...], ...]:
+    projected: list[tuple[object, ...]] = []
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        relative = path.relative_to(root).as_posix()
+        payload_digest = None
+        if stat.S_ISREG(metadata.st_mode):
+            payload_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        projected.append(
+            (
+                relative,
+                stat.S_IFMT(metadata.st_mode),
+                metadata.st_mode & 0o7777,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_ino,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+                payload_digest,
+            )
+        )
+    return tuple(projected)
+
+
+def test_artifact_f0_a1_cli_envelope_fixture_is_canonical() -> None:
+    lines = _CLI_ENVELOPES_PATH.read_bytes().splitlines()
+    assert len(lines) == 5
+    for line in lines:
+        value = json.loads(line)
+        assert line + b"\n" == _compact_json(value)
+    assert json.loads(lines[0])["artifact_object_ref"] == _object_ref(_oracle())
+    assert list(json.loads(lines[0])) == [
+        "schema_version",
+        "command",
+        "ok",
+        "changed",
+        "profile",
+        "artifact_object_ref",
+        "payload_length",
+        "runtime_kind",
+        "adapter_abi",
+        "target_profile",
+        "diagnostics",
+    ]
+    assert list(json.loads(lines[4])) == [
+        "schema_version",
+        "command",
+        "ok",
+        "changed",
+        "operation_id",
+        "state",
+        "artifact_object_ref",
+        "materialization_receipt_ref",
+        "diagnostics",
+    ]
+
+
+def test_artifact_f0_a1_dispatch_and_authority_source_guards() -> None:
+    main_source = (_REPOSITORY_ROOT / "crates/paraegox-local/src/main.rs").read_text()
+    artifact_dispatch = main_source.index("config::artifact_json_intent")
+    for later_dispatch in (
+        "config::tui_attach_intent",
+        "config::init_json_intent",
+        "config::offline_json_intent",
+        "config::lifecycle_json_intent",
+    ):
+        assert artifact_dispatch < main_source.index(later_dispatch)
+
+    artifact_source = (_REPOSITORY_ROOT / "crates/paraegox-local/src/artifact.rs").read_text()
+    build_body = artifact_source[
+        artifact_source.index("pub(super) fn run_build") : artifact_source.index(
+            "pub(super) fn run_inspect"
+        )
+    ]
+    inspect_body = artifact_source[
+        artifact_source.index("pub(super) fn run_inspect") : artifact_source.index(
+            "pub(super) fn run_materialize"
+        )
+    ]
+    assert "ArtifactStore" not in build_body
+    assert "ArtifactStore" not in inspect_body
+    assert "RevalidatingArtifactAuthority::new" in artifact_source
+    assert artifact_source.count("drop(authority);") == 2
+    assert artifact_source.count("Ok(project_invocation(operation_id, invocation))") == 2
+
+
+def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
+    assert os.name == "posix" and os.geteuid() != 0 and os.getegid() != 0
+    binary = _require_exact_cli_binary()
+    fixtures = [line + b"\n" for line in _CLI_ENVELOPES_PATH.read_bytes().splitlines()]
+    base = Path(tempfile.mkdtemp(prefix=".paraegox-a1-", dir=Path.home()))
+    os.chmod(base, 0o700)
+    try:
+        workspace = base / "workspace"
+        init = subprocess.run(
+            [os.fspath(binary), "init", "--directory", os.fspath(workspace), "--json"],
+            cwd=binary.parent,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30.0,
+            check=False,
+        )
+        assert init.returncode == 0 and init.stderr == b""
+        config_path = workspace / "paraegox.toml"
+        state_root = workspace / "state"
+        assert config_path.is_file() and not state_root.exists()
+
+        source = workspace / "artifact-prefix.txt"
+        source.write_bytes(b"artifact-f0-prefix: ")
+        os.chmod(source, 0o600)
+        output_parent = workspace / "artifact-builds"
+        output_parent.mkdir(mode=0o700)
+        output = output_parent / "prefix-object"
+
+        build_arguments = [
+            "artifact",
+            "build",
+            "--profile",
+            "developer-local-echo-prefix-v1",
+            "--source",
+            os.fspath(source),
+            "--output",
+            os.fspath(output),
+            "--json",
+        ]
+        returncode, raw, build = _invoke_artifact(binary, build_arguments)
+        assert returncode == 0 and raw == fixtures[0]
+        assert not state_root.exists(), "offline build must not construct Store authority"
+        assert sorted(path.name for path in output.iterdir()) == [
+            "manifest.pxam",
+            "payload.bin",
+        ]
+        assert [path.name for path in output_parent.iterdir()] == ["prefix-object"]
+
+        returncode, raw, replay = _invoke_artifact(binary, build_arguments)
+        assert returncode == 0 and raw == fixtures[1]
+        assert replay["artifact_object_ref"] == build["artifact_object_ref"]
+
+        manifest = output / "manifest.pxam"
+        payload = output / "payload.bin"
+        before_inspect = _filesystem_projection(output_parent)
+        returncode, raw, inspected = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "inspect",
+                "--manifest",
+                os.fspath(manifest),
+                "--payload",
+                os.fspath(payload),
+                "--json",
+            ],
+        )
+        after_inspect = _filesystem_projection(output_parent)
+        assert returncode == 0 and raw == fixtures[2]
+        assert inspected["artifact_object_ref"] == build["artifact_object_ref"]
+        assert after_inspect == before_inspect
+        assert not state_root.exists(), "offline inspect must not construct Store authority"
+
+        primary = "a2" * 16
+        returncode, raw, _ = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "materialization",
+                "query",
+                "--config",
+                os.fspath(config_path),
+                "--operation-id",
+                primary,
+                "--json",
+            ],
+        )
+        assert returncode == 1 and raw == fixtures[4]
+        assert not state_root.exists(), "query must not create a missing state root"
+
+        returncode, _, materialized = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "materialize",
+                "--config",
+                os.fspath(config_path),
+                "--manifest",
+                os.fspath(manifest),
+                "--payload",
+                os.fspath(payload),
+                "--operation-id",
+                primary,
+                "--json",
+            ],
+        )
+        assert returncode == 0
+        assert materialized["changed"] is True
+        assert materialized["state"] == "materialized"
+        assert materialized["artifact_object_ref"] == build["artifact_object_ref"]
+        receipt = materialized["materialization_receipt_ref"]
+        assert isinstance(receipt, str) and receipt.startswith("pxamr1:")
+
+        returncode, _, replayed_materialization = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "materialize",
+                "--config",
+                os.fspath(config_path),
+                "--manifest",
+                os.fspath(manifest),
+                "--payload",
+                os.fspath(payload),
+                "--operation-id",
+                primary,
+                "--json",
+            ],
+        )
+        assert returncode == 0
+        assert replayed_materialization == {**materialized, "changed": False}
+
+        returncode, _, queried = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "materialization",
+                "query",
+                "--config",
+                os.fspath(config_path),
+                "--operation-id",
+                primary,
+                "--json",
+            ],
+        )
+        assert returncode == 0
+        assert queried == {
+            **materialized,
+            "command": "artifact.materialization.query",
+            "changed": False,
+        }
+
+        second = "a3" * 16
+        returncode, _, already = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "materialize",
+                "--config",
+                os.fspath(config_path),
+                "--manifest",
+                os.fspath(manifest),
+                "--payload",
+                os.fspath(payload),
+                "--operation-id",
+                second,
+                "--json",
+            ],
+        )
+        assert returncode == 0
+        assert already["changed"] is True
+        assert already["state"] == "already_materialized"
+        assert already["artifact_object_ref"] == build["artifact_object_ref"]
+        assert already["materialization_receipt_ref"] != receipt
+
+        returncode, raw, malformed = _invoke_artifact(
+            binary,
+            build_arguments[:-1],
+        )
+        assert returncode == 2 and raw == fixtures[3]
+        assert malformed["diagnostics"][0]["code"] == "PXLC-ARTIFACT-GRAMMAR"
+        assert not (workspace / "operator-v1").exists()
+    finally:
+        shutil.rmtree(base)

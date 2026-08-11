@@ -4,6 +4,18 @@ use crate::config::ConfigError;
 pub(crate) enum LocalProcessError {
     Configuration(ConfigError),
     OfflineJsonOutput,
+    ArtifactPath,
+    ArtifactProfile,
+    ArtifactCompatibility,
+    ArtifactConflict,
+    ArtifactCapacity,
+    ArtifactAdmissionRequired,
+    ArtifactNotFound,
+    ArtifactMaterializationFailed,
+    ArtifactUncertain,
+    ArtifactOwner,
+    ArtifactIo,
+    ArtifactJsonOutput,
     InitUnsafeExecutionIdentity,
     InitWorkspaceConflict,
     InitIo,
@@ -90,6 +102,18 @@ impl LocalProcessError {
         match self {
             Self::Configuration(error) => error.code(),
             Self::OfflineJsonOutput => "PXLC-OFFLINE-JSON-OUTPUT",
+            Self::ArtifactPath => "PXLC-ARTIFACT-PATH",
+            Self::ArtifactProfile => "PXLC-ARTIFACT-PROFILE",
+            Self::ArtifactCompatibility => "PXLC-ARTIFACT-COMPATIBILITY",
+            Self::ArtifactConflict => "PXLC-ARTIFACT-CONFLICT",
+            Self::ArtifactCapacity => "PXLC-ARTIFACT-CAPACITY",
+            Self::ArtifactAdmissionRequired => "A0_APPLICATION_ADMISSION_REQUIRED",
+            Self::ArtifactNotFound => "PXLC-ARTIFACT-NOT-FOUND",
+            Self::ArtifactMaterializationFailed => "PXLC-ARTIFACT-MATERIALIZATION-FAILED",
+            Self::ArtifactUncertain => "PXLC-ARTIFACT-UNCERTAIN",
+            Self::ArtifactOwner => "PXLC-ARTIFACT-OWNER",
+            Self::ArtifactIo => "PXLC-ARTIFACT-IO",
+            Self::ArtifactJsonOutput => "PXLC-ARTIFACT-JSON-OUTPUT",
             Self::InitUnsafeExecutionIdentity => "PXLC-INIT-EXECUTION-IDENTITY",
             Self::InitWorkspaceConflict => "PXLC-INIT-WORKSPACE-CONFLICT",
             Self::InitIo => "PXLC-INIT-IO",
@@ -176,6 +200,20 @@ impl LocalProcessError {
         match self {
             Self::Configuration(error) => error.message(),
             Self::OfflineJsonOutput => "offline machine-readable output failed",
+            Self::ArtifactPath => "artifact path is invalid or unsafe",
+            Self::ArtifactProfile => "artifact profile is unsupported",
+            Self::ArtifactCompatibility => "artifact bytes are invalid or incompatible",
+            Self::ArtifactConflict => "artifact operation conflicts with its durable request",
+            Self::ArtifactCapacity => "artifact store capacity is exhausted",
+            Self::ArtifactAdmissionRequired => {
+                "application admission is required before this operation"
+            }
+            Self::ArtifactNotFound => "artifact operation was not found",
+            Self::ArtifactMaterializationFailed => "artifact materialization failed",
+            Self::ArtifactUncertain => "artifact operation outcome is uncertain",
+            Self::ArtifactOwner => "artifact store owner state failed strict validation",
+            Self::ArtifactIo => "artifact operation could not complete",
+            Self::ArtifactJsonOutput => "artifact JSON output could not be written",
             Self::InitUnsafeExecutionIdentity => "init requires a non-root Unix user and group",
             Self::InitWorkspaceConflict => {
                 "init workspace or configuration conflicts with the strict private layout"
@@ -333,6 +371,12 @@ impl LocalProcessError {
     pub(crate) const fn exit_code(self) -> u8 {
         match self {
             Self::Configuration(_)
+            | Self::ArtifactPath
+            | Self::ArtifactProfile
+            | Self::ArtifactCompatibility
+            | Self::ArtifactConflict
+            | Self::ArtifactCapacity
+            | Self::ArtifactAdmissionRequired
             | Self::InitUnsafeExecutionIdentity
             | Self::InitWorkspaceConflict
             | Self::LifecycleConfiguration => 2,

@@ -23,6 +23,7 @@ use serde_json::json;
 
 #[cfg(unix)]
 mod composition;
+mod artifact;
 mod config;
 mod error;
 #[cfg(unix)]
@@ -164,6 +165,13 @@ struct LocalChatSupervisorInvocationV1 {
 
 fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(intent) = config::artifact_json_intent(&arguments) {
+        return ExitCode::from(artifact::dispatch_to(
+            &mut io::stdout().lock(),
+            intent,
+            &arguments,
+        ));
+    }
     if config::tui_attach_intent(&arguments) {
         return match dispatch_tui_attach(&arguments) {
             Ok(outcome) => outcome.exit_code(),
@@ -1365,6 +1373,10 @@ fn print_usage_to_stderr() {
 
 fn usage() -> &'static str {
     r"Usage: paraegox chat --config <absolute-paraegox.toml>
+       paraegox artifact build --profile developer-local-echo-prefix-v1 --source <ABS> --output <ABS> --json
+       paraegox artifact inspect --manifest <ABS> --payload <ABS> --json
+       paraegox artifact materialize --config <ABS> --manifest <ABS> --payload <ABS> --operation-id <32hex> --json
+       paraegox artifact materialization query --config <ABS> --operation-id <32hex> --json
        paraegox init --directory <absolute-directory> --json
        paraegox up --config <absolute-paraegox.toml> --json
        paraegox status --config <absolute-paraegox.toml> --json
@@ -1383,6 +1395,12 @@ fn usage() -> &'static str {
 init creates or strictly reopens one private DeveloperLocal config workspace
 and atomically publishes paraegox.toml. It configures but does not create the
 state directory. It does not read Secrets, access the network, or start owners.
+
+artifact build and inspect are bounded offline operations over one canonical
+non-executable model-data pair; inspect performs no filesystem mutation.
+artifact materialize and materialization query access only the ArtifactStore
+owner. These four implementation-internal candidate commands create no active
+pointer, Installation, lifecycle owner, deployment or Runtime effect.
 
 version, config check, and doctor are machine-readable offline commands. They
 emit one JSON object and do not start owners, access the network, resolve Secret

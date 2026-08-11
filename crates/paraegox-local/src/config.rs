@@ -10,6 +10,7 @@ use std::{
 };
 
 use ed25519_dalek::VerifyingKey;
+use paraegox_artifact::{ArtifactConfigCommitmentV1, ArtifactOperationIdV1};
 use paraegox_fabric::RemoteTlsEndpoint;
 #[cfg(unix)]
 use paraegox_fabric::{
@@ -43,6 +44,13 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 const CHAT_COMMAND: &str = "chat";
+const ARTIFACT_COMMAND: &str = "artifact";
+const ARTIFACT_BUILD_COMMAND: &str = "build";
+const ARTIFACT_INSPECT_COMMAND: &str = "inspect";
+const ARTIFACT_MATERIALIZE_COMMAND: &str = "materialize";
+const ARTIFACT_MATERIALIZATION_COMMAND: &str = "materialization";
+const ARTIFACT_QUERY_COMMAND: &str = "query";
+const ARTIFACT_PROFILE: &str = "developer-local-echo-prefix-v1";
 const TUI_COMMAND: &str = "tui";
 const INIT_COMMAND: &str = "init";
 const DEPLOY_COMMAND: &str = "deploy";
@@ -64,6 +72,12 @@ const LOCAL_OPTION: &str = "--local";
 const OFFLINE_OPTION: &str = "--offline";
 const JSON_OPTION: &str = "--json";
 const DIRECTORY_OPTION: &str = "--directory";
+const PROFILE_OPTION: &str = "--profile";
+const SOURCE_OPTION: &str = "--source";
+const OUTPUT_OPTION: &str = "--output";
+const MANIFEST_OPTION: &str = "--manifest";
+const PAYLOAD_OPTION: &str = "--payload";
+const OPERATION_ID_OPTION: &str = "--operation-id";
 const DETERMINISTIC_ECHO_PROVIDER: &str = "deterministic-echo-v1";
 const OPENAI_RESPONSES_PROVIDER: &str = "openai-responses-v1";
 const DEEPSEEK_CHAT_COMPLETIONS_PROVIDER: &str = "deepseek-chat-completions-v1";
@@ -141,6 +155,7 @@ const FABRIC_CONNECT_PRIVATE_KEY_FILE_A_OPTION: &str = "--fabric-connect-private
 const FABRIC_CONNECT_PRIVATE_KEY_FILE_B_OPTION: &str = "--fabric-connect-private-key-file-b";
 const LOOPBACK_TCP_PREFIX: &str = "tcp/127.0.0.1:";
 const MAX_STATE_ROOT_BYTES: usize = 4_096;
+const MAX_ARTIFACT_STATE_ROOT_UTF8_BYTES: usize = 3_917;
 const INIT_CONFIG_FILE_NAME: &str = "paraegox.toml";
 const MAX_INIT_DIRECTORY_BYTES: usize = MAX_STATE_ROOT_BYTES - INIT_CONFIG_FILE_NAME.len() - 1;
 const MAX_TLS_FILE_PATH_BYTES: usize = 4_096;
@@ -170,6 +185,74 @@ pub(crate) enum OfflineCommandV1 {
     Version,
     ConfigCheck(OfflineConfigSummaryV1),
     Doctor(OfflineConfigSummaryV1),
+}
+
+/// Stable JSON channel selected before Artifact grammar validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactJsonIntentV1 {
+    Build,
+    Inspect,
+    Materialize,
+    MaterializationQuery,
+}
+
+impl ArtifactJsonIntentV1 {
+    pub(crate) const fn command(self) -> &'static str {
+        match self {
+            Self::Build => "artifact.build",
+            Self::Inspect => "artifact.inspect",
+            Self::Materialize => "artifact.materialize",
+            Self::MaterializationQuery => "artifact.materialization.query",
+        }
+    }
+}
+
+/// Exact syntactic inputs for the four Artifact F0 commands. Build and inspect
+/// retain path values as `OsString` until execution identity has been checked;
+/// their non-UTF-8 path classification is deliberately later than identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactCommandV1 {
+    Build {
+        source: OsString,
+        output: OsString,
+    },
+    Inspect {
+        manifest: OsString,
+        payload: OsString,
+    },
+    Materialize {
+        config: PathBuf,
+        manifest: PathBuf,
+        payload: PathBuf,
+        operation_id: ArtifactOperationIdV1,
+    },
+    MaterializationQuery {
+        config: PathBuf,
+        operation_id: ArtifactOperationIdV1,
+    },
+}
+
+/// Minimal projection of the existing strict managed-chat configuration used
+/// as ArtifactStore authority. It does not create a second config schema.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalArtifactStoreAuthorityConfigV1 {
+    source_path: PathBuf,
+    state_root: PathBuf,
+    config_commitment: ArtifactConfigCommitmentV1,
+}
+
+impl LocalArtifactStoreAuthorityConfigV1 {
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    pub(crate) const fn config_commitment(&self) -> ArtifactConfigCommitmentV1 {
+        self.config_commitment
+    }
 }
 
 /// Exact public lifecycle actions for one managed local chat composition.
@@ -1874,6 +1957,7 @@ pub(crate) enum ConfigError {
     UnknownOption,
     MissingOptionValue,
     DuplicateOption,
+    InvalidArtifactGrammar,
     InvalidInitGrammar,
     InvalidInitDirectory,
     InvalidLocalDeployGrammar,
@@ -1960,6 +2044,7 @@ impl ConfigError {
             Self::UnknownOption => "PXLC-OPTION-UNKNOWN",
             Self::MissingOptionValue => "PXLC-OPTION-VALUE-MISSING",
             Self::DuplicateOption => "PXLC-OPTION-DUPLICATE",
+            Self::InvalidArtifactGrammar => "PXLC-ARTIFACT-GRAMMAR",
             Self::InvalidInitGrammar => "PXLC-INIT-GRAMMAR",
             Self::InvalidInitDirectory => "PXLC-INIT-DIRECTORY-INVALID",
             Self::InvalidLocalDeployGrammar => "PXLC-DEPLOY-GRAMMAR",
@@ -2056,6 +2141,7 @@ impl ConfigError {
             Self::UnknownOption => "the mode contains an unknown or positional argument",
             Self::MissingOptionValue => "an option is missing its value",
             Self::DuplicateOption => "an option was supplied more than once",
+            Self::InvalidArtifactGrammar => "artifact command grammar is invalid",
             Self::InvalidInitGrammar => {
                 "init requires exactly --directory <absolute-directory> --json"
             }
@@ -2191,6 +2277,140 @@ impl ConfigError {
                 "the model identifier is invalid for the selected provisioned chat profile"
             }
         }
+    }
+}
+
+/// Recognizes one of the four exact Artifact command namespaces before
+/// validating its complete grammar. Unknown Artifact subcommands have no
+/// frozen JSON `command` value and remain on the global usage surface.
+pub(crate) fn artifact_json_intent(arguments: &[OsString]) -> Option<ArtifactJsonIntentV1> {
+    let first = arguments.first()?.as_os_str();
+    if first != std::ffi::OsStr::new(ARTIFACT_COMMAND) {
+        return None;
+    }
+    match arguments.get(1)?.to_str()? {
+        ARTIFACT_BUILD_COMMAND => Some(ArtifactJsonIntentV1::Build),
+        ARTIFACT_INSPECT_COMMAND => Some(ArtifactJsonIntentV1::Inspect),
+        ARTIFACT_MATERIALIZE_COMMAND => Some(ArtifactJsonIntentV1::Materialize),
+        ARTIFACT_MATERIALIZATION_COMMAND => Some(ArtifactJsonIntentV1::MaterializationQuery),
+        _ => None,
+    }
+}
+
+/// Parses only fixed Artifact tokens and value encodings. Filesystem access,
+/// lexical path admission and configuration reads remain in `artifact.rs` so
+/// the Program's platform/execution/path precedence is preserved.
+pub(crate) fn parse_artifact_command(
+    intent: ArtifactJsonIntentV1,
+    arguments: &[OsString],
+) -> Result<ArtifactCommandV1, ConfigError> {
+    let fixed = |index: usize, expected: &str| {
+        arguments
+            .get(index)
+            .is_some_and(|value| value.as_os_str() == std::ffi::OsStr::new(expected))
+    };
+    match intent {
+        ArtifactJsonIntentV1::Build => {
+            if arguments.len() != 9
+                || !fixed(0, ARTIFACT_COMMAND)
+                || !fixed(1, ARTIFACT_BUILD_COMMAND)
+                || !fixed(2, PROFILE_OPTION)
+                || !fixed(3, ARTIFACT_PROFILE)
+                || !fixed(4, SOURCE_OPTION)
+                || !fixed(6, OUTPUT_OPTION)
+                || !fixed(8, JSON_OPTION)
+            {
+                return Err(ConfigError::InvalidArtifactGrammar);
+            }
+            Ok(ArtifactCommandV1::Build {
+                source: arguments[5].clone(),
+                output: arguments[7].clone(),
+            })
+        }
+        ArtifactJsonIntentV1::Inspect => {
+            if arguments.len() != 7
+                || !fixed(0, ARTIFACT_COMMAND)
+                || !fixed(1, ARTIFACT_INSPECT_COMMAND)
+                || !fixed(2, MANIFEST_OPTION)
+                || !fixed(4, PAYLOAD_OPTION)
+                || !fixed(6, JSON_OPTION)
+            {
+                return Err(ConfigError::InvalidArtifactGrammar);
+            }
+            Ok(ArtifactCommandV1::Inspect {
+                manifest: arguments[3].clone(),
+                payload: arguments[5].clone(),
+            })
+        }
+        ArtifactJsonIntentV1::Materialize => {
+            if arguments.len() != 11
+                || !fixed(0, ARTIFACT_COMMAND)
+                || !fixed(1, ARTIFACT_MATERIALIZE_COMMAND)
+                || !fixed(2, CONFIG_OPTION)
+                || !fixed(4, MANIFEST_OPTION)
+                || !fixed(6, PAYLOAD_OPTION)
+                || !fixed(8, OPERATION_ID_OPTION)
+                || !fixed(10, JSON_OPTION)
+            {
+                return Err(ConfigError::InvalidArtifactGrammar);
+            }
+            let config = artifact_utf8_value(arguments, 3)?;
+            let manifest = artifact_utf8_value(arguments, 5)?;
+            let payload = artifact_utf8_value(arguments, 7)?;
+            let operation_id = parse_artifact_operation_id(artifact_utf8_value(arguments, 9)?)?;
+            Ok(ArtifactCommandV1::Materialize {
+                config: PathBuf::from(config),
+                manifest: PathBuf::from(manifest),
+                payload: PathBuf::from(payload),
+                operation_id,
+            })
+        }
+        ArtifactJsonIntentV1::MaterializationQuery => {
+            if arguments.len() != 8
+                || !fixed(0, ARTIFACT_COMMAND)
+                || !fixed(1, ARTIFACT_MATERIALIZATION_COMMAND)
+                || !fixed(2, ARTIFACT_QUERY_COMMAND)
+                || !fixed(3, CONFIG_OPTION)
+                || !fixed(5, OPERATION_ID_OPTION)
+                || !fixed(7, JSON_OPTION)
+            {
+                return Err(ConfigError::InvalidArtifactGrammar);
+            }
+            let config = artifact_utf8_value(arguments, 4)?;
+            let operation_id = parse_artifact_operation_id(artifact_utf8_value(arguments, 6)?)?;
+            Ok(ArtifactCommandV1::MaterializationQuery {
+                config: PathBuf::from(config),
+                operation_id,
+            })
+        }
+    }
+}
+
+fn artifact_utf8_value(arguments: &[OsString], index: usize) -> Result<&str, ConfigError> {
+    arguments
+        .get(index)
+        .and_then(|value| value.to_str())
+        .ok_or(ConfigError::NonUtf8Argument)
+}
+
+fn parse_artifact_operation_id(value: &str) -> Result<ArtifactOperationIdV1, ConfigError> {
+    if value.len() != 32 {
+        return Err(ConfigError::InvalidArtifactGrammar);
+    }
+    let mut bytes = [0_u8; 16];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = artifact_hex_nibble(pair[0])?;
+        let low = artifact_hex_nibble(pair[1])?;
+        bytes[index] = (high << 4) | low;
+    }
+    ArtifactOperationIdV1::try_from_bytes(bytes).map_err(|_| ConfigError::InvalidArtifactGrammar)
+}
+
+fn artifact_hex_nibble(value: u8) -> Result<u8, ConfigError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(ConfigError::InvalidArtifactGrammar),
     }
 }
 
@@ -2630,6 +2850,27 @@ fn parse_managed_chat_config_file(
         source_path: PathBuf::from(source_path),
         config_commitment: digest.finalize().into(),
         owner,
+    })
+}
+
+/// Reuses the one strict managed-chat decoder as ArtifactStore configuration
+/// authority, then projects only the immutable source/root/commitment fields.
+/// The tighter 3917-byte root bound reserves the frozen longest derived Store
+/// suffix and therefore remains a config error rather than a later path error.
+pub(crate) fn parse_artifact_store_authority_config(
+    source_path: &Path,
+) -> Result<LocalArtifactStoreAuthorityConfigV1, ConfigError> {
+    let config = parse_managed_chat_config_file(source_path.as_os_str().to_os_string())?;
+    let state_root = config.state_root().to_path_buf();
+    if state_root.as_os_str().as_encoded_bytes().len() > MAX_ARTIFACT_STATE_ROOT_UTF8_BYTES {
+        return Err(ConfigError::StateRootTooLong);
+    }
+    let config_commitment = ArtifactConfigCommitmentV1::try_from_bytes(config.config_commitment())
+        .map_err(|_| ConfigError::InvalidConfigDocument)?;
+    Ok(LocalArtifactStoreAuthorityConfigV1 {
+        source_path: config.source_path().to_path_buf(),
+        state_root,
+        config_commitment,
     })
 }
 
@@ -7112,6 +7353,93 @@ client_private_key_file = "{root}/node/controller-key.pem"
     }
 
     #[test]
+    fn artifact_parser_accepts_only_the_four_exact_token_shapes() {
+        let operation_id = "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+        let cases = [
+            (
+                ArtifactJsonIntentV1::Build,
+                vec![
+                    "artifact",
+                    "build",
+                    "--profile",
+                    ARTIFACT_PROFILE,
+                    "--source",
+                    "/private/source",
+                    "--output",
+                    "/private/output",
+                    "--json",
+                ],
+            ),
+            (
+                ArtifactJsonIntentV1::Inspect,
+                vec![
+                    "artifact",
+                    "inspect",
+                    "--manifest",
+                    "/private/manifest.pxam",
+                    "--payload",
+                    "/private/payload.bin",
+                    "--json",
+                ],
+            ),
+            (
+                ArtifactJsonIntentV1::Materialize,
+                vec![
+                    "artifact",
+                    "materialize",
+                    "--config",
+                    "/private/paraegox.toml",
+                    "--manifest",
+                    "/private/manifest.pxam",
+                    "--payload",
+                    "/private/payload.bin",
+                    "--operation-id",
+                    operation_id,
+                    "--json",
+                ],
+            ),
+            (
+                ArtifactJsonIntentV1::MaterializationQuery,
+                vec![
+                    "artifact",
+                    "materialization",
+                    "query",
+                    "--config",
+                    "/private/paraegox.toml",
+                    "--operation-id",
+                    operation_id,
+                    "--json",
+                ],
+            ),
+        ];
+        for (intent, arguments) in cases {
+            let arguments = arguments.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(parse_artifact_command(intent, &arguments).is_ok());
+            let mut malformed = arguments.clone();
+            malformed.push(OsString::from("--extra"));
+            assert_eq!(
+                parse_artifact_command(intent, &malformed),
+                Err(ConfigError::InvalidArtifactGrammar)
+            );
+        }
+
+        let uppercase = [
+            OsString::from("artifact"),
+            OsString::from("materialization"),
+            OsString::from("query"),
+            OsString::from("--config"),
+            OsString::from("/private/paraegox.toml"),
+            OsString::from("--operation-id"),
+            OsString::from("A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2"),
+            OsString::from("--json"),
+        ];
+        assert_eq!(
+            parse_artifact_command(ArtifactJsonIntentV1::MaterializationQuery, &uppercase),
+            Err(ConfigError::InvalidArtifactGrammar)
+        );
+    }
+
+    #[test]
     fn error_codes_and_messages_are_stable_and_do_not_echo_values() {
         let errors = [
             ConfigError::NonUtf8Argument,
@@ -7131,6 +7459,7 @@ client_private_key_file = "{root}/node/controller-key.pem"
             ConfigError::UnknownOption,
             ConfigError::MissingOptionValue,
             ConfigError::DuplicateOption,
+            ConfigError::InvalidArtifactGrammar,
             ConfigError::InvalidInitGrammar,
             ConfigError::InvalidInitDirectory,
             ConfigError::InvalidLocalDeployGrammar,
