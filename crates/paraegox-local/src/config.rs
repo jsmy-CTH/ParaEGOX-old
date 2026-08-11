@@ -51,6 +51,8 @@ const ARTIFACT_MATERIALIZE_COMMAND: &str = "materialize";
 const ARTIFACT_MATERIALIZATION_COMMAND: &str = "materialization";
 const ARTIFACT_QUERY_COMMAND: &str = "query";
 const ARTIFACT_PROFILE: &str = "developer-local-echo-prefix-v1";
+const DEPLOYMENT_OPERATION_COMMAND: &str = "operation";
+const DEPLOYMENT_QUERY_COMMAND: &str = "query";
 const TUI_COMMAND: &str = "tui";
 const INIT_COMMAND: &str = "init";
 const DEPLOY_COMMAND: &str = "deploy";
@@ -78,6 +80,8 @@ const OUTPUT_OPTION: &str = "--output";
 const MANIFEST_OPTION: &str = "--manifest";
 const PAYLOAD_OPTION: &str = "--payload";
 const OPERATION_ID_OPTION: &str = "--operation-id";
+const ARTIFACT_OBJECT_REF_OPTION: &str = "--artifact-object-ref";
+const MATERIALIZATION_RECEIPT_REF_OPTION: &str = "--materialization-receipt-ref";
 const DETERMINISTIC_ECHO_PROVIDER: &str = "deterministic-echo-v1";
 const OPENAI_RESPONSES_PROVIDER: &str = "openai-responses-v1";
 const DEEPSEEK_CHAT_COMPLETIONS_PROVIDER: &str = "deepseek-chat-completions-v1";
@@ -326,6 +330,87 @@ pub(crate) struct LocalLifecycleCommandV1 {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LocalDeployCommandV1 {
     config: LocalManagedChatConfigV1,
+}
+
+/// Stable JSON channel selected for the external Artifact deploy grammar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactExternalDeploymentJsonIntentV1 {
+    Deploy,
+    Query,
+}
+
+impl ArtifactExternalDeploymentJsonIntentV1 {
+    pub(crate) const fn command(self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::Query => "deployment.operation.query",
+        }
+    }
+}
+
+/// Strict syntactic input for one fresh external Artifact deployment.
+///
+/// Text references stay canonical input text until the ordered Artifact and
+/// materialization-receipt preflights run. Their parse failures are not CLI
+/// grammar failures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactExternalDeployCommandV1 {
+    config: PathBuf,
+    artifact_object_ref: Box<str>,
+    materialization_receipt_ref: Box<str>,
+    operation_id: ArtifactExternalDeploymentOperationIdInputV1,
+}
+
+impl ArtifactExternalDeployCommandV1 {
+    pub(crate) fn config(&self) -> &Path {
+        &self.config
+    }
+
+    pub(crate) fn artifact_object_ref(&self) -> &str {
+        &self.artifact_object_ref
+    }
+
+    pub(crate) fn materialization_receipt_ref(&self) -> &str {
+        &self.materialization_receipt_ref
+    }
+
+    pub(crate) const fn operation_id(&self) -> ArtifactExternalDeploymentOperationIdInputV1 {
+        self.operation_id
+    }
+}
+
+/// Strict syntactic input for one read-only external deployment query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactExternalDeploymentQueryCommandV1 {
+    config: PathBuf,
+    operation_id: ArtifactExternalDeploymentOperationIdInputV1,
+}
+
+impl ArtifactExternalDeploymentQueryCommandV1 {
+    pub(crate) fn config(&self) -> &Path {
+        &self.config
+    }
+
+    pub(crate) const fn operation_id(&self) -> ArtifactExternalDeploymentOperationIdInputV1 {
+        self.operation_id
+    }
+}
+
+/// Strictly parsed lower-hex input in the DeploymentController operation-id
+/// namespace. The owner converts these exact bytes into its public typed ID;
+/// the CLI parser never interprets them as ArtifactStore or Runtime IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ArtifactExternalDeploymentOperationIdInputV1([u8; 16]);
+
+impl ArtifactExternalDeploymentOperationIdInputV1 {
+    pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// Parsed input for one read-only local Inspection snapshot.
@@ -1961,6 +2046,8 @@ pub(crate) enum ConfigError {
     InvalidInitGrammar,
     InvalidInitDirectory,
     InvalidLocalDeployGrammar,
+    InvalidArtifactExternalDeployGrammar,
+    InvalidArtifactExternalDeploymentQueryGrammar,
     UnsupportedLocalDeployProfile,
     InvalidInspectionSnapshotGrammar,
     InvalidReceiptSnapshotGrammar,
@@ -2048,6 +2135,10 @@ impl ConfigError {
             Self::InvalidInitGrammar => "PXLC-INIT-GRAMMAR",
             Self::InvalidInitDirectory => "PXLC-INIT-DIRECTORY-INVALID",
             Self::InvalidLocalDeployGrammar => "PXLC-DEPLOY-GRAMMAR",
+            Self::InvalidArtifactExternalDeployGrammar => "PXLC-DEPLOY-EXTERNAL-GRAMMAR",
+            Self::InvalidArtifactExternalDeploymentQueryGrammar => {
+                "PXLC-DEPLOYMENT-QUERY-GRAMMAR"
+            }
             Self::UnsupportedLocalDeployProfile => "PXLC-DEPLOY-PROFILE-UNSUPPORTED",
             Self::InvalidInspectionSnapshotGrammar => "PXLC-INSPECTION-GRAMMAR",
             Self::InvalidReceiptSnapshotGrammar => "PXLC-RECEIPT-GRAMMAR",
@@ -2150,6 +2241,12 @@ impl ConfigError {
             }
             Self::InvalidLocalDeployGrammar => {
                 "deploy requires exactly --local --config <absolute-paraegox.toml> --json"
+            }
+            Self::InvalidArtifactExternalDeployGrammar => {
+                "external deploy requires the exact artifact and operation arguments"
+            }
+            Self::InvalidArtifactExternalDeploymentQueryGrammar => {
+                "deployment operation query requires the exact config and operation arguments"
             }
             Self::UnsupportedLocalDeployProfile => {
                 "local deploy supports only the deterministic-echo-v1 profile"
@@ -2489,6 +2586,35 @@ pub(crate) fn init_json_intent(arguments: &[OsString]) -> bool {
         .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(INIT_COMMAND))
 }
 
+/// Selects the two external-deployment JSON channels without merging them
+/// into the pre-existing five-token compiled deploy grammar.
+///
+/// Any malformed `deploy` containing a reserved external option stays on the
+/// D0b grammar channel. The exact `deployment operation` prefix similarly
+/// owns only the new read-only query namespace.
+pub(crate) fn artifact_external_deployment_json_intent(
+    arguments: &[OsString],
+) -> Option<ArtifactExternalDeploymentJsonIntentV1> {
+    let first = arguments.first()?.as_os_str();
+    if first == std::ffi::OsStr::new(DEPLOY_COMMAND) {
+        let owns_external_option = arguments.iter().any(|argument| {
+            argument.as_os_str() == std::ffi::OsStr::new(ARTIFACT_OBJECT_REF_OPTION)
+                || argument.as_os_str()
+                    == std::ffi::OsStr::new(MATERIALIZATION_RECEIPT_REF_OPTION)
+                || argument.as_os_str() == std::ffi::OsStr::new(OPERATION_ID_OPTION)
+        });
+        return owns_external_option.then_some(ArtifactExternalDeploymentJsonIntentV1::Deploy);
+    }
+    if first == std::ffi::OsStr::new(DEPLOYMENT_COMMAND)
+        && arguments.get(1).is_some_and(|argument| {
+            argument.as_os_str() == std::ffi::OsStr::new(DEPLOYMENT_OPERATION_COMMAND)
+        })
+    {
+        return Some(ArtifactExternalDeploymentJsonIntentV1::Query);
+    }
+    None
+}
+
 /// Recognizes every invocation of the public `deploy` command before grammar
 /// validation so its failures remain on the exact deploy JSON channel.
 pub(crate) fn local_deploy_json_intent(arguments: &[OsString]) -> bool {
@@ -2571,6 +2697,125 @@ pub(crate) fn parse_local_deploy(
         return Err(ConfigError::UnsupportedLocalDeployProfile);
     }
     Ok(Some(LocalDeployCommandV1 { config }))
+}
+
+/// Parses one exact external Artifact deployment grammar. Reference texts are
+/// retained for their later, separately ordered owner preflights.
+pub(crate) fn parse_artifact_external_deploy(
+    arguments: &[OsString],
+) -> Result<ArtifactExternalDeployCommandV1, ConfigError> {
+    if artifact_external_deployment_json_intent(arguments)
+        != Some(ArtifactExternalDeploymentJsonIntentV1::Deploy)
+        || !artifact_external_deploy_fixed_shape(arguments)
+    {
+        return Err(ConfigError::InvalidArtifactExternalDeployGrammar);
+    }
+    let config = external_utf8_value(arguments, 3)?;
+    let artifact_object_ref = external_utf8_value(arguments, 5)?;
+    let materialization_receipt_ref = external_utf8_value(arguments, 7)?;
+    let operation_id = parse_external_deployment_operation_id(external_utf8_value(arguments, 9)?)?;
+    ensure_unix_developer_local()?;
+    Ok(ArtifactExternalDeployCommandV1 {
+        config: PathBuf::from(config),
+        artifact_object_ref: artifact_object_ref.into(),
+        materialization_receipt_ref: materialization_receipt_ref.into(),
+        operation_id,
+    })
+}
+
+/// Parses one exact read-only external deployment operation query grammar.
+pub(crate) fn parse_artifact_external_deployment_query(
+    arguments: &[OsString],
+) -> Result<ArtifactExternalDeploymentQueryCommandV1, ConfigError> {
+    if artifact_external_deployment_json_intent(arguments)
+        != Some(ArtifactExternalDeploymentJsonIntentV1::Query)
+        || !artifact_external_deployment_query_fixed_shape(arguments)
+    {
+        return Err(ConfigError::InvalidArtifactExternalDeploymentQueryGrammar);
+    }
+    let config = external_utf8_value(arguments, 4)?;
+    let operation_id = parse_external_deployment_operation_id(external_utf8_value(arguments, 6)?)
+        .map_err(|_| ConfigError::InvalidArtifactExternalDeploymentQueryGrammar)?;
+    ensure_unix_developer_local()?;
+    Ok(ArtifactExternalDeploymentQueryCommandV1 {
+        config: PathBuf::from(config),
+        operation_id,
+    })
+}
+
+pub(crate) fn artifact_external_preparsed_operation_id(
+    intent: ArtifactExternalDeploymentJsonIntentV1,
+    arguments: &[OsString],
+) -> Option<ArtifactExternalDeploymentOperationIdInputV1> {
+    let index = match intent {
+        ArtifactExternalDeploymentJsonIntentV1::Deploy
+            if artifact_external_deploy_fixed_shape(arguments) => 9,
+        ArtifactExternalDeploymentJsonIntentV1::Query
+            if artifact_external_deployment_query_fixed_shape(arguments) => 6,
+        ArtifactExternalDeploymentJsonIntentV1::Deploy
+        | ArtifactExternalDeploymentJsonIntentV1::Query => return None,
+    };
+    parse_external_deployment_operation_id(arguments.get(index)?.to_str()?).ok()
+}
+
+fn artifact_external_deploy_fixed_shape(arguments: &[OsString]) -> bool {
+    arguments.len() == 11
+        && external_fixed(arguments, 0, DEPLOY_COMMAND)
+        && external_fixed(arguments, 1, LOCAL_OPTION)
+        && external_fixed(arguments, 2, CONFIG_OPTION)
+        && external_fixed(arguments, 4, ARTIFACT_OBJECT_REF_OPTION)
+        && external_fixed(arguments, 6, MATERIALIZATION_RECEIPT_REF_OPTION)
+        && external_fixed(arguments, 8, OPERATION_ID_OPTION)
+        && external_fixed(arguments, 10, JSON_OPTION)
+}
+
+fn artifact_external_deployment_query_fixed_shape(arguments: &[OsString]) -> bool {
+    arguments.len() == 8
+        && external_fixed(arguments, 0, DEPLOYMENT_COMMAND)
+        && external_fixed(arguments, 1, DEPLOYMENT_OPERATION_COMMAND)
+        && external_fixed(arguments, 2, DEPLOYMENT_QUERY_COMMAND)
+        && external_fixed(arguments, 3, CONFIG_OPTION)
+        && external_fixed(arguments, 5, OPERATION_ID_OPTION)
+        && external_fixed(arguments, 7, JSON_OPTION)
+}
+
+fn external_fixed(arguments: &[OsString], index: usize, expected: &str) -> bool {
+    arguments
+        .get(index)
+        .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new(expected))
+}
+
+fn external_utf8_value(arguments: &[OsString], index: usize) -> Result<&str, ConfigError> {
+    arguments
+        .get(index)
+        .and_then(|argument| argument.to_str())
+        .ok_or(ConfigError::NonUtf8Argument)
+}
+
+fn parse_external_deployment_operation_id(
+    value: &str,
+) -> Result<ArtifactExternalDeploymentOperationIdInputV1, ConfigError> {
+    if value.len() != 32 {
+        return Err(ConfigError::InvalidArtifactExternalDeployGrammar);
+    }
+    let mut bytes = [0_u8; 16];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = external_hex_nibble(pair[0])?;
+        let low = external_hex_nibble(pair[1])?;
+        bytes[index] = (high << 4) | low;
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Err(ConfigError::InvalidArtifactExternalDeployGrammar);
+    }
+    Ok(ArtifactExternalDeploymentOperationIdInputV1(bytes))
+}
+
+fn external_hex_nibble(value: u8) -> Result<u8, ConfigError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(ConfigError::InvalidArtifactExternalDeployGrammar),
+    }
 }
 
 /// Parses the sole public local Inspection grammar without resolving a
@@ -5869,6 +6114,139 @@ client_private_key_file = "{root}/node/controller-key.pem"
             parse_local_deploy(&[OsString::from(CHAT_COMMAND)]),
             Ok(None)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_deployment_parsers_preserve_exact_typed_operation_identity() {
+        let operation_id = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
+        let deploy = vec![
+            OsString::from(DEPLOY_COMMAND),
+            OsString::from(LOCAL_OPTION),
+            OsString::from(CONFIG_OPTION),
+            OsString::from("/private/tmp/paraegox.toml"),
+            OsString::from(ARTIFACT_OBJECT_REF_OPTION),
+            OsString::from("pxak1:deferred-owner-validation"),
+            OsString::from(MATERIALIZATION_RECEIPT_REF_OPTION),
+            OsString::from("pxamr1:deferred-owner-validation"),
+            OsString::from(OPERATION_ID_OPTION),
+            OsString::from(operation_id),
+            OsString::from(JSON_OPTION),
+        ];
+        assert_eq!(
+            artifact_external_deployment_json_intent(&deploy),
+            Some(ArtifactExternalDeploymentJsonIntentV1::Deploy)
+        );
+        let parsed = parse_artifact_external_deploy(&deploy).expect("exact external deploy");
+        assert_eq!(parsed.config(), Path::new("/private/tmp/paraegox.toml"));
+        assert_eq!(
+            parsed.artifact_object_ref(),
+            "pxak1:deferred-owner-validation"
+        );
+        assert_eq!(
+            parsed.materialization_receipt_ref(),
+            "pxamr1:deferred-owner-validation"
+        );
+        assert_eq!(parsed.operation_id().as_bytes(), &[0xd1; 16]);
+
+        let query = vec![
+            OsString::from(DEPLOYMENT_COMMAND),
+            OsString::from(DEPLOYMENT_OPERATION_COMMAND),
+            OsString::from(DEPLOYMENT_QUERY_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            OsString::from("/private/tmp/paraegox.toml"),
+            OsString::from(OPERATION_ID_OPTION),
+            OsString::from(operation_id),
+            OsString::from(JSON_OPTION),
+        ];
+        assert_eq!(
+            artifact_external_deployment_json_intent(&query),
+            Some(ArtifactExternalDeploymentJsonIntentV1::Query)
+        );
+        let parsed = parse_artifact_external_deployment_query(&query)
+            .expect("exact external deployment query");
+        assert_eq!(parsed.config(), Path::new("/private/tmp/paraegox.toml"));
+        assert_eq!(parsed.operation_id().as_bytes(), &[0xd1; 16]);
+        assert_eq!(
+            artifact_external_preparsed_operation_id(
+                ArtifactExternalDeploymentJsonIntentV1::Query,
+                &query,
+            )
+            .expect("preparsed query id")
+            .as_bytes(),
+            &[0xd1; 16]
+        );
+    }
+
+    #[test]
+    fn external_deployment_intent_does_not_change_legacy_deploy_or_process_grammar() {
+        let legacy = vec![
+            OsString::from(DEPLOY_COMMAND),
+            OsString::from(LOCAL_OPTION),
+            OsString::from(CONFIG_OPTION),
+            OsString::from("/private/tmp/paraegox.toml"),
+            OsString::from(JSON_OPTION),
+        ];
+        assert_eq!(artifact_external_deployment_json_intent(&legacy), None);
+        assert!(local_deploy_json_intent(&legacy));
+
+        for reserved in [
+            ARTIFACT_OBJECT_REF_OPTION,
+            MATERIALIZATION_RECEIPT_REF_OPTION,
+            OPERATION_ID_OPTION,
+        ] {
+            let malformed = vec![
+                OsString::from(DEPLOY_COMMAND),
+                OsString::from(reserved),
+            ];
+            assert_eq!(
+                artifact_external_deployment_json_intent(&malformed),
+                Some(ArtifactExternalDeploymentJsonIntentV1::Deploy)
+            );
+            assert_eq!(
+                parse_artifact_external_deploy(&malformed),
+                Err(ConfigError::InvalidArtifactExternalDeployGrammar)
+            );
+        }
+
+        let existing_process = vec![
+            OsString::from(DEPLOYMENT_COMMAND),
+            OsString::from(CONFIG_OPTION),
+            OsString::from("/private/tmp/paraegox-deployment.toml"),
+        ];
+        assert_eq!(
+            artifact_external_deployment_json_intent(&existing_process),
+            None
+        );
+    }
+
+    #[test]
+    fn external_deployment_operation_id_is_nonzero_canonical_lower_hex() {
+        let deploy = |value: &str| {
+            vec![
+                OsString::from(DEPLOY_COMMAND),
+                OsString::from(LOCAL_OPTION),
+                OsString::from(CONFIG_OPTION),
+                OsString::from("/private/tmp/paraegox.toml"),
+                OsString::from(ARTIFACT_OBJECT_REF_OPTION),
+                OsString::from("object"),
+                OsString::from(MATERIALIZATION_RECEIPT_REF_OPTION),
+                OsString::from("receipt"),
+                OsString::from(OPERATION_ID_OPTION),
+                OsString::from(value),
+                OsString::from(JSON_OPTION),
+            ]
+        };
+        for invalid in [
+            "00000000000000000000000000000000",
+            "D1D1D1D1D1D1D1D1D1D1D1D1D1D1D1D1",
+            "d1d1",
+        ] {
+            assert_eq!(
+                parse_artifact_external_deploy(&deploy(invalid)),
+                Err(ConfigError::InvalidArtifactExternalDeployGrammar)
+            );
+        }
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub(crate) enum LocalProcessError {
     LocalDeployQuery,
     LocalDeployEvidence,
     LocalDeployJsonOutput,
+    ArtifactExternalDeployArtifact,
+    ArtifactExternalDeployMaterializationReceipt,
+    ArtifactExternalDeployOwner,
+    ArtifactExternalDeployJsonOutput,
     LocalInspectionNotRunning,
     LocalInspectionLocator,
     LocalInspectionBootstrap,
@@ -129,6 +133,12 @@ impl LocalProcessError {
             Self::LocalDeployQuery => "PXLC-DEPLOY-QUERY",
             Self::LocalDeployEvidence => "PXLC-DEPLOY-EVIDENCE",
             Self::LocalDeployJsonOutput => "PXLC-DEPLOY-JSON-OUTPUT",
+            Self::ArtifactExternalDeployArtifact => "PXLC-DEPLOY-ARTIFACT",
+            Self::ArtifactExternalDeployMaterializationReceipt => {
+                "PXLC-DEPLOY-MATERIALIZATION-RECEIPT"
+            }
+            Self::ArtifactExternalDeployOwner => "PXLC-DEPLOY-OWNER",
+            Self::ArtifactExternalDeployJsonOutput => "PXLC-DEPLOY-EXTERNAL-JSON-OUTPUT",
             Self::LocalInspectionNotRunning => "PXLC-INSPECTION-NOT-RUNNING",
             Self::LocalInspectionLocator => "PXLC-INSPECTION-LOCATOR",
             Self::LocalInspectionBootstrap => "PXLC-INSPECTION-BOOTSTRAP",
@@ -240,6 +250,18 @@ impl LocalProcessError {
                 "compiled local deployment terminal evidence failed strict validation"
             }
             Self::LocalDeployJsonOutput => "compiled local deployment JSON output failed",
+            Self::ArtifactExternalDeployArtifact => {
+                "deployment artifact reference is invalid or incompatible"
+            }
+            Self::ArtifactExternalDeployMaterializationReceipt => {
+                "materialization receipt is invalid or not ready"
+            }
+            Self::ArtifactExternalDeployOwner => {
+                "deployment owner could not complete the operation"
+            }
+            Self::ArtifactExternalDeployJsonOutput => {
+                "external deployment JSON output could not be written"
+            }
             Self::LocalInspectionNotRunning => {
                 "local Inspection requires the current owner generation to be running"
             }
@@ -371,6 +393,8 @@ impl LocalProcessError {
             | Self::ArtifactCompatibility
             | Self::ArtifactConflict
             | Self::ArtifactCapacity
+            | Self::ArtifactExternalDeployArtifact
+            | Self::ArtifactExternalDeployMaterializationReceipt
             | Self::InitUnsafeExecutionIdentity
             | Self::InitWorkspaceConflict
             | Self::LifecycleConfiguration => 2,

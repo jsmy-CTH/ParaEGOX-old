@@ -10,7 +10,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use paraegox_artifact::ArtifactOperationIdV1;
+use paraegox_artifact::{
+    ArtifactObjectRefV1, ArtifactOperationIdV1, MaterializationReceiptRefV1,
+    VerifiedMaterializationReadBundleV1,
+};
 use serde::Serialize;
 
 #[cfg(not(unix))]
@@ -25,6 +28,24 @@ const PROFILE: &str = "developer-local-echo-prefix-v1";
 const RUNTIME_KIND: &str = "managed_model_data_v1";
 const ADAPTER_ABI: &str = "bounded-text-model-data-v1";
 const TARGET_PROFILE: &str = "developer-local-managed-model-v1";
+
+/// Reopens and verifies the exact ArtifactStore Receipt chain consumed by
+/// D0b. This retains the existing config/authority adapter as the only local
+/// bridge into `paraegox-artifact`; deployment code receives only the fully
+/// owned verified bundle and never a store path or lock guard.
+#[cfg(unix)]
+pub(crate) fn read_verified_materialization_for_deployment(
+    config_path: &Path,
+    object_ref: ArtifactObjectRefV1,
+    receipt_ref: MaterializationReceiptRefV1,
+) -> Result<VerifiedMaterializationReadBundleV1, LocalProcessError> {
+    unix::read_verified_materialization_for_deployment(config_path, object_ref, receipt_ref)
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_deployment_execution_identity() -> Result<(), LocalProcessError> {
+    unix::ensure_execution_identity()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ArtifactFailureV1 {
@@ -617,12 +638,12 @@ mod unix {
         unistd::{PathconfVar, fpathconf, getegid, geteuid},
     };
     use paraegox_artifact::{
-        ArtifactManifestProfileClassificationV1, ArtifactManifestV1,
+        ArtifactManifestProfileClassificationV1, ArtifactManifestV1, ArtifactObjectRefV1,
         ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1,
         ArtifactStoreAuthorityV1, ArtifactStoreChangeV1, ArtifactStoreFailureV1,
         ArtifactStoreInvocationV1, ArtifactStoreOperationStateV1, ArtifactStoreOperationViewV1,
-        ArtifactStoreV1, MaterializationOperationV1, MaterializationRequestV1,
-        VerifiedArtifactPairV1,
+        ArtifactStoreV1, MaterializationOperationV1, MaterializationReceiptRefV1,
+        MaterializationRequestV1, VerifiedArtifactPairV1, VerifiedMaterializationReadBundleV1,
     };
     use rustix::fs::{RenameFlags, renameat_with};
     use sha2::{Digest as _, Sha256};
@@ -976,6 +997,31 @@ mod unix {
         let invocation = ArtifactStoreV1::query(&mut authority, operation_id);
         drop(authority);
         Ok(project_invocation(operation_id, invocation))
+    }
+
+    pub(super) fn read_verified_materialization_for_deployment(
+        config_path: &Path,
+        object_ref: ArtifactObjectRefV1,
+        receipt_ref: MaterializationReceiptRefV1,
+    ) -> Result<VerifiedMaterializationReadBundleV1, LocalProcessError> {
+        let config = config::parse_artifact_store_authority_config(config_path)?;
+        let mut authority = RevalidatingArtifactAuthority::new(&config);
+        let result = ArtifactStoreV1::read_verified(&mut authority, object_ref, receipt_ref);
+        drop(authority);
+        result.map_err(|failure| match failure {
+            paraegox_artifact::ArtifactStoreReadFailureV1::ConfigurationMismatch => {
+                LocalProcessError::LifecycleConfiguration
+            }
+            paraegox_artifact::ArtifactStoreReadFailureV1::ReferenceMismatch
+            | paraegox_artifact::ArtifactStoreReadFailureV1::NotFound => {
+                LocalProcessError::ArtifactExternalDeployMaterializationReceipt
+            }
+            paraegox_artifact::ArtifactStoreReadFailureV1::Contended
+            | paraegox_artifact::ArtifactStoreReadFailureV1::Owner
+            | paraegox_artifact::ArtifactStoreReadFailureV1::Io => {
+                LocalProcessError::ArtifactExternalDeployOwner
+            }
+        })
     }
 
     fn pair_projection(changed: bool, pair: &VerifiedArtifactPairV1) -> ArtifactPairProjectionV1 {

@@ -26,6 +26,7 @@ mod artifact;
 mod composition;
 mod config;
 mod error;
+mod external_deployment;
 #[cfg(unix)]
 mod identity;
 #[cfg(unix)]
@@ -167,6 +168,13 @@ fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if let Some(intent) = config::artifact_json_intent(&arguments) {
         return ExitCode::from(artifact::dispatch_to(
+            &mut io::stdout().lock(),
+            intent,
+            &arguments,
+        ));
+    }
+    if let Some(intent) = config::artifact_external_deployment_json_intent(&arguments) {
+        return ExitCode::from(external_deployment::dispatch_to(
             &mut io::stdout().lock(),
             intent,
             &arguments,

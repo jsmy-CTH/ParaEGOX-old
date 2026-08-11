@@ -77,10 +77,10 @@ const ARTIFACT_DESIRED_DIGEST_DOMAIN: &[u8] =
 
 /// DeploymentController-owned D0b operation identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ArtifactDeploymentOperationIdV1([u8; 16]);
+pub struct ArtifactDeploymentOperationIdV1([u8; 16]);
 
 impl ArtifactDeploymentOperationIdV1 {
-    pub(crate) const fn try_from_bytes(
+    pub const fn try_from_bytes(
         bytes: [u8; 16],
     ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
         let mut index = 0;
@@ -94,7 +94,7 @@ impl ArtifactDeploymentOperationIdV1 {
     }
 
     #[must_use]
-    pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
+    pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
 }
