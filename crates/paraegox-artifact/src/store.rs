@@ -1947,12 +1947,7 @@ fn create_and_lock_staging(staging: &DirectoryHandle) -> Result<(File, FileIdent
 }
 
 fn classify_bootstrap_lock_collision(error: StoreError) -> StoreError {
-    match error {
-        StoreError::Contended => StoreError::Contended,
-        StoreError::Owner => StoreError::Owner,
-        StoreError::Io => StoreError::Io,
-        other => other,
-    }
+    error
 }
 
 fn create_objects_directory(staging: &DirectoryHandle) -> Result<DirectoryHandle, StoreError> {
@@ -2534,7 +2529,7 @@ fn open_or_initialize_store(
         unlock?;
         return Err(StoreError::Owner);
     }
-    continue_initialization(
+    continue_initialization(ContinueInitializationInput {
         authority,
         binding,
         state_root,
@@ -2546,7 +2541,7 @@ fn open_or_initialize_store(
         lock_identity,
         request,
         tracker,
-    )
+    })
 }
 
 fn validate_initial_snapshot_shape(snapshot: &ArtifactStoreSnapshotV1) -> Result<(), StoreError> {
@@ -2597,10 +2592,9 @@ fn validate_initial_request(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn continue_initialization(
-    authority: &mut dyn ArtifactStoreAuthorityV1,
-    binding: &ArtifactStoreAuthorityBindingV1,
+struct ContinueInitializationInput<'a> {
+    authority: &'a mut dyn ArtifactStoreAuthorityV1,
+    binding: &'a ArtifactStoreAuthorityBindingV1,
     state_root: StateRootHandle,
     staging: DirectoryHandle,
     names: BTreeSet<OsString>,
@@ -2608,9 +2602,26 @@ fn continue_initialization(
     complete: BTreeSet<OsString>,
     lock: File,
     lock_identity: FileIdentity,
-    request: &MaterializationRequestV1,
-    tracker: &mut ChangeTracker,
+    request: &'a MaterializationRequestV1,
+    tracker: &'a mut ChangeTracker,
+}
+
+fn continue_initialization(
+    input: ContinueInitializationInput<'_>,
 ) -> Result<LockedStore, StoreError> {
+    let ContinueInitializationInput {
+        authority,
+        binding,
+        state_root,
+        staging,
+        names,
+        lock_only,
+        complete,
+        lock,
+        lock_identity,
+        request,
+        tracker,
+    } = input;
     let mut lock = Some(lock);
     let result = (|| {
         let (final_after_lock, staging_after_lock) = root_selection(&state_root.leaf)?;
