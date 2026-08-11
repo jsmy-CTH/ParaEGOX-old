@@ -2565,10 +2565,8 @@ mod tests {
             .is_err()
         );
         let successor = decode_hex(
-            include_str!(
-                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_exact_zero_initial.hex"
-            )
-            .trim_end(),
+            include_str!("../../../tests/fixtures/wire/artifact_f0_pxma_v2_exact_zero_initial.hex")
+                .trim_end(),
         );
         assert!(
             ManagedModelAgentStackSnapshot::decode(

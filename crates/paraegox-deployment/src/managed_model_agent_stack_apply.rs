@@ -4211,14 +4211,15 @@ mod tests {
             )
             .expect("durable predecessor ActiveReady PXMT");
         let state = journal.state();
-        let stack = state
-            .model_agent_stack_state()
-            .expect("predecessor PXMJ1");
+        let stack = state.model_agent_stack_state().expect("predecessor PXMJ1");
         let fixture = decode_fixture_hex(include_str!(
             "../../../tests/fixtures/wire/artifact_f0_pxmj_v1.hex"
         ));
         assert_eq!(
-            stack.encode().expect("canonical predecessor PXMJ1").as_ref(),
+            stack
+                .encode()
+                .expect("canonical predecessor PXMJ1")
+                .as_ref(),
             fixture.as_slice()
         );
         assert!(ArtifactExternalControllerStateV2::decode(&fixture).is_err());
