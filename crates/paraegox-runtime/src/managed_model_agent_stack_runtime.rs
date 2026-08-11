@@ -397,7 +397,7 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
 
         let agent_generation = next_generation(core.snapshot.agent_generation_high_water)?;
         core.commit_agent_start_intent(fabric, agent_generation)?;
-        if let Err(error) = core
+        if core
             .start_agent(
                 predecessor.control,
                 request.target_execution().embedded(),
@@ -405,6 +405,7 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
                 model_dependency,
             )
             .await
+            .is_err()
         {
             let model_exact = core.shutdown_model().await;
             let terminal = if model_exact {

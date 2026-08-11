@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
+import termios
+import time
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 _BINARY_ENVIRONMENT = "PARAEGOX_D0B_EXTERNAL_ARTIFACT_CLI_BINARY"
 _COMMAND_TIMEOUT_SECONDS = 180.0
+_TUI_START_TIMEOUT_SECONDS = 45.0
+_TUI_REPLY_TIMEOUT_SECONDS = 45.0
+_TUI_EXIT_TIMEOUT_SECONDS = 12.0
+_MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 _GENERATION_PATTERN = re.compile(r"[0-9a-f]{32}")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 _DECIMAL_PATTERN = re.compile(r"[1-9][0-9]*")
@@ -38,6 +51,15 @@ _DEPLOYMENT_FIELDS = {
     "current_health_checked",
     "diagnostics",
 }
+
+
+@dataclass
+class PtyInvocation:
+    process: subprocess.Popen[bytes]
+    master_fd: int
+    observer_fd: int
+    original_termios: list[Any]
+    capture: bytearray
 
 
 def _require_exact_binary() -> Path:
@@ -92,6 +114,7 @@ def _environment(root: Path) -> dict[str, str]:
         "HOME": os.fspath(root),
         "TMPDIR": os.fspath(temporary),
         "PATH": "/usr/bin:/bin",
+        "TERM": "xterm-256color",
         "LANG": "C.UTF-8",
     }
 
@@ -131,6 +154,104 @@ def _invoke_json(
     )
     assert process.stderr == b""
     return _decode_json_line(process.stdout)
+
+
+def _set_controlling_terminal() -> None:
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def _spawn_tui_pty(
+    binary: Path,
+    config: Path,
+    environment: dict[str, str],
+) -> PtyInvocation:
+    master_fd, slave_fd = os.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 34, 120, 0, 0))
+    observer_fd = os.dup(slave_fd)
+    original_termios = termios.tcgetattr(observer_fd)
+    process = subprocess.Popen(
+        [os.fspath(binary), "tui", "--config", os.fspath(config)],
+        cwd=binary.parent,
+        env=environment,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        preexec_fn=_set_controlling_terminal,
+    )
+    os.close(slave_fd)
+    return PtyInvocation(process, master_fd, observer_fd, original_termios, bytearray())
+
+
+def _read_pty_once(invocation: PtyInvocation, timeout: float) -> bool:
+    ready, _, _ = select.select([invocation.master_fd], [], [], timeout)
+    if not ready:
+        return False
+    try:
+        chunk = os.read(invocation.master_fd, 65_536)
+    except OSError as error:
+        if error.errno == errno.EIO:
+            return False
+        raise
+    if not chunk:
+        return False
+    invocation.capture.extend(chunk)
+    if len(invocation.capture) > _MAX_CAPTURE_BYTES:
+        del invocation.capture[: len(invocation.capture) - _MAX_CAPTURE_BYTES]
+    return True
+
+
+def _safe_terminal_tail(capture: bytearray | bytes) -> str:
+    text = bytes(capture[-8_192:]).decode("utf-8", errors="replace")
+    return "".join(value for value in text if value in "\n\r\t" or value >= " ")
+
+
+def _read_until(invocation: PtyInvocation, marker: bytes, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while marker not in invocation.capture:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"timed out waiting for {marker!r}; "
+                f"tail={_safe_terminal_tail(invocation.capture)!r}"
+            )
+        _read_pty_once(invocation, 0.2)
+        if invocation.process.poll() is not None and marker not in invocation.capture:
+            raise AssertionError(
+                f"TUI exited {invocation.process.returncode} before {marker!r}; "
+                f"tail={_safe_terminal_tail(invocation.capture)!r}"
+            )
+
+
+def _wait_for_pty_exit(invocation: PtyInvocation) -> bytes:
+    deadline = time.monotonic() + _TUI_EXIT_TIMEOUT_SECONDS
+    while invocation.process.poll() is None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"TUI did not exit; tail={_safe_terminal_tail(invocation.capture)!r}"
+            )
+        _read_pty_once(invocation, 0.2)
+    while _read_pty_once(invocation, 0):
+        pass
+    assert invocation.process.returncode == 0, (
+        invocation.process.returncode,
+        _safe_terminal_tail(invocation.capture),
+    )
+    assert termios.tcgetattr(invocation.observer_fd) == invocation.original_termios
+    return bytes(invocation.capture)
+
+
+def _close_pty(invocation: PtyInvocation) -> None:
+    if invocation.process.poll() is None:
+        with suppress(ProcessLookupError):
+            os.killpg(invocation.process.pid, signal.SIGTERM)
+        try:
+            invocation.process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                os.killpg(invocation.process.pid, signal.SIGKILL)
+            invocation.process.wait(timeout=3.0)
+    os.close(invocation.master_fd)
+    os.close(invocation.observer_fd)
 
 
 def _matching_processes(binary: Path) -> list[int]:
@@ -309,6 +430,21 @@ def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins() 
                 receipt_ref=receipt_ref,
             )
             assert replayed["generation"] == deployed["generation"]
+
+            tui = _spawn_tui_pty(binary, config_path, environment)
+            try:
+                _read_until(tui, b"System: connected", _TUI_START_TIMEOUT_SECONDS)
+                os.write(tui.master_fd, b"d0b-external-prompt\r")
+                _read_until(
+                    tui,
+                    b"artifact-d0b-prefix: d0b-external-prompt",
+                    _TUI_REPLY_TIMEOUT_SECONDS,
+                )
+                os.write(tui.master_fd, b"\x1b")
+                capture = _wait_for_pty_exit(tui)
+                assert b"artifact-d0b-prefix: d0b-external-prompt" in capture
+            finally:
+                _close_pty(tui)
 
             status = _invoke_json(
                 binary,
