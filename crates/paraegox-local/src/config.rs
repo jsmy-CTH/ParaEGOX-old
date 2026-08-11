@@ -407,6 +407,14 @@ impl ArtifactExternalDeploymentOperationIdInputV1 {
         &self.0
     }
 
+    pub(crate) fn parse_hidden(value: &OsStr) -> Result<Self, ConfigError> {
+        parse_external_deployment_operation_id(
+            value
+                .to_str()
+                .ok_or(ConfigError::InvalidArtifactExternalDeployGrammar)?,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test(bytes: [u8; 16]) -> Self {
         Self(bytes)

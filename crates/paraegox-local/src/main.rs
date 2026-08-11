@@ -20,6 +20,8 @@ use config::{
 use error::LocalProcessError;
 use serde::Serialize;
 use serde_json::json;
+#[cfg(unix)]
+use paraegox_deployment::DeveloperArtifactExternalControllerRequestV1;
 
 mod artifact;
 #[cfg(unix)]
@@ -160,6 +162,14 @@ struct LocalReceiptErrorJsonLineV1<'a> {
 #[cfg(unix)]
 struct LocalChatSupervisorInvocationV1 {
     config: LocalManagedChatConfigV1,
+    expected_commitment: [u8; 32],
+    expected_generation: [u8; 16],
+}
+
+#[cfg(unix)]
+struct ArtifactExternalSupervisorInvocationV1 {
+    config: LocalManagedChatConfigV1,
+    request: DeveloperArtifactExternalControllerRequestV1,
     expected_commitment: [u8; 32],
     expected_generation: [u8; 16],
 }
@@ -840,6 +850,23 @@ fn dispatch(
             Err(error) => Err(error),
         };
     }
+    #[cfg(unix)]
+    if let Some(supervisor) = parse_artifact_external_supervisor(&arguments)? {
+        return match lifecycle::run_artifact_external_supervisor(
+            supervisor.config,
+            supervisor.request,
+            supervisor.expected_commitment,
+            supervisor.expected_generation,
+        ) {
+            Ok(lifecycle::LocalChatSupervisorResultV1::Completed) => {
+                Ok(DispatchOutcome::Success)
+            }
+            Ok(lifecycle::LocalChatSupervisorResultV1::Contended) => {
+                Ok(DispatchOutcome::HiddenSupervisorContended)
+            }
+            Err(error) => Err(error),
+        };
+    }
     if let Some(paths) = parse_node_daemon_child(&arguments)? {
         return run_node_daemon_child(&paths).map(|()| DispatchOutcome::Success);
     }
@@ -1233,6 +1260,45 @@ fn parse_local_chat_supervisor(
     let expected_generation = lifecycle::decode_generation_hex(arguments[6].as_os_str())?;
     Ok(Some(LocalChatSupervisorInvocationV1 {
         config,
+        expected_commitment,
+        expected_generation,
+    }))
+}
+
+#[cfg(unix)]
+fn parse_artifact_external_supervisor(
+    arguments: &[OsString],
+) -> Result<Option<ArtifactExternalSupervisorInvocationV1>, LocalProcessError> {
+    if arguments.first().map(OsString::as_os_str)
+        != Some(OsStr::new(
+            lifecycle::LOCAL_ARTIFACT_EXTERNAL_SUPERVISOR_MODE_V1,
+        ))
+    {
+        return Ok(None);
+    }
+    if arguments.len() != 13
+        || arguments[1].as_os_str() != OsStr::new("--config")
+        || arguments[3].as_os_str() != OsStr::new("--artifact-object-ref")
+        || arguments[5].as_os_str() != OsStr::new("--materialization-receipt-ref")
+        || arguments[7].as_os_str() != OsStr::new("--operation-id")
+        || arguments[9].as_os_str()
+            != OsStr::new(lifecycle::EXPECTED_CONFIG_COMMITMENT_OPTION)
+        || arguments[11].as_os_str() != OsStr::new(lifecycle::EXPECTED_GENERATION_OPTION)
+    {
+        return Err(LocalProcessError::LifecycleConfiguration);
+    }
+    let config = config::parse_managed_chat_supervisor_config(arguments[2].clone())?;
+    let request = external_deployment::parse_supervisor_request(
+        &config,
+        arguments[4].as_os_str(),
+        arguments[6].as_os_str(),
+        arguments[8].as_os_str(),
+    )?;
+    let expected_commitment = lifecycle::decode_config_commitment_hex(arguments[10].as_os_str())?;
+    let expected_generation = lifecycle::decode_generation_hex(arguments[12].as_os_str())?;
+    Ok(Some(ArtifactExternalSupervisorInvocationV1 {
+        config,
+        request,
         expected_commitment,
         expected_generation,
     }))

@@ -5,7 +5,11 @@
 //! delegated through typed owner seams; no frame bytes or filesystem handles
 //! are serialized here.
 
-use std::{ffi::OsString, io::Write, str::FromStr};
+use std::{
+    ffi::{OsStr, OsString},
+    io::Write,
+    str::FromStr,
+};
 
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -17,7 +21,8 @@ use paraegox_deployment::{
     DeveloperArtifactExternalControllerAuthorityRecheckFailureV1,
     DeveloperArtifactExternalControllerAuthorityV1, DeveloperArtifactExternalControllerFailureV1,
     DeveloperArtifactExternalControllerInvocationV1, DeveloperArtifactExternalControllerPhaseV1,
-    DeveloperArtifactExternalControllerProjectionV1, DeveloperArtifactExternalControllerV1,
+    DeveloperArtifactExternalControllerProjectionV1, DeveloperArtifactExternalControllerRequestV1,
+    DeveloperArtifactExternalControllerV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
     ArtifactExecutionBindingV1, artifact_execution_profile_commitment_v1,
@@ -35,6 +40,43 @@ use crate::{
 
 const OUTPUT_SCHEMA_VERSION: u16 = 1;
 const PROFILE: &str = "developer-local-echo-prefix-v1";
+
+#[cfg(unix)]
+pub(crate) fn parse_supervisor_request(
+    config: &config::LocalManagedChatConfigV1,
+    object_ref: &OsStr,
+    receipt_ref: &OsStr,
+    operation_id: &OsStr,
+) -> Result<DeveloperArtifactExternalControllerRequestV1, LocalProcessError> {
+    let object_ref = ArtifactObjectRefV1::from_str(
+        object_ref
+            .to_str()
+            .ok_or(LocalProcessError::ArtifactExternalDeployArtifact)?,
+    )
+    .map_err(|_| LocalProcessError::ArtifactExternalDeployArtifact)?;
+    let receipt_ref = MaterializationReceiptRefV1::from_str(
+        receipt_ref
+            .to_str()
+            .ok_or(LocalProcessError::ArtifactExternalDeployMaterializationReceipt)?,
+    )
+    .map_err(|_| LocalProcessError::ArtifactExternalDeployMaterializationReceipt)?;
+    let operation_id = config::ArtifactExternalDeploymentOperationIdInputV1::parse_hidden(
+        operation_id,
+    )?;
+    let operation_id = ArtifactDeploymentOperationIdV1::try_from_bytes(*operation_id.as_bytes())
+        .ok_or(LocalProcessError::ArtifactExternalDeployOwner)?;
+    let commitment = paraegox_artifact::ArtifactConfigCommitmentV1::try_from_bytes(
+        config.config_commitment(),
+    )
+    .map_err(|_| LocalProcessError::LifecycleConfiguration)?;
+    DeveloperArtifactExternalControllerRequestV1::try_new(
+        operation_id,
+        commitment,
+        object_ref,
+        receipt_ref,
+    )
+    .ok_or(LocalProcessError::ArtifactExternalDeployArtifact)
+}
 
 #[derive(Serialize)]
 struct DiagnosticJsonV1<'a> {
@@ -325,16 +367,18 @@ fn lower_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(unix)]
-struct RevalidatingExternalControllerAuthority {
+pub(crate) struct RevalidatingExternalControllerAuthority {
     config_path: PathBuf,
 }
 
 #[cfg(unix)]
 impl RevalidatingExternalControllerAuthority {
     fn new(config: &config::LocalArtifactStoreAuthorityConfigV1) -> Self {
-        Self {
-            config_path: config.source_path().to_path_buf(),
-        }
+        Self::from_path(config.source_path().to_path_buf())
+    }
+
+    pub(crate) const fn from_path(config_path: PathBuf) -> Self {
+        Self { config_path }
     }
 }
 
@@ -352,6 +396,65 @@ impl DeveloperArtifactExternalControllerAuthorityV1 for RevalidatingExternalCont
             config.state_root().to_path_buf(),
             config.config_commitment(),
         )
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn admit_under_lifecycle_owner(
+    config: &config::LocalManagedChatConfigV1,
+    request: &DeveloperArtifactExternalControllerRequestV1,
+) -> Result<(), LocalProcessError> {
+    let current = config::parse_artifact_store_authority_config(config.source_path())?;
+    if current.config_commitment().as_bytes() != &config.config_commitment()
+        || request.config_commitment() != current.config_commitment()
+    {
+        return Err(LocalProcessError::LifecycleConfiguration);
+    }
+    let mut authority = RevalidatingExternalControllerAuthority::new(&current);
+    let invocation =
+        DeveloperArtifactExternalControllerV1::admit_under_lifecycle_owner(&mut authority, request);
+    if invocation.changed() != Some(true) {
+        return Err(LocalProcessError::ArtifactExternalDeployOwner);
+    }
+    let projection = invocation
+        .into_result()
+        .map_err(map_controller_owner_failure)?;
+    if projection.phase() != DeveloperArtifactExternalControllerPhaseV1::Admitted
+        || projection.operation_id() != request.operation_id()
+        || projection.object_ref() != request.object_ref()
+        || projection.materialization_receipt_ref() != request.materialization_receipt_ref()
+    {
+        return Err(LocalProcessError::ArtifactExternalDeployOwner);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn map_controller_owner_failure(
+    failure: DeveloperArtifactExternalControllerFailureV1,
+) -> LocalProcessError {
+    match failure {
+        DeveloperArtifactExternalControllerFailureV1::UnsafePath => {
+            LocalProcessError::Configuration(config::ConfigError::InvalidStateRoot)
+        }
+        DeveloperArtifactExternalControllerFailureV1::ConfigurationMismatch => {
+            LocalProcessError::LifecycleConfiguration
+        }
+        DeveloperArtifactExternalControllerFailureV1::Conflict => {
+            LocalProcessError::ArtifactExternalDeployConflict
+        }
+        DeveloperArtifactExternalControllerFailureV1::ReplaceRequired => {
+            LocalProcessError::ArtifactExternalDeployReplaceRequired
+        }
+        DeveloperArtifactExternalControllerFailureV1::Contended
+        | DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(_) => {
+            LocalProcessError::ArtifactExternalDeployUncertain
+        }
+        DeveloperArtifactExternalControllerFailureV1::NotFound
+        | DeveloperArtifactExternalControllerFailureV1::Owner
+        | DeveloperArtifactExternalControllerFailureV1::Io => {
+            LocalProcessError::ArtifactExternalDeployOwner
+        }
     }
 }
 

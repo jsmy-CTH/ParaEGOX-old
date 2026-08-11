@@ -19,6 +19,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use nix::unistd::{Gid, Uid, chown, setsid};
+use paraegox_deployment::DeveloperArtifactExternalControllerRequestV1;
 use paraegox_inspection::developer_local::{
     DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_HEADER_BYTES,
     MAX_DEVELOPER_LOCAL_INSPECTION_BOOTSTRAP_V2_BYTES,
@@ -32,8 +33,9 @@ use tokio::time::{Instant, sleep, timeout};
 use zeroize::Zeroizing;
 
 use crate::composition::{
-    HeadlessLifecycleControlV1, PreparedHeadlessChatV1, VerifiedLocalDeploymentProjectionV1,
-    prepare_headless_chat, run_prepared_headless_chat,
+    HeadlessLifecycleControlV1, PreparedArtifactExternalOwnerV1, PreparedHeadlessChatV1,
+    VerifiedLocalDeploymentProjectionV1, prepare_artifact_external_owner, prepare_headless_chat,
+    run_prepared_artifact_external_owner, run_prepared_headless_chat,
 };
 use crate::config::{LocalLifecycleActionV1, LocalManagedChatConfigV1};
 use crate::error::LocalProcessError;
@@ -43,6 +45,8 @@ use crate::receipt_snapshot::{
 };
 
 pub(crate) const LOCAL_CHAT_SUPERVISOR_MODE_V1: &str = "__local-chat-supervisor-v1";
+pub(crate) const LOCAL_ARTIFACT_EXTERNAL_SUPERVISOR_MODE_V1: &str =
+    "__local-artifact-external-supervisor-v1";
 pub(crate) const EXPECTED_CONFIG_COMMITMENT_OPTION: &str = "--expected-config-commitment";
 pub(crate) const EXPECTED_GENERATION_OPTION: &str = "--expected-generation";
 pub(crate) const LOCAL_CHAT_SUPERVISOR_CONTENTION_EXIT_CODE_V1: u8 = 3;
@@ -51,6 +55,14 @@ pub(crate) const LOCAL_CHAT_SUPERVISOR_CONTENTION_EXIT_CODE_V1: u8 = 3;
 pub(crate) enum LocalChatSupervisorResultV1 {
     Completed,
     Contended,
+}
+
+enum PreparedLifecycleOwnerV1 {
+    Chat(PreparedHeadlessChatV1),
+    ArtifactExternal {
+        prepared: PreparedArtifactExternalOwnerV1,
+        request: DeveloperArtifactExternalControllerRequestV1,
+    },
 }
 
 const OPERATOR_DIRECTORY: &str = "operator-v1";
@@ -1183,7 +1195,37 @@ pub(crate) fn run_supervisor(
         .enable_all()
         .build()
         .map_err(|_| LocalProcessError::LifecycleStartup)?;
-    runtime.block_on(run_supervisor_async(config, prepared, expected_generation))
+    runtime.block_on(run_supervisor_async(
+        config,
+        PreparedLifecycleOwnerV1::Chat(prepared),
+        expected_generation,
+    ))
+}
+
+pub(crate) fn run_artifact_external_supervisor(
+    config: LocalManagedChatConfigV1,
+    request: DeveloperArtifactExternalControllerRequestV1,
+    expected_config_commitment: [u8; 32],
+    expected_generation: [u8; 16],
+) -> Result<LocalChatSupervisorResultV1, LocalProcessError> {
+    validate_execution_identity()?;
+    if config.config_commitment() != expected_config_commitment
+        || request.config_commitment().as_bytes() != &expected_config_commitment
+        || expected_generation.iter().all(|byte| *byte == 0)
+    {
+        return Err(LocalProcessError::LifecycleConfiguration);
+    }
+    let prepared = prepare_artifact_external_owner(config.clone(), request)?;
+    setsid().map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    runtime.block_on(run_supervisor_async(
+        config,
+        PreparedLifecycleOwnerV1::ArtifactExternal { prepared, request },
+        expected_generation,
+    ))
 }
 
 /// Builds a fail-closed public projection after an operation-level failure.
@@ -1253,7 +1295,7 @@ fn live_owner_transition_in_progress(
 
 async fn run_supervisor_async(
     config: LocalManagedChatConfigV1,
-    prepared: PreparedHeadlessChatV1,
+    prepared: PreparedLifecycleOwnerV1,
     expected_generation: [u8; 16],
 ) -> Result<LocalChatSupervisorResultV1, LocalProcessError> {
     let canonical_state_root = ensure_private_state_root(config.state_root())?;
@@ -1277,6 +1319,9 @@ async fn run_supervisor_async(
         if record.state != LocalLifecycleStateV1::Stopped {
             return Err(LocalProcessError::LifecycleReconcileRequired);
         }
+    }
+    if let PreparedLifecycleOwnerV1::ArtifactExternal { request, .. } = &prepared {
+        crate::external_deployment::admit_under_lifecycle_owner(&config, request)?;
     }
     remove_terminal_stale_socket(&paths.socket)?;
     let standard_listener = std::os::unix::net::UnixListener::bind(&paths.socket)
@@ -1401,7 +1446,7 @@ async fn wait_for_thread_exit(
 }
 
 fn spawn_composition(
-    prepared: PreparedHeadlessChatV1,
+    prepared: PreparedLifecycleOwnerV1,
     events: UnboundedSender<SupervisorEventV1>,
     shutdown: Receiver<()>,
     generation: [u8; 16],
@@ -1417,7 +1462,18 @@ fn spawn_composition(
                 generation,
                 config_commitment,
             };
-            let result = run_prepared_headless_chat(prepared, &mut control);
+            let result = match prepared {
+                PreparedLifecycleOwnerV1::Chat(prepared) => {
+                    run_prepared_headless_chat(prepared, &mut control)
+                }
+                PreparedLifecycleOwnerV1::ArtifactExternal { prepared, .. } => {
+                    run_prepared_artifact_external_owner(
+                        prepared,
+                        generation,
+                        &mut control,
+                    )
+                }
+            };
             let _ = events.send(SupervisorEventV1::Exited(result));
             result
         })

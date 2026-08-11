@@ -22,6 +22,8 @@ use nix::unistd::{Gid, Pid, Uid};
 use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSessionId};
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
 use paraegox_deployment::{
+    DeveloperArtifactExternalControllerRequestV1,
+    DeveloperArtifactExternalModelAgentStackInputV1,
     DeveloperDeploymentAgentBootstrapStartFieldsV1, DeveloperDeploymentAgentBootstrapStartInputV1,
     DeveloperDeploymentAgentBootstrapStartOutcomeV1, DeveloperDeploymentEnrollmentFactsFieldsV1,
     DeveloperDeploymentEnrollmentFactsV1, DeveloperDeploymentOwnerV1,
@@ -38,6 +40,7 @@ use paraegox_deployment::{
     DeveloperProvisionedAgentStackInputV1, DeveloperProvisionedModelAgentStackInputV1,
     complete_developer_fixture_distributed_agent_stack_v1,
     prepare_developer_fixture_distributed_agent_stack_v1,
+    run_developer_artifact_external_model_agent_stack_v1,
     run_developer_fixture_model_agent_stack_v1, run_developer_provisioned_model_agent_stack_v1,
     start_developer_deployment_agent_bootstrap_v1, start_developer_deployment_v1,
 };
@@ -96,7 +99,8 @@ use paraegox_runtime::{
     RuntimeFabricCredentialRequirementV1, RuntimeFabricCredentialResolveErrorV2,
     RuntimeFabricCredentialResolverV2, RuntimeModelBackendResolveError,
     RuntimeModelBackendResolverV1, RuntimeResolvedAgentProviderV1,
-    RuntimeResolvedFabricPeerCredentialV2, RuntimeResolvedModelBackendV1,
+    RuntimeResolvedArtifactModelBackendV1, RuntimeResolvedFabricPeerCredentialV2,
+    RuntimeResolvedModelBackendV1,
     start_runtime_agent_developer_local_ipc_v1, start_runtime_developer_local_v1,
 };
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
@@ -113,8 +117,8 @@ use paraegox_runtime_contracts::managed_agent_stack_plan::{
 };
 use paraegox_runtime_contracts::managed_fabric_plan::ManagedFabricListenEndpointV1;
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
-    ManagedModelAdapterBindingV1, ManagedModelAdapterVersionV1, ManagedModelCapabilityIdV1,
-    ManagedModelServicePlanV1,
+    ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelAdapterBindingV1,
+    ManagedModelAdapterVersionV1, ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
 };
 use paraegox_runtime_contracts::managed_service::{
     ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
@@ -141,8 +145,9 @@ use crate::config::{
     DeveloperDeploymentConfigV1, DeveloperDeploymentResolvedPartsV1,
     DeveloperDistributedFixtureConfigV1, DeveloperDistributedTargetConfigV1,
     DeveloperFixtureConfigV1, DeveloperLocalProfileV1, DeveloperNodeConfigSchemaV1,
-    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1, LocalManagedChatOwnerConfigV1,
-    ProviderProfileV1, ProvisionedProviderConfigV1, ProvisionedSecretRefV1,
+    DeveloperNodeConfigV1, DeveloperProvisionedConfigV1, LocalManagedChatConfigV1,
+    LocalManagedChatOwnerConfigV1, ProviderProfileV1, ProvisionedProviderConfigV1,
+    ProvisionedSecretRefV1,
 };
 use crate::error::LocalProcessError;
 use crate::inspection::{
@@ -241,6 +246,16 @@ pub(crate) fn run(config: DeveloperFixtureConfigV1) -> Result<(), LocalProcessEr
 /// second time after it begins making process or durable-state effects.
 pub(crate) struct PreparedHeadlessChatV1 {
     owner: PreparedHeadlessChatOwnerV1,
+    peer: DeveloperLocalPeerIdentityV1,
+}
+
+/// Single-use inputs for one already-admitted external Artifact resident.
+/// Construction is read-only: identity/layout/owner effects remain strictly
+/// after the lifecycle owner has durably published the matching top-store A.
+pub(crate) struct PreparedArtifactExternalOwnerV1 {
+    config: DeveloperFixtureConfigV1,
+    config_path: PathBuf,
+    request: DeveloperArtifactExternalControllerRequestV1,
     peer: DeveloperLocalPeerIdentityV1,
 }
 
@@ -375,6 +390,28 @@ fn prepare_headless_chat_with_environment(
     Ok(PreparedHeadlessChatV1 { owner, peer })
 }
 
+pub(crate) fn prepare_artifact_external_owner(
+    config: LocalManagedChatConfigV1,
+    request: DeveloperArtifactExternalControllerRequestV1,
+) -> Result<PreparedArtifactExternalOwnerV1, LocalProcessError> {
+    if request.config_commitment().as_bytes() != &config.config_commitment() {
+        return Err(LocalProcessError::LifecycleConfiguration);
+    }
+    let config_path = config.source_path().to_path_buf();
+    let config = match config.into_owner_config() {
+        LocalManagedChatOwnerConfigV1::Fixture(config) => config,
+        LocalManagedChatOwnerConfigV1::Provisioned(_) => {
+            return Err(LocalProcessError::ArtifactExternalDeployArtifact);
+        }
+    };
+    Ok(PreparedArtifactExternalOwnerV1 {
+        config,
+        config_path,
+        request,
+        peer: current_developer_local_peer()?,
+    })
+}
+
 /// Runs the same admitted chat owner graph without spawning the Textual
 /// console. The supplied control remains the only owner of process lifecycle:
 /// readiness is reported only after both local IPC endpoints are live, and a
@@ -391,6 +428,113 @@ pub(crate) fn run_prepared_headless_chat(
             run_provisioned_with_runner_and_key(*config, api_key, peer, &mut runner)
         }
     }
+}
+
+/// Runs one already-admitted external Artifact generation. The caller owns
+/// the lifecycle lock and top authority; this function starts lower owners,
+/// reaches a correlated ActiveReady terminal, publishes conversation/Receipt
+/// endpoints, waits for shutdown, then performs the existing joined cleanup.
+pub(crate) fn run_prepared_artifact_external_owner(
+    prepared: PreparedArtifactExternalOwnerV1,
+    lifecycle_generation: [u8; 16],
+    control: &mut impl HeadlessLifecycleControlV1,
+) -> Result<(), LocalProcessError> {
+    let PreparedArtifactExternalOwnerV1 {
+        config,
+        config_path,
+        request,
+        peer,
+    } = prepared;
+    let mut authority =
+        crate::external_deployment::RevalidatingExternalControllerAuthority::from_path(
+            config_path.clone(),
+        );
+    let manifest =
+        identity::load_or_create(&config).map_err(|_| LocalProcessError::IdentityManifest)?;
+    let mut provider = prepare_fixture_provider(&manifest)?;
+    provider.model_backend_resolver = Arc::new(LocalArtifactModelResolverV1 {
+        compiled: Arc::clone(&provider.model_backend_resolver),
+        config_path,
+    });
+    let layout =
+        layout::prepare(&config, &manifest).map_err(|_| LocalProcessError::LayoutPreparation)?;
+    let mut stack = start_running_stack(
+        CompositionConfigRef::Fixture(&config),
+        &manifest,
+        &layout,
+        provider,
+        peer,
+    )?;
+    let activation = (|| {
+        let input = DeveloperArtifactExternalModelAgentStackInputV1::try_new(
+            stack.deployment_input(LocalProcessError::DeploymentActivation)?,
+            request,
+            lifecycle_generation,
+        )
+        .map_err(|_| LocalProcessError::DeploymentActivation)?;
+        run_developer_artifact_external_model_agent_stack_v1(input, &mut authority)
+            .map_err(|_| LocalProcessError::DeploymentActivation)
+    })();
+    let outcome = match activation {
+        Ok(outcome) => outcome,
+        Err(primary) => {
+            let cleanup = stack.cleanup();
+            return Err::<(), LocalProcessError>(primary).and(cleanup);
+        }
+    };
+    let runtime_ready = stack.runtime().ready();
+    let request_digest = outcome
+        .projection()
+        .runtime_apply_request_digest()
+        .ok_or(LocalProcessError::DeploymentActivation)?;
+    let terminal_digest = outcome
+        .projection()
+        .runtime_terminal_receipt_digest()
+        .ok_or(LocalProcessError::DeploymentActivation)?;
+    let receipt_activation = LocalReceiptActivationInputV1::try_new(
+        outcome
+            .model_agent_terminal_receipt()
+            .to_vec()
+            .into_boxed_slice(),
+        request_digest.into_bytes(),
+        terminal_digest.into_bytes(),
+        runtime_ready.target(),
+        runtime_ready.runtime_store_instance_id(),
+        runtime_ready.runtime_response_key_ref(),
+        runtime_ready.runtime_response_public_key(),
+    )?;
+    let conversation_result = (|| {
+        let handle = stack
+            .runtime()
+            .claim_model_agent_handle(outcome.model_agent_terminal_receipt())
+            .map_err(|_| LocalProcessError::ConversationCapability)?;
+        let bounds = LocalConversationBounds::try_new(
+            AgentConversationDeckRunId::try_from_bytes(*manifest.deck_run_id())
+                .map_err(|_| LocalProcessError::ConversationConfiguration)?,
+            AgentConversationSessionId::try_from_bytes(*manifest.session_id())
+                .map_err(|_| LocalProcessError::ConversationConfiguration)?,
+            config.profile().request_deadline_budget(),
+            config.profile().command_capacity(),
+            config.profile().operation_timeout(),
+        )?;
+        HeadlessConversationRunner { control }.run(ConversationRunInput {
+            handle,
+            config: bounds,
+            ipc_socket_path: layout.agent_ipc_socket_path().to_path_buf(),
+            ipc_bootstrap_path: layout.agent_ipc_bootstrap_path().to_path_buf(),
+            inspection: None,
+            receipt: Some(ConversationReceiptInput {
+                activation: receipt_activation,
+                ipc_socket_path: layout.receipt_ipc_socket_path().to_path_buf(),
+                ipc_bootstrap_path: layout.receipt_ipc_bootstrap_path().to_path_buf(),
+            }),
+            local_deployment_projection: None,
+            expected_uid: Uid::effective().as_raw(),
+            expected_gid: Gid::effective().as_raw(),
+        })
+    })();
+    let cleanup = stack.cleanup();
+    conversation_result.and(cleanup)
 }
 
 /// Runs the public, single-owner DeploymentController composition. The
@@ -1431,65 +1575,7 @@ fn run_prepared(
     peer: DeveloperLocalPeerIdentityV1,
     runner: &mut impl ConversationRunner,
 ) -> Result<(), LocalProcessError> {
-    let identities = derive_identities(&manifest)?;
-    let controller_verification_key = signing_verification_key(manifest.controller_signing_seed());
-    let authority_verification_key = signing_verification_key(manifest.authority_signing_seed());
-
-    let authority_config = DeveloperLocalTenureAuthorityConfigV1::try_new(
-        layout.authority_state_directory().to_path_buf(),
-        layout.authority_socket_path().to_path_buf(),
-        authority_identities(identities),
-        Zeroizing::new(*manifest.authority_signing_seed()),
-        controller_verification_key,
-        None,
-        peer,
-    )
-    .map_err(|_| LocalProcessError::AuthorityStartup)?;
-    let authority = DeveloperLocalTenureAuthorityV1::start(authority_config)
-        .map_err(|_| LocalProcessError::AuthorityStartup)?;
-    let mut owners = RunningOwners::new(authority);
-
-    let runtime_identity = runtime_developer_local_identity(
-        identities,
-        controller_verification_key,
-        authority_verification_key,
-        Zeroizing::new(*manifest.runtime_signing_seed()),
-    )?;
-    let CompositionProvider {
-        deployment: deployment_provider,
-        adapter_descriptor,
-        agent_resolver,
-        model_backend_resolver,
-    } = provider;
-    let runtime_config = RuntimeDeveloperLocalConfigV1::try_new_with_agent_and_model_resolvers(
-        layout.runtime_state_directory().to_path_buf(),
-        layout.runtime_socket_path().to_path_buf(),
-        runtime_identity,
-        agent_resolver,
-        model_backend_resolver,
-    )
-    .map_err(|_| LocalProcessError::RuntimeStartup)?;
-    owners.runtime_a = Some(
-        start_runtime_developer_local_v1(runtime_config)
-            .map_err(|_| LocalProcessError::RuntimeStartup)?,
-    );
-    let (node_bootstrap, node_status) = prepare_developer_local_node_v1(&layout, identities)?;
-    owners.node_a = Some(RunningNodeDaemon::start(
-        layout.pxnb_bootstrap_path(),
-        &node_bootstrap,
-        node_status,
-    )?);
-
-    let mut stack = RunningStack {
-        config,
-        manifest: &manifest,
-        layout: &layout,
-        identities,
-        authority_verification_key,
-        deployment_provider,
-        adapter_descriptor,
-        owners: Some(owners),
-    };
+    let mut stack = start_running_stack(config, &manifest, &layout, provider, peer)?;
     let deployment = match stack.activate() {
         Ok(deployment) => deployment,
         Err(primary) => {
@@ -1562,6 +1648,71 @@ fn run_prepared(
     })();
     let cleanup_result = stack.cleanup();
     conversation_result.and(cleanup_result)
+}
+
+fn start_running_stack<'a>(
+    config: CompositionConfigRef<'a>,
+    manifest: &'a identity::IdentityManifestV1,
+    layout: &'a layout::DeveloperLocalLayoutV1,
+    provider: CompositionProvider,
+    peer: DeveloperLocalPeerIdentityV1,
+) -> Result<RunningStack<'a>, LocalProcessError> {
+    let identities = derive_identities(manifest)?;
+    let controller_verification_key = signing_verification_key(manifest.controller_signing_seed());
+    let authority_verification_key = signing_verification_key(manifest.authority_signing_seed());
+    let authority_config = DeveloperLocalTenureAuthorityConfigV1::try_new(
+        layout.authority_state_directory().to_path_buf(),
+        layout.authority_socket_path().to_path_buf(),
+        authority_identities(identities),
+        Zeroizing::new(*manifest.authority_signing_seed()),
+        controller_verification_key,
+        None,
+        peer,
+    )
+    .map_err(|_| LocalProcessError::AuthorityStartup)?;
+    let authority = DeveloperLocalTenureAuthorityV1::start(authority_config)
+        .map_err(|_| LocalProcessError::AuthorityStartup)?;
+    let mut owners = RunningOwners::new(authority);
+    let runtime_identity = runtime_developer_local_identity(
+        identities,
+        controller_verification_key,
+        authority_verification_key,
+        Zeroizing::new(*manifest.runtime_signing_seed()),
+    )?;
+    let CompositionProvider {
+        deployment: deployment_provider,
+        adapter_descriptor,
+        agent_resolver,
+        model_backend_resolver,
+    } = provider;
+    let runtime_config = RuntimeDeveloperLocalConfigV1::try_new_with_agent_and_model_resolvers(
+        layout.runtime_state_directory().to_path_buf(),
+        layout.runtime_socket_path().to_path_buf(),
+        runtime_identity,
+        agent_resolver,
+        model_backend_resolver,
+    )
+    .map_err(|_| LocalProcessError::RuntimeStartup)?;
+    owners.runtime_a = Some(
+        start_runtime_developer_local_v1(runtime_config)
+            .map_err(|_| LocalProcessError::RuntimeStartup)?,
+    );
+    let (node_bootstrap, node_status) = prepare_developer_local_node_v1(layout, identities)?;
+    owners.node_a = Some(RunningNodeDaemon::start(
+        layout.pxnb_bootstrap_path(),
+        &node_bootstrap,
+        node_status,
+    )?);
+    Ok(RunningStack {
+        config,
+        manifest,
+        layout,
+        identities,
+        authority_verification_key,
+        deployment_provider,
+        adapter_descriptor,
+        owners: Some(owners),
+    })
 }
 
 fn runtime_developer_local_identity(
@@ -2090,6 +2241,11 @@ struct LocalModelResolver {
     adapter_selection: ModelAdapterSelectionV1,
 }
 
+struct LocalArtifactModelResolverV1 {
+    compiled: Arc<dyn RuntimeModelBackendResolverV1>,
+    config_path: PathBuf,
+}
+
 #[derive(Clone)]
 struct DeveloperDistributedFabricCredentialResolverV2 {
     peer_runtime_host: RuntimeHostId,
@@ -2209,6 +2365,32 @@ impl paraegox_runtime::RuntimeModelBackendResolverV1 for LocalModelResolver {
             .resolve(adapter_selection)
             .map_err(|_| RuntimeModelBackendResolveError::ResolutionFailed)?;
         Ok(RuntimeResolvedModelBackendV1::from_shared(*plan, backend))
+    }
+}
+
+impl RuntimeModelBackendResolverV1 for LocalArtifactModelResolverV1 {
+    fn resolve(
+        &self,
+        plan: &ManagedModelServicePlanV1,
+    ) -> Result<RuntimeResolvedModelBackendV1, RuntimeModelBackendResolveError> {
+        self.compiled.resolve(plan)
+    }
+
+    fn resolve_artifact(
+        &self,
+        execution: &ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    ) -> Result<RuntimeResolvedArtifactModelBackendV1, RuntimeModelBackendResolveError> {
+        let binding = execution.binding();
+        let materialization = crate::artifact::read_verified_materialization_for_deployment(
+            &self.config_path,
+            binding.object_ref(),
+            binding.materialization_receipt_ref(),
+        )
+        .map_err(|_| RuntimeModelBackendResolveError::ResolutionFailed)?;
+        Ok(RuntimeResolvedArtifactModelBackendV1::new(
+            execution.clone(),
+            materialization,
+        ))
     }
 }
 
