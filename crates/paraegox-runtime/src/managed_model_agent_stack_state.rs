@@ -46,6 +46,15 @@ const MAX_TERMINALS: usize = 256;
 const MAX_REPLAY_ENTRIES: usize = 256;
 pub(crate) const MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
+const _: fn() = artifact_snapshot_v2_compile_time_anchor;
+
+fn artifact_snapshot_v2_compile_time_anchor() {
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::decode;
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::validate_successor;
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::sequence;
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::canonical_wire;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum ManagedModelAgentStackDurablePhase {
@@ -887,10 +896,8 @@ impl ArtifactManagedModelAgentStackSnapshotV2 {
         frame[147] = u8::from(self.fabric_to_agent_dependency_ready);
         frame[148] = u8::from(self.model_to_agent_dependency_ready);
         frame[168..172].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        let checksum = artifact_snapshot_checksum(
-            &frame[..SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES],
-            &payload,
-        );
+        let checksum =
+            artifact_snapshot_checksum(&frame[..SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES], &payload);
         frame[176..208].copy_from_slice(checksum.as_bytes());
         frame.extend_from_slice(&payload);
         Ok(frame)
@@ -903,9 +910,11 @@ impl ArtifactManagedModelAgentStackSnapshotV2 {
         if next.store_instance_id != self.store_instance_id
             || next.owner_target_fingerprint != self.owner_target_fingerprint
             || next.transition_projection_digest != self.transition_projection_digest
-            || next.sequence != self.sequence.checked_add(1).ok_or(
-                ManagedModelAgentStackStateError::SequenceOverflow,
-            )?
+            || next.sequence
+                != self
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(ManagedModelAgentStackStateError::SequenceOverflow)?
             || next.runtime_host_epoch < self.runtime_host_epoch
             || next.fabric_generation_high_water < self.fabric_generation_high_water
             || next.model_generation_high_water < self.model_generation_high_water
@@ -1263,8 +1272,7 @@ fn validate_artifact_terminals(
             || state
                 .agent_generation()
                 .is_some_and(|generation| generation.value() > snapshot.agent_generation_high_water)
-            || evidence.resource_census_digest
-                != artifact_resource_census_digest(state, evidence)?
+            || evidence.resource_census_digest != artifact_resource_census_digest(state, evidence)?
         {
             return Err(ManagedModelAgentStackStateError::InvalidState);
         }
@@ -1524,26 +1532,47 @@ fn validate_artifact_terminal_variant(
         || evidence.raw_outcome_digest
             != artifact_raw_outcome_digest(raw_code, raw_context, terminal.request_digest)?
         || outer_matches_terminal
-            && (state.fabric_generation().map(ManagedServiceGeneration::value)
+            && (state
+                .fabric_generation()
+                .map(ManagedServiceGeneration::value)
                 != snapshot
                     .pending
                     .as_ref()
                     .and_then(|pending| pending.fabric_generation)
-                    .or_else(|| snapshot.active.as_ref().map(|active| active.fabric_generation))
+                    .or_else(|| {
+                        snapshot
+                            .active
+                            .as_ref()
+                            .map(|active| active.fabric_generation)
+                    })
                     .map(ManagedServiceGeneration::value)
-                || state.model_generation().map(ManagedServiceGeneration::value)
+                || state
+                    .model_generation()
+                    .map(ManagedServiceGeneration::value)
                     != snapshot
                         .pending
                         .as_ref()
                         .and_then(|pending| pending.model_generation)
-                        .or_else(|| snapshot.active.as_ref().map(|active| active.model_generation))
+                        .or_else(|| {
+                            snapshot
+                                .active
+                                .as_ref()
+                                .map(|active| active.model_generation)
+                        })
                         .map(ManagedServiceGeneration::value)
-                || state.agent_generation().map(ManagedServiceGeneration::value)
+                || state
+                    .agent_generation()
+                    .map(ManagedServiceGeneration::value)
                     != snapshot
                         .pending
                         .as_ref()
                         .and_then(|pending| pending.agent_generation)
-                        .or_else(|| snapshot.active.as_ref().map(|active| active.agent_generation))
+                        .or_else(|| {
+                            snapshot
+                                .active
+                                .as_ref()
+                                .map(|active| active.agent_generation)
+                        })
                         .map(ManagedServiceGeneration::value)
                 || evidence.physical_binding_census != snapshot.physical_binding_census
                 || evidence.census_complete != snapshot.census_complete
@@ -1572,20 +1601,28 @@ fn artifact_resource_census_digest(
         .and_then(|builder| builder.field_u16(u16::from(evidence.fabric_ready)))
         .and_then(|builder| builder.field_u16(u16::from(evidence.model_ready)))
         .and_then(|builder| builder.field_u16(u16::from(evidence.agent_ready)))
+        .and_then(|builder| builder.field_u16(u16::from(evidence.fabric_to_agent_dependency_ready)))
+        .and_then(|builder| builder.field_u16(u16::from(evidence.model_to_agent_dependency_ready)))
         .and_then(|builder| {
-            builder.field_u16(u16::from(evidence.fabric_to_agent_dependency_ready))
+            builder.field_u64(
+                state
+                    .fabric_generation()
+                    .map_or(0, ManagedServiceGeneration::value),
+            )
         })
         .and_then(|builder| {
-            builder.field_u16(u16::from(evidence.model_to_agent_dependency_ready))
+            builder.field_u64(
+                state
+                    .model_generation()
+                    .map_or(0, ManagedServiceGeneration::value),
+            )
         })
         .and_then(|builder| {
-            builder.field_u64(state.fabric_generation().map_or(0, ManagedServiceGeneration::value))
-        })
-        .and_then(|builder| {
-            builder.field_u64(state.model_generation().map_or(0, ManagedServiceGeneration::value))
-        })
-        .and_then(|builder| {
-            builder.field_u64(state.agent_generation().map_or(0, ManagedServiceGeneration::value))
+            builder.field_u64(
+                state
+                    .agent_generation()
+                    .map_or(0, ManagedServiceGeneration::value),
+            )
         })
         .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
     Ok(builder.finish())
@@ -1944,9 +1981,8 @@ fn decode_artifact_terminals(
         let source_scope = SourceScopeRef::from_bytes(cursor.array()?);
         let operation_id = ApplyOperationId::from_bytes(cursor.array()?);
         let request_digest = cursor.digest()?;
-        let request_wire = cursor.bounded(
-            MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
-        )?;
+        let request_wire =
+            cursor.bounded(MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES)?;
         let receipt_wire = cursor.bounded(MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES)?;
         let terminal_bytes = 16_usize
             .checked_add(16)
@@ -2687,9 +2723,7 @@ mod tests {
                 11,
             ),
             (
-                include_str!(
-                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_active_ready.hex"
-                ),
+                include_str!("../../../tests/fixtures/wire/artifact_f0_pxma_v2_active_ready.hex"),
                 ManagedModelAgentStackDurablePhase::ActiveReady,
                 12,
             ),
@@ -2745,21 +2779,25 @@ mod tests {
                 .validate_successor(&pair[1])
                 .unwrap_or_else(|error| panic!("shared PXMA2 successor rejected: {error}"));
         }
-        assert_eq!(decoded[1].pending.as_ref().map(|pending| pending.kind), Some(
-            ArtifactManagedModelAgentStackPendingKindV2::ActivateArtifactV12
-        ));
-        assert_eq!(decoded[4].pending.as_ref().map(|pending| pending.kind), Some(
-            ArtifactManagedModelAgentStackPendingKindV2::RetireCurrentArtifactV12
-        ));
+        assert_eq!(
+            decoded[1].pending.as_ref().map(|pending| pending.kind),
+            Some(ArtifactManagedModelAgentStackPendingKindV2::ActivateArtifactV12)
+        );
+        assert_eq!(
+            decoded[4].pending.as_ref().map(|pending| pending.kind),
+            Some(ArtifactManagedModelAgentStackPendingKindV2::RetireCurrentArtifactV12)
+        );
     }
 
     #[test]
     fn artifact_snapshot_v2_failure_branches_are_exact_successors() {
         let model_intent = ArtifactManagedModelAgentStackSnapshotV2::decode(
-            &decode_hex(include_str!(
-                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_activate.hex"
-            )
-            .trim_end()),
+            &decode_hex(
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_activate.hex"
+                )
+                .trim_end(),
+            ),
             STORE,
             OWNER,
             PROJECTION_DIGEST,
@@ -2805,10 +2843,12 @@ mod tests {
         }
 
         let agent_intent = ArtifactManagedModelAgentStackSnapshotV2::decode(
-            &decode_hex(include_str!(
-                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_agent_start.hex"
-            )
-            .trim_end()),
+            &decode_hex(
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_agent_start.hex"
+                )
+                .trim_end(),
+            ),
             STORE,
             OWNER,
             PROJECTION_DIGEST,
@@ -2826,11 +2866,13 @@ mod tests {
             &projection(),
         )
         .expect("shared agent quarantine");
-        assert!(agent_quarantine
-            .pending
-            .as_ref()
-            .and_then(|pending| pending.agent_generation)
-            .is_some());
+        assert!(
+            agent_quarantine
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.agent_generation)
+                .is_some()
+        );
         agent_intent
             .validate_successor(&agent_quarantine)
             .expect("agent-intent quarantine successor");
@@ -2849,10 +2891,10 @@ mod tests {
             ),
             Err(ManagedModelAgentStackStateError::UnsupportedFrame),
         );
-        let pending = decode_hex(include_str!(
-            "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_activate.hex"
-        )
-        .trim_end());
+        let pending = decode_hex(
+            include_str!("../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_activate.hex")
+                .trim_end(),
+        );
         assert_eq!(
             ManagedModelAgentStackSnapshot::decode(
                 &pending,
