@@ -589,9 +589,7 @@ fn open_directory_at(
     .map_err(|error| {
         if matches!(
             error,
-            nix::errno::Errno::ENOENT
-                | nix::errno::Errno::ELOOP
-                | nix::errno::Errno::ENOTDIR
+            nix::errno::Errno::ENOENT | nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR
         ) {
             StoreError::Owner
         } else {
@@ -651,12 +649,10 @@ fn open_state_parent(path: &Path) -> Result<(DirectoryHandle, OsString), StoreEr
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         )
-        .map_err(|error| {
-            match error {
-                nix::errno::Errno::ENOENT => StoreError::NotFound,
-                nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => StoreError::UnsafePath,
-                _ => StoreError::Io,
-            }
+        .map_err(|error| match error {
+            nix::errno::Errno::ENOENT => StoreError::NotFound,
+            nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => StoreError::UnsafePath,
+            _ => StoreError::Io,
         })?;
         let next = directory_from_owned(owned, owner_uid, owner_gid, false)?;
         drop(current);
@@ -751,9 +747,7 @@ fn open_regular_at(
     .map_err(|error| {
         if matches!(
             error,
-            nix::errno::Errno::ENOENT
-                | nix::errno::Errno::ELOOP
-                | nix::errno::Errno::ENOTDIR
+            nix::errno::Errno::ENOENT | nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR
         ) {
             StoreError::Owner
         } else {
@@ -829,8 +823,7 @@ fn acquire_lock(
         TryLockError::WouldBlock => StoreError::Contended,
         TryLockError::Error(_) => StoreError::Io,
     })?;
-    if let Err(error) =
-        validate_named_regular(root, OsStr::new(STORE_LOCK_NAME), identity, Some(0))
+    if let Err(error) = validate_named_regular(root, OsStr::new(STORE_LOCK_NAME), identity, Some(0))
     {
         let _ = lock.unlock();
         drop(lock);
@@ -1115,20 +1108,14 @@ fn open_final_locked(
         if !has_final || has_staging {
             return Err(StoreError::Owner);
         }
-        let public_root = reopen_named_directory(
-            &state_root.leaf,
-            OsStr::new(STORE_ROOT_NAME),
-            root.identity,
-        )?;
+        let public_root =
+            reopen_named_directory(&state_root.leaf, OsStr::new(STORE_ROOT_NAME), root.identity)?;
         let public_names = scan_names(&public_root)?;
         if public_names != stable && public_names != with_next {
             return Err(StoreError::Owner);
         }
-        let public_objects = reopen_named_directory(
-            &public_root,
-            OsStr::new(OBJECTS_NAME),
-            objects.identity,
-        )?;
+        let public_objects =
+            reopen_named_directory(&public_root, OsStr::new(OBJECTS_NAME), objects.identity)?;
         validate_named_regular(
             &public_root,
             OsStr::new(STORE_LOCK_NAME),
@@ -1827,8 +1814,7 @@ fn publish_initial_staging(
             snapshot_identity,
             Some(u64::try_from(snapshot_bytes.len()).map_err(|_| StoreError::Owner)?),
         )?;
-        let objects =
-            reopen_named_directory(&staging, OsStr::new(OBJECTS_NAME), objects_identity)?;
+        let objects = reopen_named_directory(&staging, OsStr::new(OBJECTS_NAME), objects_identity)?;
         exact_names(&objects, &[])?;
         staging.file.sync_all().map_err(|_| StoreError::Io)?;
         state_root
@@ -1887,10 +1873,7 @@ fn publish_initial_staging(
             OsStr::new(STORE_ROOT_NAME),
             staging_identity,
         )?;
-        exact_names(
-            &root,
-            &[STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME],
-        )?;
+        exact_names(&root, &[STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME])?;
         validate_named_regular(&root, OsStr::new(STORE_LOCK_NAME), lock_identity, Some(0))?;
         validate_named_regular(
             &root,
@@ -2001,6 +1984,29 @@ fn open_or_initialize_store(
     )
 }
 
+fn validate_initial_snapshot_shape(
+    snapshot: &ArtifactStoreSnapshotV1,
+) -> Result<(), StoreError> {
+    if snapshot.snapshot_sequence().get() != 1
+        || snapshot.operation_high_water() != 1
+        || snapshot.object_high_water() != 0
+        || !snapshot.objects().is_empty()
+        || snapshot.operations().len() != 1
+        || snapshot.quarantine() != ArtifactQuarantineFactsV1::Absent
+    {
+        return Err(StoreError::Owner);
+    }
+    let operation = &snapshot.operations()[0];
+    if operation.admission().operation_sequence().get() != 1
+        || operation.materializing().is_some()
+        || operation.terminal().is_some()
+        || operation.receipt().is_some()
+    {
+        return Err(StoreError::Owner);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn continue_initialization(
     authority: &mut dyn ArtifactStoreAuthorityV1,
@@ -2037,8 +2043,8 @@ fn continue_initialization(
                 return Err(StoreError::ConfigurationMismatch);
             }
             let snapshot = validate_candidate_filesystem(&objects, candidate)?;
-            let operation = snapshot.operations().first().ok_or(StoreError::Owner)?;
-            if operation.request() != request {
+            validate_initial_snapshot_shape(&snapshot)?;
+            if snapshot.operations()[0].request() != request {
                 return Err(StoreError::Conflict);
             }
             let (state_root, staging, objects) = seal_initial_prefix(
@@ -2094,6 +2100,7 @@ fn continue_initialization(
             admission,
         )
         .map_err(|_| StoreError::Owner)?;
+        validate_initial_snapshot_shape(&snapshot)?;
         let snapshot_bytes = snapshot
             .encode_canonical()
             .map_err(|_| StoreError::Capacity)?;
@@ -2514,11 +2521,8 @@ fn publish_or_recover_pair(
             OsStr::new(OBJECTS_NAME),
             store.objects.identity,
         )?;
-        let reopened_child = reopen_named_directory(
-            &reopened_objects,
-            OsStr::new(&child_name),
-            child_identity,
-        )?;
+        let reopened_child =
+            reopen_named_directory(&reopened_objects, OsStr::new(&child_name), child_identity)?;
         drop(child);
         publish_pair_file(
             &reopened_child,
@@ -2538,12 +2542,7 @@ fn publish_or_recover_pair(
     })();
     match publication {
         Ok(verified) => Ok(PairPublication::Complete(verified)),
-        Err(_) => match sync_partial_child(
-            store,
-            &child_name,
-            pair.object_ref(),
-            child_identity,
-        ) {
+        Err(_) => match sync_partial_child(store, &child_name, pair.object_ref(), child_identity) {
             Ok(bytes) => Ok(PairPublication::Quarantined(bytes)),
             Err(error) => Err(error),
         },
@@ -2987,6 +2986,20 @@ mod tests {
             Ok(operation.operation_id()),
         );
         assert_eq!(permitted_next(&initial, &initial), Err(StoreError::Owner));
+    }
+
+    #[test]
+    fn complete_initial_staging_rejects_materializing_successor() {
+        let (initial, _) = initial_snapshot();
+        assert_eq!(validate_initial_snapshot_shape(&initial), Ok(()));
+        let materializing = MaterializingRecordV1::new(initial.operations()[0].admission());
+        let progressed = initial
+            .try_successor(ArtifactSnapshotSuccessorV1::Materializing { materializing })
+            .expect("valid materializing successor");
+        assert_eq!(
+            validate_initial_snapshot_shape(&progressed),
+            Err(StoreError::Owner),
+        );
     }
 
     #[test]
