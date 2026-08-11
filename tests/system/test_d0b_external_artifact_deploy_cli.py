@@ -93,6 +93,9 @@ def _environment(root: Path) -> dict[str, str]:
         "TMPDIR": os.fspath(temporary),
         "PATH": "/usr/bin:/bin",
         "LANG": "C.UTF-8",
+        "PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH": os.fspath(
+            root / "d0b-runtime-diagnostic.txt"
+        ),
     }
 
 
@@ -135,6 +138,12 @@ def _invoke_json(
 
 
 def _print_d0b_failure_state(environment: dict[str, str]) -> None:
+    diagnostic_path = Path(environment["PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH"])
+    if diagnostic_path.is_file():
+        print(
+            "D0B-RUNTIME-DIAGNOSTIC:"
+            f"{diagnostic_path.read_text(encoding='utf-8', errors='backslashreplace').strip()}"
+        )
     state_root = Path(environment["HOME"]) / "state"
     if not state_root.is_dir():
         print("D0B-STATE:<absent>")

@@ -4714,15 +4714,14 @@ mod tests {
             verified.authenticated().proof_envelope_digest(),
             authenticated.proof_envelope_digest(),
         );
+        let mut mismatched_authenticated = authenticated;
+        mismatched_authenticated.request_envelope_digest = Digest32::from_bytes([0xff; 32]);
         assert_eq!(
             admission
                 .policy
                 .admit_authenticated_artifact_managed_model_agent_stack_apply_request(
                     &request,
-                    AuthenticatedManagedModelAgentStackApplyV1 {
-                        request_envelope_digest: Digest32::from_bytes([0xff; 32]),
-                        ..authenticated
-                    },
+                    mismatched_authenticated,
                     reading,
                 ),
             Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation),
