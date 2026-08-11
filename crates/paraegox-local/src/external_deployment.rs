@@ -105,30 +105,6 @@ impl ProjectionV1 {
         }
     }
 
-    fn verified_preflight(
-        operation_id: ArtifactExternalDeploymentOperationIdInputV1,
-        object_ref: ArtifactObjectRefV1,
-        receipt_ref: MaterializationReceiptRefV1,
-        error: LocalProcessError,
-    ) -> Self {
-        Self {
-            changed: Some(false),
-            operation_id: Some(operation_id_text(operation_id)),
-            state: None,
-            profile: Some(PROFILE),
-            artifact_object_ref: Some(object_ref.to_string()),
-            materialization_receipt_ref: Some(receipt_ref.to_string()),
-            generation: None,
-            deployment_revision: None,
-            controller_snapshot_sequence: None,
-            deployment_receipt_ref: None,
-            runtime_apply_request_digest: None,
-            runtime_terminal_receipt_digest: None,
-            terminal_outcome: None,
-            error: Some(error),
-        }
-    }
-
     #[cfg(unix)]
     fn from_controller(
         projection: &DeveloperArtifactExternalControllerProjectionV1,
@@ -246,10 +222,8 @@ fn run_deploy_preflight(command: ArtifactExternalDeployCommandV1) -> ProjectionV
         );
     }
     drop(bundle);
-    ProjectionV1::verified_preflight(
-        operation_id,
-        object_ref,
-        receipt_ref,
+    ProjectionV1::error(
+        Some(operation_id),
         LocalProcessError::ArtifactExternalDeployOwner,
     )
 }
@@ -610,6 +584,35 @@ mod tests {
         assert_eq!(value["changed"], false);
         assert_eq!(value["state"], "admitted");
         assert_eq!(value["diagnostics"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn owner_projection_preserves_only_the_input_operation_id() {
+        let projection = ProjectionV1::error(
+            Some(ArtifactExternalDeploymentOperationIdInputV1::for_test(
+                [0xd1; 16],
+            )),
+            LocalProcessError::ArtifactExternalDeployOwner,
+        );
+        let mut output = Vec::new();
+        write_projection(&mut output, "deploy", &projection).expect("JSON vector");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("deploy JSON");
+        assert_eq!(value["operation_id"], "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1");
+        for field in [
+            "state",
+            "profile",
+            "artifact_object_ref",
+            "materialization_receipt_ref",
+            "generation",
+            "deployment_revision",
+            "controller_snapshot_sequence",
+            "deployment_receipt_ref",
+            "runtime_apply_request_digest",
+            "runtime_terminal_receipt_digest",
+            "terminal_outcome",
+        ] {
+            assert_eq!(value[field], serde_json::Value::Null, "{field}");
+        }
     }
 
     #[cfg(unix)]
