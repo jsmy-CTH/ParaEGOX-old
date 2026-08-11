@@ -53,6 +53,22 @@ def _execution_profile_commitment() -> bytes:
     return _raw_digest(b"paraegox.artifact.execution-profile.sha256.v1", body)
 
 
+def _decode_artifact_binding(frame: bytes) -> dict[str, bytes | int]:
+    assert len(frame) == 192
+    object_ref = frame[:72]
+    assert object_ref[:4] == b"PXAK"
+    assert struct.unpack(">H", object_ref[4:6])[0] == 1
+    assert struct.unpack(">H", object_ref[6:8])[0] == 72
+    assert frame[160:192] == _execution_profile_commitment()
+    return {
+        "object_ref": object_ref,
+        "materialization_store_instance": frame[72:104],
+        "materialization_sequence": struct.unpack(">Q", frame[104:112])[0],
+        "materialization_operation_id": frame[112:128],
+        "materialization_receipt_digest": frame[128:160],
+    }
+
+
 def _decode_pxdq(frame: bytes) -> dict[str, bytes | int]:
     assert frame[:4] == b"PXDQ"
     assert struct.unpack(">H", frame[4:6])[0] == 1
@@ -222,6 +238,33 @@ def _decode_pxmj2_prefix(
         receipt = frame[1216:1648]
         assert record == _encode_pre_c_terminal_record(phase, pxdq, pxdk)
         assert receipt == _encode_pre_c_terminal_receipt(phase, record, pxdq, pxdk)
+
+
+def test_artifact_execution_binding_shared_golden_is_independently_derived() -> None:
+    binding_wire = _fixture("artifact_f0_binding_v1.hex", 192)
+    binding = _decode_artifact_binding(binding_wire)
+    pxdq = _fixture("artifact_f0_pxdq_v1.hex", 288)
+    request = _decode_pxdq(pxdq)
+    receipt = _fixture("artifact_f0_pxax_materialized_v1.hex", 240)
+    artifact = LEDGER["artifact_store"]
+
+    assert binding_wire == pxdq[64:256]
+    assert binding["object_ref"] == _fixture("artifact_f0_pxak_v1.hex", 72)
+    assert binding["materialization_store_instance"] == receipt[16:48]
+    assert binding["materialization_sequence"] == struct.unpack(">Q", receipt[48:56])[0]
+    assert binding["materialization_operation_id"] == receipt[56:72]
+    assert binding["materialization_receipt_digest"] == receipt[208:240]
+    assert binding["materialization_store_instance"] == bytes.fromhex(
+        artifact["store_instance_hex"]
+    )
+    assert binding["materialization_sequence"] == artifact["primary_operation_sequence"]
+    assert binding["materialization_operation_id"] == bytes.fromhex(
+        artifact["primary_operation_id_hex"]
+    )
+    assert binding["object_ref"] == request["object_ref"]
+    assert binding["materialization_receipt_digest"] == request[
+        "materialization_receipt_digest"
+    ]
 
 
 def test_pxdq_pxdk_shared_goldens_have_independent_exact_layout_and_correlation() -> None:

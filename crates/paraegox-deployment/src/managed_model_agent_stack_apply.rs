@@ -3108,6 +3108,19 @@ mod tests {
         )
         .expect("shared binding");
         assert_eq!(
+            binding.canonical_wire().as_slice(),
+            decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_binding_v1.hex"
+            )),
+        );
+        assert_eq!(
+            ArtifactExecutionBindingV1::decode(&decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_binding_v1.hex"
+            )))
+            .expect("decoded shared Artifact execution binding"),
+            binding,
+        );
+        assert_eq!(
             artifact_execution_profile_commitment_v1().as_bytes(),
             &[
                 0x1f, 0xe2, 0x43, 0xfd, 0x90, 0x34, 0xf0, 0x4d, 0xae, 0xc0, 0xc0, 0x23, 0x66, 0x1c,
