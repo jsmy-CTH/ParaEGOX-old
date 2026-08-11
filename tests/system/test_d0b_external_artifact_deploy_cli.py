@@ -129,6 +129,8 @@ def _invoke_json(
         print(f"D0B-STDOUT:{process.stdout.decode(errors='backslashreplace')}")
         print(f"D0B-STDERR:{process.stderr.decode(errors='backslashreplace')}")
         _print_d0b_failure_state(environment)
+        if arguments and arguments[0] == "deploy":
+            pytest.exit("captured first D0b deploy failure", returncode=1)
     assert process.returncode == expected_returncode, (
         arguments,
         process.returncode,
@@ -236,7 +238,7 @@ def _assert_active_ready(
     assert envelope["diagnostics"] == []
 
 
-@pytest.mark.parametrize("_attempt", range(30))
+@pytest.mark.parametrize("_attempt", range(50))
 def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins(
     _attempt: int,
 ) -> None:
