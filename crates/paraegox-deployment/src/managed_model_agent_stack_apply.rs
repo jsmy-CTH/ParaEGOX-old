@@ -4333,8 +4333,9 @@ mod tests {
                 selection_observed_at_nanos,
             },
         )?;
-        let facts =
-            ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(request, state, evidence)?;
+        let facts = ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(
+            request, state, evidence,
+        )?;
         let channel = fabric_tests::channel();
         let auth = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
             channel,
@@ -4580,8 +4581,8 @@ mod tests {
             )
             .expect("PXMJ2 post-P terminal");
             let wire = controller.encode().expect("PXMJ2 terminal wire");
-            let reopened = ArtifactExternalControllerStateV2::decode(&wire)
-                .expect("reopen post-P terminal");
+            let reopened =
+                ArtifactExternalControllerStateV2::decode(&wire).expect("reopen post-P terminal");
             assert_eq!(reopened, controller);
             assert_eq!(reopened.phase(), controller_phase);
             assert_eq!(
@@ -4592,7 +4593,11 @@ mod tests {
                 terminal.canonical_wire(),
             );
             assert_eq!(
-                reopened.records().last().expect("terminal record").progress()
+                reopened
+                    .records()
+                    .last()
+                    .expect("terminal record")
+                    .progress()
                     .runtime_terminal_receipt_digest,
                 *terminal.receipt_digest().as_bytes(),
             );
@@ -4648,11 +4653,13 @@ mod tests {
             );
         }
 
-        assert!(signed_artifact_receipt(
-            &runtime_request,
-            ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero,
-        )
-        .is_err());
+        assert!(
+            signed_artifact_receipt(
+                &runtime_request,
+                ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero,
+            )
+            .is_err()
+        );
 
         let failed_progress = ArtifactExternalDeploymentProgressV1::try_new(
             None,
@@ -4715,8 +4722,8 @@ mod tests {
             &pre_commit_uncertain_record,
         )
         .expect("PXDO-U pre-C");
-        let pre_commit_uncertain = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let pre_commit_uncertain =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Uncertain,
                 controller_snapshot_sequence: NonZeroU64::new(2).expect("sequence"),
                 request: request.clone(),
@@ -4727,14 +4734,11 @@ mod tests {
                 runtime_terminal: None,
                 records: vec![pre_commit_uncertain_record],
                 receipt: Some(pre_commit_uncertain_receipt),
-            },
-        )
-        .expect("PXMJ2-U pre-C");
+            })
+            .expect("PXMJ2-U pre-C");
         assert_eq!(
             ArtifactExternalControllerStateV2::decode(
-                &pre_commit_uncertain
-                    .encode()
-                    .expect("PXMJ2-U pre-C wire"),
+                &pre_commit_uncertain.encode().expect("PXMJ2-U pre-C wire"),
             )
             .expect("reopen U pre-C"),
             pre_commit_uncertain,
