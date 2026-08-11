@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 _BINARY_ENVIRONMENT = "PARAEGOX_D0B_EXTERNAL_ARTIFACT_CLI_BINARY"
 _COMMAND_TIMEOUT_SECONDS = 180.0
 _GENERATION_PATTERN = re.compile(r"[0-9a-f]{32}")
@@ -234,7 +236,10 @@ def _assert_active_ready(
     assert envelope["diagnostics"] == []
 
 
-def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins() -> None:
+@pytest.mark.parametrize("_attempt", range(5))
+def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins(
+    _attempt: int,
+) -> None:
     assert os.name == "posix" and Path("/proc").is_dir()
     assert os.geteuid() != 0 and os.getegid() != 0
     source_binary = _require_exact_binary()
