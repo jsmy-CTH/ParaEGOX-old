@@ -3642,7 +3642,6 @@ fn run_materialize(
 mod tests {
     use super::*;
     use std::fs::{self, OpenOptions, Permissions};
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
     struct FailingObserver {
