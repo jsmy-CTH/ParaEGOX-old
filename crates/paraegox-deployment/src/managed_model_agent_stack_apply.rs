@@ -5056,12 +5056,8 @@ impl DeveloperArtifactExternalControllerRequestV1 {
             artifact_execution_profile_commitment_v1(),
         )
         .ok()?;
-        ArtifactExternalDeploymentRequestV1::try_new(
-            operation_id,
-            config_commitment,
-            binding,
-        )
-        .ok()?;
+        ArtifactExternalDeploymentRequestV1::try_new(operation_id, config_commitment, binding)
+            .ok()?;
         Some(Self {
             operation_id,
             config_commitment,
@@ -5429,18 +5425,17 @@ fn project_external_state(
         operation_id: state.request().operation_id(),
         object_ref: state.request().binding().object_ref(),
         materialization_receipt_ref: state.request().binding().materialization_receipt_ref(),
-        lifecycle_generation: progress.and_then(ArtifactExternalDeploymentProgressV1::lifecycle_generation),
-        deployment_revision: progress.and_then(ArtifactExternalDeploymentProgressV1::deployment_revision),
-        committed_controller_snapshot_sequence: progress.and_then(
-            ArtifactExternalDeploymentProgressV1::committed_controller_snapshot_sequence,
-        ),
+        lifecycle_generation: progress
+            .and_then(ArtifactExternalDeploymentProgressV1::lifecycle_generation),
+        deployment_revision: progress
+            .and_then(ArtifactExternalDeploymentProgressV1::deployment_revision),
+        committed_controller_snapshot_sequence: progress
+            .and_then(ArtifactExternalDeploymentProgressV1::committed_controller_snapshot_sequence),
         deployment_receipt_ref,
-        runtime_apply_request_digest: progress.and_then(
-            ArtifactExternalDeploymentProgressV1::runtime_apply_request_digest,
-        ),
-        runtime_terminal_receipt_digest: progress.and_then(
-            ArtifactExternalDeploymentProgressV1::runtime_terminal_receipt_digest,
-        ),
+        runtime_apply_request_digest: progress
+            .and_then(ArtifactExternalDeploymentProgressV1::runtime_apply_request_digest),
+        runtime_terminal_receipt_digest: progress
+            .and_then(ArtifactExternalDeploymentProgressV1::runtime_terminal_receipt_digest),
         terminal_outcome,
     })
 }
@@ -5594,9 +5589,7 @@ mod tests {
         binding: DeveloperArtifactExternalControllerAuthorityBindingV1,
     }
 
-    impl DeveloperArtifactExternalControllerAuthorityV1
-        for FixedDeveloperArtifactExternalAuthority
-    {
+    impl DeveloperArtifactExternalControllerAuthorityV1 for FixedDeveloperArtifactExternalAuthority {
         fn revalidate(
             &mut self,
         ) -> Result<
