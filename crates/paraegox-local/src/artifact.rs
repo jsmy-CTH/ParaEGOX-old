@@ -629,10 +629,11 @@ mod unix {
 
     use super::{
         ArtifactFailureV1, ArtifactMaterializationProjectionV1, ArtifactPairProjectionV1,
-        BuildMkdirEvidenceV1, artifact_path_from_os, artifact_regular_read_flags,
-        classify_build_mkdir_failure, classify_build_pre_effect_failure, lexical_absolute_path,
-        lower_hex, map_artifact_metadata_error, map_artifact_path_errno,
-        map_artifact_presence_errno, map_existing_build_read_failure, operation_id_text,
+        ArtifactPairReadFailuresV1, BuildMkdirEvidenceV1, artifact_path_from_os,
+        artifact_regular_read_flags, classify_build_mkdir_failure,
+        classify_build_pre_effect_failure, lexical_absolute_path, lower_hex,
+        map_artifact_metadata_error, map_artifact_path_errno, map_artifact_presence_errno,
+        map_existing_build_read_failure, operation_id_text,
     };
     use crate::{
         config::{self, ConfigError, LocalArtifactStoreAuthorityConfigV1},
@@ -703,8 +704,7 @@ mod unix {
                 MaterializeAuthorityPreflightV1::Continue
             }
             Some(
-                ArtifactStoreFailureV1::UnsafePath
-                | ArtifactStoreFailureV1::ConfigurationMismatch,
+                ArtifactStoreFailureV1::UnsafePath | ArtifactStoreFailureV1::ConfigurationMismatch,
             ) => MaterializeAuthorityPreflightV1::Immediate,
             Some(
                 ArtifactStoreFailureV1::Conflict
@@ -830,8 +830,7 @@ mod unix {
         }
         if let (Some(existing), Some(requested)) = (final_pair.as_ref(), pair.as_ref())
             && (existing.manifest_bytes() != requested.manifest_bytes()
-                || existing.payload() != requested.payload()
-            )
+                || existing.payload() != requested.payload())
         {
             final_path_failed = true;
         }
@@ -892,9 +891,7 @@ mod unix {
                     expected_manifest,
                     pair.payload(),
                 ) {
-                    Err(LocalProcessError::ArtifactUncertain) => {
-                        BuildMkdirEvidenceV1::KnownStage
-                    }
+                    Err(LocalProcessError::ArtifactUncertain) => BuildMkdirEvidenceV1::KnownStage,
                     Err(LocalProcessError::ArtifactPath) => BuildMkdirEvidenceV1::Structural,
                     Ok(_) | Err(_) => BuildMkdirEvidenceV1::Unknown,
                 }
@@ -924,7 +921,7 @@ mod unix {
             .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
         let payload = artifact_path_from_os(payload)
             .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
-        let pair = read_verified_pair(&manifest, &payload, true)
+        let pair = read_verified_pair(&manifest, &payload, true, false)
             .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
         Ok(pair_projection(false, &pair))
     }
@@ -939,20 +936,19 @@ mod unix {
             .map_err(|error| ArtifactFailureV1::new(Some(false), error.into()))?;
         let mut authority = RevalidatingArtifactAuthority::new(&config);
         let authority_preflight = ArtifactStoreV1::query(&mut authority, operation_id);
-        let deferred_authority = match classify_materialize_authority_preflight(
-            authority_preflight.result().err(),
-        ) {
-            MaterializeAuthorityPreflightV1::Continue => None,
-            MaterializeAuthorityPreflightV1::Immediate => {
-                drop(authority);
-                return Ok(project_invocation(operation_id, authority_preflight));
-            }
-            MaterializeAuthorityPreflightV1::Deferred => Some(authority_preflight),
-        };
+        let deferred_authority =
+            match classify_materialize_authority_preflight(authority_preflight.result().err()) {
+                MaterializeAuthorityPreflightV1::Continue => None,
+                MaterializeAuthorityPreflightV1::Immediate => {
+                    drop(authority);
+                    return Ok(project_invocation(operation_id, authority_preflight));
+                }
+                MaterializeAuthorityPreflightV1::Deferred => Some(authority_preflight),
+            };
         lexical_absolute_path(manifest)
             .and_then(|()| lexical_absolute_path(payload))
             .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
-        let pair = read_verified_pair(manifest, payload, false)
+        let pair = read_verified_pair(manifest, payload, false, true)
             .map_err(|error| ArtifactFailureV1::new(Some(false), error))?;
         if let Some(invocation) = deferred_authority {
             drop(authority);
@@ -1437,15 +1433,47 @@ mod unix {
         }
     }
 
-    fn record_manifest_profile(
+    fn record_manifest_contract(
         manifest: Option<&(Box<[u8]>, FileIdentity)>,
+        classify_profile: bool,
         failures: &mut ArtifactPairReadFailuresV1,
     ) {
-        if manifest.is_some_and(|(bytes, _)| {
-            ArtifactManifestV1::classify_profile(bytes)
-                == ArtifactManifestProfileClassificationV1::Mismatch
-        }) {
+        let Some((bytes, _)) = manifest else {
+            return;
+        };
+        let profile = ArtifactManifestV1::classify_profile(bytes);
+        if profile == ArtifactManifestProfileClassificationV1::Mismatch && classify_profile {
             failures.record(LocalProcessError::ArtifactProfile);
+        } else if profile == ArtifactManifestProfileClassificationV1::Mismatch
+            || ArtifactManifestV1::decode(bytes).is_err()
+        {
+            failures.record(LocalProcessError::ArtifactCompatibility);
+        }
+    }
+
+    fn record_payload_contract(
+        payload: Option<&(Box<[u8]>, FileIdentity)>,
+        failures: &mut ArtifactPairReadFailuresV1,
+    ) {
+        if payload.is_some_and(|(bytes, _)| ArtifactManifestV1::from_payload(bytes).is_err()) {
+            failures.record(LocalProcessError::ArtifactCompatibility);
+        }
+    }
+
+    fn record_pair_contract(
+        manifest: Option<&(Box<[u8]>, FileIdentity)>,
+        payload: Option<&(Box<[u8]>, FileIdentity)>,
+        failures: &mut ArtifactPairReadFailuresV1,
+    ) -> Option<VerifiedArtifactPairV1> {
+        let (Some((manifest, _)), Some((payload, _))) = (manifest, payload) else {
+            return None;
+        };
+        match VerifiedArtifactPairV1::verify(manifest, payload) {
+            Ok(pair) => Some(pair),
+            Err(_) => {
+                failures.record(LocalProcessError::ArtifactCompatibility);
+                None
+            }
         }
     }
 
@@ -1472,6 +1500,7 @@ mod unix {
         manifest_path: &Path,
         payload_path: &Path,
         inspect_noatime: bool,
+        classify_profile: bool,
     ) -> Result<VerifiedArtifactPairV1, LocalProcessError> {
         let mut failures = ArtifactPairReadFailuresV1::default();
         if let Err(error) = lexical_absolute_path(manifest_path) {
@@ -1488,14 +1517,10 @@ mod unix {
         let payload_name = payload_path
             .file_name()
             .expect("lexically valid absolute payload has a leaf");
-        let manifest_parent = collect_pair_evidence(
-            open_pinned_parent(manifest_path, false),
-            &mut failures,
-        );
-        let payload_parent = collect_pair_evidence(
-            open_pinned_parent(payload_path, false),
-            &mut failures,
-        );
+        let manifest_parent =
+            collect_pair_evidence(open_pinned_parent(manifest_path, false), &mut failures);
+        let payload_parent =
+            collect_pair_evidence(open_pinned_parent(payload_path, false), &mut failures);
         let manifest = manifest_parent.as_ref().and_then(|parent| {
             collect_pair_evidence(
                 read_pair_member(
@@ -1518,13 +1543,13 @@ mod unix {
                 &mut failures,
             )
         });
-        record_manifest_profile(manifest.as_ref(), &mut failures);
+        record_manifest_contract(manifest.as_ref(), classify_profile, &mut failures);
+        record_payload_contract(payload.as_ref(), &mut failures);
+        let _ = record_pair_contract(manifest.as_ref(), payload.as_ref(), &mut failures);
 
         let current_manifest_parent = manifest_parent.as_ref().and_then(|parent| {
-            let current = collect_pair_evidence(
-                open_pinned_parent(manifest_path, false),
-                &mut failures,
-            );
+            let current =
+                collect_pair_evidence(open_pinned_parent(manifest_path, false), &mut failures);
             if current
                 .as_ref()
                 .is_some_and(|value| value.parent.identity != parent.parent.identity)
@@ -1566,7 +1591,17 @@ mod unix {
                 &mut failures,
             )
         });
-        record_manifest_profile(current_manifest.as_ref(), &mut failures);
+        record_manifest_contract(
+            current_manifest.as_ref(),
+            classify_profile,
+            &mut failures,
+        );
+        record_payload_contract(current_payload.as_ref(), &mut failures);
+        let verified = record_pair_contract(
+            current_manifest.as_ref(),
+            current_payload.as_ref(),
+            &mut failures,
+        );
 
         if let (Some((initial, initial_identity)), Some((current, current_identity))) =
             (manifest.as_ref(), current_manifest.as_ref())
@@ -1581,11 +1616,7 @@ mod unix {
             failures.record(LocalProcessError::ArtifactPath);
         }
         failures.result()?;
-
-        let (manifest, _) = current_manifest.expect("successful pair preflight has manifest");
-        let (payload, _) = current_payload.expect("successful pair preflight has payload");
-        VerifiedArtifactPairV1::verify(&manifest, &payload)
-            .map_err(|_| LocalProcessError::ArtifactCompatibility)
+        Ok(verified.expect("successful pair preflight has verified current pair"))
     }
 
     fn write_new_exact(
@@ -1643,13 +1674,8 @@ mod unix {
         let final_dir = open_build_directory(parent, output_leaf)?;
         let mut failures = ArtifactPairReadFailuresV1::default();
         let manifest = collect_pair_evidence(
-            read_pair_member(
-                &final_dir,
-                OsStr::new(MANIFEST_NAME),
-                MANIFEST_BYTES,
-                false,
-            )
-            .map_err(|error| map_existing_build_read_failure(error).error),
+            read_pair_member(&final_dir, OsStr::new(MANIFEST_NAME), MANIFEST_BYTES, false)
+                .map_err(|error| map_existing_build_read_failure(error).error),
             &mut failures,
         );
         let payload = collect_pair_evidence(
@@ -1662,11 +1688,32 @@ mod unix {
             .map_err(|error| map_existing_build_read_failure(error).error),
             &mut failures,
         );
+        if manifest
+            .as_ref()
+            .is_some_and(|(bytes, _)| ArtifactManifestV1::decode(bytes).is_err())
+        {
+            failures.record(LocalProcessError::ArtifactPath);
+        }
+        if payload
+            .as_ref()
+            .is_some_and(|(bytes, _)| ArtifactManifestV1::from_payload(bytes).is_err())
+        {
+            failures.record(LocalProcessError::ArtifactPath);
+        }
+        let verified = match (manifest.as_ref(), payload.as_ref()) {
+            (Some((manifest, _)), Some((payload, _))) => {
+                match VerifiedArtifactPairV1::verify(manifest, payload) {
+                    Ok(pair) => Some(pair),
+                    Err(_) => {
+                        failures.record(LocalProcessError::ArtifactPath);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         failures.result()?;
-        let (manifest, _) = manifest.expect("successful final probe has manifest");
-        let (payload, _) = payload.expect("successful final probe has payload");
-        VerifiedArtifactPairV1::verify(&manifest, &payload)
-            .map_err(|_| LocalProcessError::ArtifactPath)
+        Ok(verified.expect("successful final probe has verified pair"))
     }
 
     fn observe_build_precondition(
@@ -1740,14 +1787,8 @@ mod unix {
         manifest: &[u8],
         payload: &[u8],
     ) -> Result<(), ArtifactFailureV1> {
-        if observe_build_precondition(
-            &pinned.parent,
-            output_leaf,
-            staging_name,
-            manifest,
-            payload,
-        )
-        .map_err(|error| ArtifactFailureV1::new(Some(false), error))?
+        if observe_build_precondition(&pinned.parent, output_leaf, staging_name, manifest, payload)
+            .map_err(|error| ArtifactFailureV1::new(Some(false), error))?
             != BuildPublicationPreconditionV1::FinalAppeared
         {
             return Err(ArtifactFailureV1::new(
@@ -1861,13 +1902,7 @@ mod unix {
         if path_parent.parent.identity != pinned.parent.identity {
             return Err(LocalProcessError::ArtifactPath);
         }
-        observe_build_precondition(
-            &pinned.parent,
-            output_leaf,
-            staging_name,
-            manifest,
-            payload,
-        )
+        observe_build_precondition(&pinned.parent, output_leaf, staging_name, manifest, payload)
     }
 
     fn revalidate_parent_for_rename(

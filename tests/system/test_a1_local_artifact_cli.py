@@ -1311,7 +1311,7 @@ def test_artifact_f0_a1_dispatch_and_authority_source_guards() -> None:
     assert "RevalidatingArtifactAuthority::new" in artifact_source
     assert "ArtifactStoreV1::query(&mut authority, operation_id)" in artifact_source
     assert artifact_source.count("drop(authority);") >= 2
-    assert artifact_source.count("Ok(project_invocation(operation_id, invocation))") == 2
+    assert artifact_source.count("Ok(project_invocation(operation_id, invocation))") == 3
 
 
 def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
@@ -1511,7 +1511,8 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
         profile_bytes[80] ^= 1
         profile_mismatch.write_bytes(profile_bytes)
         os.chmod(profile_mismatch, 0o600)
-        for arguments in (
+        returncode, _, inspect_profile = _invoke_artifact(
+            binary,
             [
                 "artifact",
                 "inspect",
@@ -1521,6 +1522,15 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
                 os.fspath(payload),
                 "--json",
             ],
+        )
+        assert returncode == 2
+        assert inspect_profile["changed"] is False
+        assert inspect_profile["diagnostics"][0]["code"] == (
+            "PXLC-ARTIFACT-COMPATIBILITY"
+        )
+
+        returncode, _, materialize_profile = _invoke_artifact(
+            binary,
             [
                 "artifact",
                 "materialize",
@@ -1534,16 +1544,15 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
                 "a5" * 16,
                 "--json",
             ],
-        ):
-            returncode, _, profile_failure = _invoke_artifact(binary, arguments)
-            assert returncode == 2
-            assert profile_failure["changed"] is False
-            assert profile_failure["diagnostics"] == [
-                {
-                    "code": "PXLC-ARTIFACT-PROFILE",
-                    "message": "artifact profile is unsupported",
-                }
-            ]
+        )
+        assert returncode == 2
+        assert materialize_profile["changed"] is False
+        assert materialize_profile["diagnostics"] == [
+            {
+                "code": "PXLC-ARTIFACT-PROFILE",
+                "message": "artifact profile is unsupported",
+            }
+        ]
 
         returncode, _, path_before_profile = _invoke_artifact(
             binary,
