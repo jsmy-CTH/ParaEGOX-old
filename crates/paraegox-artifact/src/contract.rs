@@ -1494,19 +1494,18 @@ impl MaterializationOperationV1 {
         {
             return Err(ArtifactContractError::CrossFrameMismatch);
         }
-        if let Some(materializing) = &self.materializing {
-            if materializing.store_instance() != self.admission.store_instance()
+        if let Some(materializing) = &self.materializing
+            && (materializing.store_instance() != self.admission.store_instance()
                 || materializing.operation_sequence() != self.admission.operation_sequence()
                 || materializing.operation_id() != self.operation_id()
                 || materializing.request_digest() != self.request.request_digest()
                 || materializing.admission_digest() != self.admission.admission_digest()
-                || materializing.object_ref() != self.request.object_ref()
-            {
-                return Err(ArtifactContractError::CrossFrameMismatch);
-            }
+                || materializing.object_ref() != self.request.object_ref())
+        {
+            return Err(ArtifactContractError::CrossFrameMismatch);
         }
-        if let Some(terminal) = &self.terminal {
-            if terminal.store_instance() != self.admission.store_instance()
+        if let Some(terminal) = &self.terminal
+            && (terminal.store_instance() != self.admission.store_instance()
                 || terminal.operation_sequence() != self.admission.operation_sequence()
                 || terminal.operation_id() != self.operation_id()
                 || terminal.request_digest() != self.request.request_digest()
@@ -1516,10 +1515,9 @@ impl MaterializationOperationV1 {
                     != self
                         .materializing
                         .as_ref()
-                        .map(MaterializingRecordV1::materializing_digest)
-            {
-                return Err(ArtifactContractError::CrossFrameMismatch);
-            }
+                        .map(MaterializingRecordV1::materializing_digest))
+        {
+            return Err(ArtifactContractError::CrossFrameMismatch);
         }
         if let Some(receipt) = &self.receipt {
             let terminal = self
@@ -2346,10 +2344,11 @@ impl ArtifactStoreSnapshotV1 {
             {
                 return Err(ArtifactContractError::InvalidSnapshot);
             }
-            if operation.receipt().is_none() {
-                if missing_receipt.replace(index).is_some() || index + 1 != self.operations.len() {
-                    return Err(ArtifactContractError::InvalidSnapshot);
-                }
+            if operation.receipt().is_none()
+                && (missing_receipt.replace(index).is_some()
+                    || index + 1 != self.operations.len())
+            {
+                return Err(ArtifactContractError::InvalidSnapshot);
             }
             if let Some(terminal) = operation.terminal() {
                 match terminal.state() {
