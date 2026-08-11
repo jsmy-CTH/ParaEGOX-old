@@ -3026,9 +3026,11 @@ mod tests {
     fn verified_read_bundle_requires_exact_receipt_and_object_locators() {
         let (snapshot, pair, _, receipt) = materialized();
         let reference = MaterializationReceiptRefV1::from_receipt(&receipt);
-        assert!(snapshot
-            .verified_read_bundle(reference, pair.object_ref(), Some(pair.clone()))
-            .is_ok());
+        assert!(
+            snapshot
+                .verified_read_bundle(reference, pair.object_ref(), Some(pair.clone()))
+                .is_ok()
+        );
 
         let mut store_drift = reference;
         store_drift.store_instance =
@@ -3090,12 +3092,7 @@ mod tests {
             );
 
             let mut pxaw = terminal.encode();
-            zero_correlation_and_rehash(
-                &mut pxaw,
-                offset,
-                272,
-                OPERATION_TERMINAL_DIGEST_DOMAIN,
-            );
+            zero_correlation_and_rehash(&mut pxaw, offset, 272, OPERATION_TERMINAL_DIGEST_DOMAIN);
             assert_eq!(
                 MaterializationTerminalV1::decode(&pxaw),
                 Err(ArtifactContractError::DigestMismatch)
@@ -3270,21 +3267,20 @@ mod tests {
         assert_eq!(final_snapshot.encode_canonical().expect("wire").len(), 2848);
         assert_eq!(final_snapshot.accounted_rest_bytes(), Ok(3074));
         let reference = receipt_ref(&final_snapshot, operation(0xa3));
-        assert!(final_snapshot
-            .verified_read_bundle(reference, pair.object_ref(), Some(pair))
-            .is_ok());
+        assert!(
+            final_snapshot
+                .verified_read_bundle(reference, pair.object_ref(), Some(pair))
+                .is_ok()
+        );
     }
 
     #[test]
     fn quarantine_rejects_every_historical_pxav() {
         let (snapshot, _, _, _) = materialized();
-        let second_pair = VerifiedArtifactPairV1::from_payload(b"other-prefix: ")
-            .expect("second canonical pair");
-        let second_request = MaterializationRequestV1::new(
-            operation(0xa3),
-            config(),
-            second_pair.object_ref(),
-        );
+        let second_pair =
+            VerifiedArtifactPairV1::from_payload(b"other-prefix: ").expect("second canonical pair");
+        let second_request =
+            MaterializationRequestV1::new(operation(0xa3), config(), second_pair.object_ref());
         let second_admission = admission(2, &second_request);
         let admitted = snapshot
             .try_successor(ArtifactSnapshotSuccessorV1::Admission {
@@ -3346,9 +3342,11 @@ mod tests {
         );
         let failed_ref = receipt_ref(&failed_snapshot, operation(0xa2));
         let failed_object_ref = failed_snapshot.operations()[0].request().object_ref();
-        assert!(failed_snapshot
-            .verified_read_bundle(failed_ref, failed_object_ref, None)
-            .is_ok());
+        assert!(
+            failed_snapshot
+                .verified_read_bundle(failed_ref, failed_object_ref, None)
+                .is_ok()
+        );
 
         let progressing = admitted();
         let admission = progressing.operations()[0].admission().clone();
@@ -3414,9 +3412,11 @@ mod tests {
         );
         let uncertain_ref = receipt_ref(&uncertain_snapshot, operation(0xa2));
         let uncertain_object_ref = uncertain_snapshot.operations()[0].request().object_ref();
-        assert!(uncertain_snapshot
-            .verified_read_bundle(uncertain_ref, uncertain_object_ref, None)
-            .is_ok());
+        assert!(
+            uncertain_snapshot
+                .verified_read_bundle(uncertain_ref, uncertain_object_ref, None)
+                .is_ok()
+        );
         assert_eq!(
             uncertain_snapshot.verified_read_bundle(
                 uncertain_ref,
