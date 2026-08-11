@@ -64,6 +64,12 @@ STACK_QUARANTINE_DIGEST_DOMAIN = (
 STACK_SNAPSHOT_V2_CHECKSUM_DOMAIN = (
     b"paraegox.runtime.managed-model-agent-stack-snapshot.sha256.v2"
 )
+STACK_SNAPSHOT_V1_CHECKSUM_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-snapshot.sha256.v1"
+)
+CONTROLLER_STATE_V1_CHECKSUM_DOMAIN = (
+    b"paraegox.deployment.managed-model-agent-stack-state.sha256.v1"
+)
 STACK_TENURE_REPLAY_DOMAIN = (
     b"paraegox.runtime.managed-model-agent-stack-tenure-nonce.sha256.v1"
 )
@@ -1383,6 +1389,83 @@ def _pxma_checksum(header: bytes, payload: bytes) -> bytes:
     )
 
 
+def _encode_pxma1_predecessor() -> bytes:
+    state = LEDGER["runtime_state"]
+    runtime = LEDGER["runtime_apply"]
+    payload = struct.pack(">Q", state["runtime_host_epoch"])
+    payload += bytes([0, 0, 0, 0])
+    payload += struct.pack(">HHHH", 0, 0, 0, 0)
+    payload += bytes([0])
+    assert len(payload) == 21
+    header = bytearray(176)
+    header[:4] = b"PXMA"
+    header[4:12] = struct.pack(">HHI", 1, 208, 208 + len(payload))
+    header[12:20] = struct.pack(">Q", 1)
+    header[20:52] = bytes.fromhex(runtime["runtime_store_instance_hex"])
+    header[52:84] = bytes.fromhex(state["owner_target_fingerprint_hex"])
+    header[84:116] = bytes.fromhex(state["transition_projection_digest_hex"])
+    header[116:140] = struct.pack(">QQQ", 7, 8, 9)
+    header[140] = 1
+    header[141:143] = struct.pack(">H", 0)
+    header[143] = 1
+    header[168:172] = struct.pack(">I", len(payload))
+    checksum = _raw_digest(
+        STACK_SNAPSHOT_V1_CHECKSUM_DOMAIN,
+        struct.pack(">Q", len(header))
+        + header
+        + struct.pack(">Q", len(payload))
+        + payload,
+    )
+    return bytes(header) + checksum + payload
+
+
+def _decode_pxmj1_predecessor(frame: bytes) -> dict[str, bytes | int]:
+    assert len(frame) >= 111
+    assert frame[:4] == b"PXMJ"
+    assert struct.unpack(">H", frame[4:6])[0] == 1
+    phase = frame[6]
+    revision = struct.unpack(">Q", frame[7:15])[0]
+    predecessor = frame[15:47]
+    execution_length, request_length, receipt_length = struct.unpack(">III", frame[47:59])
+    archived_revision = struct.unpack(">Q", frame[59:67])[0]
+    archived_lengths = struct.unpack(">III", frame[67:79])
+    body_end = 79 + sum(
+        (execution_length, request_length, receipt_length, *archived_lengths)
+    )
+    assert body_end + 32 == len(frame)
+    assert frame[-32:] == _canonical_digest(
+        CONTROLLER_STATE_V1_CHECKSUM_DOMAIN, frame[:-32]
+    )
+    cursor = 79
+    execution = frame[cursor : cursor + execution_length]
+    cursor += execution_length
+    request = frame[cursor : cursor + request_length]
+    cursor += request_length
+    receipt = frame[cursor : cursor + receipt_length]
+    cursor += receipt_length
+    archived = frame[cursor:body_end]
+    assert cursor + len(archived) == body_end
+    assert phase == 3
+    assert revision > 0 and predecessor != bytes(32)
+    assert archived_revision == 0 and archived_lengths == (0, 0, 0) and not archived
+    assert execution[:6] == b"PXTE" + struct.pack(">H", 8)
+    assert request[:6] == b"PXAR" + struct.pack(">H", 9)
+    assert receipt[:6] == b"PXMT" + struct.pack(">H", 1)
+    request_envelope, request_assignments, request_execution = struct.unpack(
+        ">III", request[6:18]
+    )
+    assert 18 + request_envelope + request_assignments + request_execution == len(request)
+    assert request[-request_execution:] == execution
+    return {
+        "phase": phase,
+        "revision": revision,
+        "predecessor": predecessor,
+        "execution": execution,
+        "request": request,
+        "receipt": receipt,
+    }
+
+
 def _encode_pxma2_states() -> dict[str, bytes]:
     request = _encode_artifact_runtime_request()
     terminals = _encode_artifact_terminals()
@@ -1654,6 +1737,37 @@ def test_artifact_pxmt_signature_drift_is_rejected_by_independent_decoder() -> N
         assert error.__class__.__name__ == "InvalidSignature"
     else:
         raise AssertionError("PXMT signature drift was accepted")
+
+
+def test_predecessor_pxmj1_and_pxma1_goldens_are_independently_strict() -> None:
+    pxmj = _fixture("artifact_f0_pxmj_v1.hex", 4_273)
+    controller = _decode_pxmj1_predecessor(pxmj)
+    request = controller["request"]
+    assert isinstance(request, bytes)
+    envelope_length = struct.unpack(">I", request[6:10])[0]
+    values = AGENT.FABRIC.LEGACY._decode_envelope(
+        request[18 : 18 + envelope_length]
+    )
+    assert controller["phase"] == 3
+    assert controller["revision"] == struct.unpack(">Q", values[5])[0]
+    assert controller["predecessor"] == values[23]
+
+    pxma = _fixture("artifact_f0_pxma_v1.hex", 229)
+    assert pxma == _encode_pxma1_predecessor()
+    assert struct.unpack(">HHI", pxma[4:12]) == (1, 208, len(pxma))
+    assert struct.unpack(">Q", pxma[12:20])[0] == 1
+    assert pxma[140:149] == bytes([1, 0, 0, 1, 0, 0, 0, 0, 0])
+
+    assert (
+        struct.unpack(">H", _fixture("artifact_f0_pxmj_v2_active_ready.hex", 9_905)[4:6])[0]
+        == 2
+    )
+    assert (
+        struct.unpack(
+            ">H", _fixture("artifact_f0_pxma_v2_exact_zero_initial.hex", 565)[4:6]
+        )[0]
+        == 2
+    )
 
 
 def test_pxdq_pxdk_shared_goldens_have_independent_exact_layout_and_correlation() -> None:

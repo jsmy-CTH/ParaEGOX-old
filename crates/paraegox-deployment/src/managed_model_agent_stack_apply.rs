@@ -4192,6 +4192,66 @@ mod tests {
     }
 
     #[test]
+    fn predecessor_pxmj_v1_shared_golden_is_exact_and_cross_version_strict() {
+        let controller = fabric_tests::controller_signer();
+        let provisioning = fabric_tests::provisioning();
+        let (mut journal, action) = uncertain_journal();
+        let receipt = signed_receipt(
+            action.request(),
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+            1,
+        );
+        journal
+            .consume_pxmt_with(
+                action,
+                receipt.canonical_wire(),
+                &controller,
+                &provisioning,
+                |_| Ok(()),
+            )
+            .expect("durable predecessor ActiveReady PXMT");
+        let state = journal.state();
+        let stack = state
+            .model_agent_stack_state()
+            .expect("predecessor PXMJ1");
+        let fixture = decode_fixture_hex(include_str!(
+            "../../../tests/fixtures/wire/artifact_f0_pxmj_v1.hex"
+        ));
+        assert_eq!(
+            stack.encode().expect("canonical predecessor PXMJ1").as_ref(),
+            fixture.as_slice()
+        );
+        assert!(ArtifactExternalControllerStateV2::decode(&fixture).is_err());
+
+        let fabric_context = state
+            .verified_current_context(&controller, &provisioning)
+            .expect("verified predecessor Fabric context");
+        let desired = state.desired().expect("predecessor Fabric desired");
+        let fabric_request = state.request().expect("predecessor Fabric request");
+        let generation = state
+            .receipt()
+            .and_then(|value| value.facts().generation())
+            .expect("predecessor Fabric generation");
+        let decode = || ManagedModelAgentStackDecodeContextV1 {
+            fabric: &fabric_context,
+            cutover_marker_digest: state.cutover_marker_digest(),
+            predecessor_revision: desired.revision(),
+            predecessor_execution: desired.execution(),
+            predecessor_slice_digest: fabric_request.target_slice_digest(),
+            predecessor_generation: generation,
+        };
+        assert_eq!(
+            ManagedModelAgentStackControllerStateV1::decode(&fixture, decode())
+                .expect("shared predecessor PXMJ1 must reopen"),
+            *stack
+        );
+        let successor = decode_fixture_hex(include_str!(
+            "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_active_ready.hex"
+        ));
+        assert!(ManagedModelAgentStackControllerStateV1::decode(&successor, decode()).is_err());
+    }
+
+    #[test]
     fn every_legal_active_pxmt_is_durable_but_only_active_ready_opens_empty() {
         for (index, outcome) in [
             ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,

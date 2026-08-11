@@ -2537,6 +2537,52 @@ mod tests {
     }
 
     #[test]
+    fn predecessor_pxma_v1_shared_golden_is_exact_and_cross_version_strict() {
+        let snapshot = initial_exact_zero();
+        let fixture = decode_hex(
+            include_str!("../../../tests/fixtures/wire/artifact_f0_pxma_v1.hex").trim_end(),
+        );
+        assert_eq!(snapshot.canonical_wire(), fixture.as_slice());
+        assert_eq!(
+            ManagedModelAgentStackSnapshot::decode(
+                &fixture,
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            )
+            .expect("shared predecessor PXMA1 must reopen"),
+            snapshot
+        );
+        assert!(
+            ArtifactManagedModelAgentStackSnapshotV2::decode(
+                &fixture,
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            )
+            .is_err()
+        );
+        let successor = decode_hex(
+            include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_exact_zero_initial.hex"
+            )
+            .trim_end(),
+        );
+        assert!(
+            ManagedModelAgentStackSnapshot::decode(
+                &successor,
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn checksum_tamper_and_truncation_fail_before_state_is_admitted() {
         let snapshot = initial_exact_zero();
         let mut corrupt = snapshot.canonical_wire().to_vec();
