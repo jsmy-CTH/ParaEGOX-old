@@ -12,7 +12,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use nix::fcntl::{OFlag, open};
@@ -1858,14 +1858,8 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
         EXCHANGE_TIMEOUT,
     )
     .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
-    let exchange_started = Instant::now();
     let response =
         runtime.block_on(client.exchange_artifact(&runtime_request, fabric_context.channel()));
-    if let Err(error) = &response {
-        record_d0b_exchange_diagnostic(error, exchange_started.elapsed());
-    } else {
-        record_d0b_exchange_checkpoint("exchange-ok");
-    }
     let (runtime_terminal, missing_terminal_phase) = match response {
         Ok(wire) => (
             Some(
@@ -1882,12 +1876,9 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
         }
     };
 
-    record_d0b_exchange_checkpoint("controller-open-start");
     let mut controller =
         DeveloperArtifactExternalControllerResidentV1::open(authority, request.operation_id())?;
-    record_d0b_exchange_checkpoint("controller-open-ok");
     let successor = reopen_artifact_successor(&context)?;
-    record_d0b_exchange_checkpoint("successor-open-ok");
     let reopened_context = successor
         .state()
         .verified_current_context(&context.controller_signer, &context.fabric_provisioning)
@@ -1903,10 +1894,8 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
             .validate_against_artifact_request(&runtime_request, reopened_context.channel())
             .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
     }
-    record_d0b_exchange_checkpoint("receipt-validated");
     let terminal =
         controller.finish_apply(authority, runtime_terminal.clone(), missing_terminal_phase);
-    record_d0b_exchange_checkpoint("finish-apply-returned");
     let authority_proof = successor
         .state()
         .legacy_snapshot()
@@ -1923,7 +1912,6 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
         controller,
         terminal.map_err(DeveloperArtifactExternalModelAgentStackError::from),
     )?;
-    record_d0b_exchange_checkpoint("controller-release-ok");
     let projection = internal_external_projection(&terminal)?;
     let Some(runtime_terminal) = runtime_terminal else {
         return Err(DeveloperArtifactExternalModelAgentStackError::ModelAgentApply);
@@ -1952,32 +1940,6 @@ fn release_external_controller<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(release)) => Err(release.into()),
     }
-}
-
-#[cold]
-#[inline(never)]
-fn record_d0b_exchange_diagnostic(
-    error: &RuntimeManagedModelAgentStackExchangeError,
-    elapsed: Duration,
-) {
-    record_d0b_exchange_checkpoint(&format!(
-        "client-error={error:?};elapsed-ms={}",
-        elapsed.as_millis()
-    ));
-}
-
-#[cold]
-#[inline(never)]
-fn record_d0b_exchange_checkpoint(checkpoint: &str) {
-    use std::io::Write as _;
-
-    let Some(path) = std::env::var_os("PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH") else {
-        return;
-    };
-    let Ok(mut output) = fs::OpenOptions::new().create(true).append(true).open(path) else {
-        return;
-    };
-    let _ = writeln!(output, "{checkpoint}");
 }
 
 fn reopen_artifact_successor(

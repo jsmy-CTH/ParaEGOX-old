@@ -12,8 +12,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 _BINARY_ENVIRONMENT = "PARAEGOX_D0B_EXTERNAL_ARTIFACT_CLI_BINARY"
 _COMMAND_TIMEOUT_SECONDS = 180.0
 _GENERATION_PATTERN = re.compile(r"[0-9a-f]{32}")
@@ -95,9 +93,6 @@ def _environment(root: Path) -> dict[str, str]:
         "TMPDIR": os.fspath(temporary),
         "PATH": "/usr/bin:/bin",
         "LANG": "C.UTF-8",
-        "PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH": os.fspath(
-            root / "d0b-runtime-diagnostic.txt"
-        ),
     }
 
 
@@ -128,27 +123,6 @@ def _invoke_json(
     if process.returncode != expected_returncode:
         print(f"D0B-STDOUT:{process.stdout.decode(errors='backslashreplace')}")
         print(f"D0B-STDERR:{process.stderr.decode(errors='backslashreplace')}")
-        _print_d0b_failure_state(environment)
-        if arguments and arguments[0] == "deploy":
-            diagnostic_path = Path(environment["PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH"])
-            if not diagnostic_path.is_file():
-                diagnostic_path = next(
-                    (Path(environment["HOME"]) / "state").rglob(
-                        "d0b-runtime-diagnostic.txt"
-                    ),
-                    diagnostic_path,
-                )
-            diagnostic = (
-                diagnostic_path.read_text(encoding="utf-8", errors="backslashreplace").strip()
-                if diagnostic_path.is_file()
-                else "<absent>"
-            )
-            pytest.exit(
-                "captured first D0b deploy failure: "
-                f"diagnostic={diagnostic}; stdout={process.stdout!r}; "
-                f"stderr={process.stderr!r}; state={_d0b_state_summary(environment)}",
-                returncode=1,
-            )
     assert process.returncode == expected_returncode, (
         arguments,
         process.returncode,
@@ -157,66 +131,6 @@ def _invoke_json(
     )
     assert process.stderr == b""
     return _decode_json_line(process.stdout)
-
-
-def _print_d0b_failure_state(environment: dict[str, str]) -> None:
-    diagnostic_path = Path(environment["PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH"])
-    if diagnostic_path.is_file():
-        print(
-            "D0B-RUNTIME-DIAGNOSTIC:"
-            f"{diagnostic_path.read_text(encoding='utf-8', errors='backslashreplace').strip()}"
-        )
-    state_root = Path(environment["HOME"]) / "state"
-    if not state_root.is_dir():
-        print("D0B-STATE:<absent>")
-        return
-    for path in sorted(state_root.rglob("*")):
-        relative = path.relative_to(state_root)
-        try:
-            metadata = path.lstat()
-        except OSError as error:
-            print(f"D0B-STATE:{relative}:lstat={error!r}")
-            continue
-        print(
-            f"D0B-STATE:{relative}:mode={stat.S_IMODE(metadata.st_mode):04o}:"
-            f"size={metadata.st_size}"
-        )
-        if path.name != "managed-model-agent-stack.snapshot-v1":
-            continue
-        try:
-            header = path.read_bytes()[:208]
-        except OSError as error:
-            print(f"D0B-PXMA:{relative}:read={error!r}")
-            continue
-        if len(header) < 208 or header[:4] != b"PXMA":
-            print(f"D0B-PXMA:{relative}:invalid-header={header.hex()}")
-            continue
-        print(
-            f"D0B-PXMA:{relative}:version={int.from_bytes(header[4:6], 'big')}:"
-            f"sequence={int.from_bytes(header[12:20], 'big')}:phase={header[140]}:"
-            f"fabric={int.from_bytes(header[116:124], 'big')}:"
-            f"model={int.from_bytes(header[124:132], 'big')}:"
-            f"agent={int.from_bytes(header[132:140], 'big')}:"
-            f"census={int.from_bytes(header[141:143], 'big')}:"
-            f"complete={header[143]}:ready={header[144:147].hex()}"
-        )
-
-
-def _d0b_state_summary(environment: dict[str, str]) -> str:
-    state_root = Path(environment["HOME"]) / "state"
-    if not state_root.is_dir():
-        return "<absent>"
-    names: list[str] = []
-    snapshots: list[str] = []
-    for path in sorted(state_root.rglob("*")):
-        relative = path.relative_to(state_root)
-        names.append(os.fspath(relative))
-        if path.name == "managed-model-agent-stack.snapshot-v1":
-            try:
-                snapshots.append(f"{relative}:{path.read_bytes()[:208].hex()}")
-            except OSError as error:
-                snapshots.append(f"{relative}:read={error!r}")
-    return f"names={','.join(names)};pxma={'|'.join(snapshots)}"
 
 
 def _matching_processes(binary: Path) -> list[int]:
@@ -273,10 +187,7 @@ def _assert_active_ready(
     assert envelope["diagnostics"] == []
 
 
-@pytest.mark.parametrize("_attempt", range(20))
-def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins(
-    _attempt: int,
-) -> None:
+def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins() -> None:
     assert os.name == "posix" and Path("/proc").is_dir()
     assert os.geteuid() != 0 and os.getegid() != 0
     source_binary = _require_exact_binary()

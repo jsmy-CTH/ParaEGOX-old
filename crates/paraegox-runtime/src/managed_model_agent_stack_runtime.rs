@@ -369,7 +369,6 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         {
             Ok(dependency) => dependency,
             Err(error) => {
-                record_d0b_runtime_diagnostic(&core.state_directory, &error);
                 let terminal = match model_start_cleanup_exact_zero(&error) {
                     Some(true) => Some(core.commit_model_terminal(
                         fabric,
@@ -407,7 +406,6 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
             )
             .await
         {
-            record_d0b_runtime_diagnostic(&core.state_directory, &error);
             let model_exact = core.shutdown_model().await;
             let terminal = if model_exact {
                 Some(core.commit_agent_quarantined(
@@ -2638,26 +2636,6 @@ fn build_artifact_pre_cutover_no_effect_terminal(
         .response_signer
         .sign(draft.signing_transcript()?.as_bytes());
     Ok(draft.finalize(&signature.to_bytes())?)
-}
-
-#[cold]
-#[inline(never)]
-fn record_d0b_runtime_diagnostic(
-    runtime_state_directory: &std::path::Path,
-    error: &ManagedModelAgentStackRuntimeError,
-) {
-    let diagnostic = format!("{error:?}\n");
-    let _ = std::fs::write(
-        runtime_state_directory.join("d0b-runtime-diagnostic.txt"),
-        diagnostic.as_bytes(),
-    );
-    let Some(test_home) = runtime_state_directory
-        .parent()
-        .and_then(std::path::Path::parent)
-    else {
-        return;
-    };
-    let _ = std::fs::write(test_home.join("d0b-runtime-diagnostic.txt"), diagnostic);
 }
 
 fn validate_artifact_cutover_request(
