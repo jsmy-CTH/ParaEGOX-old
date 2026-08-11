@@ -2220,7 +2220,12 @@ fn artifact_model_intent_transition(
     model_generation: ManagedServiceGeneration,
 ) -> Result<ArtifactManagedModelAgentStackSnapshotTransitionV2, ManagedModelAgentStackRuntimeError>
 {
-    let proof_digest = verified.authenticated().proof_envelope_digest();
+    let proof_digest = request
+        .control_commitment()
+        .control()
+        .writer_context()
+        .proof()
+        .envelope_digest()?;
     transition.fabric_generation_high_water = transition
         .fabric_generation_high_water
         .max(fabric_generation.value());
