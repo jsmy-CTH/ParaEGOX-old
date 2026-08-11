@@ -514,10 +514,7 @@ impl LockedStore {
         self.release_observed(&mut observer)
     }
 
-    fn release_observed(
-        mut self,
-        observer: &mut dyn StoreFaultObserver,
-    ) -> Result<(), StoreError> {
+    fn release_observed(mut self, observer: &mut dyn StoreFaultObserver) -> Result<(), StoreError> {
         let injected = observer
             .checkpoint(StoreFaultPoint::BeforeUnlock)
             .map_err(|_| StoreError::Io);
@@ -1969,8 +1966,7 @@ fn create_objects_directory(staging: &DirectoryHandle) -> Result<DirectoryHandle
         exact_names(&objects, &[])?;
         objects.file.sync_all().map_err(|_| StoreError::Io)?;
         staging.file.sync_all().map_err(|_| StoreError::Io)?;
-        let reopened =
-            reopen_named_directory(staging, OsStr::new(OBJECTS_NAME), objects.identity)?;
+        let reopened = reopen_named_directory(staging, OsStr::new(OBJECTS_NAME), objects.identity)?;
         exact_names(&reopened, &[])?;
         drop(objects);
         Ok(reopened)
@@ -2170,10 +2166,8 @@ fn classify_initial_rename_error(
         Err(error) => return classify_rename_observation_error(error),
     };
     let observed = match selection {
-        (false, true) => {
-            initial_directory_matches(&state_root.leaf, STORE_STAGING_NAME, claim)
-                .map(|()| InitialRenameState::Old)
-        }
+        (false, true) => initial_directory_matches(&state_root.leaf, STORE_STAGING_NAME, claim)
+            .map(|()| InitialRenameState::Old),
         (true, false) => initial_directory_matches(&state_root.leaf, STORE_ROOT_NAME, claim)
             .map(|()| InitialRenameState::New),
         _ => return InitialRenameState::OwnerInvalid,
@@ -2443,10 +2437,7 @@ fn open_or_initialize_store(
                     Ok(reopened)
                 })()
                 .map_err(|error| {
-                    classify_initial_phase_error(
-                        InitialMutationPhase::OwnerFilesystemEffect,
-                        error,
-                    )
+                    classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
                 })?;
                 tracker.restore(staging_checkpoint);
                 created
@@ -2653,28 +2644,19 @@ fn continue_initialization(
                 Some((snapshot_identity, &snapshot_bytes)),
             )
             .map_err(|error| {
-                classify_initial_phase_error(
-                    InitialMutationPhase::OwnerFilesystemEffect,
-                    error,
-                )
+                classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
             })?;
             revalidate_current_authority(authority, binding, &state_root)
                 .map_err(classify_owner_authority_error)?;
             let (sealed_candidate, sealed_bytes, sealed_identity) =
                 decode_snapshot(&staging, STORE_SNAPSHOT_NAME).map_err(|error| {
-                    classify_initial_phase_error(
-                        InitialMutationPhase::OwnerFilesystemEffect,
-                        error,
-                    )
+                    classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
                 })?;
             if sealed_identity != snapshot_identity || sealed_bytes != snapshot_bytes {
                 return Err(StoreError::Owner);
             }
             if validate_candidate_filesystem(&objects, sealed_candidate).map_err(|error| {
-                classify_initial_phase_error(
-                    InitialMutationPhase::OwnerFilesystemEffect,
-                    error,
-                )
+                classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
             })? != snapshot
             {
                 return Err(StoreError::Owner);
@@ -2732,10 +2714,9 @@ fn continue_initialization(
         let snapshot_identity = write_new_exact(&staging, STORE_SNAPSHOT_NAME, &snapshot_bytes)
             .map_err(|error| match error {
                 StoreError::AlreadyExists | StoreError::Owner => error,
-                _ => classify_initial_phase_error(
-                    InitialMutationPhase::OwnerFilesystemEffect,
-                    error,
-                ),
+                _ => {
+                    classify_initial_phase_error(InitialMutationPhase::OwnerFilesystemEffect, error)
+                }
             })?;
         let mut observer = NoStoreFaultObserver;
         sync_initial_snapshot_parent_observed(&staging, &mut observer)?;
@@ -3558,14 +3539,7 @@ fn publish_or_recover_pair(
     tracker: &mut ChangeTracker,
 ) -> Result<PairPublication, StoreError> {
     let mut observer = NoStoreFaultObserver;
-    publish_or_recover_pair_observed(
-        store,
-        authority,
-        binding,
-        pair,
-        tracker,
-        &mut observer,
-    )
+    publish_or_recover_pair_observed(store, authority, binding, pair, tracker, &mut observer)
 }
 
 fn commit_receipt(
@@ -3796,8 +3770,8 @@ fn preflight_initial_operation_chain(
     request: &MaterializationRequestV1,
     pair: &VerifiedArtifactPairV1,
 ) -> Result<(), StoreError> {
-    let instance = ArtifactStoreInstanceV1::try_from_bytes([1; 32])
-        .map_err(map_preflight_contract_error)?;
+    let instance =
+        ArtifactStoreInstanceV1::try_from_bytes([1; 32]).map_err(map_preflight_contract_error)?;
     let sequence = NonZeroU64::new(1).expect("one is nonzero");
     let admission = MaterializationAdmissionV1::new(instance, sequence, request);
     let admitted = ArtifactStoreSnapshotV1::initial(
@@ -4500,8 +4474,7 @@ mod tests {
         } else {
             let object = ArtifactObjectRecordV1::new(
                 progressing.store_instance(),
-                NonZeroU64::new(progressing.object_high_water() + 1)
-                    .expect("pure object sequence"),
+                NonZeroU64::new(progressing.object_high_water() + 1).expect("pure object sequence"),
                 pair,
             );
             let with_object = progressing
@@ -4717,16 +4690,15 @@ mod tests {
             seen: Vec::new(),
             fired: false,
         };
-        let publication =
-            publish_or_recover_pair_observed(
-                &store,
-                &mut fixture.authority,
-                &binding,
-                &pair,
-                &mut tracker,
-                &mut observer,
-            )
-            .expect("late full pair is recovered in the same call");
+        let publication = publish_or_recover_pair_observed(
+            &store,
+            &mut fixture.authority,
+            &binding,
+            &pair,
+            &mut tracker,
+            &mut observer,
+        )
+        .expect("late full pair is recovered in the same call");
         let PairPublication::Complete(verified) = publication else {
             panic!("late full pair must recover as complete");
         };
@@ -4824,11 +4796,8 @@ mod tests {
             calls: 0,
         };
 
-        let invocation = ArtifactStoreV1::materialize(
-            &mut authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let invocation =
+            ArtifactStoreV1::materialize(&mut authority, &fixture.request, &fixture.pair);
         assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unchanged);
         assert_eq!(
             invocation
@@ -4853,11 +4822,8 @@ mod tests {
         let staging = fixture.state_root().join(STORE_STAGING_NAME);
         create_test_directory(&staging);
         drop(create_test_regular(&staging.join(STORE_LOCK_NAME), &[]));
-        fs::set_permissions(
-            staging.join(STORE_LOCK_NAME),
-            Permissions::from_mode(0o640),
-        )
-        .expect("invalidate bootstrap lock mode");
+        fs::set_permissions(staging.join(STORE_LOCK_NAME), Permissions::from_mode(0o640))
+            .expect("invalidate bootstrap lock mode");
         let before = tree_fingerprint(fixture.state_root());
 
         let invocation =
@@ -4876,8 +4842,7 @@ mod tests {
     fn authority_binding_rejects_noncanonical_or_overlong_paths() {
         let commitment = config(0x11);
         for path in [
-            "", "./", ".", "relative", "/", "/a/", "/a//b", "/a/./b", "/a/.",
-            "/a/../b",
+            "", "./", ".", "relative", "/", "/a/", "/a//b", "/a/./b", "/a/.", "/a/../b",
         ] {
             assert_eq!(
                 ArtifactStoreAuthorityBindingV1::try_new(PathBuf::from(path), commitment),
@@ -4961,10 +4926,7 @@ mod tests {
     #[test]
     fn initial_phase_errors_keep_scaffold_and_owner_effect_taxonomy_distinct() {
         assert_eq!(
-            classify_initial_phase_error(
-                InitialMutationPhase::StateRootScaffold,
-                StoreError::Io,
-            ),
+            classify_initial_phase_error(InitialMutationPhase::StateRootScaffold, StoreError::Io,),
             StoreError::PublicationUncertain(None),
         );
         assert_eq!(
@@ -5024,18 +4986,16 @@ mod tests {
             first_admission,
         )
         .expect("first pure admission");
-        let mut snapshot =
-            complete_pure_admitted_operation(admitted, &first_request, &first_pair);
+        let mut snapshot = complete_pure_admitted_operation(admitted, &first_request, &first_pair);
         for index in 2_u8..=crate::MAX_ARTIFACT_OBJECTS as u8 {
             let payload = format!("object-{index:02} ");
-            let pair = VerifiedArtifactPairV1::from_payload(payload.as_bytes())
-                .expect("unique pure pair");
+            let pair =
+                VerifiedArtifactPairV1::from_payload(payload.as_bytes()).expect("unique pure pair");
             let request =
                 MaterializationRequestV1::new(operation(index), config, pair.object_ref());
             let sequence = NonZeroU64::new(snapshot.operation_high_water() + 1)
                 .expect("pure operation sequence");
-            let admission =
-                MaterializationAdmissionV1::new(instance, sequence, &request);
+            let admission = MaterializationAdmissionV1::new(instance, sequence, &request);
             let admitted = snapshot
                 .try_successor(ArtifactSnapshotSuccessorV1::Admission {
                     request: request.clone(),
