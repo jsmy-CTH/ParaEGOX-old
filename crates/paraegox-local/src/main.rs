@@ -18,10 +18,10 @@ use config::{
     LocalManagedChatConfigV1, LocalReceiptSnapshotCommandV1, LocalTuiAttachCommandV1,
 };
 use error::LocalProcessError;
-use serde::Serialize;
-use serde_json::json;
 #[cfg(unix)]
 use paraegox_deployment::DeveloperArtifactExternalControllerRequestV1;
+use serde::Serialize;
+use serde_json::json;
 
 mod artifact;
 #[cfg(unix)]
@@ -858,9 +858,7 @@ fn dispatch(
             supervisor.expected_commitment,
             supervisor.expected_generation,
         ) {
-            Ok(lifecycle::LocalChatSupervisorResultV1::Completed) => {
-                Ok(DispatchOutcome::Success)
-            }
+            Ok(lifecycle::LocalChatSupervisorResultV1::Completed) => Ok(DispatchOutcome::Success),
             Ok(lifecycle::LocalChatSupervisorResultV1::Contended) => {
                 Ok(DispatchOutcome::HiddenSupervisorContended)
             }
@@ -1281,8 +1279,7 @@ fn parse_artifact_external_supervisor(
         || arguments[3].as_os_str() != OsStr::new("--artifact-object-ref")
         || arguments[5].as_os_str() != OsStr::new("--materialization-receipt-ref")
         || arguments[7].as_os_str() != OsStr::new("--operation-id")
-        || arguments[9].as_os_str()
-            != OsStr::new(lifecycle::EXPECTED_CONFIG_COMMITMENT_OPTION)
+        || arguments[9].as_os_str() != OsStr::new(lifecycle::EXPECTED_CONFIG_COMMITMENT_OPTION)
         || arguments[11].as_os_str() != OsStr::new(lifecycle::EXPECTED_GENERATION_OPTION)
     {
         return Err(LocalProcessError::LifecycleConfiguration);

@@ -1467,11 +1467,7 @@ fn spawn_composition(
                     run_prepared_headless_chat(prepared, &mut control)
                 }
                 PreparedLifecycleOwnerV1::ArtifactExternal { prepared, .. } => {
-                    run_prepared_artifact_external_owner(
-                        prepared,
-                        generation,
-                        &mut control,
-                    )
+                    run_prepared_artifact_external_owner(prepared, generation, &mut control)
                 }
             };
             let _ = events.send(SupervisorEventV1::Exited(result));

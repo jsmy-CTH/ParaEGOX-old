@@ -22,8 +22,7 @@ use nix::unistd::{Gid, Pid, Uid};
 use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSessionId};
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
 use paraegox_deployment::{
-    DeveloperArtifactExternalControllerRequestV1,
-    DeveloperArtifactExternalModelAgentStackInputV1,
+    DeveloperArtifactExternalControllerRequestV1, DeveloperArtifactExternalModelAgentStackInputV1,
     DeveloperDeploymentAgentBootstrapStartFieldsV1, DeveloperDeploymentAgentBootstrapStartInputV1,
     DeveloperDeploymentAgentBootstrapStartOutcomeV1, DeveloperDeploymentEnrollmentFactsFieldsV1,
     DeveloperDeploymentEnrollmentFactsV1, DeveloperDeploymentOwnerV1,
@@ -100,8 +99,8 @@ use paraegox_runtime::{
     RuntimeFabricCredentialResolverV2, RuntimeModelBackendResolveError,
     RuntimeModelBackendResolverV1, RuntimeResolvedAgentProviderV1,
     RuntimeResolvedArtifactModelBackendV1, RuntimeResolvedFabricPeerCredentialV2,
-    RuntimeResolvedModelBackendV1,
-    start_runtime_agent_developer_local_ipc_v1, start_runtime_developer_local_v1,
+    RuntimeResolvedModelBackendV1, start_runtime_agent_developer_local_ipc_v1,
+    start_runtime_developer_local_v1,
 };
 use paraegox_runtime_contracts::distributed_agent_stack_plan::{
     DistributedFabricCredentialRefV1, DistributedFabricPeerAuthenticationRequirementV1,

@@ -60,15 +60,13 @@ pub(crate) fn parse_supervisor_request(
             .ok_or(LocalProcessError::ArtifactExternalDeployMaterializationReceipt)?,
     )
     .map_err(|_| LocalProcessError::ArtifactExternalDeployMaterializationReceipt)?;
-    let operation_id = config::ArtifactExternalDeploymentOperationIdInputV1::parse_hidden(
-        operation_id,
-    )?;
+    let operation_id =
+        config::ArtifactExternalDeploymentOperationIdInputV1::parse_hidden(operation_id)?;
     let operation_id = ArtifactDeploymentOperationIdV1::try_from_bytes(*operation_id.as_bytes())
         .ok_or(LocalProcessError::ArtifactExternalDeployOwner)?;
-    let commitment = paraegox_artifact::ArtifactConfigCommitmentV1::try_from_bytes(
-        config.config_commitment(),
-    )
-    .map_err(|_| LocalProcessError::LifecycleConfiguration)?;
+    let commitment =
+        paraegox_artifact::ArtifactConfigCommitmentV1::try_from_bytes(config.config_commitment())
+            .map_err(|_| LocalProcessError::LifecycleConfiguration)?;
     DeveloperArtifactExternalControllerRequestV1::try_new(
         operation_id,
         commitment,
