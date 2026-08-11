@@ -5115,10 +5115,7 @@ mod tests {
             assert_eq!(state.phase(), phase);
             assert_eq!(state.controller_snapshot_sequence().get(), sequence);
             assert_eq!(state.request().operation_id().as_bytes(), &[0xd1; 16]);
-            assert_eq!(
-                state.request().config_commitment().as_bytes(),
-                &[0xa1; 32],
-            );
+            assert_eq!(state.request().config_commitment().as_bytes(), &[0xa1; 32],);
             assert_eq!(state.admission().controller_store_instance(), &[0xd0; 32]);
             assert_eq!(state.admission().admission_sequence().get(), 1);
             assert!(state.runtime_request().is_none());
@@ -5141,7 +5138,11 @@ mod tests {
                     assert_eq!(record.progress().controller_snapshot_sequence, 0);
                     assert_eq!(record.progress().lifecycle_generation, [0xd2; 16]);
                     assert_eq!(
-                        state.receipt().expect("pre-C PXDO").receipt_sequence().get(),
+                        state
+                            .receipt()
+                            .expect("pre-C PXDO")
+                            .receipt_sequence()
+                            .get(),
                         1,
                     );
                 }
