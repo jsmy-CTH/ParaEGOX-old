@@ -131,13 +131,22 @@ def _invoke_json(
         _print_d0b_failure_state(environment)
         if arguments and arguments[0] == "deploy":
             diagnostic_path = Path(environment["PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH"])
+            if not diagnostic_path.is_file():
+                diagnostic_path = next(
+                    (Path(environment["HOME"]) / "state").rglob(
+                        "d0b-runtime-diagnostic.txt"
+                    ),
+                    diagnostic_path,
+                )
             diagnostic = (
                 diagnostic_path.read_text(encoding="utf-8", errors="backslashreplace").strip()
                 if diagnostic_path.is_file()
                 else "<absent>"
             )
             pytest.exit(
-                f"captured first D0b deploy failure: {diagnostic}",
+                "captured first D0b deploy failure: "
+                f"diagnostic={diagnostic}; stdout={process.stdout!r}; "
+                f"stderr={process.stderr!r}",
                 returncode=1,
             )
     assert process.returncode == expected_returncode, (

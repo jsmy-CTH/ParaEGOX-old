@@ -2645,6 +2645,11 @@ fn record_d0b_runtime_diagnostic(
     runtime_state_directory: &std::path::Path,
     error: &ManagedModelAgentStackRuntimeError,
 ) {
+    let diagnostic = format!("{error:?}\n");
+    let _ = std::fs::write(
+        runtime_state_directory.join("d0b-runtime-diagnostic.txt"),
+        diagnostic.as_bytes(),
+    );
     let Some(test_home) = runtime_state_directory
         .parent()
         .and_then(std::path::Path::parent)
@@ -2653,7 +2658,7 @@ fn record_d0b_runtime_diagnostic(
     };
     let _ = std::fs::write(
         test_home.join("d0b-runtime-diagnostic.txt"),
-        format!("{error:?}\n"),
+        diagnostic,
     );
 }
 
