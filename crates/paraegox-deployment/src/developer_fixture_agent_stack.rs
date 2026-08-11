@@ -40,8 +40,11 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricApplyTerminalOutcomeV1, ManagedFabricListenEndpointV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
-    ManagedModelAgentStackTargetModeV1, ManagedModelAgentStackTerminalOutcomeV1,
-    ManagedModelServicePlanV1,
+    ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelAdapterBindingV1,
+    ManagedModelAdapterVersionV1, ManagedModelAgentStackTargetModeV1,
+    ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
+    ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
 };
 use paraegox_runtime_contracts::managed_service::{
     ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
@@ -99,11 +102,19 @@ use crate::managed_fabric_producer::{
 };
 use crate::managed_fabric_store::{ManagedAgentStackDurableStoreV1, ManagedFabricSuccessorStoreV1};
 use crate::managed_model_agent_stack_apply::{
+    ArtifactExternalControllerPhaseV2, DeveloperArtifactExternalControllerAuthorityV1,
+    DeveloperArtifactExternalControllerFailureV1, DeveloperArtifactExternalControllerProjectionV1,
+    DeveloperArtifactExternalControllerRequestV1, DeveloperArtifactExternalControllerResidentV1,
     ManagedModelAgentStackApplyControllerError, ManagedModelAgentStackApplyJournalV1,
-    ManagedModelAgentStackTerminalCommitV1,
+    ManagedModelAgentStackTerminalCommitV1, internal_external_projection,
+    internal_external_request,
 };
 use crate::managed_model_agent_stack_producer::{
-    FreshManagedModelAgentStackApplyV1, ManagedModelAgentStackActivationV1,
+    ArtifactBoundManagedModelAgentStackDesiredInputV1,
+    ArtifactBoundManagedModelAgentStackDesiredPlanV1, FreshManagedModelAgentStackApplyV1,
+    ManagedModelAgentStackActivationV1,
+    produce_artifact_bound_managed_model_agent_stack_request_v1,
+    validate_artifact_bound_managed_model_agent_stack_request_v1,
 };
 use crate::managed_serving_client::{
     FreshManagedServingBootstrapV1, ManagedServingBootstrapPhaseV1, VerifiedManagedServingPinV1,
@@ -116,11 +127,11 @@ use crate::planner::{
 };
 use crate::runtime_control_client::{
     RuntimeControlSocketAcl, RuntimeManagedAgentStackResponseVerifier,
-    RuntimeManagedFabricResponseVerifier, RuntimeManagedModelAgentStackResponseVerifier,
-    RuntimeManagedServingResponseVerifier, RuntimeQueryResponseVerifier, RuntimeUnixCredentials,
-    UnixRuntimeControlEndpoint, UnixRuntimeManagedAgentStackClient, UnixRuntimeManagedFabricClient,
-    UnixRuntimeManagedModelAgentStackClient, UnixRuntimeManagedServingClient,
-    UnixRuntimeQueryClient,
+    RuntimeManagedFabricResponseVerifier, RuntimeManagedModelAgentStackExchangeError,
+    RuntimeManagedModelAgentStackResponseVerifier, RuntimeManagedServingResponseVerifier,
+    RuntimeQueryResponseVerifier, RuntimeUnixCredentials, UnixRuntimeControlEndpoint,
+    UnixRuntimeManagedAgentStackClient, UnixRuntimeManagedFabricClient,
+    UnixRuntimeManagedModelAgentStackClient, UnixRuntimeManagedServingClient, UnixRuntimeQueryClient,
 };
 use crate::tenure_client::{
     AcquireTenureRequestToSign, AuthorityProofVerifier, AuthoritySocketAcl,
@@ -978,6 +989,43 @@ impl fmt::Debug for DeveloperProvisionedModelAgentStackInputV1 {
     }
 }
 
+/// Resident-only external Artifact activation input. The caller has already
+/// published the matching PXMJ2 admitted state while holding the lifecycle
+/// owner lock; this value carries no top-store handle across that boundary.
+pub struct DeveloperArtifactExternalModelAgentStackInputV1 {
+    common: DeveloperFixtureAgentStackInputV1,
+    request: DeveloperArtifactExternalControllerRequestV1,
+    lifecycle_generation: [u8; 16],
+}
+
+impl DeveloperArtifactExternalModelAgentStackInputV1 {
+    pub fn try_new(
+        common: DeveloperFixtureAgentStackInputV1,
+        request: DeveloperArtifactExternalControllerRequestV1,
+        lifecycle_generation: [u8; 16],
+    ) -> Result<Self, DeveloperArtifactExternalModelAgentStackError> {
+        if lifecycle_generation.iter().all(|byte| *byte == 0) {
+            return Err(DeveloperArtifactExternalModelAgentStackError::InvalidInput);
+        }
+        Ok(Self {
+            common,
+            request,
+            lifecycle_generation,
+        })
+    }
+}
+
+impl fmt::Debug for DeveloperArtifactExternalModelAgentStackInputV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeveloperArtifactExternalModelAgentStackInputV1")
+            .field("common", &self.common)
+            .field("request", &self.request)
+            .field("lifecycle_generation", &"<redacted>")
+            .finish()
+    }
+}
+
 fn validate_model_plan(
     identities: DeveloperFixtureDerivedIdentityV1,
     agent_provider: ManagedAgentProviderSelectionV1,
@@ -1106,6 +1154,42 @@ pub struct DeveloperFixtureModelAgentStackOutcomeV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeveloperProvisionedModelAgentStackOutcomeV1(DeveloperFixtureModelAgentStackOutcomeV1);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeveloperArtifactExternalModelAgentStackOutcomeV1 {
+    projection: DeveloperArtifactExternalControllerProjectionV1,
+    model_agent_terminal_receipt: Box<[u8]>,
+    authority_tenure_epoch: u64,
+    authority_proof_digest: Digest32,
+    fabric_replayed: bool,
+}
+
+impl DeveloperArtifactExternalModelAgentStackOutcomeV1 {
+    #[must_use]
+    pub const fn projection(&self) -> &DeveloperArtifactExternalControllerProjectionV1 {
+        &self.projection
+    }
+
+    #[must_use]
+    pub fn model_agent_terminal_receipt(&self) -> &[u8] {
+        &self.model_agent_terminal_receipt
+    }
+
+    #[must_use]
+    pub const fn authority_tenure_epoch(&self) -> u64 {
+        self.authority_tenure_epoch
+    }
+
+    #[must_use]
+    pub const fn authority_proof_digest(&self) -> Digest32 {
+        self.authority_proof_digest
+    }
+
+    #[must_use]
+    pub const fn fabric_replayed(&self) -> bool {
+        self.fabric_replayed
+    }
+}
 
 impl DeveloperProvisionedModelAgentStackOutcomeV1 {
     #[must_use]
@@ -1383,6 +1467,41 @@ impl fmt::Display for DeveloperFixtureModelAgentStackError {
 
 impl std::error::Error for DeveloperFixtureModelAgentStackError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeveloperArtifactExternalModelAgentStackError {
+    InvalidInput,
+    Base(DeveloperFixtureAgentStackError),
+    Controller(DeveloperArtifactExternalControllerFailureV1),
+    ModelAgentApply,
+}
+
+impl From<DeveloperFixtureAgentStackError>
+    for DeveloperArtifactExternalModelAgentStackError
+{
+    fn from(value: DeveloperFixtureAgentStackError) -> Self {
+        Self::Base(value)
+    }
+}
+
+impl From<DeveloperArtifactExternalControllerFailureV1>
+    for DeveloperArtifactExternalModelAgentStackError
+{
+    fn from(value: DeveloperArtifactExternalControllerFailureV1) -> Self {
+        Self::Controller(value)
+    }
+}
+
+impl fmt::Display for DeveloperArtifactExternalModelAgentStackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "developer external Artifact Model+Agent activation failed closed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for DeveloperArtifactExternalModelAgentStackError {}
+
 /// Phase one: advances and seals both durable single-target ActiveReady
 /// predecessors, then returns only the public Runtime observation authorities
 /// required to construct PXOB and start the two Node daemons.
@@ -1562,6 +1681,296 @@ pub fn run_developer_provisioned_model_agent_stack_v1(
 ) -> Result<DeveloperProvisionedModelAgentStackOutcomeV1, DeveloperFixtureModelAgentStackError> {
     run_developer_model_agent_stack(input.common, input.provider, input.model)
         .map(DeveloperProvisionedModelAgentStackOutcomeV1)
+}
+
+/// Advances one already-admitted external Artifact deployment through the
+/// real Fabric predecessor, exact PXAR12 Runtime exchange, and durable PXMJ2
+/// terminal. The caller retains the lifecycle owner lock for this whole call;
+/// every Controller/lower lock remains transaction-scoped inside Deployment.
+pub fn run_developer_artifact_external_model_agent_stack_v1(
+    input: DeveloperArtifactExternalModelAgentStackInputV1,
+    authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+) -> Result<
+    DeveloperArtifactExternalModelAgentStackOutcomeV1,
+    DeveloperArtifactExternalModelAgentStackError,
+> {
+    let DeveloperArtifactExternalModelAgentStackInputV1 {
+        common,
+        request,
+        lifecycle_generation,
+    } = input;
+    let provider = deterministic_provider(common.identities)?;
+    let context = FixtureContext::try_new(common, provider)?;
+    let runtime = RuntimeBuilder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| {
+            DeveloperArtifactExternalModelAgentStackError::Base(
+                DeveloperFixtureAgentStackError::Runtime,
+            )
+        })?;
+    let internal_request = internal_external_request(&request)
+        .map_err(|_| DeveloperArtifactExternalModelAgentStackError::InvalidInput)?;
+
+    let mut controller = DeveloperArtifactExternalControllerResidentV1::open(
+        authority,
+        request.operation_id(),
+    )?;
+    if controller.state().phase() != ArtifactExternalControllerPhaseV2::Admitted
+        || controller.state().request() != &internal_request
+    {
+        return release_external_controller(
+            controller,
+            Err(DeveloperArtifactExternalModelAgentStackError::Controller(
+                DeveloperArtifactExternalControllerFailureV1::Owner,
+            )),
+        );
+    }
+    let mut successor = match open_or_initialize_legacy(&context) {
+        Ok(legacy) => advance_legacy_and_cutover(&context, &runtime, legacy)?,
+        Err(_) => ManagedFabricSuccessorStoreV1::resume_from_cutover_marker_developer_local(
+            &context.paths.controller_state_directory,
+            &context.paths.successor_state_directory,
+            context.identities.successor_store_instance_id(),
+            context.owner_identity,
+            &context.controller_signer,
+            &context.fabric_provisioning,
+        )
+        .map_err(|_| {
+            DeveloperArtifactExternalModelAgentStackError::Base(
+                DeveloperFixtureAgentStackError::Cutover,
+            )
+        })?,
+    };
+    ensure_a2_successor_root(successor.state())
+        .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let _serving = advance_serving_pin(&context, &runtime, &mut successor)?;
+    let fabric = advance_fabric_active(&context, &runtime, &mut successor)?;
+    let fabric_context = successor
+        .state()
+        .verified_current_context(&context.controller_signer, &context.fabric_provisioning)
+        .map_err(|_| {
+            DeveloperArtifactExternalModelAgentStackError::Base(
+                DeveloperFixtureAgentStackError::Cutover,
+            )
+        })?;
+    let predecessor = successor.state().desired().ok_or(
+        DeveloperArtifactExternalModelAgentStackError::Base(
+            DeveloperFixtureAgentStackError::Cutover,
+        ),
+    )?;
+    let predecessor_request = successor.state().request().ok_or(
+        DeveloperArtifactExternalModelAgentStackError::Base(
+            DeveloperFixtureAgentStackError::Cutover,
+        ),
+    )?;
+    let activation = ManagedModelAgentStackActivationV1::try_new(
+        predecessor.execution().clone(),
+        developer_artifact_agent_plan(&context)?,
+        developer_artifact_model_plan(&context)?,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let desired = ArtifactBoundManagedModelAgentStackDesiredPlanV1::try_activate(
+        ArtifactBoundManagedModelAgentStackDesiredInputV1 {
+            context: &fabric_context,
+            cutover_marker_digest: controller
+                .state()
+                .cutover_marker_digest()
+                .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?,
+            predecessor_revision: predecessor.revision(),
+            predecessor_execution: predecessor.execution(),
+            predecessor_slice_digest: predecessor_request.target_slice_digest(),
+            deployment_request_digest: controller.state().request().request_digest(),
+            deployment_admission_digest: controller.state().admission().admission_digest(),
+            binding: controller.state().request().binding(),
+            activation: &activation,
+        },
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let runtime_request = produce_artifact_bound_managed_model_agent_stack_request_v1(
+        &fabric_context,
+        &desired,
+        fresh_managed_model_agent_stack_apply()
+            .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?,
+        &context.controller_signer,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    validate_artifact_bound_managed_model_agent_stack_request_v1(
+        &fabric_context,
+        &desired,
+        &runtime_request,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let committed = controller.commit_plan(
+        authority,
+        desired.plan_content().clone(),
+        desired.execution().clone(),
+        runtime_request.clone(),
+    );
+    drop(successor);
+    let committed = release_external_controller(
+        controller,
+        committed.map_err(DeveloperArtifactExternalModelAgentStackError::from),
+    )?;
+    if committed.phase() != ArtifactExternalControllerPhaseV2::Committed {
+        return Err(DeveloperArtifactExternalModelAgentStackError::Controller(
+            DeveloperArtifactExternalControllerFailureV1::Owner,
+        ));
+    }
+
+    let mut controller = DeveloperArtifactExternalControllerResidentV1::open(
+        authority,
+        request.operation_id(),
+    )?;
+    let successor = reopen_artifact_successor(&context)?;
+    let reopened_context = successor
+        .state()
+        .verified_current_context(&context.controller_signer, &context.fabric_provisioning)
+        .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    validate_artifact_bound_managed_model_agent_stack_request_v1(
+        &reopened_context,
+        &desired,
+        &runtime_request,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let applying = controller.begin_apply(authority, lifecycle_generation);
+    drop(successor);
+    let applying = release_external_controller(
+        controller,
+        applying.map_err(DeveloperArtifactExternalModelAgentStackError::from),
+    )?;
+    if applying.phase() != ArtifactExternalControllerPhaseV2::Applying {
+        return Err(DeveloperArtifactExternalModelAgentStackError::Controller(
+            DeveloperArtifactExternalControllerFailureV1::Owner,
+        ));
+    }
+
+    let verifier = RuntimeManagedModelAgentStackResponseVerifier::try_new(
+        PrincipalRef::from_bytes(context.identities.runtime_principal()),
+        ApplyAuthKeyRef::from_bytes(context.identities.runtime_response_key_ref()),
+        context.request_auth.algorithm(),
+        context.request_auth.algorithm_version(),
+        runtime_response_key_fingerprint(&context)?,
+        context.runtime_response_verification_key,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let client = UnixRuntimeManagedModelAgentStackClient::try_new(
+        runtime_endpoint(&context)?,
+        verifier,
+        EXCHANGE_TIMEOUT,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let response = runtime.block_on(client.exchange_artifact(
+        &runtime_request,
+        fabric_context.channel(),
+    ));
+    let (runtime_terminal, missing_terminal_phase) = match response {
+        Ok(wire) => (
+            Some(
+                ManagedModelAgentStackTerminalReceiptV1::decode(&wire)
+                    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?,
+            ),
+            None,
+        ),
+        Err(RuntimeManagedModelAgentStackExchangeError::NotSent(_)) => {
+            (None, Some(ArtifactExternalControllerPhaseV2::Failed))
+        }
+        Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(_)) => {
+            (None, Some(ArtifactExternalControllerPhaseV2::Uncertain))
+        }
+    };
+
+    let mut controller = DeveloperArtifactExternalControllerResidentV1::open(
+        authority,
+        request.operation_id(),
+    )?;
+    let successor = reopen_artifact_successor(&context)?;
+    let reopened_context = successor
+        .state()
+        .verified_current_context(&context.controller_signer, &context.fabric_provisioning)
+        .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    validate_artifact_bound_managed_model_agent_stack_request_v1(
+        &reopened_context,
+        &desired,
+        &runtime_request,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    if let Some(receipt) = runtime_terminal.as_ref() {
+        receipt
+            .validate_against_artifact_request(&runtime_request, reopened_context.channel())
+            .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    }
+    let terminal = controller.finish_apply(
+        authority,
+        runtime_terminal.clone(),
+        missing_terminal_phase,
+    );
+    let authority_proof = successor
+        .state()
+        .legacy_snapshot()
+        .state()
+        .latest_committed_tenure_proof(PlanWriterRef::from_bytes(context.identities.writer()))
+        .ok_or(DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?
+        .clone();
+    let authority_tenure_epoch = authority_proof.claim().epoch().value();
+    let authority_proof_digest = authority_proof
+        .envelope_digest()
+        .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    drop(successor);
+    let terminal = release_external_controller(
+        controller,
+        terminal.map_err(DeveloperArtifactExternalModelAgentStackError::from),
+    )?;
+    let projection = internal_external_projection(&terminal)?;
+    let Some(runtime_terminal) = runtime_terminal else {
+        return Err(DeveloperArtifactExternalModelAgentStackError::ModelAgentApply);
+    };
+    if terminal.phase() != ArtifactExternalControllerPhaseV2::ActiveReady
+        || runtime_terminal.facts().state().outcome()
+            != ManagedModelAgentStackTerminalOutcomeV1::ActiveReady
+    {
+        return Err(DeveloperArtifactExternalModelAgentStackError::ModelAgentApply);
+    }
+    Ok(DeveloperArtifactExternalModelAgentStackOutcomeV1 {
+        projection,
+        model_agent_terminal_receipt: runtime_terminal.canonical_wire().into(),
+        authority_tenure_epoch,
+        authority_proof_digest,
+        fabric_replayed: fabric.replayed_from_journal(),
+    })
+}
+
+fn release_external_controller<T>(
+    controller: DeveloperArtifactExternalControllerResidentV1,
+    result: Result<T, DeveloperArtifactExternalModelAgentStackError>,
+) -> Result<T, DeveloperArtifactExternalModelAgentStackError> {
+    match (result, controller.release()) {
+        (Err(primary), _) => Err(primary),
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(release)) => Err(release.into()),
+    }
+}
+
+fn reopen_artifact_successor(
+    context: &FixtureContext,
+) -> Result<ManagedFabricSuccessorStoreV1, DeveloperArtifactExternalModelAgentStackError> {
+    let successor = ManagedFabricSuccessorStoreV1::resume_from_cutover_marker_developer_local(
+        &context.paths.controller_state_directory,
+        &context.paths.successor_state_directory,
+        context.identities.successor_store_instance_id(),
+        context.owner_identity,
+        &context.controller_signer,
+        &context.fabric_provisioning,
+    )
+    .map_err(|_| {
+        DeveloperArtifactExternalModelAgentStackError::Base(
+            DeveloperFixtureAgentStackError::Cutover,
+        )
+    })?;
+    ensure_a2_successor_root(successor.state())
+        .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    Ok(successor)
 }
 
 fn run_developer_model_agent_stack(
@@ -3293,6 +3702,71 @@ fn developer_agent_plan(
         context.provider,
     )
     .map_err(|_| DeveloperFixtureAgentStackError::AgentApply)
+}
+
+fn developer_artifact_agent_plan(
+    context: &FixtureContext,
+) -> Result<ManagedAgentServicePlanV1, DeveloperArtifactExternalModelAgentStackError> {
+    let budgets = ManagedServiceLifecycleBudgetsV1::try_new(
+        BoundedDuration::from_nanos(1_000_000),
+        BoundedDuration::from_nanos(2_000_000),
+        BoundedDuration::from_nanos(3_000_000),
+        BoundedDuration::from_nanos(4_000_000),
+        BoundedDuration::from_nanos(5_000_000),
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::InvalidInput)?;
+    let ingress =
+        ManagedAgentIngressLimitsV1::try_new(8, 512 * 1024, 64 * 1024, 64 * 1024, 2_000_000_000)
+            .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    let port = ManagedAgentPortPlanV1::try_new(
+        BindingId::from_bytes(context.identities.submit_binding_id()),
+        BindingId::from_bytes(context.identities.control_binding_id()),
+        "paraegox/local/agent/v1/submit",
+        "paraegox/local/agent/v1/control",
+        ingress,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
+    ManagedAgentServicePlanV1::try_new(
+        ManagedServiceSpecV1::new(
+            ManagedServiceId::from_bytes(context.identities.agent_service_id()),
+            budgets,
+        ),
+        ManagedAgentSemanticLimitsV1::try_new(8, 16, 16, 32)
+            .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?,
+        port,
+        context.provider,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)
+}
+
+fn developer_artifact_model_plan(
+    context: &FixtureContext,
+) -> Result<ManagedModelServicePlanV1, DeveloperArtifactExternalModelAgentStackError> {
+    let budgets = ManagedServiceLifecycleBudgetsV1::try_new(
+        BoundedDuration::from_nanos(23),
+        BoundedDuration::from_nanos(29),
+        BoundedDuration::from_nanos(31),
+        BoundedDuration::from_nanos(37),
+        BoundedDuration::from_nanos(41),
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::InvalidInput)?;
+    let adapter = ManagedModelAdapterBindingV1::try_new(
+        *b"px-art-prefix-v1",
+        ManagedModelAdapterVersionV1::try_new(1)
+            .map_err(|_| DeveloperArtifactExternalModelAgentStackError::InvalidInput)?,
+        ManagedModelCapabilityIdV1::bounded_text_v1(),
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::InvalidInput)?;
+    ManagedModelServicePlanV1::try_new(
+        ManagedServiceSpecV1::new(
+            ManagedServiceId::from_bytes(context.identities.model_service_id()),
+            budgets,
+        ),
+        8,
+        context.provider,
+        adapter,
+    )
+    .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)
 }
 
 fn deterministic_provider(

@@ -5472,7 +5472,99 @@ impl DeveloperArtifactExternalControllerV1 {
     }
 }
 
-fn internal_external_request(
+/// Crate-private resident transaction guard. Local never receives this value:
+/// Deployment keeps the top-store lock and canonical state transitions behind
+/// the owner facade while the resident owns the outer lifecycle lock.
+pub(crate) struct DeveloperArtifactExternalControllerResidentV1 {
+    binding: artifact_external_store::ArtifactExternalControllerAuthorityBindingV1,
+    store: artifact_external_store::ArtifactExternalDeploymentControllerLockedV1,
+}
+
+impl DeveloperArtifactExternalControllerResidentV1 {
+    pub(crate) fn open(
+        authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+        operation_id: ArtifactDeploymentOperationIdV1,
+    ) -> Result<Self, DeveloperArtifactExternalControllerFailureV1> {
+        let mut adapter = DeveloperArtifactExternalControllerAuthorityAdapter { authority };
+        let (binding, store) =
+            artifact_external_store::ArtifactExternalDeploymentControllerStoreV1::open_exclusive(
+                &mut adapter,
+                operation_id,
+            )
+            .map_err(project_external_failure)?;
+        Ok(Self { binding, store })
+    }
+
+    pub(crate) const fn state(&self) -> &ArtifactExternalControllerStateV2 {
+        self.store.state()
+    }
+
+    pub(crate) fn commit_plan(
+        &mut self,
+        authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+        plan_content: ArtifactBoundManagedModelAgentStackPlanContentV2,
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        runtime_request: ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> Result<ArtifactExternalControllerStateV2, DeveloperArtifactExternalControllerFailureV1>
+    {
+        let next = self
+            .store
+            .state()
+            .commit(plan_content, execution, runtime_request)
+            .map_err(|_| DeveloperArtifactExternalControllerFailureV1::Owner)?;
+        self.commit(authority, next)
+    }
+
+    pub(crate) fn begin_apply(
+        &mut self,
+        authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+        lifecycle_generation: [u8; 16],
+    ) -> Result<ArtifactExternalControllerStateV2, DeveloperArtifactExternalControllerFailureV1>
+    {
+        let next = self
+            .store
+            .state()
+            .begin_apply(lifecycle_generation)
+            .map_err(|_| DeveloperArtifactExternalControllerFailureV1::Owner)?;
+        self.commit(authority, next)
+    }
+
+    pub(crate) fn finish_apply(
+        &mut self,
+        authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+        runtime_terminal: Option<ManagedModelAgentStackTerminalReceiptV1>,
+        missing_terminal_phase: Option<ArtifactExternalControllerPhaseV2>,
+    ) -> Result<ArtifactExternalControllerStateV2, DeveloperArtifactExternalControllerFailureV1>
+    {
+        let next = self
+            .store
+            .state()
+            .finish_apply(runtime_terminal, missing_terminal_phase)
+            .map_err(|_| DeveloperArtifactExternalControllerFailureV1::Owner)?;
+        self.commit(authority, next)
+    }
+
+    fn commit(
+        &mut self,
+        authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+        next: ArtifactExternalControllerStateV2,
+    ) -> Result<ArtifactExternalControllerStateV2, DeveloperArtifactExternalControllerFailureV1>
+    {
+        let mut adapter = DeveloperArtifactExternalControllerAuthorityAdapter { authority };
+        self.store
+            .commit_successor(&mut adapter, &self.binding, next)
+            .into_result()
+            .map_err(project_external_failure)
+    }
+
+    pub(crate) fn release(
+        self,
+    ) -> Result<(), DeveloperArtifactExternalControllerFailureV1> {
+        self.store.release().map_err(project_external_failure)
+    }
+}
+
+pub(crate) fn internal_external_request(
     request: &DeveloperArtifactExternalControllerRequestV1,
 ) -> Result<ArtifactExternalDeploymentRequestV1, ManagedModelAgentStackApplyControllerError> {
     let binding = ArtifactExecutionBindingV1::try_new(
@@ -5485,6 +5577,13 @@ fn internal_external_request(
         request.config_commitment,
         binding,
     )
+}
+
+pub(crate) fn internal_external_projection(
+    state: &ArtifactExternalControllerStateV2,
+) -> Result<DeveloperArtifactExternalControllerProjectionV1, DeveloperArtifactExternalControllerFailureV1>
+{
+    project_external_state(state)
 }
 
 fn project_external_invocation(
