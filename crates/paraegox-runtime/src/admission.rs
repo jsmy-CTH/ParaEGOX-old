@@ -998,8 +998,10 @@ impl ApplyAdmissionPolicy {
         &self,
         request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
         reading: ClockReading,
-    ) -> Result<VerifiedArtifactManagedModelAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError>
-    {
+    ) -> Result<
+        VerifiedArtifactManagedModelAgentStackApplyIngressV1,
+        ManagedFabricApplyAdmissionError,
+    > {
         let authenticated =
             self.authenticate_artifact_managed_model_agent_stack_apply_request(request)?;
         let temporal = request.temporal();
@@ -4672,14 +4674,12 @@ mod tests {
 
     #[test]
     fn artifact_pxar_v12_reuses_strict_owner_authentication_and_clock_admission() {
-        let request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
-            &decode_fixture_hex(include_str!(
-                "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
-            )),
-        )
-        .expect("shared PXAR v12 fixture");
-        let (admission, _) =
-            python_fixture_admission_for_target_and_budget(0x05, 6_000_083);
+        let request =
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(&decode_fixture_hex(
+                include_str!("../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"),
+            ))
+            .expect("shared PXAR v12 fixture");
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 6_000_083);
         let generation = ClockGeneration::try_new(3).expect("fixture generation");
         let reading = ClockReading::new(
             ClockDomainRef::from_bytes([0x0a; 16]),
