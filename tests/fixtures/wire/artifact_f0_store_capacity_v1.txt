@@ -1,0 +1,14 @@
+stable-components=1241344+64*(206+64)+540,result=1259164
+transaction-components=1259164+1241344+270,result=2500778
+snapshot-frame=1241344,result=accept
+snapshot-frame=1241345,result=reject
+objects=64,result=accept
+objects=65,result=reject
+operations=1024,result=accept
+operations=1025,result=reject
+quarantine=540,result=accept
+quarantine=541,result=reject
+indexed-object-bytes=270,extra-temp-bytes=270,count=once-each,result=accept
+defense-ceiling=8388608,result=accept
+defense-ceiling=8388609,result=reject
+checked-add=u64-max-plus-one,result=reject

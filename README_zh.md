@@ -1,10 +1,341 @@
 # ParaEGOX
 
-ParaEGOX 是一个面向机器人与具身智能体的物理感知 Grounding OS，目前正在从零重构。
+ParaEGOX 是一个面向机器人与具身智能体的分布式 Agent OS，目前正在从零重构。
 
 ParaEGOX 基于 [PhanthyMotus](https://github.com/4paradigm/phanthymotus) 构建。原始基线保留在 `archive/phanthymotus-baseline` 分支，并保留其许可证归属。
 
-> 当前状态：正在进行全新架构设计与实现；生产核心机制优先采用 Rust，Python/C++ 作为受管工作负载与生态语言，暂未提供稳定版本。
+> 当前状态：当前工作树已有首个 DeveloperLocal 后端、Textual 对话组合和 typed 单次 Inspection
+> 启动视图；原生 Intel macOS r29 artifact run `31238285076` 仍是本地 Textual→Runtime Echo 证据。
+> Ubuntu r130 commit `92923eef016e6ce060c32113ad3cf5e59ee8520c` 是当前最新已验证的公开
+> Node/Deployment ref：Node schema v3 发布 PXEA v2，Deployment schema v2 持久完成 managed Fabric、
+> managed Agent stack 与 bootstrap descriptor 三段序列。其有界单主机 process smoke 已通过，但 Agent
+> access/session/Echo、双主机执行与 reconnect 仍未获证明。生产核心机制优先采用 Rust，Python/C++
+> 作为受管工作负载与生态语言，暂未提供稳定版本。
+
+## 当前可运行切片
+
+`paraegox` binary 会沿真实 owner 链启动 Authority、DeploymentController、Runtime，以及由 Runtime
+管理的 Zenoh Fabric、ModelService、AgentService；同时启动独立 NodeDaemon reference child、
+owner-private Agent/Inspection IPC 和内部 Python Textual child。Runtime 按 Fabric → Model → Agent
+启动，只有精确、已签名的 PXMT ActiveReady 回执持久提交后才发放对话能力。
+
+公开对话入口只有一个：
+
+```text
+paraegox chat --config <absolute-paraegox.toml>
+```
+
+provider、model、state root 和 Fabric listener 由 strict versioned TOML 配置选择，不是 provider 专属
+子命令或 override flags。Secret value 不得进入配置或 argv，配置只保存精确 SecretRef。Chat 配置的
+无凭据示例是 [`configs/paraegox.example.toml`](configs/paraegox.example.toml)；它当前选择 DeepSeek
+作为可替换验证后端，不表示 CLI mode 或默认模型。
+
+Textual child 由仓库中的 Python project 安装。开发工作树启动 `paraegox` 前，先准备并激活 locked
+environment；若内部 `paraegox-console` executable 不存在，Rust parent 会直接失败，不会暗中回退到
+另一套 frontend 或 transport：
+
+```zsh
+uv sync --locked
+source .venv/bin/activate
+command -v paraegox-console
+```
+
+`paraegox-console` 只是内部 packaging，不是第二个公开对话命令。macOS 请保留示例中的 canonical
+`/private/tmp` state root（`/tmp` 是 symlink，会被安全校验拒绝）。macOS CI artifact 包含一个
+SHA-256 校验的 `tar.gz`；解包前必须用相邻的 `.sha256` 文件验证。解包后的可搬移目录同级包含
+`paraegox`、可执行的 `paraegox-console`，以及 `python/` 下的 vendored packages；三者必须保持在一起，
+并保证 `PATH` 中有 Python 3.11 或更高版本的 `python3`。验证配置中的 DeepSeek 路径时，通过进程环境
+提供它引用的 Secret，并传入配置的绝对路径：
+
+```zsh
+read -s 'DEEPSEEK_API_KEY?DeepSeek API key: '; echo
+export DEEPSEEK_API_KEY
+CONFIG_PATH="$(pwd)/configs/paraegox.example.toml"
+PARAEGOX_BIN=/absolute/path/to/native/paraegox
+test -x "$PARAEGOX_BIN"
+"$PARAEGOX_BIN" chat --config "$CONFIG_PATH"
+unset DEEPSEEK_API_KEY
+```
+
+原生 binary 必须在指定服务器或 GitHub CI 构建，Mac 只下载完整 bundle；当前工作流禁止在 Mac 运行
+Cargo。
+
+历史 Ubuntu r22 源码快照 `ff2d8109` 已通过 workspace format、locked metadata 和 locked
+all-targets check，并通过 Inspection 39/39、非 root DeveloperLocal 89/89 以及非 root Deployment
+364/364。该 r22 workspace Clippy 运行暴露了约 30 个历史结构 lint，而不是通过；修正已进入后续源码
+快照，但 r29 macOS artifact workflow 没有运行 workspace Clippy，因此这里不把它冒充为 fresh
+Clippy pass。
+
+原生 Intel macOS r29 commit `944ce332`、run `31238285076` 已通过 locked Textual tests 和完整
+governance checker，构建并验证公开 native CLI，组装可搬移 bundle，并真实走通 PTY 下的 typed
+Inspection markers、Runtime ready、Textual→Runtime Echo、priority Ctrl-C、terminal restoration 和
+父进程 joined shutdown；bundle checksum、executable mode、archive 和 artifact upload 也已通过。
+真实 credentialed DeepSeek smoke 仍未完成，因此还不能把配置中的 DeepSeek 路径描述成外部验证
+通过或 production ready。离线验证系统基座时，使用同一个配置 schema，将 `model.provider` 改为
+`deterministic-echo-v1` 并省略 model/SecretRef；`echo: <你的消息>` 只证明 DeveloperLocal owner 链。
+旧的独立 Rust reference frontend 现已删除；内部 Textual child 是唯一当前展示路径，也不存在第二个
+公开 `paraegox chat` 入口。
+
+当前 A2 仍是最小文本链：不流式、同时只允许一个 Model 调用、每轮只把当前输入发给模型；会话历史
+回灌、Memory、Tools、规划和多 Agent 编排仍属于后续 Agent Core。父进程只把 owner-private bootstrap
+文件路径交给内部 Textual child：一个用于 Agent 对话，存在时另一个用于只读本地 Inspection。Python
+`AgentConversationClient` 只消费 Runtime Agent 路径，不打开 raw Zenoh，也看不到 provider/model 凭据。
+另一个 strict typed client 会验证 owner-private PXIB v2 bootstrap，并在 Textual App 启动前只执行
+一次无重试 PXIQ Latest 交换，严格关联 PXIP response 并解码完整 PXIS v2 snapshot。任何
+bootstrap、transport、correlation 或 snapshot 错误都会阻止 UI 启动。成功时只显示三行只读
+startup status；没有 watch、retry、cache、background refresh、action、持续监控、Ops 或
+federated view。argv 不携带 raw identity、Node management capability、Zenoh route、capability token
+或 Secret，parent 会从 child 环境同时移除 `OPENAI_API_KEY` 和 `DEEPSEEK_API_KEY`。这套
+typed boundary 不是复活全能 ConsoleBridge。Node 合同、Unix 同一 registration tenure 的
+NodeDaemon 持久状态和只读管理协议现在已经由 `paraegox-local` 真实消费，而不再只是独立机制。
+launcher 会创建或安全重开精确的本地 Node tenure，提交一份初始 feature-only status，启动真实、
+独立的 reference child，并只在本地 management channel、target、tenure 与 status fence 全部通过后
+接受有界 PXNQ/PXNS Latest 响应。这个单目标初始 NodeStatus 的 Runtime observation 数量明确为零；
+它**不证明** Runtime discovery、持续 observation/reconciliation、生产 Zenoh carrier、registration
+acquisition、多主机运行或 distributed readiness。正常退出顺序为 Textual child/Agent IPC → Runtime
+内部 Agent→Model→Fabric → NodeDaemon → Authority，并逐个 joined。
+
+## 可运行的 Node 宿主基座：schema v1、v2 与 v3
+
+下面这个独立公开命令总是启动一个 split-trust Runtime 和一个 NodeDaemon child。严格配置 schema
+决定宿主 profile；G2 没有另一条启动命令：
+
+```text
+paraegox node --config <absolute-node.toml>
+```
+
+当 `schema_version = 1` 时，命令保留已验证的 G1 路径：restricted mTLS Runtime-apply listener 固定
+执行 legacy generic rejection；NodeDaemon 发布 RuntimeHost observation 为零的 feature-only status，
+parent 再通过一次 authenticated typed Latest 严格验证 child。
+
+当 `schema_version = 2` 时，同一命令增量启动 G2 **host-side** 路径。Runtime listener 接收有界、由
+Controller 签名的 PXCC control carrier，并返回 Runtime 签名的 PXDR Describe facts；在 LegacyReady
+阶段还承载冻结的 PXQR query，并接收 authenticated PXFB 单向 cutover。另一条 Node listener 会先
+认证 Controller，再把 Describe、Latest、Watch、observation challenge 或 Runtime observation
+publication 交给既有唯一 NodeDaemon store 与 observation capability；创建 observation bridge 前还会
+交叉验证 Runtime readiness facts。因此 schema v2 已提供后续外部 Controller 所需的真实 Ubuntu-side
+listener、durable owner 与 bridge，但不会把 Controller 偷塞进 Node 进程。
+
+当 `schema_version = 3` 时，Node 保留完整 schema-v2 control path，并额外强制
+`[managed_agent_bootstrap]` 使用编译内唯一的 `provider = "deterministic-echo-v1"` profile。该 provider
+selection、派生 provider ref 与 Node config digest 会进入 public-safe、Runtime-attested PXEA v2 successor：
+`<node-state-root>/node/enrollment-v2.pxea`。desired Fabric/Agent service identity、listen endpoint 与 limits
+仍归 Deployment 所有，不是合法 Node 字段。
+
+三个 schema 都只在已配置的本地 owner 和 listener 启动后输出 `paraegox: node ready`。这个 marker
+不证明 Controller 已连接、PXFB cutover 已完成、Runtime observation 已发布，或目标 Agent stack 已
+apply。三种模式都不启动 Authority、DeploymentController、managed Fabric、Model、Agent、Inspection、
+Textual 或 chat 链。下文所述的独立公开 Controller 命令现在已经存在，但仍没有端到端双主机 process
+proof、remote Agent conversation 路径、remote TUI 或 partition/reconnect policy。后续单 Ubuntu 主机
+smoke 已执行 semantic Controller sequence，但不会扩大这个 Node-local marker 的含义。
+
+T1 profile 从
+[`configs/paraegox-node.agent-bootstrap.example.toml`](configs/paraegox-node.agent-bootstrap.example.toml)
+开始；旧 schema-v2 示例仍位于
+[`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml)。把选中的文件复制到绝对普通
+文件路径，将两处仅用于文档的 `192.0.2.10` listener 地址替换为宿主机真实拥有的 IPv4，并同步修改
+`state_root` 和六条 credential path。启动前，同一个非 root 账号必须创建 canonical state root 及其
+精确的 `credentials` 子目录，两者 mode 都是 `0700`。Runtime 与 Node listener 分别使用不同的 PEM
+CA/certificate/key 文件，但六个文件都必须放在这一个目录；两张 certificate 的 SAN 都必须包含对应
+配置 IP，两把 key 必须是 `0600`，CA/certificate 不得允许 group/other 写入。agent-bootstrap 示例选择
+schema v3，旧示例选择 schema v2。若要保留 G1，设置 `schema_version = 1`，完整删除 `[node_control]`
+和 `[managed_agent_bootstrap]`，并只准备三条 Runtime-listener credential；若保留 schema v2，只删除
+`[managed_agent_bootstrap]`。两份示例都只含非秘密 reference value 和 public verification key；只有 Controller/Authority
+enrollment owner 才能替换这些 pin，绝不能填入 private seed。完整准备与启动命令见本地
+`docs/runbooks/developer-local.md`。
+
+Ubuntu r33 commit `7618f6a51c5eb5731874d2cdf3231603e3a824f7` 已通过 workspace format、locked
+metadata、workspace all-target check 和 warnings-denied workspace all-target Clippy。完整
+`paraegox-local` unit binary 以非 root 身份 98/98 通过；另有 9 个 focused Local filter 和 3 个非 root
+Runtime split-trust/provisioning filter 通过。真实非 root process smoke 到达 readiness marker，且进程树
+只有一个 child、一个非 loopback TLS listener 和两条预期 private Unix socket。SIGTERM 与 SIGINT 均
+返回 0；restart 保持 PXNI/PXNB hash 逐字相同；强制杀死 child 后 parent 以 `PXLC-NODE-CHILD`
+fail closed；root 启动在写 state 前以 `PXLC-EXECUTION-IDENTITY` 拒绝。这些事实只证明 G1 host-local
+基座及其 cleanup/restart 边界。
+
+host-side G2 的 validation ref 为 r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`。Ubuntu 已通过 workspace format、
+公开 help focused test 1/1、完整 governance checker、workspace all-target check、warnings-denied
+workspace all-target Clippy，以及完整 non-root `paraegox-local` suite 111/111。所有 workspace all-target
+test executable 也已通过 `--no-run` 完成编译和链接。workspace doc tests 已通过，包括 Fabric 2 个、
+Kernel 1 个以及 runtime-contracts 1 个 compile-fail doctest；其他 crate 为 0。`--no-run` 不表示完整
+workspace test suite 已执行。
+
+另有一条独立证据：PXQR authentication nonce 与精确 Node observation challenge 绑定修复后，对应
+Deployment source/binary lineage 的完整 non-root Deployment suite 374/374 通过。此后直到 r51 没有修改
+Deployment 源码，但交接没有保留该 374/374 invocation 的精确 immutable ref；因此这里只把它记为
+lineage evidence，不写成“r51 重新执行了 Deployment 374/374”。
+
+r48 真实 non-root schema-v2 process smoke 已到达 Ready：进程树严格为 parent + 1 个 hidden Node child，
+有两条 non-loopback TLS listener（`172.17.0.2:28448`、`:28449`）以及预期 Runtime、management、
+observation UDS。使用已配置 Controller client certificate 时，两条 TLS handshake 都成功；不带 client
+certificate 时两端都拒绝。SIGTERM exit 0 并完成清理；同 state restart 再次 Ready/exit 0，PXNI/PXNB/
+PXND digest 稳定。杀死 Node child 后 parent exit 1 并报告 `PXLC-NODE-CHILD`，listener、PXOB 与进程全部
+清理；同 state 随后仍能再次 Ready，并以 SIGINT exit 0。root 启动在 state mutation 前以
+`PXLC-EXECUTION-IDENTITY` 拒绝。它证明 r48 的 host process、mTLS 和 lifecycle boundary，不证明
+PXCC/PXNR 语义 exchange 或 cutover。后续公开 Controller composition 不会把这份 host-only smoke
+追溯升级成双主机 control sequence、remote Agent conversation、remote TUI 或 reconnect 结果。旧的
+双目标 DeveloperLocal fixture 仍是内部实现；当前没有公开的 `developer-distributed-fixture-v1` 命令，
+也不宣称完整分布式系统已经可运行。
+
+## 公开 Developer DeploymentController 与 T1 Agent bootstrap
+
+第三个公开命令会启动一条有界的 Controller-side owner graph：
+
+```text
+paraegox deployment --config <absolute-paraegox-deployment.toml>
+```
+
+其 strict TOML schema v1 只包含本地 filesystem authority：`state_root`、精确 PXEA
+`enrollment_artifact_file` 及其小写 whole-file `enrollment_artifact_sha256`、互相独立的 Controller 与
+tenure-Authority signing-seed 文件、Authority state directory/socket，以及 `[runtime_connector]` /
+`[node_connector]` 的 CA、client certificate 和 client private-key 路径。未知字段和替代 CLI submode
+都会 fail closed。endpoint、route、target、principal、trust、manifest 与 credential-reference 语义只从
+独立 pin 的 PXEA 接受，不能在 TOML 中重复声明为第二配置权威。增量 schema v2 保留这些字段，并严格
+要求 `[managed_agent_bootstrap]`：两个不同且非零的 Fabric/Agent service ID、loopback Fabric listen
+endpoint，以及固定 `developer-agent-bootstrap-v1` limits profile。T1 从
+[`configs/paraegox-deployment.agent-bootstrap.example.toml`](configs/paraegox-deployment.agent-bootstrap.example.toml)
+开始；旧 schema-v1 示例仍位于
+[`configs/paraegox-deployment.example.toml`](configs/paraegox-deployment.example.toml)。
+
+schema-v2 Node 发布 `<node-state-root>/node/enrollment-v1.pxea`；schema v3 改为发布
+`<node-state-root>/node/enrollment-v2.pxea`，两者都只在 Runtime 与 Node bootstrap 已获证明后发布。
+PXEA v2 保留 public-safe、Runtime-attested 的 v1 facts，并额外提交精确 provider profile/ref/config
+digest；它包含
+immutable Runtime manifest 和完整 public Runtime/Node transport、identity、enrollment pins，但不含
+bearer token、signing seed、private-key bytes 或 private-key path。Controller 侧先核对通过独立渠道传递的
+whole-file SHA-256，随后才解码任何 frame length、signature 或 semantic field，并继续交叉验证另行配置的
+Controller 与 Authority keys。artifact signature 证明 continuity，不是 first-use trust。
+
+`paraegox: deployment ready` 的含义被刻意收窄。Local 只有收到 facade 的 `Ready` outcome 才能输出并
+flush 该 marker；此前必须保证 remote connector/cutover state 已持久化、精确 PXFR managed-serving
+terminal 已 durable `ResponseDurable`，且 fresh post-PXFR PXDR Describe 已验证为 `ManagedReady` 并持久
+提交。delivery uncertainty、需要 operator reconciliation 的 publish 状态、非法 response，或没有 durable
+PXFR 的 ManagedReady Describe 都不能合成 readiness；命令会 joined 关闭 owner，并用稳定 Deployment
+错误非零退出。这个 process 只执行一次有界、无重试 attempt，不是 continuous reconciler。
+
+schema v2 只有在 base managed-ready 与三个有序 PXAG/PXAH 操作全部持久终态后，才精确输出并 flush
+`paraegox: deployment agent bootstrap ready`：Fabric apply 携带逐字不变的 PXAR v6 并返回 PXFT
+ActiveReady；Agent-stack apply 携带逐字不变的 PXAR v7 并返回 PXST ActiveReady；descriptor Describe
+返回以该精确 PXST 及当前 Fabric/Agent generation 为根的 PXAH。PXFJ v7 保存 exact outer request 与
+receipt；同 state Resume 会重新验证历史 terminal bytes 并返回同一 Ready 结果，不会合成替代 terminal。
+
+Ubuntu 已验证精确 r130 commit `92923eef016e6ce060c32113ad3cf5e59ee8520c`：workspace format、Local
+all-target check 与 warnings-denied Clippy、完整 non-root Local 138/138（49.57 秒）、workspace all-target
+check 与 warnings-denied Clippy 均通过；所有 workspace all-target test executable 也在 `--no-run` 下
+完成编译和链接。`--no-run` 不表示完整 workspace test suite 已执行。完整 Deployment suite 也以
+`nobody`、link-count-1 binary、16 MiB stack、单 test thread 运行，并以 393/393（172.97 秒）通过。
+
+精确 ref 的 public process smoke 在单 Ubuntu host、同一 `nobody` UID/GID 与真实 non-loopback mTLS 下
+以 1/1 通过。它覆盖 schema-v3 Node/PXEA-v2 fresh、隔离 wrong-SHA 拒绝、schema-v2 Deployment Fresh
+Ready 与 joined SIGTERM、同 state Node/Deployment Resume Ready，以及 Node unavailable 时无 Ready 且
+socket cleanup。pytest parent 使用默认 8192 KiB stack；harness 保留 16 MiB `RUST_MIN_STACK` fixture
+设置，r130 production 自身则在具名、有界 16 MiB executor thread 上承载 Deployment root future。
+
+descriptor 只是 bootstrap evidence。这些结果不证明 descriptor access/authorization、Agent session、
+Agent data-plane traffic、Echo/conversation、reconnect、remote TUI、distributed/two-host、provider
+mismatch 或 Authority-owner failure。T2-A 已定义 remote-Agent contract 与状态图；T2-B 现只增加
+下述 Fabric 传输基座，Echo、reconnect 与 TUI 继续后置。
+
+## T2-B 非对称 Fabric 传输基座
+
+精确 ref `0bcc49d03d15cca720021868a08d37912f62128a` 在
+[`paraegox-fabric`](crates/paraegox-fabric/src/service.rs) 中增加两种按角色区分的非对称 mTLS
+profile。单个 `FabricService` 仍只持有一个私有 Zenoh 1.9 `Session`：Ubuntu 侧保留 T1 loopback
+listener，再增加一个 non-loopback TLS listener，并保持零 connector；名义上的 Mac 侧 profile
+则只有一个 TLS connector，且没有 listener。
+
+两种 profile 都使用默认拒绝策略，以对端证书的精确 CN 为主体，只允许 remote-Agent submit
+与 control 两条精确 query 路径及其对应的 query、reply、queryable 方向。构造阶段拒绝 `**` wildcard
+route，策略中也没有 put/subscriber allow rule。这只是传输配置，不代表 Runtime 已激活或取得
+状态所有权。
+
+Ubuntu 上完整 Fabric suite 为 50/50 全绿，format 与 Clippy 均通过。聚焦的
+[真实网络测试](crates/paraegox-fabric/tests/remote_agent_mtls.rs) 用时 7.05 秒：正确 CN 可访问两条
+精确 route；sentinel、parent、child route 均被拒绝；同 CA 的错误 CN 可以完成 TLS/session 建立，
+但随后被 ACL 拒绝；同一 Session 内既有 T1 本地 route 仍成功；独立 plaintext loopback peer
+被拒绝；shutdown 后两个端口均可重新绑定。`**` 拒绝只属于 constructor/static 证据，并非真实
+网络 case；put/subscriber 没有 allow rule 也只做了静态检查，未通过网络实跑。
+
+T1 本地结果依赖精确锁定的 Zenoh 1.9 中 same-session local-face 边界；升级 Zenoh 时必须重跑
+该矩阵。错误 CN peer 可在 ACL 拒绝前占用唯一 session，因此 `max_sessions = 1` 仍有可用性风险，
+但这不是认证绕过。现有证据只是单 Ubuntu 主机上的网络测试，并非真实双机 Mac process 证明。
+
+## T2-B1 内部独立 S1 启动底座（未激活）
+
+crate-private Fabric lifecycle 可以在不触碰既有 S0 session 的前提下准备一条独立、仅 TLS 的 S1。其
+不可 clone 的内部 prepared owner 只构建私有 Zenoh config 并预留一个非零 session epoch，不读取
+credential 文件、不绑定 socket、不声明 queryable，也不启动 worker。消耗式 start 才是第一个传输
+effect；随后得到的内部 live token 只暴露预留 epoch 与消耗式 shutdown。通用
+`FabricService::start` 会拒绝这个 private profile。
+
+聚焦的单 Ubuntu 真实网络测试覆盖独立 S1 生命周期前、中、后的 S0，并检查 prepare 后 S1 endpoint
+仍未绑定、预留 epoch 与 live epoch 一致，以及 shutdown 后端口可复用；它没有安装任何 S1 queryable，
+也没有发送 S1 请求。Runtime owner/orchestration、S1 queryable 安装、PXRA dispatch 与 Mac connector
+均未实现，所以这不是 remote-Agent activation，也不提供 conversation/Echo、restart recovery 或双机
+证明。这个 candidate 必须在下一有界批次由一个真实 Runtime owner 消费，并取得语义 lifecycle/cleanup
+证据；否则就要折回唯一 owner 或删除。
+
+## T2-C0 持久 PXAG/PXAH descriptor evidence
+
+精确 r176 `9eb8e6a7e61d0ba6149d4313dd66bce1b2f2ff3f` 在既有 Runtime store 与同一
+`runtime.lock` 下增加一个 crate-private、有界的 PXDE v1 latest-slot ledger。每个 slot 保留逐字不变、
+已认证的 PXAG 与 PXAH、whole-PXAH receipt digest、shared-domain PXAP payload digest、active PXST
+digest、target、Runtime store instance、RuntimeHost epoch、Fabric/Agent generations、request digest、
+slot sequence、previous-slot digest 与完整 record checksum。它是单个可替换 slot，不是 append-only
+历史。
+
+对于已认证的 Describe，Runtime 会导出以精确 active PXST 为根的当前 descriptor，签出 PXAH，构造
+PXDE，并发布 mode-0600、single-link 的私有临时文件。它先同步临时文件，再重验目录、持有中的 writer
+lock、Agent-stack authority 与旧 slot identity，随后 rename、同步目录，并读回逐字一致的 strict final
+bytes。只有完成这些步骤后，endpoint 才会对所保留的双签名以及独立导出的 descriptor、PXST、
+target/store/epoch 与 generations 做 post-commit live reverification，然后返回精确 PXAH。临时文件永不
+成为 recovery candidate；publication 前失败或 rename 后 uncertainty 都会让内存 owner fail-stop，直至
+strict reopen 选择具名 final state。
+
+slot sequence 与 previous digest 只表示当前 slot 内 owner-private replacement continuity；它们
+不证明历史真实性或 anti-rollback，也不提供 durable high-water 或 key-rotation continuity。首次 PXDE
+提交后，旧 binary reopen 会 fail closed；不保证 downgrade compatibility。对同一 PXAG 的 retry 即使
+得到逐字一致的 signed PXAH，也会创建下一 sequence，并重复临时写入、file sync、rename、directory
+sync 与 readback：不保证 idempotent no-write，也不保证有界 write amplification 或 SSD
+lifetime/performance SLO。
+
+Ubuntu r176 已通过 format、Runtime all-target check、warnings-denied Clippy，以及以 `nobody` 和
+link-count-1 test binary 运行的精确 endpoint test 1/1。r174 机制基线
+`baa64655f1f15c6ec03c6ad170fc3b0bbfd1a3fc` 的七项 PXDE/store focused tests 全部通过，完整 Runtime
+suite 为 633 passed、0 failed、2 ignored。这七项 focused tests 只证明 strict codec、replacement、
+temporary-file 与注入式 rename 前后分支语义，不构成 process-abort 或 power-cut 认证。
+
+PXDE 不是 PXRA dispatcher，不是 descriptor/access capability，也不证明已部署 remote-Agent
+reachability。它不新增 authorization、live session、remote conversation/Echo、connector activation、
+reconnect/partition recovery、TUI、双机或 production-platform 声明。
+
+## T2-D0 单次 Echo owner 边界
+
+T2-D0 现在仅新增 crate-private 的 PXOJ v1 有界 codec，以及一个只处理一次精确 Open 加字面量
+`Echo` 尝试的可 fake owner。Prepared 会固定完整 attempt/request scope、只作为可信 proof scope 的
+PXCB，以及两组不同且预分配的 Describe challenge。不可 clone 的 verified bundle 会把双签名、严格
+PXAP 投影、已签名 generations 与唯一由 action 持有的 data-plane binding 绑定在一起；fake once-send
+之前必须先提交 claim，Uncertain 永不重建 send authority，commit 结果未知时必须从 durable bytes
+重新加载。PXCB 只属于 proof scope，绝不是 connector 配置。Ubuntu r164
+（`03c67bdda436e89a1d06f38706984a6bbf3a0d9c`）已通过 format、Runtime all-target check、
+Clippy `-D warnings`、全部 21 项 D0 focused tests，以及 626 passed、0 failed、2 ignored 的完整
+Runtime suite。
+
+这仍然只是 codec、trait boundary 与确定性内存 fake，不是 filesystem/APFS outbox、原子 durable
+store、真实 Controller Describe source、discovery-currentness 证明、Mac data-plane connector、
+Zenoh composition、公开 CLI、已部署 remote Agent 或 Echo、reconnect/partition owner、TUI、双机结果
+或生产平台声明；这些仍是 D1 gate。
+
+Unix-only `paraegox-noded developer-local-reference-v1` 也能独立重开一份由外部授权的 exact tenure，
+并通过 same-user、token-bound 本地 socket 返回最后一次已提交状态。新增的
+`developer-local-runtime-observation-v1` 模式会在独立的 owner-private 本地 capability socket 上验证
+Runtime 已签名的 PXQR/PXQS 交换，并在回应前原子发布对应的新 Node 状态。这是本地认证观测适配器，
+其短时 query challenge 精确绑定 Node tenure、observation endpoint、Runtime authority、apply descriptor 和待发布序列。
+认证后的绝对截止时间会同时进入状态摘要和持久状态，消费者必须与相对 freshness 一并校验；到期后
+管理端不会再返回该观测产生的旧状态。多 Runtime 状态采用所保留 Runtime 中最早的截止时间，因此刷新
+一个 Runtime 不会顺带给另一个续鲜；已提交的同一请求仍可恢复丢失的 ACK，且不会借此续鲜。
+这不是生产 Zenoh 观测或 Runtime apply。注册获取、持续协调、双主机证据、federated Inspection/Ops
+与 Web Console 仍在开发中。
 
 ## 许可证
 

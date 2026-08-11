@@ -1,0 +1,1410 @@
+name: macos-cli-artifact
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "build/macos-artifact-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-paraegox-cli:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install repository-pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Report active Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install repository-pinned uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/paraegox-uv-bootstrap"
+          "$RUNNER_TEMP/paraegox-uv-bootstrap/bin/python" -m pip install \
+            --disable-pip-version-check \
+            'uv==0.11.32'
+          printf '%s\n' "$RUNNER_TEMP/paraegox-uv-bootstrap/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare locked Python environment
+        run: uv sync --locked
+
+      - name: Verify Textual client and internal entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --frozen ruff check \
+            src/paraegox_sdk/console_client.py \
+            src/paraegox_sdk/console_tui.py \
+            tests/console \
+            scripts/smoke_macos_textual_chat.py
+          uv run --frozen python scripts/check_governance.py
+          uv run --frozen pytest tests/console -q
+          uv run --frozen paraegox-console --help
+
+      - name: Build the ParaEGOX CLI
+        run: cargo build --locked -p paraegox-local --bin paraegox
+
+      - name: Verify lifecycle transport regressions on macOS
+        run: cargo test --locked -p paraegox-local client_transport_ -- --nocapture
+
+      - name: Verify native binary and public CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="target/debug/paraegox"
+          test -x "$binary"
+
+          binary_description="$(file -b "$binary")"
+          printf '%s\n' "$binary_description"
+          case "$binary_description" in
+            "Mach-O 64-bit executable x86_64"*) ;;
+            *)
+              printf 'unexpected ParaEGOX artifact: %s\n' "$binary_description" >&2
+              exit 1
+              ;;
+          esac
+
+          help_output="$RUNNER_TEMP/paraegox-help.txt"
+          "$binary" --help | tee "$help_output"
+
+          grep -Fqx 'Usage: paraegox chat --config <absolute-paraegox.toml>' "$help_output"
+          grep -Fqx '       paraegox init --directory <absolute-directory> --json' "$help_output"
+          grep -Fqx '       paraegox up --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox status --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox down --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox deploy --local --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox inspection snapshot --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox receipt snapshot --config <absolute-paraegox.toml> --json' "$help_output"
+          grep -Fqx '       paraegox tui --config <absolute-paraegox.toml>' "$help_output"
+          grep -Fqx '       paraegox node --config <absolute-paraegox-node.toml>' "$help_output"
+          grep -Fqx '       paraegox deployment --config <absolute-paraegox-deployment.toml>' "$help_output"
+          grep -Fqx '       paraegox version --json' "$help_output"
+          grep -Fqx '       paraegox config check <chat|node|deployment> --config <absolute-config.toml> --json' "$help_output"
+          grep -Fqx '       paraegox doctor <chat|node|deployment> --config <absolute-config.toml> --offline --json' "$help_output"
+          grep -Fqx '       paraegox --help' "$help_output"
+          test "$(grep -Ec '^(Usage: paraegox|       paraegox)' "$help_output")" -eq 15
+
+          version_json="$RUNNER_TEMP/paraegox-version.json"
+          init_first_json="$RUNNER_TEMP/paraegox-init-first.json"
+          init_repeat_json="$RUNNER_TEMP/paraegox-init-repeat.json"
+          init_config_json="$RUNNER_TEMP/paraegox-init-config-check.json"
+          deploy_rejected_json="$RUNNER_TEMP/paraegox-deploy-rejected.json"
+          deploy_grammar_json="$RUNNER_TEMP/paraegox-deploy-grammar.json"
+          inspection_not_running_json="$RUNNER_TEMP/paraegox-inspection-not-running.json"
+          inspection_grammar_json="$RUNNER_TEMP/paraegox-inspection-grammar.json"
+          receipt_not_running_json="$RUNNER_TEMP/paraegox-receipt-not-running.json"
+          receipt_grammar_json="$RUNNER_TEMP/paraegox-receipt-grammar.json"
+          tui_not_running_stdout="$RUNNER_TEMP/paraegox-tui-not-running.stdout"
+          tui_grammar_stdout="$RUNNER_TEMP/paraegox-tui-grammar.stdout"
+          config_json="$RUNNER_TEMP/paraegox-config-check.json"
+          doctor_json="$RUNNER_TEMP/paraegox-doctor.json"
+          invalid_json="$RUNNER_TEMP/paraegox-invalid-config.json"
+          version_stderr="$RUNNER_TEMP/paraegox-version.stderr"
+          init_stderr="$RUNNER_TEMP/paraegox-init.stderr"
+          deploy_stderr="$RUNNER_TEMP/paraegox-deploy.stderr"
+          deploy_grammar_stderr="$RUNNER_TEMP/paraegox-deploy-grammar.stderr"
+          inspection_not_running_stderr="$RUNNER_TEMP/paraegox-inspection-not-running.stderr"
+          inspection_grammar_stderr="$RUNNER_TEMP/paraegox-inspection-grammar.stderr"
+          receipt_not_running_stderr="$RUNNER_TEMP/paraegox-receipt-not-running.stderr"
+          receipt_grammar_stderr="$RUNNER_TEMP/paraegox-receipt-grammar.stderr"
+          tui_not_running_stderr="$RUNNER_TEMP/paraegox-tui-not-running.stderr"
+          tui_grammar_stderr="$RUNNER_TEMP/paraegox-tui-grammar.stderr"
+          config_stderr="$RUNNER_TEMP/paraegox-config-check.stderr"
+          doctor_stderr="$RUNNER_TEMP/paraegox-doctor.stderr"
+          invalid_stderr="$RUNNER_TEMP/paraegox-invalid-config.stderr"
+          offline_config="$RUNNER_TEMP/paraegox-offline-check.toml"
+          offline_state_root="$RUNNER_TEMP/paraegox-offline-state"
+          physical_runner_temp="$(cd "$RUNNER_TEMP" && pwd -P)"
+          init_directory="$physical_runner_temp/paraegox-init-smoke"
+          OFFLINE_CONFIG="$offline_config" \
+            OFFLINE_STATE_ROOT="$offline_state_root" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+
+          Path(os.environ["OFFLINE_CONFIG"]).write_text(
+              "schema_version = 1\n"
+              f"state_root = {json.dumps(os.environ['OFFLINE_STATE_ROOT'])}\n"
+              'fabric_listen = "tcp/127.0.0.1:7447"\n\n'
+              "[model]\n"
+              'provider = "deepseek-chat-completions-v1"\n'
+              'model = "deepseek-v4-flash"\n'
+              'secret_ref = "env:DEEPSEEK_API_KEY"\n',
+              encoding="utf-8",
+          )
+          PY
+          test ! -e "$offline_state_root"
+          test ! -e "$init_directory"
+          "$binary" version --json > "$version_json" 2> "$version_stderr"
+          OPENAI_API_KEY='init poison Secret value' \
+            DEEPSEEK_API_KEY='init poison Secret value' \
+            "$binary" init \
+              --directory "$init_directory" \
+              --json > "$init_first_json" 2> "$init_stderr"
+          test ! -s "$init_stderr"
+          test "$(stat -f '%Lp' "$init_directory")" = '700'
+          test "$(stat -f '%Lp' "$init_directory/paraegox.toml")" = '600'
+          test "$(stat -f '%u:%g' "$init_directory")" = "$(id -u):$(id -g)"
+          test "$(stat -f '%u:%g' "$init_directory/paraegox.toml")" = "$(id -u):$(id -g)"
+          test "$(stat -f '%l' "$init_directory/paraegox.toml")" = '1'
+          test ! -L "$init_directory"
+          test ! -L "$init_directory/paraegox.toml"
+          test ! -e "$init_directory/state"
+          test "$(find "$init_directory" -print | wc -l | tr -d ' ')" -eq 2
+          init_config_identity="$(stat -f '%d:%i:%m:%c' "$init_directory/paraegox.toml")"
+          init_config_sha256="$(shasum -a 256 "$init_directory/paraegox.toml" | cut -d ' ' -f 1)"
+          OPENAI_API_KEY='init poison Secret value' \
+            DEEPSEEK_API_KEY='init poison Secret value' \
+            "$binary" init \
+              --directory "$init_directory" \
+              --json > "$init_repeat_json" 2> "$init_stderr"
+          test ! -s "$init_stderr"
+          test "$(stat -f '%d:%i:%m:%c' "$init_directory/paraegox.toml")" = \
+            "$init_config_identity"
+          test "$(shasum -a 256 "$init_directory/paraegox.toml" | cut -d ' ' -f 1)" = \
+            "$init_config_sha256"
+          "$binary" config check chat \
+            --config "$init_directory/paraegox.toml" \
+            --json > "$init_config_json" 2> "$init_stderr"
+          test ! -e "$init_directory/state"
+          set +e
+          OPENAI_API_KEY='deploy poison Secret value' \
+            DEEPSEEK_API_KEY='deploy poison Secret value' \
+            "$binary" deploy --local \
+              --config "$offline_config" \
+              --json > "$deploy_rejected_json" 2> "$deploy_stderr"
+          deploy_status=$?
+          set -e
+          test "$deploy_status" -eq 2
+          test ! -s "$deploy_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          "$binary" deploy --local \
+            --config "$offline_config" \
+            --json --retry > "$deploy_grammar_json" 2> "$deploy_grammar_stderr"
+          deploy_grammar_status=$?
+          set -e
+          test "$deploy_grammar_status" -eq 2
+          test ! -s "$deploy_grammar_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='inspection poison Secret value' \
+            DEEPSEEK_API_KEY='inspection poison Secret value' \
+            "$binary" inspection snapshot \
+              --config "$offline_config" \
+              --json > "$inspection_not_running_json" \
+              2> "$inspection_not_running_stderr"
+          inspection_not_running_status=$?
+          set -e
+          test "$inspection_not_running_status" -eq 1
+          test ! -s "$inspection_not_running_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='inspection poison Secret value' \
+            DEEPSEEK_API_KEY='inspection poison Secret value' \
+            "$binary" inspection snapshot \
+              --config "$offline_config" \
+              --json --watch > "$inspection_grammar_json" \
+              2> "$inspection_grammar_stderr"
+          inspection_grammar_status=$?
+          set -e
+          test "$inspection_grammar_status" -eq 2
+          test ! -s "$inspection_grammar_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='receipt poison Secret value' \
+            DEEPSEEK_API_KEY='receipt poison Secret value' \
+            PARAEGOX_M4A_UNLISTED_CANARY='receipt environment canary value' \
+            "$binary" receipt snapshot \
+              --config "$offline_config" \
+              --json > "$receipt_not_running_json" \
+              2> "$receipt_not_running_stderr"
+          receipt_not_running_status=$?
+          set -e
+          test "$receipt_not_running_status" -eq 1
+          test ! -s "$receipt_not_running_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='receipt poison Secret value' \
+            DEEPSEEK_API_KEY='receipt poison Secret value' \
+            PARAEGOX_M4A_UNLISTED_CANARY='receipt environment canary value' \
+            "$binary" receipt snapshot \
+              --config "$offline_config" \
+              --json --watch > "$receipt_grammar_json" \
+              2> "$receipt_grammar_stderr"
+          receipt_grammar_status=$?
+          set -e
+          test "$receipt_grammar_status" -eq 2
+          test ! -s "$receipt_grammar_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='tui poison Secret value' \
+            DEEPSEEK_API_KEY='tui poison Secret value' \
+            PARAEGOX_M5A_UNLISTED_CANARY='tui environment canary value' \
+            "$binary" tui --help \
+              > "$tui_grammar_stdout" 2> "$tui_grammar_stderr"
+          tui_grammar_status=$?
+          set -e
+          test "$tui_grammar_status" -eq 2
+          test ! -s "$tui_grammar_stdout"
+          test "$(wc -l < "$tui_grammar_stderr" | tr -d ' ')" -eq 1
+          grep -Fqx \
+            'paraegox: code=PXLC-TUI-GRAMMAR message=tui requires exactly --config <absolute-paraegox.toml>' \
+            "$tui_grammar_stderr"
+          test ! -e "$offline_state_root"
+          set +e
+          OPENAI_API_KEY='tui poison Secret value' \
+            DEEPSEEK_API_KEY='tui poison Secret value' \
+            PARAEGOX_M5A_UNLISTED_CANARY='tui environment canary value' \
+            "$binary" tui --config "$offline_config" \
+              > "$tui_not_running_stdout" 2> "$tui_not_running_stderr"
+          tui_not_running_status=$?
+          set -e
+          test "$tui_not_running_status" -eq 1
+          test ! -s "$tui_not_running_stdout"
+          test "$(wc -l < "$tui_not_running_stderr" | tr -d ' ')" -eq 1
+          grep -Fqx \
+            'paraegox: code=PXLC-TUI-NOT-RUNNING message=local TUI requires the current owner generation to be running' \
+            "$tui_not_running_stderr"
+          if grep -Fq \
+            -e 'tui poison Secret value' \
+            -e 'tui environment canary value' \
+            "$tui_grammar_stderr" "$tui_not_running_stderr"; then
+            printf 'TUI pre-effect diagnostic leaked a Secret or environment canary\n' >&2
+            exit 1
+          fi
+          test ! -e "$offline_state_root"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$binary" config check chat \
+            --config "$offline_config" \
+            --json > "$config_json" 2> "$config_stderr"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$binary" doctor chat \
+            --config "$offline_config" \
+            --offline --json > "$doctor_json" 2> "$doctor_stderr"
+          set +e
+          "$binary" config check chat \
+            --config "$RUNNER_TEMP/does-not-exist.toml" \
+            --json > "$invalid_json" 2> "$invalid_stderr"
+          invalid_status=$?
+          set -e
+          test "$invalid_status" -eq 2
+          test ! -s "$version_stderr"
+          test ! -s "$init_stderr"
+          test ! -s "$deploy_stderr"
+          test ! -s "$deploy_grammar_stderr"
+          test ! -s "$inspection_not_running_stderr"
+          test ! -s "$inspection_grammar_stderr"
+          test ! -s "$receipt_not_running_stderr"
+          test ! -s "$receipt_grammar_stderr"
+          test ! -s "$config_stderr"
+          test ! -s "$doctor_stderr"
+          test ! -s "$invalid_stderr"
+          test ! -e "$offline_state_root"
+          VERSION_JSON="$version_json" \
+            INIT_FIRST_JSON="$init_first_json" \
+            INIT_REPEAT_JSON="$init_repeat_json" \
+            INIT_CONFIG_JSON="$init_config_json" \
+            INIT_DIRECTORY="$init_directory" \
+            DEPLOY_REJECTED_JSON="$deploy_rejected_json" \
+            DEPLOY_GRAMMAR_JSON="$deploy_grammar_json" \
+            INSPECTION_NOT_RUNNING_JSON="$inspection_not_running_json" \
+            INSPECTION_GRAMMAR_JSON="$inspection_grammar_json" \
+            RECEIPT_NOT_RUNNING_JSON="$receipt_not_running_json" \
+            RECEIPT_GRAMMAR_JSON="$receipt_grammar_json" \
+            CONFIG_JSON="$config_json" \
+            DOCTOR_JSON="$doctor_json" \
+            INVALID_JSON="$invalid_json" \
+            OFFLINE_CONFIG="$offline_config" \
+            OFFLINE_STATE_ROOT="$offline_state_root" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+
+          def load_one(name: str) -> dict:
+              raw = Path(os.environ[name]).read_bytes()
+              if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+                  raise SystemExit(f"{name} is not one newline-terminated JSON object")
+              value = json.loads(raw)
+              if not isinstance(value, dict):
+                  raise SystemExit(f"{name} is not a JSON object")
+              return value
+
+
+          version = load_one("VERSION_JSON")
+          init_first = load_one("INIT_FIRST_JSON")
+          init_repeat = load_one("INIT_REPEAT_JSON")
+          init_config = load_one("INIT_CONFIG_JSON")
+          deploy_rejected = load_one("DEPLOY_REJECTED_JSON")
+          deploy_grammar = load_one("DEPLOY_GRAMMAR_JSON")
+          inspection_not_running = load_one("INSPECTION_NOT_RUNNING_JSON")
+          inspection_grammar = load_one("INSPECTION_GRAMMAR_JSON")
+          receipt_not_running = load_one("RECEIPT_NOT_RUNNING_JSON")
+          receipt_grammar = load_one("RECEIPT_GRAMMAR_JSON")
+          config = load_one("CONFIG_JSON")
+          doctor = load_one("DOCTOR_JSON")
+          invalid = load_one("INVALID_JSON")
+          if (version["schema_version"], version["command"], version["ok"]) != (
+              1,
+              "version",
+              True,
+          ):
+              raise SystemExit(f"unexpected version envelope: {version!r}")
+          expected_init_fields = {
+              "schema_version",
+              "command",
+              "ok",
+              "changed",
+              "profile",
+              "config_relative_path",
+              "state_relative_path",
+              "diagnostics",
+          }
+          for result, changed in ((init_first, True), (init_repeat, False)):
+              if set(result) != expected_init_fields:
+                  raise SystemExit(f"unexpected init fields: {result!r}")
+              if (
+                  result["schema_version"],
+                  result["command"],
+                  result["ok"],
+                  result["changed"],
+                  result["profile"],
+                  result["config_relative_path"],
+                  result["state_relative_path"],
+                  result["diagnostics"],
+              ) != (
+                  1,
+                  "init",
+                  True,
+                  changed,
+                  "deterministic-echo-v1",
+                  "paraegox.toml",
+                  "state",
+                  [],
+              ):
+                  raise SystemExit(f"unexpected init envelope: {result!r}")
+              serialized = str(result)
+              if os.environ["INIT_DIRECTORY"] in serialized:
+                  raise SystemExit("init output leaked its absolute directory")
+              if "init poison Secret value" in serialized:
+                  raise SystemExit("init output leaked a Secret canary")
+          if (
+              init_config["command"],
+              init_config["kind"],
+              init_config["ok"],
+              init_config["profile"],
+          ) != ("config.check", "chat", True, "deterministic-echo-v1"):
+              raise SystemExit(f"generated config failed strict check: {init_config!r}")
+          if os.environ["INIT_DIRECTORY"] in str(init_config):
+              raise SystemExit("generated config check leaked the init directory")
+          expected_deploy_fields = {
+              "schema_version",
+              "command",
+              "mode",
+              "ok",
+              "profile",
+              "changed",
+              "generation",
+              "deployment_revision",
+              "controller_snapshot_sequence",
+              "runtime_apply_request_digest",
+              "runtime_terminal_receipt_digest",
+              "terminal_outcome",
+              "current_health_checked",
+              "diagnostics",
+          }
+          expected_deploy_diagnostics = (
+              (
+                  deploy_rejected,
+                  "PXLC-DEPLOY-PROFILE-UNSUPPORTED",
+                  "local deploy supports only the deterministic-echo-v1 profile",
+              ),
+              (
+                  deploy_grammar,
+                  "PXLC-DEPLOY-GRAMMAR",
+                  "deploy requires exactly --local --config "
+                  "<absolute-paraegox.toml> --json",
+              ),
+          )
+          for result, code, message in expected_deploy_diagnostics:
+              if set(result) != expected_deploy_fields:
+                  raise SystemExit(f"unexpected deploy fields: {result!r}")
+              if (
+                  result["schema_version"],
+                  result["command"],
+                  result["mode"],
+                  result["ok"],
+                  result["changed"],
+                  result["current_health_checked"],
+              ) != (1, "deploy", "local", False, False, False):
+                  raise SystemExit(f"unexpected rejected deploy envelope: {result!r}")
+              for field in (
+                  "profile",
+                  "generation",
+                  "deployment_revision",
+                  "controller_snapshot_sequence",
+                  "runtime_apply_request_digest",
+                  "runtime_terminal_receipt_digest",
+                  "terminal_outcome",
+              ):
+                  if result[field] is not None:
+                      raise SystemExit(f"rejected deploy exposed {field}: {result!r}")
+              if result["diagnostics"] != [{"code": code, "message": message}]:
+                  raise SystemExit(f"unexpected deploy diagnostic: {result!r}")
+              rejected_text = str(result)
+              if any(
+                  forbidden in rejected_text
+                  for forbidden in (
+                      os.environ["OFFLINE_CONFIG"],
+                      os.environ["OFFLINE_STATE_ROOT"],
+                      "DEEPSEEK_API_KEY",
+                      "deploy poison Secret value",
+                  )
+              ):
+                  raise SystemExit("rejected deploy leaked config, state, or Secret material")
+          expected_inspection_fields = [
+              "schema_version",
+              "command",
+              "ok",
+              "changed",
+              "snapshot",
+              "diagnostics",
+          ]
+          expected_inspection_diagnostics = (
+              (
+                  inspection_not_running,
+                  "PXLC-INSPECTION-NOT-RUNNING",
+                  "local Inspection requires the current owner generation to be running",
+              ),
+              (
+                  inspection_grammar,
+                  "PXLC-INSPECTION-GRAMMAR",
+                  "inspection snapshot requires exactly --config "
+                  "<absolute-paraegox.toml> --json",
+              ),
+          )
+          for result, code, message in expected_inspection_diagnostics:
+              if list(result) != expected_inspection_fields:
+                  raise SystemExit(f"unexpected Inspection field order: {result!r}")
+              if (
+                  result["schema_version"],
+                  result["command"],
+                  result["ok"],
+                  result["changed"],
+                  result["snapshot"],
+              ) != (1, "inspection.snapshot", False, False, None):
+                  raise SystemExit(f"unexpected rejected Inspection envelope: {result!r}")
+              if result["diagnostics"] != [{"code": code, "message": message}]:
+                  raise SystemExit(f"unexpected Inspection diagnostic: {result!r}")
+              rejected_text = str(result)
+              if any(
+                  forbidden in rejected_text
+                  for forbidden in (
+                      os.environ["OFFLINE_CONFIG"],
+                      os.environ["OFFLINE_STATE_ROOT"],
+                      "DEEPSEEK_API_KEY",
+                      "inspection poison Secret value",
+                  )
+              ):
+                  raise SystemExit(
+                      "rejected Inspection leaked config, state, or Secret material"
+                  )
+          expected_receipt_fields = [
+              "schema_version",
+              "command",
+              "ok",
+              "changed",
+              "generation",
+              "snapshot",
+              "diagnostics",
+          ]
+          expected_receipt_diagnostics = (
+              (
+                  receipt_not_running,
+                  "PXLC-RECEIPT-NOT-RUNNING",
+                  "local Receipt snapshot requires the current owner generation to be running",
+              ),
+              (
+                  receipt_grammar,
+                  "PXLC-RECEIPT-GRAMMAR",
+                  "receipt snapshot requires exactly --config "
+                  "<absolute-paraegox.toml> --json",
+              ),
+          )
+          for result, code, message in expected_receipt_diagnostics:
+              if list(result) != expected_receipt_fields:
+                  raise SystemExit(f"unexpected Receipt field order: {result!r}")
+              if (
+                  result["schema_version"],
+                  result["command"],
+                  result["ok"],
+                  result["changed"],
+                  result["generation"],
+                  result["snapshot"],
+              ) != (1, "receipt.snapshot", False, False, None, None):
+                  raise SystemExit(f"unexpected rejected Receipt envelope: {result!r}")
+              if result["diagnostics"] != [{"code": code, "message": message}]:
+                  raise SystemExit(f"unexpected Receipt diagnostic: {result!r}")
+              rejected_text = str(result)
+              if any(
+                  forbidden in rejected_text
+                  for forbidden in (
+                      os.environ["OFFLINE_CONFIG"],
+                      os.environ["OFFLINE_STATE_ROOT"],
+                      "DEEPSEEK_API_KEY",
+                      "receipt poison Secret value",
+                      "receipt environment canary value",
+                  )
+              ):
+                  raise SystemExit(
+                      "rejected Receipt leaked config, state, or Secret material"
+                  )
+          if (config["command"], config["kind"], config["ok"]) != (
+              "config.check",
+              "chat",
+              True,
+          ):
+              raise SystemExit(f"unexpected config-check envelope: {config!r}")
+          if (doctor["command"], doctor["kind"], doctor["ok"]) != (
+              "doctor.offline",
+              "chat",
+              True,
+          ):
+              raise SystemExit(f"unexpected doctor envelope: {doctor!r}")
+          if config["secret_input_reference_present"] is not True:
+              raise SystemExit("config check did not report the configured SecretRef")
+          if doctor["secret_input_reference_present"] is not True:
+              raise SystemExit("doctor did not report the configured SecretRef")
+          if (invalid["command"], invalid["kind"], invalid["ok"]) != (
+              "config.check",
+              "chat",
+              False,
+          ):
+              raise SystemExit(f"unexpected invalid-config envelope: {invalid!r}")
+          if invalid["diagnostics"][0]["code"] != "PXLC-CONFIG-FILE-READ":
+              raise SystemExit(f"unexpected invalid-config diagnostic: {invalid!r}")
+          if "does-not-exist" in str(invalid):
+              raise SystemExit("invalid-config output leaked the config path")
+          for result in (config, doctor):
+              if result["schema_version"] != 1:
+                  raise SystemExit(f"unexpected offline schema version: {result!r}")
+              serialized = str(result)
+              if any(
+                  path in serialized
+                  for path in (
+                      os.environ["OFFLINE_CONFIG"],
+                      os.environ["OFFLINE_STATE_ROOT"],
+                  )
+              ):
+                  raise SystemExit("offline output leaked an absolute config or state path")
+              if "DEEPSEEK_API_KEY" in serialized or "offline poison Secret value" in serialized:
+                  raise SystemExit("offline output leaked the SecretRef value")
+              skipped = {item["id"] for item in result["checks_skipped"]}
+              if not {"owner_startup", "network_connectivity", "runtime_readiness"} <= skipped:
+                  raise SystemExit(f"offline boundary is incomplete: {result!r}")
+          PY
+
+          if "$binary" controller >/dev/null 2>&1; then
+            printf 'bare controller unexpectedly selected a public command\n' >&2
+            exit 1
+          fi
+          if "$binary" deployment controller >/dev/null 2>&1; then
+            printf 'deployment unexpectedly accepted a bare controller submode\n' >&2
+            exit 1
+          fi
+
+          if grep -Eq 'paraegox-local|developer-|fixture-v1|openai-v1|deepseek-v1|__node-daemon-child-v1|--node-bootstrap-file|--node-observation-bootstrap-file|--tui-attach-fd' "$help_output"; then
+            printf 'hidden or legacy CLI surface is still exposed\n' >&2
+            exit 1
+          fi
+
+      - name: Smoke macOS managed-local lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="$(cd target/debug && pwd -P)/paraegox"
+          lifecycle_root="$(mktemp -d /tmp/pxl.XXXXXX)"
+          lifecycle_root="$(cd "$lifecycle_root" && pwd -P)"
+          lifecycle_workspace="$lifecycle_root/w"
+          lifecycle_config="$lifecycle_workspace/paraegox.toml"
+          lifecycle_state="$lifecycle_workspace/state"
+          lifecycle_socket="$lifecycle_state/operator-v1/control-v1.sock"
+          init_json="$lifecycle_root/init.json"
+          up_json="$lifecycle_root/up.json"
+          running_json="$lifecycle_root/running.json"
+          down_json="$lifecycle_root/down.json"
+          stopped_json="$lifecycle_root/stopped.json"
+          init_stderr="$lifecycle_root/init.stderr"
+          up_stderr="$lifecycle_root/up.stderr"
+          running_stderr="$lifecycle_root/running.stderr"
+          down_stderr="$lifecycle_root/down.stderr"
+          stopped_stderr="$lifecycle_root/stopped.stderr"
+
+          chmod 0700 "$lifecycle_root"
+          test "${#lifecycle_socket}" -le 103
+          test ! -e "$lifecycle_workspace"
+          if pgrep -f "$binary" >/dev/null 2>&1; then
+            printf 'ParaEGOX process existed before lifecycle smoke\n' >&2
+            exit 1
+          fi
+
+          cleanup_lifecycle() {
+            set +e
+            if [ -f "$lifecycle_config" ]; then
+              "$binary" down --config "$lifecycle_config" --json >/dev/null 2>&1
+            fi
+            if pgrep -f "$binary" >/dev/null 2>&1; then
+              pkill -TERM -f "$binary" >/dev/null 2>&1
+              for _ in {1..100}; do
+                if ! pgrep -f "$binary" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 0.05
+              done
+              pkill -KILL -f "$binary" >/dev/null 2>&1
+            fi
+          }
+          trap cleanup_lifecycle EXIT
+
+          # The generated profile is compiled-in deterministic Echo. Removing
+          # provider variables proves this smoke cannot contact an external model.
+          unset OPENAI_API_KEY DEEPSEEK_API_KEY
+          "$binary" init \
+            --directory "$lifecycle_workspace" \
+            --json > "$init_json" 2> "$init_stderr"
+          test ! -s "$init_stderr"
+          test "$(stat -f '%Lp' "$lifecycle_workspace")" = '700'
+          test "$(stat -f '%Lp' "$lifecycle_config")" = '600'
+          test ! -e "$lifecycle_state"
+
+          # Fail clearly if the runner cannot provide the one loopback-only
+          # listener required by the generated local composition.
+          python3 - <<'PY'
+          import socket
+
+
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+              probe.bind(("127.0.0.1", 7447))
+          PY
+
+          "$binary" up \
+            --config "$lifecycle_config" \
+            --json > "$up_json" 2> "$up_stderr"
+          test ! -s "$up_stderr"
+          "$binary" status \
+            --config "$lifecycle_config" \
+            --json > "$running_json" 2> "$running_stderr"
+          test ! -s "$running_stderr"
+          "$binary" down \
+            --config "$lifecycle_config" \
+            --json > "$down_json" 2> "$down_stderr"
+          test ! -s "$down_stderr"
+          "$binary" status \
+            --config "$lifecycle_config" \
+            --json > "$stopped_json" 2> "$stopped_stderr"
+          test ! -s "$stopped_stderr"
+
+          INIT_JSON="$init_json" \
+            UP_JSON="$up_json" \
+            RUNNING_JSON="$running_json" \
+            DOWN_JSON="$down_json" \
+            STOPPED_JSON="$stopped_json" \
+            LIFECYCLE_ROOT="$lifecycle_root" \
+            python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+
+          def load_exact(name: str) -> dict:
+              wire = Path(os.environ[name]).read_bytes()
+              if not wire.endswith(b"\n") or wire.count(b"\n") != 1:
+                  raise SystemExit(f"{name} is not one newline-terminated JSON object")
+              value = json.loads(wire)
+              if not isinstance(value, dict):
+                  raise SystemExit(f"{name} is not a JSON object")
+              return value
+
+
+          initialized = load_exact("INIT_JSON")
+          expected_init_fields = {
+              "schema_version",
+              "command",
+              "ok",
+              "changed",
+              "profile",
+              "config_relative_path",
+              "state_relative_path",
+              "diagnostics",
+          }
+          if set(initialized) != expected_init_fields:
+              raise SystemExit(f"unexpected lifecycle init fields: {initialized!r}")
+          if (
+              initialized["schema_version"],
+              initialized["command"],
+              initialized["ok"],
+              initialized["changed"],
+              initialized["profile"],
+              initialized["config_relative_path"],
+              initialized["state_relative_path"],
+              initialized["diagnostics"],
+          ) != (
+              1,
+              "init",
+              True,
+              True,
+              "deterministic-echo-v1",
+              "paraegox.toml",
+              "state",
+              [],
+          ):
+              raise SystemExit(f"unexpected lifecycle init envelope: {initialized!r}")
+
+          expected_lifecycle_fields = {
+              "schema_version",
+              "command",
+              "ok",
+              "state",
+              "generation",
+              "changed",
+              "owner_readiness_observed",
+              "inspection_checked",
+              "diagnostics",
+          }
+          observations = (
+              (load_exact("UP_JSON"), "up", "running", True),
+              (load_exact("RUNNING_JSON"), "status", "running", False),
+              (load_exact("DOWN_JSON"), "down", "stopped", True),
+              (load_exact("STOPPED_JSON"), "status", "stopped", False),
+          )
+          generation = observations[0][0]["generation"]
+          if not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None:
+              raise SystemExit(f"invalid lifecycle generation: {generation!r}")
+          for observation, command, state, changed in observations:
+              if set(observation) != expected_lifecycle_fields:
+                  raise SystemExit(f"unexpected {command} fields: {observation!r}")
+              if (
+                  observation["schema_version"],
+                  observation["command"],
+                  observation["ok"],
+                  observation["state"],
+                  observation["generation"],
+                  observation["changed"],
+                  observation["owner_readiness_observed"],
+                  observation["inspection_checked"],
+                  observation["diagnostics"],
+              ) != (1, command, True, state, generation, changed, True, False, []):
+                  raise SystemExit(f"unexpected {command} lifecycle envelope: {observation!r}")
+              serialized = json.dumps(observation, separators=(",", ":"))
+              if os.environ["LIFECYCLE_ROOT"] in serialized:
+                  raise SystemExit(f"{command} leaked its private lifecycle root")
+              if "API_KEY" in serialized or "Secret" in serialized:
+                  raise SystemExit(f"{command} leaked provider material")
+          PY
+
+          if find "$lifecycle_state" -type s -print -quit | grep -q .; then
+            printf 'joined lifecycle down left a Unix socket\n' >&2
+            find "$lifecycle_state" -type s -print >&2
+            exit 1
+          fi
+          for _ in {1..100}; do
+            if ! pgrep -f "$binary" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.05
+          done
+          if pgrep -f "$binary" >/dev/null 2>&1; then
+            printf 'joined lifecycle down left a ParaEGOX process\n' >&2
+            pgrep -fl "$binary" >&2
+            exit 1
+          fi
+          trap - EXIT
+
+      - name: Stage relocatable CLI and Textual bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifact
+          install -m 0755 target/debug/paraegox artifact/paraegox
+          runtime_requirements="$RUNNER_TEMP/paraegox-runtime-requirements.txt"
+          uv export \
+            --frozen \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file "$runtime_requirements"
+          uv pip install \
+            --target artifact/python \
+            --no-compile \
+            --no-deps \
+            --require-hashes \
+            --requirements "$runtime_requirements"
+          uv pip install \
+            --target artifact/python \
+            --no-compile \
+            --no-deps \
+            .
+          RUNTIME_REQUIREMENTS="$runtime_requirements" \
+            ARTIFACT_PYTHON="$PWD/artifact/python" \
+            uv run --frozen python - <<'PY'
+          import os
+          import re
+          from importlib.metadata import distributions
+          from pathlib import Path
+
+          from packaging.requirements import Requirement
+
+
+          def canonical_name(value: str) -> str:
+              return re.sub(r"[-_.]+", "-", value).lower()
+
+
+          expected: dict[str, str] = {}
+          requirements = Path(os.environ["RUNTIME_REQUIREMENTS"])
+          for raw_line in requirements.read_text(encoding="utf-8").splitlines():
+              if not raw_line or raw_line[0].isspace() or raw_line.startswith("#"):
+                  continue
+              requirement = Requirement(raw_line.removesuffix("\\").rstrip())
+              if requirement.marker is not None and not requirement.marker.evaluate():
+                  continue
+              pins = [item.version for item in requirement.specifier if item.operator == "=="]
+              if len(pins) != 1:
+                  raise SystemExit(f"runtime dependency is not exactly pinned: {requirement}")
+              expected[canonical_name(requirement.name)] = pins[0]
+
+          actual = {
+              canonical_name(distribution.metadata["Name"]): distribution.version
+              for distribution in distributions(path=[os.environ["ARTIFACT_PYTHON"]])
+              if canonical_name(distribution.metadata["Name"]) != "paraegox-sdk"
+          }
+          if actual != expected:
+              raise SystemExit(
+                  f"bundled runtime dependencies differ from uv.lock: "
+                  f"expected={expected!r} actual={actual!r}"
+              )
+          PY
+          if [ -d artifact/python/bin ]; then
+            for generated_script in artifact/python/bin/*; do
+              [ -e "$generated_script" ] || continue
+              test -f "$generated_script"
+              test ! -L "$generated_script"
+              rm -- "$generated_script"
+            done
+            rmdir artifact/python/bin
+          fi
+          if [ -e artifact/python/.lock ]; then
+            test -f artifact/python/.lock
+            test ! -L artifact/python/.lock
+            rm artifact/python/.lock
+          fi
+          install -m 0755 scripts/paraegox-console artifact/paraegox-console
+
+          test "$(head -n 1 artifact/paraegox-console)" = '#!/usr/bin/env sh'
+          test -f artifact/python/paraegox_sdk/console_tui.py
+          test -f artifact/python/paraegox_sdk/console_client.py
+          if grep -RIlE '^#!.*(/Users/runner|/_temp/|/home/runner)' artifact; then
+            printf 'bundle contains a CI-absolute shebang\n' >&2
+            exit 1
+          fi
+
+      - name: Smoke relocated parent, Textual child, and Rust Agent IPC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          relocated_bundle="$RUNNER_TEMP/ParaEGOX bundle"
+          cp -R artifact "$relocated_bundle"
+          relocated_stderr="$RUNNER_TEMP/paraegox-relocated-offline.stderr"
+          test ! -e "$RUNNER_TEMP/paraegox-offline-state"
+          "$relocated_bundle/paraegox" version --json \
+            2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-version.json"
+          test ! -s "$relocated_stderr"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$relocated_bundle/paraegox" config check chat \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-config-check.json"
+          test ! -s "$relocated_stderr"
+          OPENAI_API_KEY='offline poison Secret value' \
+            DEEPSEEK_API_KEY='offline poison Secret value' \
+            "$relocated_bundle/paraegox" doctor chat \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --offline --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-doctor.json"
+          test ! -s "$relocated_stderr"
+          set +e
+          OPENAI_API_KEY='deploy poison Secret value' \
+            DEEPSEEK_API_KEY='deploy poison Secret value' \
+            "$relocated_bundle/paraegox" deploy --local \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-deploy-rejected.json"
+          relocated_statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${relocated_statuses[0]}" -eq 2
+          test "${relocated_statuses[1]}" -eq 0
+          test ! -s "$relocated_stderr"
+          test ! -e "$RUNNER_TEMP/paraegox-offline-state"
+          set +e
+          OPENAI_API_KEY='inspection poison Secret value' \
+            DEEPSEEK_API_KEY='inspection poison Secret value' \
+            "$relocated_bundle/paraegox" inspection snapshot \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-inspection-not-running.json"
+          relocated_statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${relocated_statuses[0]}" -eq 1
+          test "${relocated_statuses[1]}" -eq 0
+          test ! -s "$relocated_stderr"
+          test ! -e "$RUNNER_TEMP/paraegox-offline-state"
+          set +e
+          OPENAI_API_KEY='receipt poison Secret value' \
+            DEEPSEEK_API_KEY='receipt poison Secret value' \
+            PARAEGOX_M4A_UNLISTED_CANARY='receipt environment canary value' \
+            "$relocated_bundle/paraegox" receipt snapshot \
+              --config "$RUNNER_TEMP/paraegox-offline-check.toml" \
+              --json 2> "$relocated_stderr" \
+            | cmp - "$RUNNER_TEMP/paraegox-receipt-not-running.json"
+          relocated_statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${relocated_statuses[0]}" -eq 1
+          test "${relocated_statuses[1]}" -eq 0
+          test ! -s "$relocated_stderr"
+          test ! -e "$RUNNER_TEMP/paraegox-offline-state"
+          smoke_python_prefix="$(.venv/bin/python3 -c 'import sys; print(sys.base_prefix)')"
+          smoke_python="$smoke_python_prefix/bin/python3"
+          test -x "$smoke_python"
+          if "$smoke_python" -I -c 'import textual' >/dev/null 2>&1; then
+            printf 'smoke interpreter unexpectedly contains Textual outside the bundle\n' >&2
+            exit 1
+          fi
+          PATH="$smoke_python_prefix/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            "$smoke_python" scripts/smoke_macos_textual_chat.py \
+              --bundle-dir "$relocated_bundle"
+
+      - name: Smoke bounded macOS artifact TUI attachment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          M5A_BUNDLE="$PWD/artifact" \
+            uv run --frozen python - <<'PY'
+          from __future__ import annotations
+
+          import errno
+          import fcntl
+          import json
+          import os
+          import select
+          import signal
+          import socket
+          import stat
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          import termios
+          import time
+          from contextlib import suppress
+          from pathlib import Path
+
+          START_TIMEOUT_SECONDS = 45.0
+          REPLY_TIMEOUT_SECONDS = 45.0
+          EXIT_TIMEOUT_SECONDS = 20.0
+          COMMAND_TIMEOUT_SECONDS = 180.0
+          MAX_CAPTURE_BYTES = 2 * 1024 * 1024
+          TEXTUAL_TERMINAL_RESTORE = b"\x1b[?1049l"
+          MESSAGE = "m5a-artifact-attach-echo"
+          OPENAI_CANARY = "m5a macOS OPENAI Secret canary"
+          DEEPSEEK_CANARY = "m5a macOS DEEPSEEK Secret canary"
+          ENVIRONMENT_CANARY = "m5a macOS unlisted environment canary"
+
+
+          def require_bundle() -> tuple[Path, Path]:
+              root = Path(os.environ["M5A_BUNDLE"]).resolve(strict=True)
+              binary = root / "paraegox"
+              launcher = root / "paraegox-console"
+              for path in (binary, launcher):
+                  metadata = path.lstat()
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or path.is_symlink()
+                      or metadata.st_mode & 0o111 == 0
+                  ):
+                      raise RuntimeError("artifact TUI executable identity is unsafe")
+              if not (root / "python" / "paraegox_sdk").is_dir():
+                  raise RuntimeError("artifact TUI Python payload is incomplete")
+              return root, binary
+
+
+          def exact_json_line(raw: bytes) -> dict[str, object]:
+              if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+                  raise RuntimeError("lifecycle output was not one JSON line")
+              value = json.loads(raw)
+              if not isinstance(value, dict):
+                  raise RuntimeError("lifecycle output was not a JSON object")
+              canonical = json.dumps(
+                  value,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ).encode() + b"\n"
+              if raw != canonical:
+                  raise RuntimeError("lifecycle output was not canonical JSON")
+              return value
+
+
+          def run_json(
+              binary: Path,
+              environment: dict[str, str],
+              *arguments: str,
+          ) -> dict[str, object]:
+              completed = subprocess.run(
+                  [os.fspath(binary), *arguments],
+                  cwd=binary.parent,
+                  env=environment,
+                  stdin=subprocess.DEVNULL,
+                  capture_output=True,
+                  timeout=COMMAND_TIMEOUT_SECONDS,
+                  check=False,
+              )
+              output = completed.stdout + completed.stderr
+              if any(
+                  value.encode() in output
+                  for value in (OPENAI_CANARY, DEEPSEEK_CANARY, ENVIRONMENT_CANARY)
+              ):
+                  raise RuntimeError("artifact lifecycle output exposed a canary")
+              if completed.returncode != 0 or completed.stderr:
+                  raise RuntimeError("artifact lifecycle command failed closed")
+              return exact_json_line(completed.stdout)
+
+
+          def bounded_append(capture: bytearray, chunk: bytes) -> None:
+              capture.extend(chunk)
+              if len(capture) > MAX_CAPTURE_BYTES:
+                  del capture[: len(capture) - MAX_CAPTURE_BYTES]
+
+
+          def read_once(master_fd: int, capture: bytearray, timeout: float) -> bool:
+              ready, _, _ = select.select([master_fd], [], [], timeout)
+              if not ready:
+                  return False
+              try:
+                  chunk = os.read(master_fd, 65_536)
+              except OSError as error:
+                  if error.errno == errno.EIO:
+                      return False
+                  raise
+              if not chunk:
+                  return False
+              bounded_append(capture, chunk)
+              return True
+
+
+          def read_until(
+              master_fd: int,
+              process: subprocess.Popen[bytes],
+              capture: bytearray,
+              marker: bytes,
+              timeout_seconds: float,
+          ) -> None:
+              deadline = time.monotonic() + timeout_seconds
+              while marker not in capture:
+                  if process.poll() is not None:
+                      raise RuntimeError("artifact TUI exited before its expected marker")
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("artifact TUI marker deadline expired")
+                  read_once(master_fd, capture, 0.2)
+
+
+          def wait_for_exit(
+              master_fd: int,
+              process: subprocess.Popen[bytes],
+              capture: bytearray,
+          ) -> None:
+              deadline = time.monotonic() + EXIT_TIMEOUT_SECONDS
+              while process.poll() is None:
+                  if time.monotonic() >= deadline:
+                      raise TimeoutError("artifact TUI exit deadline expired")
+                  read_once(master_fd, capture, 0.2)
+              while read_once(master_fd, capture, 0):
+                  pass
+              if process.returncode != 0:
+                  raise RuntimeError("artifact TUI did not detach successfully")
+
+
+          def child_terminal_setup() -> None:
+              os.setsid()
+              fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+          def assert_no_canary_or_private_path(
+              capture: bytes,
+              config: Path,
+              state_root: Path,
+          ) -> None:
+              forbidden = (
+                  os.fsencode(config),
+                  os.fsencode(state_root),
+                  OPENAI_CANARY.encode(),
+                  DEEPSEEK_CANARY.encode(),
+                  ENVIRONMENT_CANARY.encode(),
+                  b"OPENAI_API_KEY",
+                  b"DEEPSEEK_API_KEY",
+                  b"SecretRef",
+                  b"Traceback",
+              )
+              if any(value in capture for value in forbidden):
+                  raise RuntimeError("artifact TUI output exposed private input")
+
+
+          bundle, binary = require_bundle()
+          base_python = Path(sys.base_prefix) / "bin" / "python3"
+          if not base_python.is_file():
+              raise RuntimeError("Python 3.11 base interpreter is unavailable")
+          environment = os.environ.copy()
+          environment.pop("PYTHONPATH", None)
+          environment.pop("VIRTUAL_ENV", None)
+          environment["PATH"] = os.pathsep.join(
+              (
+                  os.fspath(base_python.parent),
+                  "/usr/bin",
+                  "/bin",
+                  "/usr/sbin",
+                  "/sbin",
+              )
+          )
+          environment["TERM"] = "xterm-256color"
+          environment["COLUMNS"] = "120"
+          environment["LINES"] = "34"
+          environment["OPENAI_API_KEY"] = OPENAI_CANARY
+          environment["DEEPSEEK_API_KEY"] = DEEPSEEK_CANARY
+          environment["PARAEGOX_M5A_UNLISTED_CANARY"] = ENVIRONMENT_CANARY
+
+          # Keep lifecycle-owned Unix socket paths below macOS sun_path limits.
+          # RUNNER_TEMP is substantially longer and previously produced a
+          # configuration-valid but unstartable owner path.
+          temporary_parent = Path("/tmp").resolve(strict=True)
+          with tempfile.TemporaryDirectory(
+              prefix="pxm5a-",
+              dir=temporary_parent,
+          ) as temporary:
+              root = Path(temporary).resolve(strict=True)
+              workspace = root / "w"
+              config = workspace / "paraegox.toml"
+              state_root = workspace / "state"
+              process: subprocess.Popen[bytes] | None = None
+              owner_running = False
+              master_fd = -1
+              try:
+                  with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                      probe.bind(("127.0.0.1", 7447))
+                  initialized = run_json(
+                      binary,
+                      environment,
+                      "init",
+                      "--directory",
+                      os.fspath(workspace),
+                      "--json",
+                  )
+                  if initialized.get("ok") is not True or state_root.exists():
+                      raise RuntimeError("artifact init did not remain pre-state")
+                  started = run_json(
+                      binary,
+                      environment,
+                      "up",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  owner_running = True
+                  generation = started.get("generation")
+                  if started.get("state") != "running" or not isinstance(generation, str):
+                      raise RuntimeError("artifact owner did not reach Running")
+                  before = run_json(
+                      binary,
+                      environment,
+                      "status",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  if before.get("state") != "running" or before.get("generation") != generation:
+                      raise RuntimeError("artifact owner generation was not stable")
+
+                  master_fd, slave_fd = os.openpty()
+                  fcntl.ioctl(
+                      slave_fd,
+                      termios.TIOCSWINSZ,
+                      struct.pack("HHHH", 34, 120, 0, 0),
+                  )
+                  # macOS revokes the slave side when the controlling session
+                  # leader exits, so a retained slave dup returns ENOTTY after
+                  # a clean detach. The master remains queryable and exposes
+                  # the same terminal attributes before and after the session.
+                  original_terminal = termios.tcgetattr(master_fd)
+                  process = subprocess.Popen(
+                      [
+                          os.fspath(binary),
+                          "tui",
+                          "--config",
+                          os.fspath(config),
+                      ],
+                      cwd=bundle,
+                      env=environment,
+                      stdin=slave_fd,
+                      stdout=slave_fd,
+                      stderr=slave_fd,
+                      preexec_fn=child_terminal_setup,
+                  )
+                  os.close(slave_fd)
+                  capture = bytearray()
+                  read_until(
+                      master_fd,
+                      process,
+                      capture,
+                      b"System: connected",
+                      START_TIMEOUT_SECONDS,
+                  )
+                  for marker in (b"Inspection cache", b"NodeDaemon", b"r1"):
+                      read_until(
+                          master_fd,
+                          process,
+                          capture,
+                          marker,
+                          START_TIMEOUT_SECONDS,
+                      )
+                  os.write(master_fd, f"{MESSAGE}\r".encode())
+                  read_until(
+                      master_fd,
+                      process,
+                      capture,
+                      f"echo: {MESSAGE}".encode(),
+                      REPLY_TIMEOUT_SECONDS,
+                  )
+                  os.write(master_fd, b"\x1b")
+                  wait_for_exit(master_fd, process, capture)
+                  if termios.tcgetattr(master_fd) != original_terminal:
+                      raise RuntimeError("artifact TUI did not restore terminal attributes")
+                  if TEXTUAL_TERMINAL_RESTORE not in capture:
+                      raise RuntimeError("artifact TUI did not restore the alternate screen")
+                  assert_no_canary_or_private_path(bytes(capture), config, state_root)
+
+                  after = run_json(
+                      binary,
+                      environment,
+                      "status",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  if after.get("state") != "running" or after.get("generation") != generation:
+                      raise RuntimeError("artifact TUI detach changed owner generation")
+                  stopped = run_json(
+                      binary,
+                      environment,
+                      "down",
+                      "--config",
+                      os.fspath(config),
+                      "--json",
+                  )
+                  owner_running = False
+                  if stopped.get("state") != "stopped":
+                      raise RuntimeError("artifact owner did not join after down")
+                  if any(
+                      stat.S_ISSOCK(path.lstat().st_mode)
+                      for path in state_root.rglob("*")
+                  ):
+                      raise RuntimeError("artifact owner down retained a Unix socket")
+              finally:
+                  if process is not None and process.poll() is None:
+                      with suppress(ProcessLookupError):
+                          os.killpg(process.pid, signal.SIGTERM)
+                      with suppress(subprocess.TimeoutExpired):
+                          process.wait(timeout=5.0)
+                      if process.poll() is None:
+                          with suppress(ProcessLookupError):
+                              os.killpg(process.pid, signal.SIGKILL)
+                          process.wait(timeout=5.0)
+                  if master_fd >= 0:
+                      os.close(master_fd)
+                  if owner_running:
+                      with suppress(Exception):
+                          run_json(
+                              binary,
+                              environment,
+                              "down",
+                              "--config",
+                              os.fspath(config),
+                              "--json",
+                          )
+
+          print("macOS artifact TUI light smoke completed")
+          PY
+
+      - name: Checksum the complete bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          (
+            cd artifact
+            find . -type f ! -name SHA256SUMS -print \
+              | LC_ALL=C sort \
+              | while IFS= read -r path; do shasum -a 256 "$path"; done \
+              > SHA256SUMS
+            shasum -a 256 -c SHA256SUMS
+          )
+
+      - name: Archive bundle with executable modes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_name="paraegox-macos-x86_64-${GITHUB_SHA}.tar.gz"
+          mkdir -p release
+          tar -czf "release/$archive_name" -C artifact .
+          (
+            cd release
+            shasum -a 256 "$archive_name" > "$archive_name.sha256"
+            shasum -a 256 -c "$archive_name.sha256"
+          )
+
+          mode_check="$RUNNER_TEMP/paraegox-archive-mode-check"
+          mkdir -p "$mode_check"
+          tar -xzf "release/$archive_name" -C "$mode_check"
+          test -x "$mode_check/paraegox"
+          test -x "$mode_check/paraegox-console"
+
+      - name: Upload commit-addressed macOS chat bundle
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: paraegox-macos-x86_64-${{ github.sha }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 7

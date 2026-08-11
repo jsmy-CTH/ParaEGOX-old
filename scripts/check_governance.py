@@ -20,13 +20,16 @@ from typing import Any
 VALID_PACKAGE_STATUSES = {"internal", "experimental", "enabler", "public"}
 VALID_DOCUMENT_STATUSES = {
     "Accepted",
+    "Active",
     "Current",
+    "Decision Gate",
     "Draft",
     "Proposed",
     "Rejected",
     "Research Complete",
     "Superseded",
 }
+EXPECTED_LOCAL_ONLY_ROOTS = ["docs/workbench"]
 WAIVER_ID_RE = re.compile(r"\bGOV-WAIVER-\d{4}\b")
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 DOCUMENT_STATUS_RE = re.compile(r"^> 状态：(.+)$", re.MULTILINE)
@@ -71,6 +74,7 @@ def validate_repository(root: Path, config: dict[str, Any], *, today: dt.date) -
     findings.extend(check_config(config, today=today))
     findings.extend(check_top_level_directories(root, config))
     findings.extend(check_untracked_only_roots(root, config))
+    findings.extend(check_versioned_documentation(root, config))
     findings.extend(check_package_registry(root, config))
     findings.extend(check_cargo_workspace(root, config))
     findings.extend(check_architecture_imports(root, config))
@@ -93,7 +97,8 @@ def check_config(config: dict[str, Any], *, today: dt.date) -> list[Finding]:
             Finding(
                 "VCS-003",
                 "governance.toml",
-                "repository.untracked_only_roots must be a non-empty array containing 'docs'",
+                "repository.untracked_only_roots must be a non-empty array containing "
+                "only 'docs/workbench'",
             )
         )
     else:
@@ -119,14 +124,29 @@ def check_config(config: dict[str, Any], *, today: dt.date) -> list[Finding]:
                 )
                 continue
             local_only_roots.append(value)
-        if local_only_roots != ["docs"]:
+        if local_only_roots != EXPECTED_LOCAL_ONLY_ROOTS:
             findings.append(
                 Finding(
                     "VCS-003",
                     "governance.toml",
-                    "repository.untracked_only_roots must be exactly ['docs']",
+                    "repository.untracked_only_roots must be exactly ['docs/workbench']",
                 )
             )
+
+        documentation_roots = _strings(repository.get("documentation_roots"))
+        for documentation_root in documentation_roots:
+            if any(
+                _path_is_at_or_under(documentation_root, local_only_root)
+                for local_only_root in local_only_roots
+            ):
+                findings.append(
+                    Finding(
+                        "VCS-003",
+                        "governance.toml",
+                        "repository.documentation_roots entries must not themselves be "
+                        f"local-only: {documentation_root!r}",
+                    )
+                )
 
     for name in ("packages", "public_apis", "waivers", "deprecations", "feature_flags"):
         if not isinstance(registry.get(name), list):
@@ -243,6 +263,57 @@ def check_untracked_only_roots(root: Path, config: dict[str, Any]) -> list[Findi
             )
         )
     return findings
+
+
+def check_versioned_documentation(root: Path, config: dict[str, Any]) -> list[Finding]:
+    repository = _table(config, "repository")
+    documentation_roots = _strings(repository.get("documentation_roots"))
+    local_only_roots = _strings(repository.get("untracked_only_roots"))
+    formal_files: set[str] = set()
+    for value in documentation_roots:
+        path = root / value
+        candidates: list[Path] = []
+        if path.is_file():
+            candidates.append(path)
+        elif path.is_dir():
+            candidates.extend(item for item in path.rglob("*") if item.is_file())
+        for candidate in candidates:
+            relative = candidate.relative_to(root).as_posix()
+            if not any(
+                _path_is_at_or_under(relative, local_only_root)
+                for local_only_root in local_only_roots
+            ):
+                formal_files.add(relative)
+
+    if not formal_files:
+        return []
+
+    literal_pathspecs = [f":(top,literal){value}" for value in documentation_roots]
+    command = ["git", "-C", str(root), "ls-files", "-z", "--", *literal_pathspecs]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return [Finding("VCS-002", ".", f"cannot inspect tracked paths: {exc}")]
+
+    if completed.returncode != 0:
+        detail = _first_nonempty_line(completed.stderr) or "git ls-files failed"
+        return [Finding("VCS-002", ".", f"cannot inspect tracked paths: {detail}")]
+
+    tracked = {path for path in completed.stdout.split("\0") if path}
+    return [
+        Finding(
+            "VCS-004",
+            path,
+            "formal documentation must be tracked; only local workbench paths may be untracked",
+        )
+        for path in sorted(formal_files - tracked)
+    ]
 
 
 def check_package_registry(root: Path, config: dict[str, Any]) -> list[Finding]:
@@ -727,13 +798,26 @@ def check_exceptions(root: Path, config: dict[str, Any], *, today: dt.date) -> l
 
 def check_documentation(root: Path, config: dict[str, Any]) -> list[Finding]:
     repository = _table(config, "repository")
+    local_only_roots = _strings(repository.get("untracked_only_roots"))
     markdown_files: list[Path] = []
     for value in _strings(repository.get("documentation_roots")):
         path = root / value
+        relative = path.relative_to(root).as_posix()
+        if any(
+            _path_is_at_or_under(relative, local_only_root) for local_only_root in local_only_roots
+        ):
+            continue
         if path.is_file() and path.suffix == ".md":
             markdown_files.append(path)
         elif path.is_dir():
-            markdown_files.extend(path.rglob("*.md"))
+            markdown_files.extend(
+                item
+                for item in path.rglob("*.md")
+                if not any(
+                    _path_is_at_or_under(item.relative_to(root).as_posix(), local_only_root)
+                    for local_only_root in local_only_roots
+                )
+            )
 
     findings: list[Finding] = []
     adr_ids: dict[str, Path] = {}
@@ -937,7 +1021,13 @@ def _requires_document_status(path: Path, root: Path) -> bool:
 
 
 def _base_document_status(value: str) -> str:
-    return re.split(r"[，,；;]", value, maxsplit=1)[0].strip()
+    return re.split(r"[，,；;（(]", value, maxsplit=1)[0].strip()
+
+
+def _path_is_at_or_under(value: str, root: str) -> bool:
+    value_parts = Path(value).parts
+    root_parts = Path(root).parts
+    return len(value_parts) >= len(root_parts) and value_parts[: len(root_parts)] == root_parts
 
 
 def _module_name(path: Path, source_parent: Path) -> str:

@@ -1,0 +1,11 @@
+receipt_version = 1
+authorization_status = "accepted"
+decision_maker = "ParaEGOX workspace user"
+session_reference = "current-codex-thread"
+authorization_received_at = "2026-08-10T16:19:52Z"
+authorization_phrase = "嗯全部推进"
+authorization_message_sha256 = "145f147bb92e793b464af56e2e1714536259da6dfa3a10a10086361e4ffdf579"
+authorization_scope = "current-thread recommendation accepted by '嗯全部推荐' and authorized to proceed by '嗯全部推进'; ADR-0011 bounded non-executable model-data and owner/A0/no-Graph decision boundary only; code, public contract, governance, Program mutation, and implementation remain separately gated"
+adr_path = "docs/adr/ADR-0011-local-immutable-artifact-materialization-and-deployment-selection.md"
+adr_bytes = 30326
+adr_sha256 = "fc4309f87f1770409a941d4d4ecd0694c302820ebfeeca599b9326c7bca27779"

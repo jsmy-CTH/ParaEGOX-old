@@ -9,15 +9,29 @@ use core::{fmt, num::NonZeroUsize};
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use paraegox_kernel::digest::{Digest32, DigestBuildError};
+use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
-use paraegox_kernel::time::{BoundedDuration, ClockReading, MonotonicDeadline, TimeError};
+use paraegox_kernel::time::{
+    BoundedDuration, ClockDomainRef, ClockGeneration, ClockReading, MonotonicDeadline, TimeError,
+};
+#[cfg(unix)]
+use paraegox_runtime_contracts::apply::ApplyOperationId;
 use paraegox_runtime_contracts::apply::{
     ApplyContractError, PlanWriterRef, TenureAuthorityRef, TenureKeyRef, TenureProofAlgorithm,
     TenureProofError,
 };
 use paraegox_runtime_contracts::assignment::RuntimeApplyRequest;
+use paraegox_runtime_contracts::distributed_agent_stack_plan::DistributedAgentStackApplyRequestV1;
+#[cfg(unix)]
+use paraegox_runtime_contracts::distributed_agent_stack_plan::RestrictedRuntimeApplyCarrierBindingV1;
 use paraegox_runtime_contracts::execution::RuntimeApplyRequestV2;
+use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackApplyRequestV1;
+use paraegox_runtime_contracts::managed_fabric_plan::{
+    ManagedFabricApplyRequestV1, ManagedFabricPlanError,
+};
+use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+    ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackApplyRequestV1,
+};
 use paraegox_runtime_contracts::process_execution::{
     RequestV4WireError, RuntimeApplyRequestV4, RuntimePlanSliceV4,
 };
@@ -27,18 +41,38 @@ use paraegox_runtime_contracts::reference_control::{
     REFERENCE_ADMISSION_TEMPORAL_LINEAGE_CAPACITY, REFERENCE_ADMISSION_TENURE_NONCE_CAPACITY,
     ReferenceAdmissionPolicyFingerprintV1, ReferenceAdmissionPolicyInputV1,
     ReferenceApplyIngressIdentitiesV1, ReferenceApplyRequestV1, ReferenceControlError,
-    reference_admission_policy_fingerprint_v1, reference_apply_ingress_identities_v1,
+    ed25519_control_key_fingerprint, reference_admission_policy_fingerprint_v1,
+    reference_apply_ingress_identities_v1,
+};
+#[cfg(unix)]
+use paraegox_runtime_contracts::remote_agent_access::{
+    ControllerAuthenticatedRemoteAgentAccessRequestV2, RemoteAgentAccessKindV2,
+    RemoteAgentAccessRequestV2,
+};
+use paraegox_runtime_contracts::remote_agent_data_plane_plan::RemoteAgentDataPlaneApplyRequestV1;
+#[cfg(unix)]
+use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+    RemoteAgentDataPlaneApplyRequestV2, RemoteAgentDataPlaneTerminalReceiptV2,
+    RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2,
 };
 use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
 use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
 use paraegox_runtime_contracts::wire::{
     ApplyAuthAlgorithm, ApplyAuthKeyRef, EnvelopeContractError, RuntimeApplyEnvelope, WireError,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::apply_state::{AdmittedApply, VerifiedWriterTenure};
 use crate::request::{
     RuntimeExecutionRequestAdmissionTransition, RuntimeRequestAdmissionError,
     RuntimeRequestAdmissionTransition, RuntimeThreadExecutionRequestAdmissionTransition,
+};
+#[cfg(unix)]
+use crate::{
+    runtime_control_endpoint::{
+        RuntimeRestrictedApplyCarrierPinV1, validate_restricted_runtime_apply_carrier_pins,
+    },
+    runtime_provisioning::RuntimeProvisioningV1,
 };
 
 /// Registry value for pure Ed25519 request and tenure signatures.
@@ -47,6 +81,14 @@ pub const ED25519_ALGORITHM: u16 = 1;
 pub const ED25519_ALGORITHM_VERSION: u16 = 1;
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 const ED25519_SIGNATURE_BYTES: usize = 64;
+const REMOTE_AGENT_ACCESS_OUTER_AUTH_TRANSCRIPT_DOMAIN_V2: &[u8] =
+    b"paraegox.runtime.remote-agent-access-outer-auth-transcript.sha256.v2";
+const REMOTE_AGENT_DATA_PLANE_TENURE_NONCE_DOMAIN_V2: &[u8] =
+    b"paraegox.runtime.remote-agent-data-plane-tenure-nonce.sha256.v2";
+const REMOTE_AGENT_DATA_PLANE_REQUEST_NONCE_DOMAIN_V2: &[u8] =
+    b"paraegox.runtime.remote-agent-data-plane-request-nonce.sha256.v2";
+const REMOTE_AGENT_DATA_PLANE_TEMPORAL_LINEAGE_DOMAIN_V2: &[u8] =
+    b"paraegox.runtime.remote-agent-data-plane-temporal-lineage.sha256.v2";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TenureTrustSelector {
@@ -452,6 +494,1048 @@ impl ApplyAdmissionPolicy {
             admitted_at_nanos,
         })
     }
+
+    /// Authenticates one strict PXAR v6 without aliasing the PXAR v5 facade.
+    /// The returned replay identities are Runtime-private successor-journal
+    /// keys; request/proof digests remain contract-owned values.
+    pub(crate) fn authenticate_managed_fabric_apply_request(
+        &self,
+        request: &ManagedFabricApplyRequestV1,
+    ) -> Result<AuthenticatedManagedFabricApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-fabric-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-fabric-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-fabric-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedFabricApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_managed_fabric_apply_request(
+        &self,
+        request: &ManagedFabricApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedManagedFabricApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_managed_fabric_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedManagedFabricApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v7 while keeping its replay namespace
+    /// independent from the predecessor PXAR-v6 owner.
+    pub(crate) fn authenticate_managed_agent_stack_apply_request(
+        &self,
+        request: &ManagedAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedManagedAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_managed_agent_stack_apply_request(
+        &self,
+        request: &ManagedAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedManagedAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_managed_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedManagedAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v9 in a replay namespace independent
+    /// from the PXAR-v6, PXAR-v7, and PXAR-v8 owners.
+    pub(crate) fn authenticate_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ManagedModelAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedManagedModelAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedModelAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ManagedModelAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedManagedModelAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError>
+    {
+        let authenticated = self.authenticate_managed_model_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedManagedModelAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v12 in the same logical managed
+    /// Model+Agent owner namespace. The v2 durable successor retains these
+    /// replay identities instead of creating a second ingress authority.
+    pub(crate) fn authenticate_artifact_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedManagedModelAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedModelAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_artifact_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<
+        VerifiedArtifactManagedModelAgentStackApplyIngressV1,
+        ManagedFabricApplyAdmissionError,
+    > {
+        let authenticated =
+            self.authenticate_artifact_managed_model_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedArtifactManagedModelAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v8 while keeping replay identities
+    /// independent from both PXAR-v6 Fabric and PXAR-v7 fixed-stack owners.
+    pub(crate) fn authenticate_distributed_agent_stack_apply_request(
+        &self,
+        request: &DistributedAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedDistributedAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.distributed-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.distributed-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.distributed-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedDistributedAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_distributed_agent_stack_apply_request(
+        &self,
+        request: &DistributedAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedDistributedAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_distributed_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedDistributedAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Authenticates one strict PXAR v10 in replay namespaces independent
+    /// from every PXAR-v6 through PXAR-v9 owner.
+    ///
+    /// This auth-only seam is safe for immutable historical replay lookup: it
+    /// proves the exact tenure and request signatures but installs no temporal
+    /// budget and grants no effect authority. Target/store lifecycle
+    /// correlation remains the responsibility of the later data-plane owner.
+    pub(crate) fn authenticate_remote_agent_data_plane_apply_request(
+        &self,
+        request: &RemoteAgentDataPlaneApplyRequestV1,
+    ) -> Result<AuthenticatedRemoteAgentDataPlaneApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let request_digest = request.request_digest();
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.remote-agent-data-plane-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.remote-agent-data-plane-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.remote-agent-data-plane-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedRemoteAgentDataPlaneApplyV1 {
+            request_digest,
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    /// Authenticates and temporally admits one fresh strict PXAR v10.
+    pub(crate) fn verify_remote_agent_data_plane_apply_request(
+        &self,
+        request: &RemoteAgentDataPlaneApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedRemoteAgentDataPlaneApplyIngressV1, ManagedFabricApplyAdmissionError> {
+        let authenticated = self.authenticate_remote_agent_data_plane_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedRemoteAgentDataPlaneApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
+    /// Closes the PXRA-v2 Apply ingress authority gap left by the public
+    /// Controller-authenticated outer marker.
+    ///
+    /// The public outer marker supplies only canonical structural pairing; its
+    /// caller-provided signature callbacks are not trusted by this policy.
+    /// This policy independently proves the writer-tenure signature and both
+    /// Controller signatures against the exact admission key, binds that key
+    /// to the exact restricted carrier, and installs the target-clock
+    /// operation deadline. The returned marker remains Runtime-private,
+    /// move-only evidence and grants no state effect by itself.
+    #[cfg(unix)]
+    pub(crate) fn verify_remote_agent_access_apply_ingress_v2<'request, 'running>(
+        &self,
+        authenticated_outer: ControllerAuthenticatedRemoteAgentAccessRequestV2<'request>,
+        carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+        reading: ClockReading,
+    ) -> Result<
+        VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+        ManagedFabricApplyAdmissionError,
+    > {
+        let expected_carrier = carrier_pin
+            .exact_carrier()
+            .ok_or(ManagedFabricApplyAdmissionError::CanonicalCorrelation)?;
+        if authenticated_outer.kind() != RemoteAgentAccessKindV2::ApplyRemoteAccess {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let request = authenticated_outer.request();
+        if request.carrier() != expected_carrier {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let Some(inner) = request.apply_request() else {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        };
+        self.verify_remote_agent_access_apply_ingress_v2_inner(request, inner, carrier_pin, reading)
+    }
+
+    #[cfg(unix)]
+    fn verify_remote_agent_access_apply_ingress_v2_inner<'request, 'running>(
+        &self,
+        request: &'request RemoteAgentAccessRequestV2,
+        inner: &RemoteAgentDataPlaneApplyRequestV2,
+        carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+        reading: ClockReading,
+    ) -> Result<
+        VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running>,
+        ManagedFabricApplyAdmissionError,
+    > {
+        let expected_carrier = carrier_pin
+            .exact_carrier()
+            .ok_or(ManagedFabricApplyAdmissionError::CanonicalCorrelation)?;
+        let execution = inner.target_execution();
+        let provenance = inner.provenance();
+        let control = inner.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let inner_authentication = inner.authentication();
+        let inner_auth_claim = inner_authentication.claim();
+        let outer_auth_claim = request.authentication().claim();
+
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+            || expected_carrier.target() != request.target()
+            || request.target() != inner.target()
+            || request.expected_runtime_store_instance_id()
+                != inner.expected_runtime_store_instance_id()
+            || request.request_id().as_bytes() != inner.operation_id().as_bytes()
+            || request.retained_s0_cas() != execution.retained_s0_cas()
+            || request.expected_s1_cas() != execution.expected_s1_cas()
+            || inner_auth_claim.principal() != expected_carrier.controller_principal()
+            || inner_auth_claim.key() != expected_carrier.controller_request_key()
+            || inner_auth_claim.algorithm().value() != ED25519_ALGORITHM
+            || inner_auth_claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+            || outer_auth_claim.principal() != expected_carrier.controller_principal()
+            || outer_auth_claim.key() != expected_carrier.controller_request_key()
+            || outer_auth_claim.algorithm().value() != ED25519_ALGORITHM
+            || outer_auth_claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+            || inner_auth_claim.nonce() == outer_auth_claim.nonce()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: inner.target(),
+            principal: inner_auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: inner_auth_claim.key(),
+            algorithm: inner_auth_claim.algorithm(),
+            algorithm_version: inner_auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let trusted_apply_fingerprint = ed25519_control_key_fingerprint(apply_key.as_bytes())
+            .map_err(|_| ManagedFabricApplyAdmissionError::CanonicalCorrelation)?;
+        if trusted_apply_fingerprint != expected_carrier.controller_request_key_fingerprint() {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let inner_signature = parse_reference_signature(inner_authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let inner_transcript = inner
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(inner_transcript.as_bytes(), &inner_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let outer_signature = parse_reference_signature(request.authentication().signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let outer_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(outer_transcript.as_bytes(), &outer_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let temporal = inner.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let operation_timeout_nanos = execution.profile().operation_timeout_nanos();
+        if temporal.remaining_budget().value() < operation_timeout_nanos {
+            return Err(ManagedFabricApplyAdmissionError::BudgetInsufficientForTimeout);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(operation_timeout_nanos)
+            .filter(|deadline| admitted_at_nanos != 0 && *deadline > admitted_at_nanos)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let source_scope = provenance.source_scope();
+        Ok(VerifiedRemoteAgentAccessApplyIngressV2 {
+            carrier_pin,
+            request,
+            outer_request_digest: request.request_digest(),
+            outer_auth_transcript_digest: remote_agent_access_framed_digest_v2(
+                REMOTE_AGENT_ACCESS_OUTER_AUTH_TRANSCRIPT_DOMAIN_V2,
+                &[outer_transcript.as_bytes()],
+            ),
+            inner_request_digest: inner.request_digest(),
+            inner_envelope_request_digest: inner.envelope_request_digest(),
+            proof_envelope_digest,
+            tenure_nonce_identity: remote_agent_access_framed_digest_v2(
+                REMOTE_AGENT_DATA_PLANE_TENURE_NONCE_DOMAIN_V2,
+                &[
+                    source_scope.as_bytes(),
+                    proof_authority.authority().as_bytes(),
+                    proof_authority.key().as_bytes(),
+                    proof.nonce(),
+                ],
+            ),
+            request_nonce_identity: remote_agent_access_framed_digest_v2(
+                REMOTE_AGENT_DATA_PLANE_REQUEST_NONCE_DOMAIN_V2,
+                &[
+                    source_scope.as_bytes(),
+                    inner.target().as_bytes(),
+                    inner_auth_claim.principal().as_bytes(),
+                    writer_context.writer().as_bytes(),
+                    inner_auth_claim.key().as_bytes(),
+                    inner_auth_claim.nonce(),
+                ],
+            ),
+            temporal_lineage_identity: remote_agent_access_framed_digest_v2(
+                REMOTE_AGENT_DATA_PLANE_TEMPORAL_LINEAGE_DOMAIN_V2,
+                &[
+                    source_scope.as_bytes(),
+                    inner.target().as_bytes(),
+                    temporal.constraint_id().as_bytes(),
+                ],
+            ),
+            clock_domain: reading.domain(),
+            clock_generation: reading.generation(),
+            admitted_at_nanos,
+            deadline_nanos,
+        })
+    }
+}
+
+fn managed_fabric_replay_identity(
+    domain: &'static [u8],
+    fields: &[&[u8]],
+) -> Result<Digest32, ManagedFabricApplyAdmissionError> {
+    let mut builder =
+        Digest32Builder::try_new(domain).map_err(ManagedFabricApplyAdmissionError::Digest)?;
+    for field in fields {
+        builder
+            .field_bytes(field)
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+    }
+    Ok(builder.finish())
+}
+
+fn remote_agent_access_framed_digest_v2(domain: &[u8], fields: &[&[u8]]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    Digest32::from_bytes(hasher.finalize().into())
 }
 
 fn parse_reference_signature(signature: &[u8]) -> Option<Signature> {
@@ -477,6 +1561,776 @@ impl AuthenticatedReferenceApplyV1 {
 pub(crate) struct VerifiedReferenceApplyIngressV1 {
     identities: ReferenceApplyIngressIdentitiesV1,
     admitted_at_nanos: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedManagedFabricApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedManagedFabricApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedManagedFabricApplyIngressV1 {
+    authenticated: AuthenticatedManagedFabricApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedManagedFabricApplyIngressV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admitted_at_nanos: u64,
+        deadline_nanos: u64,
+        clock_generation: paraegox_kernel::time::ClockGeneration,
+        identity_seed: u8,
+    ) -> Self {
+        assert!(
+            identity_seed != 0,
+            "test replay identity seed must be nonzero"
+        );
+        Self {
+            authenticated: AuthenticatedManagedFabricApplyV1 {
+                proof_envelope_digest: Digest32::from_bytes([0xa0; 32]),
+                tenure_nonce_identity: Digest32::from_bytes([0xa1; 32]),
+                request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
+                temporal_lineage_identity: Digest32::from_bytes(
+                    [identity_seed.wrapping_add(1); 32],
+                ),
+            },
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedFabricApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedManagedAgentStackApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedManagedAgentStackApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedManagedAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedManagedAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedManagedAgentStackApplyIngressV1 {
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedManagedModelAgentStackApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedManagedModelAgentStackApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedManagedModelAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedManagedModelAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedArtifactManagedModelAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedManagedModelAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedArtifactManagedModelAgentStackApplyIngressV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admitted_at_nanos: u64,
+        deadline_nanos: u64,
+        clock_generation: paraegox_kernel::time::ClockGeneration,
+        identity_seed: u8,
+    ) -> Self {
+        assert!(
+            identity_seed != 0,
+            "test replay identity seed must be nonzero"
+        );
+        Self {
+            authenticated: AuthenticatedManagedModelAgentStackApplyV1 {
+                proof_envelope_digest: Digest32::from_bytes([0xb0; 32]),
+                tenure_nonce_identity: Digest32::from_bytes([0xb1; 32]),
+                request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
+                temporal_lineage_identity: Digest32::from_bytes(
+                    [identity_seed.wrapping_add(1); 32],
+                ),
+            },
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedModelAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+impl VerifiedManagedModelAgentStackApplyIngressV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admitted_at_nanos: u64,
+        deadline_nanos: u64,
+        clock_generation: paraegox_kernel::time::ClockGeneration,
+        identity_seed: u8,
+    ) -> Self {
+        assert!(
+            identity_seed != 0,
+            "test replay identity seed must be nonzero"
+        );
+        Self {
+            authenticated: AuthenticatedManagedModelAgentStackApplyV1 {
+                proof_envelope_digest: Digest32::from_bytes([0xb0; 32]),
+                tenure_nonce_identity: Digest32::from_bytes([0xb1; 32]),
+                request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
+                temporal_lineage_identity: Digest32::from_bytes(
+                    [identity_seed.wrapping_add(1); 32],
+                ),
+            },
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedModelAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedDistributedAgentStackApplyV1 {
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedDistributedAgentStackApplyV1 {
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedDistributedAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedDistributedAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedDistributedAgentStackApplyIngressV1 {
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedDistributedAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+/// Signature-authenticated PXAR v10 facts for owner-private replay lookup.
+///
+/// The contract-owned digest binds this nominal evidence to the complete exact
+/// request. It carries no deadline, lifecycle authority, store ownership, or
+/// effect token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedRemoteAgentDataPlaneApplyV1 {
+    request_digest: Digest32,
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+}
+
+impl AuthenticatedRemoteAgentDataPlaneApplyV1 {
+    #[must_use]
+    pub(crate) const fn request_digest(self) -> Digest32 {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+}
+
+/// Cryptographically and temporally verified fresh PXAR v10 ingress evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedRemoteAgentDataPlaneApplyIngressV1 {
+    authenticated: AuthenticatedRemoteAgentDataPlaneApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedRemoteAgentDataPlaneApplyIngressV1 {
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedRemoteAgentDataPlaneApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
+}
+
+/// Runtime-owned PXAU-v2 verification policy reconstructed only from the
+/// protected provisioning capability and its independently pinned PXCB.
+///
+/// There is deliberately no constructor from principal/key/fingerprint/public
+/// key primitives.  Callers cannot turn receipt-selected or PXRS-selected
+/// bytes into trust: the sole production constructor reuses the restricted
+/// endpoint's exact provisioning-to-carrier predicate before retaining the
+/// protected Runtime verification key.
+#[cfg(unix)]
+pub(crate) struct RemoteAgentDataPlaneTerminalRuntimeTrustV2<'running> {
+    carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    target: RuntimeHostId,
+    runtime_principal: PrincipalRef,
+    runtime_response_key: ApplyAuthKeyRef,
+    runtime_response_key_fingerprint: Digest32,
+    verifying_key: VerifyingKey,
+}
+
+#[cfg(unix)]
+impl<'running> RemoteAgentDataPlaneTerminalRuntimeTrustV2<'running> {
+    pub(crate) fn try_from_provisioning(
+        provisioning: &RuntimeProvisioningV1,
+        carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    ) -> Result<Self, RemoteAgentDataPlaneTerminalAdmissionErrorV2> {
+        let expected_carrier = carrier_pin
+            .exact_carrier()
+            .ok_or(RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        validate_restricted_runtime_apply_carrier_pins(provisioning, expected_carrier)
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&provisioning.runtime_response_public_key())
+                .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        if verifying_key.is_weak() {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins);
+        }
+        let runtime_response_key_fingerprint =
+            ed25519_control_key_fingerprint(verifying_key.as_bytes())
+                .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        if runtime_response_key_fingerprint != expected_carrier.runtime_response_key_fingerprint() {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins);
+        }
+        Ok(Self {
+            carrier_pin,
+            target: provisioning.target(),
+            runtime_principal: provisioning.runtime_principal(),
+            runtime_response_key: provisioning.runtime_response_key_ref(),
+            runtime_response_key_fingerprint,
+            verifying_key,
+        })
+    }
+
+    /// Independently authenticates one public structural PXAU-v2 marker.
+    ///
+    /// The public marker's caller-supplied callback result is never an
+    /// authority input here.  This method repeats exact request correlation,
+    /// signer selection, signature-width parsing and strict Ed25519
+    /// verification with the protected provisioning key.
+    pub(crate) fn verify_terminal_ingress<'terminal>(
+        self,
+        structural_terminal: RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'terminal>,
+        authorized_request: &RemoteAgentAccessRequestV2,
+    ) -> Result<
+        VerifiedRemoteAgentDataPlaneTerminalIngressV2<'terminal, 'running>,
+        RemoteAgentDataPlaneTerminalAdmissionErrorV2,
+    > {
+        let expected_carrier = self
+            .carrier_pin
+            .exact_carrier()
+            .ok_or(RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        if authorized_request.kind() != RemoteAgentAccessKindV2::ApplyRemoteAccess
+            || authorized_request.target() != self.target
+            || authorized_request.carrier().binding_digest() != expected_carrier.binding_digest()
+            || authorized_request.carrier().runtime_principal() != self.runtime_principal
+            || authorized_request.carrier().runtime_response_key() != self.runtime_response_key
+            || authorized_request
+                .carrier()
+                .runtime_response_key_fingerprint()
+                != self.runtime_response_key_fingerprint
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        }
+        let Some(request) = authorized_request.apply_request() else {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        };
+        if authorized_request.request_id().as_bytes() != request.operation_id().as_bytes()
+            || authorized_request.target() != request.target()
+            || authorized_request.expected_runtime_store_instance_id()
+                != request.expected_runtime_store_instance_id()
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        }
+
+        let receipt = structural_terminal.receipt();
+        let facts = receipt
+            .validate_against_request(request)
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation)?;
+        let evidence = facts.evidence().fields();
+        if facts.target() != authorized_request.target()
+            || facts.runtime_store_instance_id()
+                != authorized_request.expected_runtime_store_instance_id()
+            || facts.operation_id().as_bytes() != authorized_request.request_id().as_bytes()
+            || facts.request_digest() != request.request_digest()
+            || facts.envelope_request_digest() != request.envelope_request_digest()
+            || evidence.completion_runtime_host_epoch
+                != authorized_request.expected_runtime_host_epoch()
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation);
+        }
+
+        let claim = receipt.authentication();
+        if claim.runtime_principal() != self.runtime_principal
+            || claim.key() != self.runtime_response_key
+            || claim.algorithm().value() != ED25519_ALGORITHM
+            || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+        {
+            return Err(RemoteAgentDataPlaneTerminalAdmissionErrorV2::SignerSelection);
+        }
+        let signature_bytes =
+            <&[u8; ED25519_SIGNATURE_BYTES]>::try_from(receipt.authentication_signature())
+                .map_err(|_| {
+                    RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignatureLength
+                })?;
+        let transcript = receipt
+            .signing_transcript()
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidTranscript)?;
+        self.verifying_key
+            .verify_strict(
+                transcript.as_bytes(),
+                &Signature::from_bytes(signature_bytes),
+            )
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignature)?;
+
+        Ok(VerifiedRemoteAgentDataPlaneTerminalIngressV2 {
+            carrier_pin: self.carrier_pin,
+            receipt,
+            outer_request_digest: authorized_request.request_digest(),
+            target: facts.target(),
+            runtime_store_instance_id: facts.runtime_store_instance_id(),
+            runtime_host_epoch: evidence.completion_runtime_host_epoch,
+            operation_id: facts.operation_id(),
+            inner_request_digest: facts.request_digest(),
+            inner_envelope_request_digest: facts.envelope_request_digest(),
+            terminal_receipt_digest: receipt.receipt_digest(),
+        })
+    }
+}
+
+/// Complete Runtime-private authority for one exact PXAU-v2 terminal edge.
+///
+/// This marker is intentionally non-`Clone`/non-`Copy`; only protected Runtime
+/// provisioning verification can construct it.
+#[cfg(unix)]
+pub(crate) struct VerifiedRemoteAgentDataPlaneTerminalIngressV2<'terminal, 'running> {
+    carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    receipt: &'terminal RemoteAgentDataPlaneTerminalReceiptV2,
+    outer_request_digest: Digest32,
+    target: RuntimeHostId,
+    runtime_store_instance_id: [u8; 32],
+    runtime_host_epoch: u64,
+    operation_id: ApplyOperationId,
+    inner_request_digest: Digest32,
+    inner_envelope_request_digest: Digest32,
+    terminal_receipt_digest: Digest32,
+}
+
+#[cfg(unix)]
+impl<'terminal, 'running> VerifiedRemoteAgentDataPlaneTerminalIngressV2<'terminal, 'running> {
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> &'terminal RemoteAgentDataPlaneTerminalReceiptV2 {
+        self.receipt
+    }
+
+    #[must_use]
+    pub(crate) const fn outer_request_digest(&self) -> Digest32 {
+        self.outer_request_digest
+    }
+
+    #[must_use]
+    pub(crate) fn carrier_binding_digest(&self) -> Option<Digest32> {
+        self.carrier_pin
+            .exact_carrier()
+            .map(RestrictedRuntimeApplyCarrierBindingV1::binding_digest)
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_store_instance_id(&self) -> [u8; 32] {
+        self.runtime_store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_host_epoch(&self) -> u64 {
+        self.runtime_host_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn operation_id(&self) -> ApplyOperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub(crate) const fn inner_request_digest(&self) -> Digest32 {
+        self.inner_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn inner_envelope_request_digest(&self) -> Digest32 {
+        self.inner_envelope_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn terminal_receipt_digest(&self) -> Digest32 {
+        self.terminal_receipt_digest
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteAgentDataPlaneTerminalAdmissionErrorV2 {
+    ProvisioningPins,
+    CanonicalCorrelation,
+    SignerSelection,
+    InvalidSignatureLength,
+    InvalidTranscript,
+    InvalidSignature,
+}
+
+/// Complete Runtime-private PXRA-v2 Apply ingress evidence.
+///
+/// This marker intentionally does not implement `Clone` or `Copy`. Its exact
+/// request reference, live endpoint carrier Pin, and immutable facts may be
+/// consumed by the later store-owned fresh-admission transition, but
+/// constructing it requires both [`ApplyAdmissionPolicy`] and the protected
+/// live restricted endpoint owner.
+#[cfg(unix)]
+pub(crate) struct VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running> {
+    carrier_pin: RuntimeRestrictedApplyCarrierPinV1<'running>,
+    request: &'request RemoteAgentAccessRequestV2,
+    outer_request_digest: Digest32,
+    outer_auth_transcript_digest: Digest32,
+    inner_request_digest: Digest32,
+    inner_envelope_request_digest: Digest32,
+    proof_envelope_digest: Digest32,
+    tenure_nonce_identity: Digest32,
+    request_nonce_identity: Digest32,
+    temporal_lineage_identity: Digest32,
+    clock_domain: ClockDomainRef,
+    clock_generation: ClockGeneration,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+}
+
+#[cfg(unix)]
+impl<'request, 'running> VerifiedRemoteAgentAccessApplyIngressV2<'request, 'running> {
+    #[must_use]
+    pub(crate) const fn request(&self) -> &'request RemoteAgentAccessRequestV2 {
+        self.request
+    }
+
+    #[must_use]
+    pub(crate) const fn outer_request_digest(&self) -> Digest32 {
+        self.outer_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn outer_auth_transcript_digest(&self) -> Digest32 {
+        self.outer_auth_transcript_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn inner_request_digest(&self) -> Digest32 {
+        self.inner_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn inner_envelope_request_digest(&self) -> Digest32 {
+        self.inner_envelope_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn proof_envelope_digest(&self) -> Digest32 {
+        self.proof_envelope_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn tenure_nonce_identity(&self) -> Digest32 {
+        self.tenure_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn request_nonce_identity(&self) -> Digest32 {
+        self.request_nonce_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn temporal_lineage_identity(&self) -> Digest32 {
+        self.temporal_lineage_identity
+    }
+
+    #[must_use]
+    pub(crate) fn carrier_binding_digest(&self) -> Option<Digest32> {
+        self.carrier_pin
+            .exact_carrier()
+            .map(|carrier| carrier.binding_digest())
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_domain(&self) -> ClockDomainRef {
+        self.clock_domain
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(&self) -> ClockGeneration {
+        self.clock_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(&self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(&self) -> u64 {
+        self.deadline_nanos
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedFabricApplyAdmissionError {
+    CanonicalCorrelation,
+    UntrustedTenureKey,
+    UntrustedApplyKey,
+    InvalidTenureTranscript,
+    InvalidRequestTranscript,
+    InvalidTenureSignature,
+    InvalidRequestSignature,
+    ClockDomainMismatch,
+    ClockGenerationMismatch,
+    BudgetExceedsPolicy,
+    BudgetExpired,
+    BudgetInsufficientForTimeout,
+    DeadlineOverflow,
+    Digest(DigestBuildError),
+    Contract(ManagedFabricPlanError),
 }
 
 impl VerifiedReferenceApplyIngressV1 {
@@ -1371,7 +3225,11 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signature, Signer, SigningKey};
+    #[cfg(unix)]
+    use paraegox_fabric::{
+        ResolvedRemoteMtlsIdentityFiles, RestrictedRuntimeApplyEndpointConfigV1,
+    };
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
     use paraegox_kernel::time::{
@@ -1388,15 +3246,38 @@ mod tests {
         MailboxSpec, OverflowPolicy, PortCardinality, PortDirection, PortEndpoint, PortRef,
         PortSpec, RuntimeApplyRequest, RuntimePlanSlice, SchemaRef, TargetAssignments,
     };
+    use paraegox_runtime_contracts::distributed_agent_stack_plan::{
+        DistributedAgentStackApplyRequestDraftV1, DistributedAgentStackApplyRequestV1,
+        DistributedFabricCredentialRefV1, DistributedFabricTrustAnchorRefV1,
+        DistributedFabricTrustDomainRefV1, RestrictedRuntimeApplyCarrierBindingFieldsV1,
+        RestrictedRuntimeApplyCarrierBindingV1, RestrictedRuntimeApplyTransportProfileFieldsV1,
+        RestrictedRuntimeApplyTransportProfileV1,
+    };
     use paraegox_runtime_contracts::execution::{
         CardDefinitionRef, CardImplementationRef, RuntimeApplyRequestV2,
     };
+    use paraegox_runtime_contracts::managed_model_agent_stack_plan::ArtifactBoundManagedModelAgentStackApplyRequestV1;
     use paraegox_runtime_contracts::process_execution::{
         RequestV4WireErrorCode, RuntimeApplyRequestV4,
     };
     use paraegox_runtime_contracts::provenance::{
         PlanProvenance, RuntimeSliceCommitment, RuntimeSliceHeader, SourcePlanDigest,
         SourcePlanRef, SourcePlanRevision, SourceScopeRef, TargetAssignmentDigest,
+    };
+    use paraegox_runtime_contracts::remote_agent_access::{
+        ControllerAuthenticatedRemoteAgentAccessRequestV2, RemoteAgentAccessKindV2,
+        RemoteAgentAccessRequestDraftV2, RemoteAgentAccessRequestFieldsV2,
+        RemoteAgentAccessRequestIdV2, RemoteAgentAccessRequestV2,
+    };
+    use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+        RemoteAgentDataPlaneApplyRequestDraftV1, RemoteAgentDataPlaneApplyRequestDraftV2,
+        RemoteAgentDataPlaneApplyRequestV1,
+    };
+    #[cfg(unix)]
+    use paraegox_runtime_contracts::remote_agent_data_plane_plan::{
+        RemoteAgentDataPlaneApplyRequestV2, RemoteAgentDataPlaneTerminalAuthClaimV2,
+        RemoteAgentDataPlaneTerminalReceiptDraftV2, RemoteAgentDataPlaneTerminalReceiptV2,
+        RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2,
     };
     use paraegox_runtime_contracts::temporal::{ApplyTemporalConstraint, TemporalConstraintId};
     use paraegox_runtime_contracts::thread_execution::RuntimeApplyRequestV3;
@@ -1405,6 +3286,9 @@ mod tests {
         MAX_RUNTIME_APPLY_ENVELOPE_BYTES, RuntimeApplyEnvelope, RuntimeApplyEnvelopeDraft,
         WireErrorCode,
     };
+    use sha2::{Digest as _, Sha256};
+    #[cfg(unix)]
+    use zeroize::Zeroizing;
 
     use crate::apply_state::{
         ApplyControlState, ApplyRejection, FenceDisposition, OperationPhase, PrepareDisposition,
@@ -1426,6 +3310,14 @@ mod tests {
     };
     use crate::port_binding::PortBinding;
     use crate::runtime_clock::RuntimeClock;
+    #[cfg(unix)]
+    use crate::runtime_control_endpoint::{
+        RuntimeRestrictedApplyEndpointDependenciesV1, runtime_restricted_apply_carrier_pin_for_test,
+    };
+    #[cfg(unix)]
+    use crate::runtime_provisioning::{
+        RuntimeDeveloperLocalProvisioningInputV1, RuntimeProvisioningV1,
+    };
     use crate::task_registry::CancellationSource;
     use crate::thread_component_runtime::{
         PreparedThreadComponentRuntime, SynchronousThreadCard, ThreadCardFailure,
@@ -1437,8 +3329,14 @@ mod tests {
     use super::{
         AdmissionConfigurationError, AdmissionDisposition, AdmissionError, AdmissionState,
         AdmissionStateLimits, ApplyAdmission, ApplyAdmissionPolicy, ED25519_ALGORITHM,
-        ED25519_ALGORITHM_VERSION, RuntimeProcessExecutionRequestAdmissionError,
-        TrustedApplyIdentity, TrustedApplyKey, TrustedTenureIdentity, TrustedTenureKey,
+        ED25519_ALGORITHM_VERSION, ManagedFabricApplyAdmissionError,
+        RuntimeProcessExecutionRequestAdmissionError, TrustedApplyIdentity, TrustedApplyKey,
+        TrustedTenureIdentity, TrustedTenureKey,
+    };
+    #[cfg(unix)]
+    use super::{
+        RemoteAgentDataPlaneTerminalAdmissionErrorV2, RemoteAgentDataPlaneTerminalRuntimeTrustV2,
+        ed25519_control_key_fingerprint,
     };
 
     const SCOPE: u8 = 1;
@@ -1463,9 +3361,25 @@ mod tests {
         include_str!("../../../tests/fixtures/wire/s5_runtime_apply_request_v3.json");
     const PYTHON_PROCESS_EXECUTION_REQUEST_FIXTURE_JSON: &str =
         include_str!("../../../tests/fixtures/wire/s6_runtime_apply_request_v4.json");
+    const DISTRIBUTED_AGENT_STACK_GOLDEN: &str = include_str!(
+        "../../paraegox-runtime-contracts/tests/fixtures/distributed_agent_stack_v1.hex"
+    );
+    const REMOTE_AGENT_DATA_PLANE_GOLDEN: &str =
+        include_str!("../../../tests/fixtures/wire/t2_remote_agent_data_plane_v1.json");
+    const REMOTE_AGENT_ACCESS_V2_GOLDEN: &str =
+        include_str!("../../../tests/fixtures/wire/t2_remote_agent_access_v2.json");
+    #[cfg(unix)]
+    const REMOTE_AGENT_PROXY_DATA_PLANE_V2_GOLDEN: &str =
+        include_str!("../../../tests/fixtures/wire/t2_remote_agent_proxy_data_plane_v2.json");
     // TEST-ONLY keys matching the independently encoded Python contract fixture.
     const PYTHON_FIXTURE_TENURE_SEED: [u8; 32] = [0x11; 32];
     const PYTHON_FIXTURE_REQUEST_SEED: [u8; 32] = [0x22; 32];
+    #[cfg(unix)]
+    const RUNTIME_TERMINAL_SIGNING_SEED_V2: [u8; 32] = [0xa6; 32];
+    #[cfg(unix)]
+    const TERMINAL_TLS_LISTENER_V2: &str = "tls/192.0.2.60:7460";
+    #[cfg(unix)]
+    const TERMINAL_OPERATION_TIMEOUT_NANOS_V2: u64 = 5_000_000_000;
 
     struct AdmittedFixtureCard;
 
@@ -1952,8 +3866,735 @@ mod tests {
         decoded
     }
 
+    fn distributed_agent_stack_golden(key: &str) -> Vec<u8> {
+        let prefix = format!("{key}=");
+        let value = DISTRIBUTED_AGENT_STACK_GOLDEN
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("distributed fixture field {key} must exist"));
+        assert_eq!(value.len() % 2, 0, "fixture hex must contain full bytes");
+        let mut decoded = Vec::with_capacity(value.len() / 2);
+        for pair in value.as_bytes().chunks_exact(2) {
+            decoded.push((hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]));
+        }
+        decoded
+    }
+
+    fn signed_distributed_agent_stack_request(
+        signing_seed: [u8; 32],
+    ) -> DistributedAgentStackApplyRequestV1 {
+        let fixture =
+            DistributedAgentStackApplyRequestV1::decode(&distributed_agent_stack_golden("request"))
+                .unwrap_or_else(|error| panic!("distributed PXAR v8 fixture must decode: {error}"));
+        let draft = DistributedAgentStackApplyRequestDraftV1::try_new(
+            fixture.target_execution().clone(),
+            fixture.provenance(),
+            fixture.control_commitment().control().clone(),
+            fixture.temporal(),
+            fixture.expected_runtime_store_instance_id(),
+            fixture.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("distributed PXAR v8 draft must build: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("distributed PXAR v8 transcript must build: {error}"));
+        let signature = SigningKey::from_bytes(&signing_seed)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("distributed PXAR v8 must finalize: {error}"))
+    }
+
+    fn remote_agent_data_plane_golden(key: &str) -> Vec<u8> {
+        fixture_document_hex_bytes(REMOTE_AGENT_DATA_PLANE_GOLDEN, key)
+    }
+
+    fn signed_remote_agent_data_plane_request(
+        signing_seed: [u8; 32],
+        temporal: Option<ApplyTemporalConstraint>,
+        tenure_signing_seed: Option<[u8; 32]>,
+    ) -> RemoteAgentDataPlaneApplyRequestV1 {
+        let fixture = RemoteAgentDataPlaneApplyRequestV1::decode(&remote_agent_data_plane_golden(
+            "pxar_v10_hex",
+        ))
+        .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 fixture must decode: {error}"));
+        let control = if let Some(tenure_signing_seed) = tenure_signing_seed {
+            let fixture_control = fixture.control_commitment().control();
+            let fixture_writer_context = fixture_control.writer_context();
+            let fixture_proof = fixture_writer_context.proof();
+            let transcript = fixture_proof.signing_transcript().unwrap_or_else(|error| {
+                panic!("remote-Agent tenure transcript must build: {error}")
+            });
+            let signature = SigningKey::from_bytes(&tenure_signing_seed)
+                .sign(transcript.as_bytes())
+                .to_bytes();
+            let proof = WriterTenureProof::try_new(
+                fixture_proof.authority(),
+                fixture_proof.claim(),
+                fixture_proof.nonce(),
+                &signature,
+            )
+            .unwrap_or_else(|error| panic!("remote-Agent tenure proof must build: {error}"));
+            let writer_context = PlanWriterContext::try_new(
+                fixture_writer_context.writer(),
+                fixture_writer_context.epoch(),
+                proof,
+            )
+            .unwrap_or_else(|error| panic!("remote-Agent writer context must build: {error}"));
+            RuntimeApplyControl::new(
+                writer_context,
+                fixture_control.expected_active(),
+                fixture_control.operation_id(),
+            )
+        } else {
+            fixture.control_commitment().control().clone()
+        };
+        let draft = RemoteAgentDataPlaneApplyRequestDraftV1::try_new(
+            fixture.target_execution().clone(),
+            fixture.provenance(),
+            control,
+            temporal.unwrap_or(fixture.temporal()),
+            fixture.expected_runtime_store_instance_id(),
+            fixture.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 draft must build: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 transcript must build: {error}"));
+        let signature = SigningKey::from_bytes(&signing_seed)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("remote-Agent PXAR v10 must finalize: {error}"))
+    }
+
+    fn remote_agent_access_request_v2_template() -> RemoteAgentAccessRequestV2 {
+        RemoteAgentAccessRequestV2::decode(&fixture_document_hex_bytes(
+            REMOTE_AGENT_ACCESS_V2_GOLDEN,
+            "wire_hex",
+        ))
+        .unwrap_or_else(|error| panic!("remote-Agent PXRA v2 fixture must decode: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn remote_agent_access_carrier_with_fingerprints(
+        template: &RestrictedRuntimeApplyCarrierBindingV1,
+        controller_request_key_fingerprint: Digest32,
+        runtime_response_key_fingerprint: Digest32,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: template.target(),
+                runtime_principal: template.runtime_principal(),
+                controller_principal: template.controller_principal(),
+                endpoint_ref: template.endpoint_ref(),
+                endpoint_generation: template.endpoint_generation(),
+                route: template.route(),
+                controller_request_key: template.controller_request_key(),
+                controller_request_key_fingerprint,
+                runtime_response_key: template.runtime_response_key(),
+                runtime_response_key_fingerprint,
+                control_transport_profile_ref: template.control_transport_profile_ref(),
+                control_transport_profile_digest: template.control_transport_profile_digest(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("remote-Agent alternate PXCB must build: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn signed_remote_agent_access_request_v2(
+        tenure_signing_seed: [u8; 32],
+        controller_signing_seed: [u8; 32],
+        controller_fingerprint_override: Option<Digest32>,
+    ) -> (
+        RemoteAgentAccessRequestV2,
+        RestrictedRuntimeApplyCarrierBindingV1,
+    ) {
+        let outer_template = remote_agent_access_request_v2_template();
+        let inner_template = outer_template
+            .apply_request()
+            .unwrap_or_else(|| panic!("PXRA v2 Apply fixture must carry PXAR v11"));
+        let control_template = inner_template.control_commitment().control();
+        let writer_template = control_template.writer_context();
+        let proof_template = writer_template.proof();
+        let tenure_transcript = proof_template
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("PXAR v11 tenure transcript must build: {error}"));
+        let tenure_signature = SigningKey::from_bytes(&tenure_signing_seed)
+            .sign(tenure_transcript.as_bytes())
+            .to_bytes();
+        let proof = WriterTenureProof::try_new(
+            proof_template.authority(),
+            proof_template.claim(),
+            proof_template.nonce(),
+            &tenure_signature,
+        )
+        .unwrap_or_else(|error| panic!("PXAR v11 tenure proof must build: {error}"));
+        let writer_context =
+            PlanWriterContext::try_new(writer_template.writer(), writer_template.epoch(), proof)
+                .unwrap_or_else(|error| panic!("PXAR v11 writer context must build: {error}"));
+        let control = RuntimeApplyControl::new(
+            writer_context,
+            control_template.expected_active(),
+            control_template.operation_id(),
+        );
+        let inner_draft = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+            inner_template.target_execution().clone(),
+            inner_template.provenance(),
+            control,
+            inner_template.temporal(),
+            inner_template.expected_runtime_store_instance_id(),
+            inner_template.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("PXAR v11 draft must build: {error}"));
+        let inner_transcript = inner_draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("PXAR v11 transcript must build: {error}"));
+        let inner_signature = SigningKey::from_bytes(&controller_signing_seed)
+            .sign(inner_transcript.as_bytes())
+            .to_bytes();
+        let inner = inner_draft
+            .finalize(&inner_signature)
+            .unwrap_or_else(|error| panic!("PXAR v11 must finalize: {error}"));
+
+        let trusted_controller_fingerprint = super::ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("production Controller fingerprint must build: {error}"));
+        let controller_fingerprint =
+            controller_fingerprint_override.unwrap_or(trusted_controller_fingerprint);
+        let runtime_fingerprint = super::ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&RUNTIME_TERMINAL_SIGNING_SEED_V2)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("production Runtime fingerprint must build: {error}"));
+        let key_pinned_carrier = remote_agent_access_carrier_with_fingerprints(
+            outer_template.carrier(),
+            controller_fingerprint,
+            runtime_fingerprint,
+        );
+        let profile = terminal_transport_profile_v2(&key_pinned_carrier);
+        let carrier = terminal_carrier_with_composition_v2(
+            &key_pinned_carrier,
+            profile.endpoint_ref(),
+            profile.endpoint_generation(),
+            profile.route(),
+            key_pinned_carrier.control_transport_profile_ref(),
+            profile.profile_digest(),
+        );
+        let outer_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+            RemoteAgentAccessRequestFieldsV2 {
+                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
+                    *inner.operation_id().as_bytes(),
+                )
+                .unwrap_or_else(|error| panic!("PXRA v2 request id must build: {error}")),
+                carrier: carrier.clone(),
+                target: inner.target(),
+                expected_runtime_store_instance_id: inner.expected_runtime_store_instance_id(),
+                expected_runtime_host_epoch: outer_template.expected_runtime_host_epoch(),
+                auth_claim: outer_template.authentication().claim().clone(),
+            },
+            inner,
+        )
+        .unwrap_or_else(|error| panic!("PXRA v2 draft must build: {error}"));
+        let outer_transcript = outer_draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("PXRA v2 transcript must build: {error}"));
+        let outer_signature = SigningKey::from_bytes(&controller_signing_seed)
+            .sign(outer_transcript.as_bytes())
+            .to_bytes();
+        let request = outer_draft
+            .finalize(&outer_signature)
+            .unwrap_or_else(|error| panic!("PXRA v2 must finalize: {error}"));
+        (request, carrier)
+    }
+
+    #[cfg(unix)]
+    fn finalize_remote_agent_access_outer_v2(
+        template: &RemoteAgentAccessRequestV2,
+        carrier: RestrictedRuntimeApplyCarrierBindingV1,
+        inner: RemoteAgentDataPlaneApplyRequestV2,
+        expected_runtime_host_epoch: u64,
+    ) -> RemoteAgentAccessRequestV2 {
+        let draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+            RemoteAgentAccessRequestFieldsV2 {
+                request_id: RemoteAgentAccessRequestIdV2::try_from_bytes(
+                    *inner.operation_id().as_bytes(),
+                )
+                .unwrap_or_else(|error| panic!("terminal PXRA v2 request id rejected: {error}")),
+                carrier,
+                target: inner.target(),
+                expected_runtime_store_instance_id: inner.expected_runtime_store_instance_id(),
+                expected_runtime_host_epoch,
+                auth_claim: template.authentication().claim().clone(),
+            },
+            inner,
+        )
+        .unwrap_or_else(|error| panic!("terminal PXRA v2 draft rejected: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("terminal PXRA v2 transcript rejected: {error}"));
+        let signature = SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("terminal PXRA v2 finalization rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_transport_profile_v2(
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> RestrictedRuntimeApplyTransportProfileV1 {
+        RestrictedRuntimeApplyTransportProfileV1::try_new(
+            RestrictedRuntimeApplyTransportProfileFieldsV1 {
+                target: carrier.target(),
+                endpoint_ref: carrier.endpoint_ref(),
+                endpoint_generation: carrier.endpoint_generation(),
+                tls_listener_locator: TERMINAL_TLS_LISTENER_V2,
+                route: carrier.route(),
+                trust_domain_ref: DistributedFabricTrustDomainRefV1::try_from_bytes([0xd1; 16])
+                    .unwrap_or_else(|error| panic!("terminal trust domain rejected: {error}")),
+                trust_anchor_ref: DistributedFabricTrustAnchorRefV1::try_from_bytes([0xd2; 16])
+                    .unwrap_or_else(|error| panic!("terminal trust anchor rejected: {error}")),
+                controller_connector_credential_ref:
+                    DistributedFabricCredentialRefV1::try_from_bytes([0xd3; 16]).unwrap_or_else(
+                        |error| panic!("terminal Controller credential rejected: {error}"),
+                    ),
+                runtime_listener_credential_ref: DistributedFabricCredentialRefV1::try_from_bytes(
+                    [0xd4; 16],
+                )
+                .unwrap_or_else(|error| panic!("terminal Runtime credential rejected: {error}")),
+                controller_principal: carrier.controller_principal(),
+                runtime_principal: carrier.runtime_principal(),
+                operation_timeout_nanos: TERMINAL_OPERATION_TIMEOUT_NANOS_V2,
+            },
+        )
+        .unwrap_or_else(|error| panic!("terminal transport profile rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_carrier_with_composition_v2(
+        template: &RestrictedRuntimeApplyCarrierBindingV1,
+        endpoint_ref: [u8; 16],
+        endpoint_generation: u64,
+        route: &str,
+        control_transport_profile_ref: [u8; 16],
+        control_transport_profile_digest: Digest32,
+    ) -> RestrictedRuntimeApplyCarrierBindingV1 {
+        RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: template.target(),
+                runtime_principal: template.runtime_principal(),
+                controller_principal: template.controller_principal(),
+                endpoint_ref,
+                endpoint_generation,
+                route,
+                controller_request_key: template.controller_request_key(),
+                controller_request_key_fingerprint: template.controller_request_key_fingerprint(),
+                runtime_response_key: template.runtime_response_key(),
+                runtime_response_key_fingerprint: template.runtime_response_key_fingerprint(),
+                control_transport_profile_ref,
+                control_transport_profile_digest,
+            },
+        )
+        .unwrap_or_else(|error| panic!("terminal composition carrier rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_endpoint_config_v2(
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> RestrictedRuntimeApplyEndpointConfigV1 {
+        let profile = terminal_transport_profile_v2(carrier);
+        assert_eq!(
+            profile.profile_digest(),
+            carrier.control_transport_profile_digest(),
+            "terminal carrier must retain the independent exact profile digest",
+        );
+        RestrictedRuntimeApplyEndpointConfigV1::try_from_transport_profile(
+            &profile,
+            carrier.control_transport_profile_ref(),
+            carrier,
+            std::path::PathBuf::from("/tmp/paraegox-terminal-root-ca.pem"),
+            ResolvedRemoteMtlsIdentityFiles::try_new(
+                std::path::PathBuf::from("/tmp/paraegox-terminal-runtime.pem"),
+                std::path::PathBuf::from("/tmp/paraegox-terminal-runtime.key"),
+            )
+            .unwrap_or_else(|error| panic!("terminal endpoint identity files rejected: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("terminal endpoint config rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_endpoint_dependencies_v2(
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+    ) -> RuntimeRestrictedApplyEndpointDependenciesV1 {
+        RuntimeRestrictedApplyEndpointDependenciesV1::new(
+            terminal_endpoint_config_v2(carrier),
+            carrier.clone(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn signed_remote_agent_access_request_for_terminal_v2() -> (
+        RemoteAgentAccessRequestV2,
+        RestrictedRuntimeApplyCarrierBindingV1,
+    ) {
+        let (base, _) = signed_remote_agent_access_request_v2(
+            PYTHON_FIXTURE_TENURE_SEED,
+            PYTHON_FIXTURE_REQUEST_SEED,
+            None,
+        );
+        let runtime_fingerprint = ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&RUNTIME_TERMINAL_SIGNING_SEED_V2)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("terminal Runtime fingerprint rejected: {error}"));
+        let key_pinned_carrier = remote_agent_access_carrier_with_fingerprints(
+            base.carrier(),
+            base.carrier().controller_request_key_fingerprint(),
+            runtime_fingerprint,
+        );
+        let profile = terminal_transport_profile_v2(&key_pinned_carrier);
+        let carrier = terminal_carrier_with_composition_v2(
+            &key_pinned_carrier,
+            profile.endpoint_ref(),
+            profile.endpoint_generation(),
+            profile.route(),
+            key_pinned_carrier.control_transport_profile_ref(),
+            profile.profile_digest(),
+        );
+        let request = finalize_remote_agent_access_outer_v2(
+            &base,
+            carrier.clone(),
+            base.apply_request()
+                .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11"))
+                .clone(),
+            base.expected_runtime_host_epoch(),
+        );
+        (request, carrier)
+    }
+
+    #[cfg(unix)]
+    fn alternate_terminal_authorized_request_v2(
+        base: &RemoteAgentAccessRequestV2,
+    ) -> RemoteAgentAccessRequestV2 {
+        let inner = base
+            .apply_request()
+            .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11"));
+        let control = inner.control_commitment().control();
+        let alternate_control = RuntimeApplyControl::new(
+            control.writer_context().clone(),
+            control.expected_active(),
+            ApplyOperationId::from_bytes([0xf8; 16]),
+        );
+        let claim = inner.authentication().claim();
+        let alternate_claim = ApplyRequestAuthClaim::try_new(
+            claim.principal(),
+            claim.key(),
+            claim.algorithm(),
+            claim.algorithm_version(),
+            &[0xf9; 16],
+        )
+        .unwrap_or_else(|error| panic!("alternate PXAR v11 auth claim rejected: {error}"));
+        let draft = RemoteAgentDataPlaneApplyRequestDraftV2::try_new(
+            inner.target_execution().clone(),
+            inner.provenance(),
+            alternate_control,
+            inner.temporal(),
+            inner.expected_runtime_store_instance_id(),
+            alternate_claim,
+        )
+        .unwrap_or_else(|error| panic!("alternate PXAR v11 draft rejected: {error}"));
+        let transcript = draft
+            .signing_transcript()
+            .unwrap_or_else(|error| panic!("alternate PXAR v11 transcript rejected: {error}"));
+        let signature = SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        let alternate_inner = draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("alternate PXAR v11 finalization rejected: {error}"));
+        finalize_remote_agent_access_outer_v2(
+            base,
+            base.carrier().clone(),
+            alternate_inner,
+            base.expected_runtime_host_epoch(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn terminal_runtime_provisioning_v2(
+        request: &RemoteAgentAccessRequestV2,
+    ) -> RuntimeProvisioningV1 {
+        let inner = request
+            .apply_request()
+            .unwrap_or_else(|| panic!("terminal provisioning requires PXAR v11"));
+        let writer = inner.control_commitment().control().writer_context();
+        let proof_authority = writer.proof().authority();
+        RuntimeProvisioningV1::try_new_developer_local(RuntimeDeveloperLocalProvisioningInputV1 {
+            socket_path: std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|error| {
+                    panic!("terminal temp directory canonicalization failed: {error}")
+                })
+                .join("paraegox-runtime-terminal-admission-test.sock"),
+            target: request.target(),
+            source_scope: inner.provenance().source_scope(),
+            writer: writer.writer(),
+            runtime_principal: request.carrier().runtime_principal(),
+            controller_principal: request.carrier().controller_principal(),
+            controller_request_key_ref: request.carrier().controller_request_key(),
+            controller_request_verification_key: SigningKey::from_bytes(
+                &PYTHON_FIXTURE_REQUEST_SEED,
+            )
+            .verifying_key()
+            .to_bytes(),
+            runtime_response_key_ref: request.carrier().runtime_response_key(),
+            runtime_response_signing_seed: Zeroizing::new(RUNTIME_TERMINAL_SIGNING_SEED_V2),
+            authority_principal: PrincipalRef::from_bytes([0x06; 16]),
+            tenure_authority_ref: proof_authority.authority(),
+            tenure_key_ref: proof_authority.key(),
+            tenure_verification_key: SigningKey::from_bytes(&PYTHON_FIXTURE_TENURE_SEED)
+                .verifying_key()
+                .to_bytes(),
+        })
+        .unwrap_or_else(|error| panic!("terminal Runtime provisioning rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_runtime_trust_v2<'dependencies>(
+        provisioning: &RuntimeProvisioningV1,
+        dependencies: &'dependencies RuntimeRestrictedApplyEndpointDependenciesV1,
+    ) -> Result<
+        RemoteAgentDataPlaneTerminalRuntimeTrustV2<'dependencies>,
+        RemoteAgentDataPlaneTerminalAdmissionErrorV2,
+    > {
+        let carrier_pin = runtime_restricted_apply_carrier_pin_for_test(dependencies, provisioning)
+            .map_err(|_| RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins)?;
+        RemoteAgentDataPlaneTerminalRuntimeTrustV2::try_from_provisioning(provisioning, carrier_pin)
+    }
+
+    #[cfg(unix)]
+    fn verify_remote_agent_access_apply_ingress_v2_for_test<'request, 'dependencies>(
+        policy: &ApplyAdmissionPolicy,
+        authenticated_outer: ControllerAuthenticatedRemoteAgentAccessRequestV2<'request>,
+        dependencies: &'dependencies RuntimeRestrictedApplyEndpointDependenciesV1,
+        provisioning: &RuntimeProvisioningV1,
+        reading: ClockReading,
+    ) -> Result<
+        super::VerifiedRemoteAgentAccessApplyIngressV2<'request, 'dependencies>,
+        ManagedFabricApplyAdmissionError,
+    > {
+        let carrier_pin = runtime_restricted_apply_carrier_pin_for_test(dependencies, provisioning)
+            .map_err(|_| ManagedFabricApplyAdmissionError::CanonicalCorrelation)?;
+        policy.verify_remote_agent_access_apply_ingress_v2(
+            authenticated_outer,
+            carrier_pin,
+            reading,
+        )
+    }
+
+    #[cfg(unix)]
+    fn expect_remote_agent_access_apply_admission_error<T>(
+        result: Result<T, ManagedFabricApplyAdmissionError>,
+        message: &str,
+    ) -> ManagedFabricApplyAdmissionError {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminal_auth_claim_v2(
+        request: &RemoteAgentAccessRequestV2,
+    ) -> RemoteAgentDataPlaneTerminalAuthClaimV2 {
+        RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+            request.carrier().runtime_principal(),
+            request.carrier().runtime_response_key(),
+            ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+                .unwrap_or_else(|error| panic!("terminal Ed25519 algorithm rejected: {error}")),
+            ED25519_ALGORITHM_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("terminal Runtime auth claim rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn terminal_receipt_v2(
+        request: &RemoteAgentAccessRequestV2,
+        auth_claim: RemoteAgentDataPlaneTerminalAuthClaimV2,
+        signing_seed: Option<[u8; 32]>,
+        signature_override: Option<&[u8]>,
+    ) -> RemoteAgentDataPlaneTerminalReceiptV2 {
+        let active = REMOTE_AGENT_PROXY_DATA_PLANE_V2_GOLDEN
+            .split_once("\"active_ready\"")
+            .map(|(_, tail)| tail)
+            .unwrap_or_else(|| panic!("active terminal fixture section missing"));
+        let terminal = active
+            .split_once("\"pxau_v2\"")
+            .map(|(_, tail)| tail)
+            .unwrap_or_else(|| panic!("PXAU v2 fixture section missing"));
+        let golden = RemoteAgentDataPlaneTerminalReceiptV2::decode(&fixture_document_hex_bytes(
+            terminal, "wire_hex",
+        ))
+        .unwrap_or_else(|error| panic!("PXAU v2 fixture rejected: {error}"));
+        let inner = request
+            .apply_request()
+            .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11"));
+        let draft = RemoteAgentDataPlaneTerminalReceiptDraftV2::try_new(
+            inner,
+            golden.facts().state(),
+            golden.facts().evidence(),
+            auth_claim,
+        )
+        .unwrap_or_else(|error| panic!("PXAU v2 terminal draft rejected: {error}"));
+        let signature = signature_override.map_or_else(
+            || {
+                let transcript = draft.signing_transcript().unwrap_or_else(|error| {
+                    panic!("PXAU v2 terminal transcript rejected: {error}")
+                });
+                SigningKey::from_bytes(&signing_seed.unwrap_or(RUNTIME_TERMINAL_SIGNING_SEED_V2))
+                    .sign(transcript.as_bytes())
+                    .to_bytes()
+                    .to_vec()
+            },
+            |signature| signature.to_vec(),
+        );
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("PXAU v2 terminal finalization rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn permissive_terminal_marker_v2<'terminal>(
+        receipt: &'terminal RemoteAgentDataPlaneTerminalReceiptV2,
+        request: &RemoteAgentAccessRequestV2,
+    ) -> RuntimeAuthenticatedRemoteAgentDataPlaneTerminalV2<'terminal> {
+        receipt
+            .verify_runtime_terminal(
+                request
+                    .apply_request()
+                    .unwrap_or_else(|| panic!("terminal PXRA v2 must carry PXAR v11")),
+                receipt.authentication(),
+                |_, _, _, _, _, _| true,
+            )
+            .unwrap_or_else(|error| panic!("permissive public PXAU v2 marker rejected: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn expect_terminal_admission_error<T>(
+        result: Result<T, RemoteAgentDataPlaneTerminalAdmissionErrorV2>,
+        message: &str,
+    ) -> RemoteAgentDataPlaneTerminalAdmissionErrorV2 {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
+    }
+
+    fn ed25519_signature_verifies(
+        signing_seed: [u8; 32],
+        transcript: &[u8],
+        signature: &[u8],
+    ) -> bool {
+        let Ok(signature_bytes) = <&[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        SigningKey::from_bytes(&signing_seed)
+            .verifying_key()
+            .verify_strict(transcript, &Signature::from_bytes(signature_bytes))
+            .is_ok()
+    }
+
+    fn controller_authenticated_remote_agent_access_v2<'request>(
+        request: &'request RemoteAgentAccessRequestV2,
+        carrier: &RestrictedRuntimeApplyCarrierBindingV1,
+        controller_signing_seed: [u8; 32],
+    ) -> ControllerAuthenticatedRemoteAgentAccessRequestV2<'request> {
+        request
+            .verify_controller_apply_request(
+                carrier,
+                |principal, key, algorithm, version, transcript, signature| {
+                    principal == carrier.controller_principal()
+                        && key == carrier.controller_request_key()
+                        && algorithm.value() == ED25519_ALGORITHM
+                        && version == ED25519_ALGORITHM_VERSION
+                        && ed25519_signature_verifies(
+                            controller_signing_seed,
+                            transcript,
+                            signature,
+                        )
+                },
+                |principal, key, fingerprint, transcript, signature| {
+                    principal == carrier.controller_principal()
+                        && key == carrier.controller_request_key()
+                        && fingerprint == carrier.controller_request_key_fingerprint()
+                        && ed25519_signature_verifies(
+                            controller_signing_seed,
+                            transcript,
+                            signature,
+                        )
+                },
+            )
+            .unwrap_or_else(|error| panic!("real Controller PXRA v2 signatures rejected: {error}"))
+    }
+
+    fn independent_remote_agent_access_framed_digest_v2(
+        domain: &[u8],
+        fields: &[&[u8]],
+    ) -> Digest32 {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        for field in fields {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
+        Digest32::from_bytes(hasher.finalize().into())
+    }
+
+    fn signed_distributed_request_sharing_remote_ingress(
+        remote: &RemoteAgentDataPlaneApplyRequestV1,
+        signing_seed: [u8; 32],
+    ) -> DistributedAgentStackApplyRequestV1 {
+        let fixture =
+            DistributedAgentStackApplyRequestV1::decode(&distributed_agent_stack_golden("request"))
+                .unwrap_or_else(|error| panic!("distributed PXAR v8 fixture must decode: {error}"));
+        let draft = DistributedAgentStackApplyRequestDraftV1::try_new(
+            fixture.target_execution().clone(),
+            remote.provenance(),
+            remote.control_commitment().control().clone(),
+            remote.temporal(),
+            remote.expected_runtime_store_instance_id(),
+            remote.authentication().claim().clone(),
+        )
+        .unwrap_or_else(|error| panic!("distributed PXAR v8 comparison draft must build: {error}"));
+        let transcript = draft.signing_transcript().unwrap_or_else(|error| {
+            panic!("distributed PXAR v8 comparison transcript must build: {error}")
+        });
+        let signature = SigningKey::from_bytes(&signing_seed)
+            .sign(transcript.as_bytes())
+            .to_bytes();
+        draft
+            .finalize(&signature)
+            .unwrap_or_else(|error| panic!("distributed PXAR v8 comparison must finalize: {error}"))
+    }
+
     fn python_fixture_admission_for_target(
         trusted_target_byte: u8,
+    ) -> (ApplyAdmission, ClockReading) {
+        python_fixture_admission_for_target_and_budget(trusted_target_byte, 100)
+    }
+
+    fn python_fixture_admission_for_target_and_budget(
+        trusted_target_byte: u8,
+        maximum_budget_nanos: u64,
     ) -> (ApplyAdmission, ClockReading) {
         let scope = SourceScopeRef::from_bytes([0x01; 16]);
         let target = RuntimeHostId::from_bytes([trusted_target_byte; 16]);
@@ -1991,7 +4632,7 @@ mod tests {
             panic!("Python fixture request trust must be valid");
         };
         let Ok(policy) = ApplyAdmissionPolicy::try_new(
-            BoundedDuration::from_nanos(100),
+            BoundedDuration::from_nanos(maximum_budget_nanos),
             state_limits(4, 4, 4),
             [tenure_trust],
             [request_trust],
@@ -2020,6 +4661,61 @@ mod tests {
             b'A'..=b'F' => value - b'A' + 10,
             _ => panic!("fixture must contain hexadecimal digits"),
         }
+    }
+
+    fn decode_fixture_hex(input: &str) -> Vec<u8> {
+        let value = input.trim_end_matches('\n');
+        assert_eq!(value.len() % 2, 0, "fixture hex length must be even");
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]))
+            .collect()
+    }
+
+    #[test]
+    fn artifact_pxar_v12_reuses_strict_owner_authentication_and_clock_admission() {
+        let request =
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(&decode_fixture_hex(
+                include_str!("../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"),
+            ))
+            .expect("shared PXAR v12 fixture");
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 6_000_083);
+        let generation = ClockGeneration::try_new(3).expect("fixture generation");
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            generation,
+            MonotonicInstant::from_ticks(100),
+        );
+        let verified = admission
+            .policy
+            .verify_artifact_managed_model_agent_stack_apply_request(&request, reading)
+            .expect("shared PXAR v12 must authenticate and admit");
+
+        assert_eq!(verified.clock_generation(), generation);
+        assert_eq!(verified.admitted_at_nanos(), 100);
+        assert_eq!(verified.deadline_nanos(), 6_000_183);
+        assert_eq!(
+            verified.authenticated().proof_envelope_digest(),
+            admission
+                .policy
+                .authenticate_artifact_managed_model_agent_stack_apply_request(&request)
+                .expect("shared PXAR v12 must authenticate")
+                .proof_envelope_digest(),
+        );
+        assert_eq!(
+            admission
+                .policy
+                .verify_artifact_managed_model_agent_stack_apply_request(
+                    &request,
+                    ClockReading::new(
+                        ClockDomainRef::from_bytes([0x0b; 16]),
+                        generation,
+                        MonotonicInstant::from_ticks(100),
+                    ),
+                ),
+            Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch),
+        );
     }
 
     #[test]
@@ -3590,6 +6286,1080 @@ mod tests {
             )
             .err(),
             Some(ApplyRejection::OperationConflict)
+        );
+    }
+
+    #[test]
+    fn distributed_pxar8_has_an_independent_authenticated_temporal_admission_namespace() {
+        let request = signed_distributed_agent_stack_request(PYTHON_FIXTURE_REQUEST_SEED);
+        let (admission, _) = python_fixture_admission_and_reading();
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            ClockGeneration::try_new(3).expect("fixture clock generation must be nonzero"),
+            MonotonicInstant::from_ticks(1),
+        );
+
+        let authenticated = admission
+            .policy
+            .authenticate_distributed_agent_stack_apply_request(&request)
+            .expect("valid PXAR v8 signatures must authenticate");
+        let zero_digest = Digest32::from_bytes([0; 32]);
+        assert_ne!(authenticated.proof_envelope_digest(), zero_digest);
+        assert_ne!(authenticated.tenure_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.request_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.temporal_lineage_identity(), zero_digest);
+
+        let verified = admission
+            .policy
+            .verify_distributed_agent_stack_apply_request(&request, reading)
+            .expect("valid PXAR v8 temporal ingress must verify");
+        assert_eq!(verified.authenticated(), authenticated);
+        assert_eq!(verified.admitted_at_nanos(), 1);
+        assert_eq!(verified.deadline_nanos(), 61);
+        assert_eq!(verified.clock_generation().value(), 3);
+
+        let wrong_signature = signed_distributed_agent_stack_request([0x23; 32]);
+        assert_eq!(
+            admission
+                .policy
+                .authenticate_distributed_agent_stack_apply_request(&wrong_signature)
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::InvalidRequestSignature
+        );
+
+        let fixture_with_predecessor_signature =
+            DistributedAgentStackApplyRequestV1::decode(&distributed_agent_stack_golden("request"))
+                .expect("canonical PXAR v8 fixture must decode");
+        assert_eq!(
+            admission
+                .policy
+                .authenticate_distributed_agent_stack_apply_request(
+                    &fixture_with_predecessor_signature,
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::InvalidRequestSignature,
+            "canonical bytes alone must never bypass the PXAR v8 signature"
+        );
+    }
+
+    #[test]
+    fn remote_agent_data_plane_pxar10_authenticates_both_signatures_and_separates_replay_domains() {
+        let request =
+            signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None, None);
+        assert_eq!(
+            request.canonical_wire(),
+            remote_agent_data_plane_golden("pxar_v10_hex"),
+            "the admission fixture must remain the exact independent PXAR v10 golden",
+        );
+        let (admission, _) = python_fixture_admission_and_reading();
+        let authenticated = admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&request)
+            .expect("valid PXAR v10 tenure and request signatures must authenticate");
+
+        let zero_digest = Digest32::from_bytes([0; 32]);
+        assert_eq!(authenticated.request_digest(), request.request_digest());
+        assert_ne!(authenticated.request_digest(), zero_digest);
+        assert_ne!(authenticated.proof_envelope_digest(), zero_digest);
+        assert_ne!(authenticated.tenure_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.request_nonce_identity(), zero_digest);
+        assert_ne!(authenticated.temporal_lineage_identity(), zero_digest);
+
+        let request_b_temporal = request
+            .temporal()
+            .try_reduce_remaining(BoundedDuration::from_nanos(59))
+            .expect("request B must only attenuate the authenticated remaining budget");
+        let request_b = signed_remote_agent_data_plane_request(
+            PYTHON_FIXTURE_REQUEST_SEED,
+            Some(request_b_temporal),
+            None,
+        );
+        let authenticated_b = admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&request_b)
+            .expect("valid request B must authenticate independently");
+        assert_eq!(
+            authenticated.proof_envelope_digest(),
+            authenticated_b.proof_envelope_digest(),
+        );
+        assert_eq!(
+            authenticated.tenure_nonce_identity(),
+            authenticated_b.tenure_nonce_identity(),
+        );
+        assert_eq!(
+            authenticated.request_nonce_identity(),
+            authenticated_b.request_nonce_identity(),
+        );
+        assert_eq!(
+            authenticated.temporal_lineage_identity(),
+            authenticated_b.temporal_lineage_identity(),
+        );
+        assert_eq!(authenticated_b.request_digest(), request_b.request_digest());
+        assert_ne!(authenticated_b.request_digest(), zero_digest);
+        assert_ne!(
+            authenticated.request_digest(),
+            request_b.request_digest(),
+            "marker A must not pair with the exact bytes of request B",
+        );
+
+        let distributed = signed_distributed_request_sharing_remote_ingress(
+            &request,
+            PYTHON_FIXTURE_REQUEST_SEED,
+        );
+        let distributed_authenticated = admission
+            .policy
+            .authenticate_distributed_agent_stack_apply_request(&distributed)
+            .expect("comparison PXAR v8 must authenticate");
+        assert_eq!(
+            authenticated.proof_envelope_digest(),
+            distributed_authenticated.proof_envelope_digest(),
+            "the comparison must retain the exact same contract-owned tenure proof",
+        );
+        assert_ne!(
+            authenticated.tenure_nonce_identity(),
+            distributed_authenticated.tenure_nonce_identity(),
+            "PXAR v10 tenure replay identity must not alias PXAR v8",
+        );
+        assert_ne!(
+            authenticated.request_nonce_identity(),
+            distributed_authenticated.request_nonce_identity(),
+            "PXAR v10 request replay identity must not alias PXAR v8",
+        );
+        assert_ne!(
+            authenticated.temporal_lineage_identity(),
+            distributed_authenticated.temporal_lineage_identity(),
+            "PXAR v10 temporal replay identity must not alias PXAR v8",
+        );
+
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            ClockGeneration::try_new(3).expect("fixture clock generation must be nonzero"),
+            MonotonicInstant::from_ticks(1),
+        );
+        let verified = admission
+            .policy
+            .verify_remote_agent_data_plane_apply_request(&request, reading)
+            .expect("valid PXAR v10 temporal ingress must verify");
+        assert_eq!(verified.authenticated(), authenticated);
+        assert_eq!(verified.admitted_at_nanos(), 1);
+        assert_eq!(verified.deadline_nanos(), 61);
+        assert_eq!(verified.clock_generation().value(), 3);
+
+        for (rejected, expected) in [
+            (
+                signed_remote_agent_data_plane_request(
+                    PYTHON_FIXTURE_REQUEST_SEED,
+                    None,
+                    Some(WRONG_SEED),
+                ),
+                ManagedFabricApplyAdmissionError::InvalidTenureSignature,
+            ),
+            (
+                signed_remote_agent_data_plane_request(WRONG_SEED, None, None),
+                ManagedFabricApplyAdmissionError::InvalidRequestSignature,
+            ),
+        ] {
+            assert_eq!(
+                RemoteAgentDataPlaneApplyRequestV1::decode(rejected.canonical_wire())
+                    .expect("signature-negative PXAR v10 must remain contract-canonical"),
+                rejected,
+            );
+            assert_eq!(
+                admission
+                    .policy
+                    .authenticate_remote_agent_data_plane_apply_request(&rejected)
+                    .unwrap_err(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn remote_agent_data_plane_pxar10_rejects_temporal_mismatch_budget_and_expiry() {
+        let request =
+            signed_remote_agent_data_plane_request(PYTHON_FIXTURE_REQUEST_SEED, None, None);
+        let (admission, _) = python_fixture_admission_and_reading();
+        let generation = ClockGeneration::try_new(3).expect("fixture generation must be nonzero");
+        let correct_domain = ClockDomainRef::from_bytes([0x0a; 16]);
+
+        assert_eq!(
+            admission
+                .policy
+                .verify_remote_agent_data_plane_apply_request(
+                    &request,
+                    ClockReading::new(
+                        ClockDomainRef::from_bytes([0x0b; 16]),
+                        generation,
+                        MonotonicInstant::from_ticks(1),
+                    ),
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::ClockDomainMismatch,
+        );
+
+        let historical_reading = ClockReading::new(
+            correct_domain,
+            ClockGeneration::try_new(4).expect("historical successor must be nonzero"),
+            MonotonicInstant::from_ticks(1),
+        );
+        admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&request)
+            .expect("auth-only replay must not consume the current target clock");
+        assert_eq!(
+            admission
+                .policy
+                .verify_remote_agent_data_plane_apply_request(&request, historical_reading)
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::ClockGenerationMismatch,
+            "historical authentication must not grant a fresh temporal effect",
+        );
+
+        let (budget_bounded, _) = python_fixture_admission_for_target_and_budget(0x05, 99);
+        assert_eq!(
+            budget_bounded
+                .policy
+                .verify_remote_agent_data_plane_apply_request(
+                    &request,
+                    ClockReading::new(correct_domain, generation, MonotonicInstant::from_ticks(1),),
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::BudgetExceedsPolicy,
+        );
+
+        let temporal = request.temporal();
+        let expired_temporal = ApplyTemporalConstraint::try_new(
+            temporal.constraint_id(),
+            temporal.target_clock_domain(),
+            temporal.target_clock_generation(),
+            temporal.original_budget(),
+            BoundedDuration::from_nanos(0),
+        )
+        .expect("zero remaining budget must remain a valid signed expiry value");
+        let expired = signed_remote_agent_data_plane_request(
+            PYTHON_FIXTURE_REQUEST_SEED,
+            Some(expired_temporal),
+            None,
+        );
+        admission
+            .policy
+            .authenticate_remote_agent_data_plane_apply_request(&expired)
+            .expect("expired request signatures remain valid for historical replay");
+        assert_eq!(
+            admission
+                .policy
+                .verify_remote_agent_data_plane_apply_request(
+                    &expired,
+                    ClockReading::new(correct_domain, generation, MonotonicInstant::from_ticks(1),),
+                )
+                .unwrap_err(),
+            ManagedFabricApplyAdmissionError::BudgetExpired,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_access_v2_mints_exact_move_only_ingress_facts_from_three_real_signatures() {
+        let golden = remote_agent_access_request_v2_template();
+        let production_controller_fingerprint = super::ed25519_control_key_fingerprint(
+            SigningKey::from_bytes(&PYTHON_FIXTURE_REQUEST_SEED)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .expect("production Controller fingerprint must build");
+        let (request, carrier) = signed_remote_agent_access_request_v2(
+            PYTHON_FIXTURE_TENURE_SEED,
+            PYTHON_FIXTURE_REQUEST_SEED,
+            None,
+        );
+        assert_ne!(
+            golden.carrier().controller_request_key_fingerprint(),
+            production_controller_fingerprint,
+            "the historical Python golden predates the production fingerprint transcript",
+        );
+        assert_eq!(
+            carrier.controller_request_key_fingerprint(),
+            production_controller_fingerprint,
+            "the real-signature admission fixture must migrate to the production fingerprint",
+        );
+        let authenticated_outer = controller_authenticated_remote_agent_access_v2(
+            &request,
+            &carrier,
+            PYTHON_FIXTURE_REQUEST_SEED,
+        );
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let dependencies = terminal_endpoint_dependencies_v2(&carrier);
+        let domain = ClockDomainRef::from_bytes([0x0a; 16]);
+        let generation =
+            ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero");
+        let admitted_at_nanos = 1_000_000_000;
+        let marker = verify_remote_agent_access_apply_ingress_v2_for_test(
+            &admission.policy,
+            authenticated_outer,
+            &dependencies,
+            &provisioning,
+            ClockReading::new(
+                domain,
+                generation,
+                MonotonicInstant::from_ticks(admitted_at_nanos),
+            ),
+        )
+        .expect("three real signatures and exact temporal authority must admit");
+
+        let inner = request
+            .apply_request()
+            .expect("PXRA v2 Apply must carry PXAR v11");
+        let writer_context = inner.control_commitment().control().writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let source_scope = inner.provenance().source_scope();
+        let inner_auth_claim = inner.authentication().claim();
+        let temporal = inner.temporal();
+        let outer_transcript = request
+            .signing_transcript()
+            .expect("PXRA v2 transcript must remain canonical");
+
+        assert_eq!(marker.request(), &request);
+        assert_eq!(marker.outer_request_digest(), request.request_digest());
+        assert_eq!(marker.inner_request_digest(), inner.request_digest());
+        assert_eq!(
+            marker.inner_envelope_request_digest(),
+            inner.envelope_request_digest(),
+        );
+        assert_eq!(
+            marker.proof_envelope_digest(),
+            proof
+                .envelope_digest()
+                .expect("writer-tenure proof digest must build"),
+        );
+        assert_eq!(
+            marker.carrier_binding_digest(),
+            Some(carrier.binding_digest())
+        );
+        assert_eq!(marker.clock_domain(), domain);
+        assert_eq!(marker.clock_generation(), generation);
+        assert_eq!(marker.admitted_at_nanos(), admitted_at_nanos);
+        assert_eq!(
+            marker.deadline_nanos(),
+            admitted_at_nanos + inner.target_execution().profile().operation_timeout_nanos(),
+            "the effect deadline is admitted + profile timeout, not admitted + remaining budget",
+        );
+        assert_eq!(marker.deadline_nanos(), 21_000_000_000);
+        assert!(
+            temporal.remaining_budget().value()
+                >= inner.target_execution().profile().operation_timeout_nanos()
+        );
+
+        assert_eq!(
+            marker.outer_auth_transcript_digest(),
+            independent_remote_agent_access_framed_digest_v2(
+                b"paraegox.runtime.remote-agent-access-outer-auth-transcript.sha256.v2",
+                &[outer_transcript.as_bytes()],
+            ),
+        );
+        assert_eq!(
+            marker.tenure_nonce_identity(),
+            independent_remote_agent_access_framed_digest_v2(
+                b"paraegox.runtime.remote-agent-data-plane-tenure-nonce.sha256.v2",
+                &[
+                    source_scope.as_bytes(),
+                    proof_authority.authority().as_bytes(),
+                    proof_authority.key().as_bytes(),
+                    proof.nonce(),
+                ],
+            ),
+        );
+        assert_eq!(
+            marker.request_nonce_identity(),
+            independent_remote_agent_access_framed_digest_v2(
+                b"paraegox.runtime.remote-agent-data-plane-request-nonce.sha256.v2",
+                &[
+                    source_scope.as_bytes(),
+                    inner.target().as_bytes(),
+                    inner_auth_claim.principal().as_bytes(),
+                    writer_context.writer().as_bytes(),
+                    inner_auth_claim.key().as_bytes(),
+                    inner_auth_claim.nonce(),
+                ],
+            ),
+        );
+        assert_eq!(
+            marker.temporal_lineage_identity(),
+            independent_remote_agent_access_framed_digest_v2(
+                b"paraegox.runtime.remote-agent-data-plane-temporal-lineage.sha256.v2",
+                &[
+                    source_scope.as_bytes(),
+                    inner.target().as_bytes(),
+                    temporal.constraint_id().as_bytes(),
+                ],
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_access_v2_public_marker_cannot_substitute_for_outer_signature_policy() {
+        let (valid_request, carrier) = signed_remote_agent_access_request_v2(
+            PYTHON_FIXTURE_TENURE_SEED,
+            PYTHON_FIXTURE_REQUEST_SEED,
+            None,
+        );
+        let altered_runtime_host_epoch = valid_request
+            .expected_runtime_host_epoch()
+            .checked_add(1)
+            .expect("PXRA v2 fixture RuntimeHost epoch must have a successor");
+        let forged_outer_draft = RemoteAgentAccessRequestDraftV2::try_apply_remote_access(
+            RemoteAgentAccessRequestFieldsV2 {
+                request_id: valid_request.request_id(),
+                carrier: carrier.clone(),
+                target: valid_request.target(),
+                expected_runtime_store_instance_id: valid_request
+                    .expected_runtime_store_instance_id(),
+                expected_runtime_host_epoch: altered_runtime_host_epoch,
+                auth_claim: valid_request.authentication().claim().clone(),
+            },
+            valid_request
+                .apply_request()
+                .unwrap_or_else(|| panic!("PXRA v2 Apply fixture must carry PXAR v11"))
+                .clone(),
+        )
+        .unwrap_or_else(|error| panic!("altered outer-only PXRA v2 draft rejected: {error}"));
+        let forged_outer = forged_outer_draft
+            .finalize(&[0xf6; 64])
+            .unwrap_or_else(|error| panic!("forged outer PXRA v2 must remain canonical: {error}"));
+        assert_ne!(
+            forged_outer.expected_runtime_host_epoch(),
+            valid_request.expected_runtime_host_epoch(),
+            "the negative must alter an outer-only authority field",
+        );
+        assert_eq!(
+            forged_outer.apply_request(),
+            valid_request.apply_request(),
+            "tenure and inner Controller signatures must remain exactly valid",
+        );
+
+        let permissive_public_marker = forged_outer
+            .verify_controller_apply_request(
+                &carrier,
+                |_, _, _, _, _, _| true,
+                |_, _, _, _, _| true,
+            )
+            .unwrap_or_else(|error| panic!("permissive public marker rejected: {error}"));
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let provisioning = terminal_runtime_provisioning_v2(&forged_outer);
+        let dependencies = terminal_endpoint_dependencies_v2(&carrier);
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero"),
+            MonotonicInstant::from_ticks(1_000_000_000),
+        );
+        assert_eq!(
+            expect_remote_agent_access_apply_admission_error(
+                verify_remote_agent_access_apply_ingress_v2_for_test(
+                    &admission.policy,
+                    permissive_public_marker,
+                    &dependencies,
+                    &provisioning,
+                    reading,
+                ),
+                "forged outer signature unexpectedly admitted",
+            ),
+            ManagedFabricApplyAdmissionError::InvalidRequestSignature,
+            "Runtime admission must independently reject the forged outer signature",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_access_v2_outer_marker_cannot_bypass_tenure_inner_or_carrier_key_policy() {
+        let (wrong_tenure, carrier) =
+            signed_remote_agent_access_request_v2(WRONG_SEED, PYTHON_FIXTURE_REQUEST_SEED, None);
+        let authenticated_wrong_tenure = controller_authenticated_remote_agent_access_v2(
+            &wrong_tenure,
+            &carrier,
+            PYTHON_FIXTURE_REQUEST_SEED,
+        );
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero"),
+            MonotonicInstant::from_ticks(1_000_000_000),
+        );
+        let wrong_tenure_provisioning = terminal_runtime_provisioning_v2(&wrong_tenure);
+        let wrong_tenure_dependencies = terminal_endpoint_dependencies_v2(&carrier);
+        assert_eq!(
+            expect_remote_agent_access_apply_admission_error(
+                verify_remote_agent_access_apply_ingress_v2_for_test(
+                    &admission.policy,
+                    authenticated_wrong_tenure,
+                    &wrong_tenure_dependencies,
+                    &wrong_tenure_provisioning,
+                    reading,
+                ),
+                "invalid writer-tenure signature unexpectedly admitted",
+            ),
+            ManagedFabricApplyAdmissionError::InvalidTenureSignature,
+            "the public outer marker authenticates two Controller signatures, not writer tenure",
+        );
+
+        let (wrong_inner_key, policy_carrier) =
+            signed_remote_agent_access_request_v2(PYTHON_FIXTURE_TENURE_SEED, WRONG_SEED, None);
+        let authenticated_wrong_inner_key = controller_authenticated_remote_agent_access_v2(
+            &wrong_inner_key,
+            &policy_carrier,
+            WRONG_SEED,
+        );
+        let wrong_inner_provisioning = terminal_runtime_provisioning_v2(&wrong_inner_key);
+        let wrong_inner_dependencies = terminal_endpoint_dependencies_v2(&policy_carrier);
+        assert_eq!(
+            expect_remote_agent_access_apply_admission_error(
+                verify_remote_agent_access_apply_ingress_v2_for_test(
+                    &admission.policy,
+                    authenticated_wrong_inner_key,
+                    &wrong_inner_dependencies,
+                    &wrong_inner_provisioning,
+                    reading,
+                ),
+                "invalid inner Controller signature unexpectedly admitted",
+            ),
+            ManagedFabricApplyAdmissionError::InvalidRequestSignature,
+            "callback authentication must not replace the policy's exact inner Controller key",
+        );
+
+        let untrusted_fingerprint = Digest32::from_bytes([0xf1; 32]);
+        let (wrong_fingerprint, wrong_carrier) = signed_remote_agent_access_request_v2(
+            PYTHON_FIXTURE_TENURE_SEED,
+            PYTHON_FIXTURE_REQUEST_SEED,
+            Some(untrusted_fingerprint),
+        );
+        let _permissive_wrong_fingerprint = controller_authenticated_remote_agent_access_v2(
+            &wrong_fingerprint,
+            &wrong_carrier,
+            PYTHON_FIXTURE_REQUEST_SEED,
+        );
+        assert_eq!(
+            wrong_carrier.controller_request_key_fingerprint(),
+            untrusted_fingerprint,
+        );
+        let wrong_fingerprint_provisioning = terminal_runtime_provisioning_v2(&wrong_fingerprint);
+        let wrong_fingerprint_dependencies = terminal_endpoint_dependencies_v2(&wrong_carrier);
+        assert!(
+            runtime_restricted_apply_carrier_pin_for_test(
+                &wrong_fingerprint_dependencies,
+                &wrong_fingerprint_provisioning,
+            )
+            .is_err(),
+            "a callback-accepted carrier with an unprotected key fingerprint must not mint the Pin required by Runtime admission",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_access_v2_rejects_clock_budget_and_operation_deadline_failures() {
+        let (request, carrier) = signed_remote_agent_access_request_v2(
+            PYTHON_FIXTURE_TENURE_SEED,
+            PYTHON_FIXTURE_REQUEST_SEED,
+            None,
+        );
+        let (admission, _) = python_fixture_admission_for_target_and_budget(0x05, 30_000_000_000);
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let dependencies = terminal_endpoint_dependencies_v2(&carrier);
+        let correct_domain = ClockDomainRef::from_bytes([0x0a; 16]);
+        let correct_generation =
+            ClockGeneration::try_new(3).expect("PXRA v2 fixture generation must be nonzero");
+
+        for (reading, expected) in [
+            (
+                ClockReading::new(
+                    ClockDomainRef::from_bytes([0x0b; 16]),
+                    correct_generation,
+                    MonotonicInstant::from_ticks(1_000_000_000),
+                ),
+                ManagedFabricApplyAdmissionError::ClockDomainMismatch,
+            ),
+            (
+                ClockReading::new(
+                    correct_domain,
+                    ClockGeneration::try_new(4)
+                        .expect("historical PXRA v2 generation must be nonzero"),
+                    MonotonicInstant::from_ticks(1_000_000_000),
+                ),
+                ManagedFabricApplyAdmissionError::ClockGenerationMismatch,
+            ),
+        ] {
+            assert_eq!(
+                expect_remote_agent_access_apply_admission_error(
+                    verify_remote_agent_access_apply_ingress_v2_for_test(
+                        &admission.policy,
+                        controller_authenticated_remote_agent_access_v2(
+                            &request,
+                            &carrier,
+                            PYTHON_FIXTURE_REQUEST_SEED,
+                        ),
+                        &dependencies,
+                        &provisioning,
+                        reading,
+                    ),
+                    "invalid target clock unexpectedly admitted",
+                ),
+                expected,
+            );
+        }
+
+        let (budget_bounded, _) =
+            python_fixture_admission_for_target_and_budget(0x05, 29_999_999_999);
+        assert_eq!(
+            expect_remote_agent_access_apply_admission_error(
+                verify_remote_agent_access_apply_ingress_v2_for_test(
+                    &budget_bounded.policy,
+                    controller_authenticated_remote_agent_access_v2(
+                        &request,
+                        &carrier,
+                        PYTHON_FIXTURE_REQUEST_SEED,
+                    ),
+                    &dependencies,
+                    &provisioning,
+                    ClockReading::new(
+                        correct_domain,
+                        correct_generation,
+                        MonotonicInstant::from_ticks(1_000_000_000),
+                    ),
+                ),
+                "over-policy temporal budget unexpectedly admitted",
+            ),
+            ManagedFabricApplyAdmissionError::BudgetExceedsPolicy,
+        );
+
+        let operation_timeout = request
+            .apply_request()
+            .expect("PXRA v2 Apply must carry PXAR v11")
+            .target_execution()
+            .profile()
+            .operation_timeout_nanos();
+        let overflowing_now = u64::MAX - operation_timeout + 1;
+        for now in [0, overflowing_now] {
+            assert_eq!(
+                expect_remote_agent_access_apply_admission_error(
+                    verify_remote_agent_access_apply_ingress_v2_for_test(
+                        &admission.policy,
+                        controller_authenticated_remote_agent_access_v2(
+                            &request,
+                            &carrier,
+                            PYTHON_FIXTURE_REQUEST_SEED,
+                        ),
+                        &dependencies,
+                        &provisioning,
+                        ClockReading::new(
+                            correct_domain,
+                            correct_generation,
+                            MonotonicInstant::from_ticks(now),
+                        ),
+                    ),
+                    "invalid admission instant unexpectedly admitted",
+                ),
+                ManagedFabricApplyAdmissionError::DeadlineOverflow,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_terminal_v2_protected_signature_mints_exact_private_marker() {
+        let (request, carrier) = signed_remote_agent_access_request_for_terminal_v2();
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let dependencies = terminal_endpoint_dependencies_v2(&carrier);
+        let trust = terminal_runtime_trust_v2(&provisioning, &dependencies)
+            .expect("live-endpoint-pinned terminal Runtime trust must build");
+        let receipt = terminal_receipt_v2(&request, terminal_auth_claim_v2(&request), None, None);
+        let marker = trust
+            .verify_terminal_ingress(permissive_terminal_marker_v2(&receipt, &request), &request)
+            .expect("the protected exact Runtime signature must admit");
+        let inner = request
+            .apply_request()
+            .expect("terminal PXRA v2 must carry PXAR v11");
+
+        assert_eq!(marker.receipt(), &receipt);
+        assert_eq!(marker.outer_request_digest(), request.request_digest());
+        assert_eq!(
+            marker.carrier_binding_digest(),
+            Some(carrier.binding_digest())
+        );
+        assert_eq!(marker.target(), request.target());
+        assert_eq!(
+            marker.runtime_store_instance_id(),
+            request.expected_runtime_store_instance_id(),
+        );
+        assert_eq!(
+            marker.runtime_host_epoch(),
+            request.expected_runtime_host_epoch(),
+        );
+        assert_eq!(marker.operation_id(), inner.operation_id());
+        assert_eq!(marker.inner_request_digest(), inner.request_digest());
+        assert_eq!(
+            marker.inner_envelope_request_digest(),
+            inner.envelope_request_digest(),
+        );
+        assert_eq!(marker.terminal_receipt_digest(), receipt.receipt_digest());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_terminal_v2_permissive_public_marker_cannot_bypass_protected_signature() {
+        let (request, carrier) = signed_remote_agent_access_request_for_terminal_v2();
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let dependencies = terminal_endpoint_dependencies_v2(&carrier);
+        let claim = terminal_auth_claim_v2(&request);
+
+        let junk = terminal_receipt_v2(&request, claim, None, Some(&[0xee; 64]));
+        assert_eq!(
+            expect_terminal_admission_error(
+                terminal_runtime_trust_v2(&provisioning, &dependencies)
+                    .expect("live terminal Runtime trust must remint")
+                    .verify_terminal_ingress(
+                        permissive_terminal_marker_v2(&junk, &request),
+                        &request,
+                    ),
+                "junk terminal signature must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignature,
+            "a permissive public callback cannot authenticate junk bytes",
+        );
+
+        let other_runtime = terminal_receipt_v2(&request, claim, Some(WRONG_SEED), None);
+        assert_eq!(
+            expect_terminal_admission_error(
+                terminal_runtime_trust_v2(&provisioning, &dependencies)
+                    .expect("live terminal Runtime trust must remint")
+                    .verify_terminal_ingress(
+                        permissive_terminal_marker_v2(&other_runtime, &request),
+                        &request,
+                    ),
+                "other Runtime terminal signature must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignature,
+            "a valid signature by another Runtime key cannot substitute",
+        );
+
+        let wrong_width = terminal_receipt_v2(&request, claim, None, Some(&[0xef; 63]));
+        assert_eq!(
+            expect_terminal_admission_error(
+                terminal_runtime_trust_v2(&provisioning, &dependencies)
+                    .expect("live terminal Runtime trust must remint")
+                    .verify_terminal_ingress(
+                        permissive_terminal_marker_v2(&wrong_width, &request),
+                        &request,
+                    ),
+                "wrong-width terminal signature must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::InvalidSignatureLength,
+            "PXAU v2 Runtime signatures are exactly 64 bytes",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_terminal_v2_rejects_signer_profile_carrier_epoch_and_request_correlation() {
+        let (request, carrier) = signed_remote_agent_access_request_for_terminal_v2();
+        let provisioning = terminal_runtime_provisioning_v2(&request);
+        let dependencies = terminal_endpoint_dependencies_v2(&carrier);
+        let algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)
+            .expect("terminal Ed25519 algorithm must build");
+        let wrong_claims = [
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                PrincipalRef::from_bytes([0xe1; 16]),
+                carrier.runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+            )
+            .expect("wrong-principal terminal claim must remain structural"),
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                carrier.runtime_principal(),
+                ApplyAuthKeyRef::from_bytes([0xe2; 16]),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+            )
+            .expect("wrong-key terminal claim must remain structural"),
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                carrier.runtime_principal(),
+                carrier.runtime_response_key(),
+                ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM + 1)
+                    .expect("alternate terminal algorithm must build"),
+                ED25519_ALGORITHM_VERSION,
+            )
+            .expect("wrong-algorithm terminal claim must remain structural"),
+            RemoteAgentDataPlaneTerminalAuthClaimV2::try_new(
+                carrier.runtime_principal(),
+                carrier.runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION + 1,
+            )
+            .expect("wrong-version terminal claim must remain structural"),
+        ];
+        for claim in wrong_claims {
+            let receipt = terminal_receipt_v2(&request, claim, None, None);
+            assert_eq!(
+                expect_terminal_admission_error(
+                    terminal_runtime_trust_v2(&provisioning, &dependencies)
+                        .expect("live terminal Runtime trust must remint")
+                        .verify_terminal_ingress(
+                            permissive_terminal_marker_v2(&receipt, &request),
+                            &request,
+                        ),
+                    "wrong terminal signer tuple must be rejected",
+                ),
+                RemoteAgentDataPlaneTerminalAdmissionErrorV2::SignerSelection,
+            );
+        }
+
+        let alternate_carrier = RestrictedRuntimeApplyCarrierBindingV1::try_new(
+            RestrictedRuntimeApplyCarrierBindingFieldsV1 {
+                target: carrier.target(),
+                runtime_principal: carrier.runtime_principal(),
+                controller_principal: carrier.controller_principal(),
+                endpoint_ref: carrier.endpoint_ref(),
+                endpoint_generation: carrier
+                    .endpoint_generation()
+                    .checked_add(1)
+                    .expect("carrier endpoint generation must have a successor"),
+                route: carrier.route(),
+                controller_request_key: carrier.controller_request_key(),
+                controller_request_key_fingerprint: carrier.controller_request_key_fingerprint(),
+                runtime_response_key: carrier.runtime_response_key(),
+                runtime_response_key_fingerprint: carrier.runtime_response_key_fingerprint(),
+                control_transport_profile_ref: carrier.control_transport_profile_ref(),
+                control_transport_profile_digest: carrier.control_transport_profile_digest(),
+            },
+        )
+        .expect("alternate structural carrier must build");
+        let carrier_mismatch = finalize_remote_agent_access_outer_v2(
+            &request,
+            alternate_carrier,
+            request
+                .apply_request()
+                .expect("terminal PXRA v2 must carry PXAR v11")
+                .clone(),
+            request.expected_runtime_host_epoch(),
+        );
+        let receipt = terminal_receipt_v2(&request, terminal_auth_claim_v2(&request), None, None);
+        assert_eq!(
+            expect_terminal_admission_error(
+                terminal_runtime_trust_v2(&provisioning, &dependencies)
+                    .expect("live terminal Runtime trust must remint")
+                    .verify_terminal_ingress(
+                        permissive_terminal_marker_v2(&receipt, &carrier_mismatch),
+                        &carrier_mismatch,
+                    ),
+                "alternate carrier must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation,
+        );
+
+        let epoch_mismatch = finalize_remote_agent_access_outer_v2(
+            &request,
+            carrier.clone(),
+            request
+                .apply_request()
+                .expect("terminal PXRA v2 must carry PXAR v11")
+                .clone(),
+            request
+                .expected_runtime_host_epoch()
+                .checked_add(1)
+                .expect("RuntimeHost epoch must have a successor"),
+        );
+        assert_eq!(
+            expect_terminal_admission_error(
+                terminal_runtime_trust_v2(&provisioning, &dependencies)
+                    .expect("live terminal Runtime trust must remint")
+                    .verify_terminal_ingress(
+                        permissive_terminal_marker_v2(&receipt, &epoch_mismatch),
+                        &epoch_mismatch,
+                    ),
+                "alternate RuntimeHost epoch must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation,
+        );
+
+        let alternate_request = alternate_terminal_authorized_request_v2(&request);
+        assert_ne!(
+            alternate_request.request_id(),
+            request.request_id(),
+            "the request-correlation negative must alter the exact operation",
+        );
+        assert_eq!(
+            expect_terminal_admission_error(
+                terminal_runtime_trust_v2(&provisioning, &dependencies)
+                    .expect("live terminal Runtime trust must remint")
+                    .verify_terminal_ingress(
+                        permissive_terminal_marker_v2(&receipt, &request),
+                        &alternate_request,
+                    ),
+                "alternate authorized operation must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::CanonicalCorrelation,
+        );
+
+        let exact_endpoint_config = terminal_endpoint_config_v2(&carrier);
+        let mut alternate_endpoint_ref = carrier.endpoint_ref();
+        alternate_endpoint_ref[0] ^= 1;
+        let mut alternate_profile_ref = carrier.control_transport_profile_ref();
+        alternate_profile_ref[0] ^= 1;
+        let alternate_profile_digest =
+            if carrier.control_transport_profile_digest() != Digest32::from_bytes([0xe4; 32]) {
+                Digest32::from_bytes([0xe4; 32])
+            } else {
+                Digest32::from_bytes([0xe5; 32])
+            };
+        let composition_mismatches = [
+            (
+                "endpoint-ref",
+                terminal_carrier_with_composition_v2(
+                    &carrier,
+                    alternate_endpoint_ref,
+                    carrier.endpoint_generation(),
+                    carrier.route(),
+                    carrier.control_transport_profile_ref(),
+                    carrier.control_transport_profile_digest(),
+                ),
+            ),
+            (
+                "endpoint-generation",
+                terminal_carrier_with_composition_v2(
+                    &carrier,
+                    carrier.endpoint_ref(),
+                    carrier
+                        .endpoint_generation()
+                        .checked_add(1)
+                        .expect("terminal endpoint generation must have a successor"),
+                    carrier.route(),
+                    carrier.control_transport_profile_ref(),
+                    carrier.control_transport_profile_digest(),
+                ),
+            ),
+            (
+                "route",
+                terminal_carrier_with_composition_v2(
+                    &carrier,
+                    carrier.endpoint_ref(),
+                    carrier.endpoint_generation(),
+                    "paraegox/runtime/endpoint-stack/other-route/apply",
+                    carrier.control_transport_profile_ref(),
+                    carrier.control_transport_profile_digest(),
+                ),
+            ),
+            (
+                "profile-ref",
+                terminal_carrier_with_composition_v2(
+                    &carrier,
+                    carrier.endpoint_ref(),
+                    carrier.endpoint_generation(),
+                    carrier.route(),
+                    alternate_profile_ref,
+                    carrier.control_transport_profile_digest(),
+                ),
+            ),
+            (
+                "profile-digest",
+                terminal_carrier_with_composition_v2(
+                    &carrier,
+                    carrier.endpoint_ref(),
+                    carrier.endpoint_generation(),
+                    carrier.route(),
+                    carrier.control_transport_profile_ref(),
+                    alternate_profile_digest,
+                ),
+            ),
+        ];
+        for (field, mismatched_carrier) in composition_mismatches {
+            assert_eq!(mismatched_carrier.target(), carrier.target());
+            assert_eq!(
+                mismatched_carrier.runtime_principal(),
+                carrier.runtime_principal()
+            );
+            assert_eq!(
+                mismatched_carrier.controller_principal(),
+                carrier.controller_principal()
+            );
+            assert_eq!(
+                mismatched_carrier.controller_request_key(),
+                carrier.controller_request_key()
+            );
+            assert_eq!(
+                mismatched_carrier.controller_request_key_fingerprint(),
+                carrier.controller_request_key_fingerprint()
+            );
+            assert_eq!(
+                mismatched_carrier.runtime_response_key(),
+                carrier.runtime_response_key()
+            );
+            assert_eq!(
+                mismatched_carrier.runtime_response_key_fingerprint(),
+                carrier.runtime_response_key_fingerprint()
+            );
+            let mismatched_outer = finalize_remote_agent_access_outer_v2(
+                &request,
+                mismatched_carrier.clone(),
+                request
+                    .apply_request()
+                    .expect("terminal PXRA v2 must carry PXAR v11")
+                    .clone(),
+                request.expected_runtime_host_epoch(),
+            );
+            let structural = permissive_terminal_marker_v2(&receipt, &mismatched_outer);
+            assert_eq!(
+                structural.receipt(),
+                &receipt,
+                "{field} public structural marker must remain non-authorizing",
+            );
+            let permissive_fresh_marker = mismatched_outer
+                .verify_controller_apply_request(
+                    &mismatched_carrier,
+                    |_, _, _, _, _, _| true,
+                    |_, _, _, _, _| true,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{field} permissive fresh marker rejected: {error}")
+                });
+            assert_eq!(
+                permissive_fresh_marker.kind(),
+                RemoteAgentAccessKindV2::ApplyRemoteAccess,
+                "{field} public fresh marker must remain structural only",
+            );
+            let mismatched_dependencies = RuntimeRestrictedApplyEndpointDependenciesV1::new(
+                exact_endpoint_config.clone(),
+                mismatched_carrier,
+            );
+            assert!(
+                runtime_restricted_apply_carrier_pin_for_test(
+                    &mismatched_dependencies,
+                    &provisioning,
+                )
+                .is_err(),
+                "{field} self-pinned public fresh marker reached Runtime verification",
+            );
+            assert_eq!(
+                expect_terminal_admission_error(
+                    terminal_runtime_trust_v2(&provisioning, &mismatched_dependencies),
+                    "composition-mismatched terminal trust must be rejected",
+                ),
+                RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins,
+                "{field} mismatch minted a live endpoint carrier pin",
+            );
+        }
+
+        let unpinned_carrier = remote_agent_access_carrier_with_fingerprints(
+            &carrier,
+            carrier.controller_request_key_fingerprint(),
+            Digest32::from_bytes([0xe6; 32]),
+        );
+        let unpinned_dependencies = terminal_endpoint_dependencies_v2(&unpinned_carrier);
+        assert_eq!(
+            expect_terminal_admission_error(
+                terminal_runtime_trust_v2(&provisioning, &unpinned_dependencies),
+                "provisioning-mismatched terminal trust must be rejected",
+            ),
+            RemoteAgentDataPlaneTerminalAdmissionErrorV2::ProvisioningPins,
+            "the protected provisioning predicate must reject another Runtime key fingerprint",
         );
     }
 }

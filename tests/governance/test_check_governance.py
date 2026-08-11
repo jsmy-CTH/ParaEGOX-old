@@ -23,7 +23,7 @@ def base_config() -> dict:
             "term_scan_roots": ["src"],
             "exception_scan_roots": ["src", "tests", ".github"],
             "documentation_roots": ["docs"],
-            "untracked_only_roots": ["docs"],
+            "untracked_only_roots": ["docs/workbench"],
             "allowed_top_level_directories": [".github", "docs", "src", "tests"],
             "ignored_top_level_directories": [".git"],
         },
@@ -84,11 +84,10 @@ def test_unadmitted_top_level_directory_is_rejected(tmp_path: Path) -> None:
 
 def test_local_only_root_allows_untracked_files(tmp_path: Path) -> None:
     init_git_repository(tmp_path)
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "local.md").write_text("local only\n", encoding="utf-8")
+    workbench = tmp_path / "docs" / "workbench"
+    workbench.mkdir(parents=True)
+    (workbench / "local.md").write_text("local only\n", encoding="utf-8")
     config = base_config()
-    config["repository"]["untracked_only_roots"] = ["docs"]
 
     findings = governance.check_untracked_only_roots(tmp_path, config)
 
@@ -97,23 +96,21 @@ def test_local_only_root_allows_untracked_files(tmp_path: Path) -> None:
 
 def test_local_only_root_rejects_tracked_files(tmp_path: Path) -> None:
     init_git_repository(tmp_path)
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    document = docs / "local.md"
+    workbench = tmp_path / "docs" / "workbench"
+    workbench.mkdir(parents=True)
+    document = workbench / "local.md"
     document.write_text("must stay local\n", encoding="utf-8")
-    subprocess.run(["git", "add", "-f", "docs/local.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "-f", "docs/workbench/local.md"], cwd=tmp_path, check=True)
     config = base_config()
-    config["repository"]["untracked_only_roots"] = ["docs"]
 
     findings = validate(tmp_path, config)
 
     assert rule_ids(findings) == {"VCS-001"}
-    assert findings[0].path == "docs/local.md"
+    assert findings[0].path == "docs/workbench/local.md"
 
 
 def test_local_only_root_check_fails_outside_git_repository(tmp_path: Path) -> None:
     config = base_config()
-    config["repository"]["untracked_only_roots"] = ["docs"]
 
     findings = governance.check_untracked_only_roots(tmp_path, config)
 
@@ -125,6 +122,7 @@ def test_local_only_root_policy_is_required_and_well_formed() -> None:
         None,
         [],
         "docs",
+        ["docs"],
         ["../docs"],
         ["/docs"],
         ["."],
@@ -142,6 +140,15 @@ def test_local_only_root_policy_is_required_and_well_formed() -> None:
         assert "VCS-003" in rule_ids(findings)
 
 
+def test_documentation_root_cannot_itself_be_local_only() -> None:
+    config = base_config()
+    config["repository"]["documentation_roots"] = ["docs/workbench"]
+
+    findings = governance.check_config(config, today=dt.date(2026, 7, 30))
+
+    assert "VCS-003" in rule_ids(findings)
+
+
 def test_missing_git_is_a_hard_local_only_root_failure(tmp_path: Path, monkeypatch) -> None:
     config = base_config()
 
@@ -153,6 +160,35 @@ def test_missing_git_is_a_hard_local_only_root_failure(tmp_path: Path, monkeypat
     findings = governance.check_untracked_only_roots(tmp_path, config)
 
     assert rule_ids(findings) == {"VCS-002"}
+
+
+def test_formal_documentation_must_be_tracked(tmp_path: Path) -> None:
+    init_git_repository(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    document = docs / "formal.md"
+    document.write_text("formal\n", encoding="utf-8")
+    config = base_config()
+
+    findings = governance.check_versioned_documentation(tmp_path, config)
+
+    assert rule_ids(findings) == {"VCS-004"}
+    assert findings[0].path == "docs/formal.md"
+
+    subprocess.run(["git", "add", "docs/formal.md"], cwd=tmp_path, check=True)
+
+    assert governance.check_versioned_documentation(tmp_path, config) == []
+
+
+def test_local_workbench_is_excluded_from_formal_document_checks(tmp_path: Path) -> None:
+    init_git_repository(tmp_path)
+    workbench = tmp_path / "docs" / "workbench"
+    workbench.mkdir(parents=True)
+    (workbench / "draft.md").write_text("[missing](absent.md)\n", encoding="utf-8")
+    config = base_config()
+
+    assert governance.check_versioned_documentation(tmp_path, config) == []
+    assert governance.check_documentation(tmp_path, config) == []
 
 
 def test_implementation_package_requires_registry_entry(tmp_path: Path) -> None:
@@ -244,6 +280,21 @@ def test_broken_local_markdown_link_is_rejected(tmp_path: Path) -> None:
     findings = validate(tmp_path, config)
 
     assert "DOC-001" in rule_ids(findings)
+
+
+def test_active_and_decision_gate_document_statuses_are_accepted(tmp_path: Path) -> None:
+    config = base_config()
+    plans = tmp_path / "docs" / "plans"
+    plans.mkdir(parents=True)
+    (plans / "active.md").write_text("# Active program\n\n> 状态：Active\n", encoding="utf-8")
+    (plans / "gate.md").write_text(
+        "# Decision gate\n\n> 状态：Decision Gate（本地执行材料，不进入 Git）\n",
+        encoding="utf-8",
+    )
+
+    findings = governance.check_documentation(tmp_path, config)
+
+    assert findings == []
 
 
 def test_forbidden_workspace_dependency_is_rejected(tmp_path: Path) -> None:

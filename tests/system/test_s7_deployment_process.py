@@ -54,6 +54,7 @@ OPERATION_ID = bytes.fromhex("76" * 16)
 AUTHORITY_SERVICE_PRINCIPAL = bytes.fromhex("77" * 16)
 AUTHORITY_OWNER_ID = bytes.fromhex("78" * 16)
 EMPTY_OPERATION_ID = bytes.fromhex("7b" * 16)
+TURNOVER_OPERATION_ID = bytes.fromhex("7d" * 16)
 REFERENCE_LIFECYCLE_BUDGET_NANOS = 1_000_000_000
 
 
@@ -345,6 +346,19 @@ class InstalledControllerProfile:
             str(authority_uid),
             str(authority_gid),
         ]
+
+    def turnover_tenure_command(
+        self,
+        store_instance_id: bytes,
+        *,
+        operation_id: bytes = TURNOVER_OPERATION_ID,
+    ) -> list[str]:
+        command = self.acquire_tenure_command(store_instance_id)
+        subcommand_index = len(self.service.command_prefix) + 1
+        assert command[subcommand_index] == "acquire-tenure-v1"
+        command[subcommand_index] = "turnover-tenure-v1"
+        command.append(operation_id.hex())
+        return command
 
     def runtime_serve_command(self) -> list[str]:
         return [
@@ -730,7 +744,7 @@ def _runtime_socket_accepts_probe(profile: InstalledControllerProfile) -> bool:
     probe = _run_text(
         [
             *profile.service.command_prefix,
-            os.fspath(Path(sys.executable).resolve()),
+            "/usr/bin/python3",
             "-c",
             (
                 "import socket,sys; "
@@ -969,6 +983,29 @@ def _acquire_tenure(
     return receipt
 
 
+def _turnover_tenure(
+    profile: InstalledControllerProfile,
+    store_instance_id: bytes,
+    *,
+    operation_id: bytes = TURNOVER_OPERATION_ID,
+) -> tuple[dict[str, str], str]:
+    with _authority_server(profile):
+        turned_over = _run_controller(
+            profile.turnover_tenure_command(
+                store_instance_id,
+                operation_id=operation_id,
+            ),
+            profile,
+        )
+    assert turned_over.returncode == 0, turned_over.stdout + turned_over.stderr
+    assert turned_over.stderr == ""
+    receipt = _receipt(turned_over.stdout, "controller_turnover_tenure_v1")
+    assert _hex_field(receipt, "operation_id", 16) == operation_id
+    assert receipt["writer_epoch"] == "2"
+    assert receipt["supersedes_through_epoch"] == "1"
+    return receipt, turned_over.stdout
+
+
 def _kill_runtime_process_group(
     profile: InstalledControllerProfile, process: subprocess.Popen[str]
 ) -> None:
@@ -997,7 +1034,7 @@ def _runtime_request_sink(
     runtime = profile.runtime.service
     socket_path = profile.runtime.provisioning.socket_path
     capture_directory = profile.root / "runtime-request-sink"
-    capture_path = capture_directory / "request-magics.txt"
+    capture_path = capture_directory / "request-events.txt"
     _run_checked(
         [
             "sudo",
@@ -1029,6 +1066,18 @@ def read_exact(stream, length):
     return bytes(chunks)
 
 
+def read_prefix_or_prewrite_eof(stream):
+    chunks = bytearray()
+    while len(chunks) < 4:
+        chunk = stream.recv(4 - len(chunks))
+        if not chunk:
+            if not chunks:
+                return None
+            raise EOFError(f"closed after {len(chunks)} of 4 prefix bytes")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
 socket_path, capture_path, connection_count = sys.argv[1:]
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
@@ -1040,11 +1089,17 @@ try:
         while captured < int(connection_count):
             stream, _ = listener.accept()
             with stream:
-                length = int.from_bytes(read_exact(stream, 4), "big")
+                prefix = read_prefix_or_prewrite_eof(stream)
+                if prefix is None:
+                    capture.write(b"PREWRITE_EOF\\n")
+                    os.fsync(capture.fileno())
+                    captured += 1
+                    continue
+                length = int.from_bytes(prefix, "big")
                 if length == 0:
                     continue
                 payload = read_exact(stream, length)
-                capture.write(payload[:4].hex().encode("ascii") + b"\\n")
+                capture.write(payload[:4] + b"\\n")
                 os.fsync(capture.fileno())
                 captured += 1
 finally:
@@ -1057,7 +1112,7 @@ finally:
     process = subprocess.Popen(
         [
             *runtime.command_prefix,
-            os.fspath(Path(sys.executable).resolve()),
+            "/usr/bin/python3",
             "-c",
             sink_source,
             os.fspath(socket_path),
@@ -1113,10 +1168,8 @@ finally:
         _run_checked(["sudo", "-n", "rm", "-f", "--", os.fspath(socket_path)])
 
 
-def _request_magics(capture_path: Path) -> list[bytes]:
-    encoded = _root_read(capture_path).splitlines()
-    assert all(len(value) == 8 for value in encoded)
-    return [bytes.fromhex(value.decode("ascii")) for value in encoded]
+def _request_events(capture_path: Path) -> list[bytes]:
+    return _root_read(capture_path).splitlines()
 
 
 def test_real_deployment_process_initializes_commits_replays_and_rejects_conflict_without_mutation(
@@ -1738,7 +1791,7 @@ def test_real_deployment_process_initializes_commits_replays_and_rejects_conflic
     _assert_only_controller_store_files(profile)
 
 
-def test_lost_runtime_response_reconcile_sends_one_query_and_no_additional_apply(
+def test_lost_runtime_response_reconcile_records_prewrite_eof_and_no_additional_apply(
     installed_controller_profile: InstalledControllerProfile,
 ) -> None:
     profile = installed_controller_profile
@@ -1771,21 +1824,47 @@ def test_lost_runtime_response_reconcile_sends_one_query_and_no_additional_apply
 
         stdout, stderr = sink.communicate(timeout=5)
         assert sink.returncode == 0, stdout + stderr
-        assert _request_magics(capture_path) == [b"PXAR", b"PXQR"]
+        assert _request_events(capture_path) == [b"PXAR", b"PREWRITE_EOF"]
 
     _assert_only_controller_store_files(profile)
 
 
-def test_runtime_active_sigkill_restart_reconciles_new_epoch_then_empty_exact_zero(
+def test_runtime_restart_turns_over_tenure_then_retires_empty_exact_zero(
     installed_controller_profile: InstalledControllerProfile,
 ) -> None:
     profile = installed_controller_profile
     store_instance_id = _initialize_and_commit_loop(profile)
+    initial_tenure = _acquire_tenure(profile, store_instance_id)
+    initial_tenure_operation = _hex_field(initial_tenure, "operation_id", 16)
+    turnover_operation = (
+        TURNOVER_OPERATION_ID
+        if initial_tenure_operation != TURNOVER_OPERATION_ID
+        else bytes.fromhex("7e" * 16)
+    )
+
+    # A new tenure is not a substitute for a current Runtime bootstrap/binding.
+    # Keep Authority live here so the failure is owned by Controller state, not
+    # by an unavailable transport endpoint.
+    before_missing_binding = _controller_store_bytes(profile)
+    with _authority_server(profile):
+        missing_binding = _run_controller(
+            profile.turnover_tenure_command(
+                store_instance_id,
+                operation_id=turnover_operation,
+            ),
+            profile,
+        )
+    assert missing_binding.returncode != 0
+    assert missing_binding.stdout == ""
+    assert missing_binding.stderr == (
+        "paraegox-deploymentd failed closed; code=PXDC-TENURE-FAILED-CLOSED "
+        "stage=acquire_tenure\n"
+    )
+    assert _controller_store_bytes(profile) == before_missing_binding
 
     with _runtime_server(profile) as runtime_process:
         initial_bootstrap = _bootstrap_runtime(profile, store_instance_id)
         initial_epoch = int(initial_bootstrap["runtime_host_epoch"])
-        _acquire_tenure(profile, store_instance_id)
 
         applied = _run_controller(profile.apply_command(store_instance_id), profile)
         assert applied.returncode == 0, applied.stdout + applied.stderr
@@ -1839,6 +1918,50 @@ def test_runtime_active_sigkill_restart_reconciles_new_epoch_then_empty_exact_ze
         finally:
             _run_checked(["sudo", "-n", "chmod", "0660", os.fspath(runtime_socket)])
 
+        # acquire-tenure-v1 remains ensure-once after restart. With Authority
+        # offline it must replay epoch 1 without changing the Controller store.
+        before_ensure = _controller_store_bytes(profile)
+        ensured = _run_controller(
+            profile.acquire_tenure_command(store_instance_id),
+            profile,
+        )
+        assert ensured.returncode == 0, ensured.stdout + ensured.stderr
+        assert ensured.stderr == ""
+        ensured_receipt = _receipt(
+            ensured.stdout,
+            "controller_acquire_tenure_v1",
+        )
+        assert _hex_field(ensured_receipt, "operation_id", 16) == initial_tenure_operation
+        assert ensured_receipt["writer_epoch"] == "1"
+        assert ensured_receipt["supersedes_through_epoch"] == "0"
+        assert _controller_store_bytes(profile) == before_ensure
+
+        turnover_receipt, turnover_stdout = _turnover_tenure(
+            profile,
+            store_instance_id,
+            operation_id=turnover_operation,
+        )
+        assert turnover_receipt["writer_epoch"] == "2"
+        assert turnover_receipt["supersedes_through_epoch"] == "1"
+        turnover_store = _controller_store_bytes(profile)
+
+        # The caller-stable operation ID is an exact replay key. Authority is
+        # offline, so a retry can only reuse the committed response; epoch 3
+        # would require an impermissible new exchange.
+        replayed_turnover = _run_controller(
+            profile.turnover_tenure_command(
+                store_instance_id,
+                operation_id=turnover_operation,
+            ),
+            profile,
+        )
+        assert replayed_turnover.returncode == 0, (
+            replayed_turnover.stdout + replayed_turnover.stderr
+        )
+        assert replayed_turnover.stderr == ""
+        assert replayed_turnover.stdout == turnover_stdout
+        assert _controller_store_bytes(profile) == turnover_store
+
         committed_empty = _run_controller(profile.commit_empty_command(store_instance_id), profile)
         assert committed_empty.returncode == 0, committed_empty.stdout + committed_empty.stderr
         assert committed_empty.stderr == ""
@@ -1852,6 +1975,7 @@ def test_runtime_active_sigkill_restart_reconciles_new_epoch_then_empty_exact_ze
         empty_terminal_ref = _hex_field(empty_receipt, "terminal_result_ref", 16)
         empty_slice_digest = _hex_field(empty_receipt, "target_slice_digest", 32)
         assert empty_receipt["source_plan_revision"] == "2"
+        assert empty_receipt["writer_epoch"] == "2"
         assert empty_receipt["terminal_outcome"] == "2"
         assert empty_receipt["terminal_head"] == "3"
         assert _hex_field(empty_receipt, "desired_head_digest", 32) == empty_slice_digest
@@ -1862,5 +1986,20 @@ def test_runtime_active_sigkill_restart_reconciles_new_epoch_then_empty_exact_ze
         assert retired.stdout == (
             f"controller_reconcile_v1 outcome=retired receipt={empty_terminal_ref.hex()}\n"
         )
+
+        retired_store = _controller_store_bytes(profile)
+        replayed_after_retirement = _run_controller(
+            profile.turnover_tenure_command(
+                store_instance_id,
+                operation_id=turnover_operation,
+            ),
+            profile,
+        )
+        assert replayed_after_retirement.returncode == 0, (
+            replayed_after_retirement.stdout + replayed_after_retirement.stderr
+        )
+        assert replayed_after_retirement.stderr == ""
+        assert replayed_after_retirement.stdout == turnover_stdout
+        assert _controller_store_bytes(profile) == retired_store
 
     _assert_only_controller_store_files(profile)

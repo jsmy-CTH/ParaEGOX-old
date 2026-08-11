@@ -44,7 +44,19 @@ not independently prove consumption:
 
 An unconsumed prerequisite may be admitted as `experimental` or `enabler`, but it must remain
 internal, identify the bounded batch that will connect it, and include a removal condition. It is
-not a completed capability.
+not a completed capability. A strategic CoreService named by an Accepted ADR or authoritative
+roadmap may establish its ownership boundary before a real running consumer only when all of the
+following are recorded:
+
+- its owner, mutation authority, and explicit non-owner responsibilities;
+- a non-placeholder contract and mechanism with focused semantic evidence;
+- the exact near-term integration batch or stage that will supply the runtime use path;
+- its `experimental`/`enabler` status and the prohibition on presenting it as running capability;
+- a batch-end checkpoint that will fold it back, remove it, or merge it if the promised use path
+  and evidence do not materialize.
+
+This narrow exception does not apply to ordinary helpers, wrappers, provider adapters, or empty
+architecture-shaped packages. Their package separation still requires concrete current evidence.
 
 ## Keep ownership smaller than deployment
 
@@ -53,6 +65,24 @@ mutation authority explicit, but colocate implementation until isolation, lifecy
 consumption requires separation. New generic `common`, `shared`, `utils`, `base`, `core`,
 `helpers`, `managers`, `registry`, or `framework` boundaries require explicit justification and at
 least two independent consumers.
+
+The same rule applies below package level. A new module or source file must own a coherent concern
+that materially reduces coupling or protects an admitted boundary. File length, an architecture
+diagram, a one-call wrapper, a test-only mirror, or a planned future consumer is not sufficient.
+Prefer the smallest complete implementation inside the current owner, and split only when at least
+one of these facts is present and recorded in the change evidence:
+
+- a dependency or compile-isolation boundary keeps heavy or provider-specific dependencies out of
+  consumers that do not need them;
+- a distinct process, restart, deployment, trust, Secret, or failure lifecycle must be isolated;
+- a versioned language-neutral contract has an independent producer and consumer;
+- two independently owned runtime consumers need the same implementation rather than merely the
+  same value shape.
+
+At bounded-batch closeout, remove, merge, or fold back one-use enablers, wrappers, strategic
+CoreService foundations, and orphan modules that did not acquire the promised runtime use path and
+semantic evidence. Do not preserve fragmentation only because the intermediate files already
+exist.
 
 ## Keep public surfaces intentional
 
@@ -91,13 +121,41 @@ or dual-write. Retry/reconcile likewise has one owner and one budget per operati
 - Do not overwrite unrelated dirty work or hide it with formatting churn.
 - Keep generated artifacts identifiable and reproducible; never edit generated and authoritative
   sources as if both were truth.
+- Parallelize disjoint research and implementation, not duplicate builds. One coordinator owns
+  Cargo validation for a shared worktree; run the validation ladder serially against the shared
+  repository target directory unless a genuinely independent target/toolchain boundary requires
+  isolation. Do not launch concurrent workspace checks or per-agent target directories that rebuild
+  the same dependency graph.
 
-## Validate locally
+### Mac source authority and remote Rust validation
+
+For the current ParaEGOX development workflow, the Mac repository is the only writable source of
+truth. All source changes, conflict resolution, formatting corrections, and Git history are created
+there. A designated Linux build server may consume an exact Git commit/ref or Git patch for Rust
+validation, but it is not a development checkout whose source can flow back into the Mac.
+
+- Prefer sending source from Mac to the build server through Git. When Git transport is unavailable,
+  an explicit user authorization may permit a one-way fallback consisting only of the required
+  uncompressed files or bounded file chunks sent from Mac to a remote temporary path. Verify the
+  completed remote file against its Mac SHA-256 digest before atomically replacing the validation
+  copy. Tar archives and other compressed source snapshots remain prohibited.
+- Never extract, copy, fetch, or merge server-side source into the Mac worktree. Server-generated
+  `target` data and Cargo caches remain disposable validation artifacts.
+- Run remote formatting in check mode. A failure is fixed in the Mac repository and sent again as a
+  new Git object or patch; a remotely formatted file is never imported.
+- Record the tested Git object or patch identity so a passing server result is tied to exact Mac
+  source. For an explicitly authorized direct-file fallback, also record matching local and remote
+  SHA-256 digests for every transferred file. Use locked dependency resolution and do not return a
+  server-mutated `Cargo.lock`.
+- Any exception to this one-way boundary requires explicit user authorization before the transfer.
+
+## Validate on admitted execution hosts
 
 The repository has a pinned Rust workspace for admitted core slices and Python 3.11/`uv`
 governance tooling. The commands below validate those current surfaces; they are not evidence that
 a production RuntimeHost exists, and they are not a claim about the eventual ROS2, Jetson,
-hardware, or production runtime support matrix.
+hardware, or production runtime support matrix. They are the complete repository-wide gates, not a
+command list authorizing every host to execute every tool.
 
 ```bash
 cargo fmt --all --check
@@ -112,11 +170,35 @@ uv run --frozen python scripts/check_governance.py
 uv run --frozen pytest
 ```
 
+### Current Mac source-authority regression
+
+The current Mac source-authority workflow prohibits direct or indirect execution of Cargo, rustc,
+rustfmt, or any other Rust build tool. The same rule applies when pytest, a script, task runner,
+build helper, or child process would launch the tool. Therefore do not run bare
+`uv run --frozen pytest` on this Mac. The complete `scripts/check_governance.py` is prohibited too:
+its required workspace check invokes `cargo metadata --locked`, so removing, filtering, mocking, or
+bypassing that phase cannot produce valid governance evidence. The permitted non-Rust Mac checks
+are:
+
+```bash
+uv lock --check
+uv run --frozen ruff check .
+uv run --frozen pytest tests/agent_worker tests/console tests/contract tests/unit tests/governance/test_s7_pure_compile_boundary.py tests/governance/test_s7_tenure_authority_boundary.py
+```
+
+The complete governance checker, its excluded integration test, and all system tests remain
+required and run on Ubuntu/CI with the pinned Rust toolchain in this workflow. All Rust commands in
+the repository-wide list also remain required on their admitted Ubuntu/CI host. A Mac result may
+report the permitted checks that actually ran, but must report the complete governance checker as
+not run; it must never claim a governance pass from a Cargo-free subset. This host-specific
+orchestration split is not a waiver, a global skip, or a reduction of required validation.
+
 Cargo is the authority for Rust dependencies, builds and tests, while `uv`, Python
 `pyproject.toml` and `uv.lock` remain
 the authority for Python governance tooling, SDKs and workloads. Neither tool may maintain a second
-lock or dependency truth for the other ecosystem. `cargo metadata --locked` failure is a hard
-governance failure; do not skip Rust checks when Cargo or the pinned toolchain is unavailable.
+lock or dependency truth for the other ecosystem. `cargo metadata --locked` failure remains a hard
+governance failure on the admitted Ubuntu/CI checker host. On the current Mac, report the complete
+checker as not run under the host policy rather than skipping its Cargo phase or claiming it passed.
 
 Hardware, external-service, or manually authorized checks remain separate and must not be reported
 as passing based on local mocks.

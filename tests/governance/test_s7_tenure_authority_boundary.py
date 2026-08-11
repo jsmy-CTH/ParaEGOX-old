@@ -32,6 +32,118 @@ PUBLIC_DEPLOYMENTD_SYMBOLS = {
     "DeploymentdProcessError",
     "run_deploymentd_process",
 }
+PUBLIC_DEVELOPER_LOCAL_SYMBOLS = {
+    "DeveloperLocalPeerIdentityV1",
+    "DeveloperLocalTenureAuthorityIdentityBytesV1",
+    "DeveloperLocalTenureAuthorityConfigV1",
+    "DeveloperLocalTenureAuthorityFactsV1",
+    "DeveloperLocalTenureAuthorityV1",
+    "DeveloperLocalTenureAuthorityError",
+    "DeveloperFixtureIdentitySeedV1",
+    "DeveloperFixtureDerivedIdentityV1",
+    "DeveloperFixturePathsV1",
+    "DeveloperFixtureRuntimePinsV1",
+    "DeveloperFixtureControllerCredentialsV1",
+    "DeveloperFixtureFabricEndpointV1",
+    "DeveloperFixtureAgentStackInputV1",
+    "DeveloperFixtureAgentStackOutcomeV1",
+    "DeveloperProvisionedAgentStackInputV1",
+    "DeveloperProvisionedAgentStackOutcomeV1",
+    "DeveloperFixtureAgentStackDeactivationOutcomeV1",
+    "DeveloperFixtureAgentStackError",
+    "run_developer_fixture_agent_stack_v1",
+    "run_developer_provisioned_agent_stack_v1",
+    "deactivate_developer_fixture_agent_stack_v1",
+    "DeveloperFixtureModelAgentStackInputV1",
+    "DeveloperFixtureModelAgentStackOutcomeV1",
+    "DeveloperProvisionedModelAgentStackInputV1",
+    "DeveloperProvisionedModelAgentStackOutcomeV1",
+    "DeveloperFixtureModelAgentStackDeactivationOutcomeV1",
+    "DeveloperFixtureModelAgentStackError",
+    "run_developer_fixture_model_agent_stack_v1",
+    "run_developer_provisioned_model_agent_stack_v1",
+    "deactivate_developer_fixture_model_agent_stack_v1",
+    "deactivate_developer_provisioned_model_agent_stack_v1",
+    "DeveloperFixtureDistributedCoordinatorV1",
+    "DeveloperFixtureDistributedTransportV1",
+    "DeveloperFixtureDistributedTargetV1",
+    "DeveloperFixtureDistributedAgentStackInputV1",
+    "DeveloperFixtureDistributedNodeV1",
+    "PreparedDeveloperFixtureDistributedAgentStackV1",
+    "DeveloperFixtureDistributedAgentStackOutcomeV1",
+    "DeveloperFixtureDistributedAgentStackError",
+    "prepare_developer_fixture_distributed_agent_stack_v1",
+    "complete_developer_fixture_distributed_agent_stack_v1",
+}
+PUBLIC_DEVELOPER_DEPLOYMENT_SYMBOLS = {
+    "DeveloperDeploymentEnrollmentFactsFieldsV1",
+    "DeveloperDeploymentEnrollmentFactsV1",
+    "DeveloperDeploymentStartFieldsV1",
+    "DeveloperDeploymentStartInputV1",
+    "DeveloperDeploymentStartModeV1",
+    "DeveloperDeploymentOwnerV1",
+    "DeveloperDeploymentReadyV1",
+    "DeveloperDeploymentStartOutcomeV1",
+    "DeveloperDeploymentErrorV1",
+    "start_developer_deployment_v1",
+}
+PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS = {
+    "DeveloperDeploymentAgentBootstrapStartFieldsV1",
+    "DeveloperDeploymentAgentBootstrapStartInputV1",
+    "DeveloperDeploymentAgentBootstrapReadyV1",
+    "DeveloperDeploymentAgentBootstrapStartOutcomeV1",
+    "start_developer_deployment_agent_bootstrap_v1",
+}
+DEVELOPER_LOCAL_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperLocalPeerIdentityV1, "
+    "DeveloperLocalTenureAuthorityIdentityBytesV1, "
+    "DeveloperLocalTenureAuthorityConfigV1, DeveloperLocalTenureAuthorityFactsV1, "
+    "DeveloperLocalTenureAuthorityV1, DeveloperLocalTenureAuthorityError, "
+    "DeveloperFixtureIdentitySeedV1, DeveloperFixtureDerivedIdentityV1, "
+    "DeveloperFixturePathsV1, DeveloperFixtureRuntimePinsV1, "
+    "DeveloperFixtureControllerCredentialsV1, DeveloperFixtureFabricEndpointV1, "
+    "DeveloperFixtureAgentStackInputV1, DeveloperFixtureAgentStackOutcomeV1, "
+    "DeveloperProvisionedAgentStackInputV1, DeveloperProvisionedAgentStackOutcomeV1, "
+    "DeveloperFixtureAgentStackDeactivationOutcomeV1, "
+    "DeveloperFixtureAgentStackError, run_developer_fixture_agent_stack_v1, "
+    "run_developer_provisioned_agent_stack_v1, "
+    "deactivate_developer_fixture_agent_stack_v1, "
+    "DeveloperFixtureModelAgentStackInputV1, "
+    "DeveloperFixtureModelAgentStackOutcomeV1, "
+    "DeveloperProvisionedModelAgentStackInputV1, "
+    "DeveloperProvisionedModelAgentStackOutcomeV1, "
+    "DeveloperFixtureModelAgentStackDeactivationOutcomeV1, "
+    "DeveloperFixtureModelAgentStackError, "
+    "run_developer_fixture_model_agent_stack_v1, "
+    "run_developer_provisioned_model_agent_stack_v1, "
+    "deactivate_developer_fixture_model_agent_stack_v1, "
+    "deactivate_developer_provisioned_model_agent_stack_v1}"
+)
+DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperFixtureDistributedCoordinatorV1, "
+    "DeveloperFixtureDistributedTransportV1, DeveloperFixtureDistributedTargetV1, "
+    "DeveloperFixtureDistributedAgentStackInputV1, DeveloperFixtureDistributedNodeV1, "
+    "PreparedDeveloperFixtureDistributedAgentStackV1, "
+    "DeveloperFixtureDistributedAgentStackOutcomeV1, "
+    "DeveloperFixtureDistributedAgentStackError, "
+    "prepare_developer_fixture_distributed_agent_stack_v1, "
+    "complete_developer_fixture_distributed_agent_stack_v1}"
+)
+DEVELOPER_DEPLOYMENT_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperDeploymentEnrollmentFactsFieldsV1, "
+    "DeveloperDeploymentEnrollmentFactsV1, DeveloperDeploymentStartFieldsV1, "
+    "DeveloperDeploymentStartInputV1, DeveloperDeploymentStartModeV1, "
+    "DeveloperDeploymentOwnerV1, DeveloperDeploymentReadyV1, "
+    "DeveloperDeploymentStartOutcomeV1, DeveloperDeploymentErrorV1, "
+    "start_developer_deployment_v1}"
+)
+DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT = (
+    "paraegox_deployment::{DeveloperDeploymentAgentBootstrapStartFieldsV1, "
+    "DeveloperDeploymentAgentBootstrapStartInputV1, "
+    "DeveloperDeploymentAgentBootstrapReadyV1, "
+    "DeveloperDeploymentAgentBootstrapStartOutcomeV1, "
+    "start_developer_deployment_agent_bootstrap_v1}"
+)
 
 
 def _read_required(path: Path) -> str:
@@ -81,6 +193,29 @@ def test_only_the_two_real_process_facades_are_promoted() -> None:
     assert symbols == PUBLIC_DEPLOYMENTD_SYMBOLS
 
 
+def test_turnover_tenure_is_an_exact_owned_replay_surface() -> None:
+    process_source = _read_required(DEPLOYMENT_SRC / "deployment_process.rs")
+    production_source = process_source.split("#[cfg(test)]", maxsplit=1)[0]
+    tenure_surface = production_source.split("fn acquire_tenure(", maxsplit=1)[1].split(
+        "fn bootstrap_runtime(", maxsplit=1
+    )[0]
+
+    assert '"acquire-tenure-v1" if arguments.len() == 18' in production_source
+    assert '"turnover-tenure-v1" if arguments.len() == 19' in production_source
+    assert "operation_id: parse_nonzero_hex(&arguments[18])?" in production_source
+    assert "TenureAcquisitionMode::EnsureOnce" in tenure_surface
+    assert "TenureAcquisitionMode::Turnover" in tenure_surface
+    assert "UnixTenureAuthorityClient::try_new" in tenure_surface
+    assert "ControllerStore::open" in tenure_surface
+    assert ".tenure_transaction(operation_id)" in tenure_surface
+    assert "if let Some(exact) = exact_operation" in tenure_surface
+    assert "if unresolved.is_some()" in tenure_surface
+    assert "global_latest_committed" in tenure_surface
+    assert "validate_durable_tenure_request" in tenure_surface
+    assert "validate_turnover_tenure_state" in tenure_surface
+    assert "ReferenceBootstrapStateV1::ReadyForApply" in tenure_surface
+
+
 def test_governance_claims_exact_one_shot_controller_vertical_without_second_restart_owner(
 ) -> None:
     governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
@@ -97,14 +232,22 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "paraegox_deployment::run_deploymentd_process",
         (
             "paraegox-deploymentd initialize-reference-v1/commit-reference-loop-v1/"
-            "commit-reference-empty-v1/acquire-tenure-v1/bootstrap-runtime-v1/"
+            "commit-reference-empty-v1/acquire-tenure-v1/turnover-tenure-v1/"
+            "bootstrap-runtime-v1/"
             "apply-reference-v1/reconcile-reference-once-v1/"
-            "migrate-controller-journal-v7-to-v8-v1 CLI"
+            "migrate-controller-journal-v7-to-v8-v1/"
+            "initialize-distributed-agent-stack-v1/"
+            "observe-distributed-agent-stack-nodes-once-v1 CLI"
         ),
+        DEVELOPER_LOCAL_ENTRYPOINT,
+        DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT,
+        DEVELOPER_DEPLOYMENT_ENTRYPOINT,
+        DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT,
     ]
     assert package["consumers"] == [
         "paraegox-tenure-authority",
         "paraegox-deploymentd",
+        "paraegox-local",
     ]
     assert "one-shot DeploymentController" in package["responsibility"]
     for command in (
@@ -112,10 +255,13 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         "commit-reference-loop-v1",
         "commit-reference-empty-v1",
         "acquire-tenure-v1",
+        "turnover-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
         "reconcile-reference-once-v1",
         "migrate-controller-journal-v7-to-v8-v1",
+        "initialize-distributed-agent-stack-v1",
+        "observe-distributed-agent-stack-nodes-once-v1",
     ):
         assert command in package["responsibility"]
     assert "exact signed PXAR before one direct Runtime send" in package["responsibility"]
@@ -127,6 +273,13 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
     assert "bootstrap refresh may legitimately pin a newer Runtime epoch" in package[
         "responsibility"
     ]
+    assert "It remains ensure-once after a committed tenure" in package["responsibility"]
+    assert "one caller-stable nonzero 16-byte operation ID" in package["responsibility"]
+    assert "a different ID cannot overtake unresolved work" in package["responsibility"]
+    assert "fully cross-pinned durable Runtime bootstrap binding" in package["responsibility"]
+    assert "not a fresh Runtime liveness probe" in package["responsibility"]
+    assert "automatic restart detector" in package["responsibility"]
+    assert "second restart/reassembly authority" in package["responsibility"]
     assert "committed at 1ed704c" in package["responsibility"]
     assert "verified by Ubuntu CI run 30748840399" in package["responsibility"]
     assert "owner-private exact PXQR/PXQS" in package["responsibility"]
@@ -138,9 +291,11 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
     assert "general workload admission and wider deployment profiles remain absent" in package[
         "responsibility"
     ]
-    assert "Runtime alone owns fixed-profile Loop/Empty restart reassembly" in package[
-        "responsibility"
-    ]
+    assert (
+        "Runtime alone owns fixed-profile Loop/Empty and managed Fabric/Model/Agent restart "
+        "reassembly"
+        in package["responsibility"]
+    )
     assert "does not constitute general Thread/Process live-state recovery" in package[
         "responsibility"
     ]
@@ -150,16 +305,24 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         for api in governance["public_apis"]
         if str(api["module"]).replace("-", "_") == "paraegox_deployment"
     ]
-    assert len(public_rows) == 1
-    assert {str(symbol) for symbol in public_rows[0]["symbols"]} == (
-        PUBLIC_AUTHORITY_SYMBOLS | PUBLIC_DEPLOYMENTD_SYMBOLS
-    )
-    compatibility = public_rows[0]["compatibility"]
+    assert len(public_rows) == 4
+    public_rows_by_symbols = {
+        frozenset(str(symbol) for symbol in row["symbols"]): row for row in public_rows
+    }
+    process_symbols = frozenset(PUBLIC_AUTHORITY_SYMBOLS | PUBLIC_DEPLOYMENTD_SYMBOLS)
+    assert set(public_rows_by_symbols) == {
+        process_symbols,
+        frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS),
+        frozenset(PUBLIC_DEVELOPER_DEPLOYMENT_SYMBOLS),
+        frozenset(PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS),
+    }
+    compatibility = public_rows_by_symbols[process_symbols]["compatibility"]
     for command in (
         "initialize-reference-v1",
         "commit-reference-loop-v1",
         "commit-reference-empty-v1",
         "acquire-tenure-v1",
+        "turnover-tenure-v1",
         "bootstrap-runtime-v1",
         "apply-reference-v1",
         "reconcile-reference-once-v1",
@@ -180,6 +343,25 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         in compatibility
     )
     assert "communicate over real strict versioned wires" in compatibility
+    assert "`acquire-tenure-v1` remains ensure-once" in compatibility
+    assert "Relative to that exact acquire grammar" in compatibility
+    assert "adds exactly one trailing nonzero 16-byte caller-stable operation ID" in compatibility
+    assert "durable transaction replay key, not caller nonce entropy" in compatibility
+    assert "a different ID cannot replace unresolved work" in compatibility
+    assert "fully cross-pinned durable Runtime bootstrap binding" in compatibility
+    assert "does not prove fresh Runtime liveness" in compatibility
+    assert "detect restart automatically" in compatibility
+    assert "create a second restart/reassembly authority" in compatibility
+
+    developer_compatibility = public_rows_by_symbols[
+        frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS)
+    ]["compatibility"]
+    assert "real durable Controller" in developer_compatibility
+    assert "move-only two-phase owner path" in developer_compatibility
+    assert "authentication nonce must equal the challenge query nonce byte-for-byte" in (
+        developer_compatibility
+    )
+    assert "choose no provider or credential" in developer_compatibility
 
     waiver_reasons = {
         waiver["id"]: waiver["reason"] for waiver in governance["waivers"]
@@ -239,7 +421,10 @@ def test_s7_f_query_contracts_are_registered_with_exact_endpoint_consumers() -> 
     )
     assert "canonical authenticated PXQR/PXQS query owner" in package["responsibility"]
     assert "never infers a missing `SourcePlanRef`" in package["responsibility"]
-    assert "do not by themselves create a Runtime query endpoint" in package["responsibility"]
+    assert "do not by themselves create a Runtime endpoint" in package["responsibility"]
+    assert "Controller producer" in package["responsibility"]
+    assert "Fabric session" in package["responsibility"]
+    assert "service graph" in package["responsibility"]
 
     api = next(
         row
@@ -336,7 +521,7 @@ def test_s7_runtime_store_query_and_migration_stay_private_behind_real_entrypoin
     assert "exact prepared request-time response channel" in runtime_package["responsibility"]
     assert "reserved-at-crash exact-zero resource shape" in runtime_package["responsibility"]
     assert "same bounded four-byte-framed channel" in runtime_package["responsibility"]
-    assert "canonical PXBR bootstrap, PXQR query, and PXAR v5 apply requests" in runtime_package[
+    assert "canonical PXBR bootstrap, PXQR query and PXAR v5 apply requests" in runtime_package[
         "responsibility"
     ]
     assert "Runtime-signed and request-correlated PXQS" in runtime_package["responsibility"]
@@ -384,3 +569,35 @@ def test_s7_runtime_store_query_and_migration_stay_private_behind_real_entrypoin
         "run_runtime_host_entrypoint",
         "RuntimeHostEntrypointError",
     }.issubset(public_symbols)
+
+
+def test_developer_local_restricted_endpoint_injection_is_owned_and_registered() -> None:
+    runtime_library = _read_required(RUNTIME_SRC / "lib.rs")
+    developer_local = _read_required(RUNTIME_SRC / "runtime_developer_local.rs")
+    assert "RuntimeDeveloperLocalConfigV1" in runtime_library
+    assert "pub fn try_new_with_restricted_runtime_apply_endpoint" in developer_local
+    assert "pub fn try_with_restricted_runtime_apply_endpoint" in developer_local
+    assert "RestrictedRuntimeApplyEndpointConfigV1::try_from_transport_profile" in developer_local
+
+    governance = _load_toml(REPO_ROOT / "governance.toml")["registry"]
+    runtime_package = next(
+        package
+        for package in governance["packages"]
+        if package.get("cargo_package") == "paraegox-runtime"
+    )
+    assert "crates/paraegox-runtime/src/runtime_developer_local.rs" in runtime_package[
+        "first_tests"
+    ]
+
+    developer_api = next(
+        row
+        for row in governance["public_apis"]
+        if row.get("owner") == "Runtime-owned DeveloperLocal lifecycle facade"
+    )
+    assert developer_api["consumers"] == ["paraegox-local"]
+    assert "RuntimeDeveloperLocalConfigV1" in developer_api["symbols"]
+    assert "one all-or-nothing restricted endpoint selection" in developer_api["compatibility"]
+    assert "durable one-way cutover on the same listener" in developer_api["compatibility"]
+    assert "not distributed Agent ActiveReady" in developer_api["compatibility"]
+    assert "crates/paraegox-runtime/src/runtime_developer_local.rs" in developer_api["tests"]
+    assert "crates/paraegox-runtime/src/runtime_control_endpoint.rs" in developer_api["tests"]

@@ -1,10 +1,392 @@
 # ParaEGOX
 
-ParaEGOX is a physics-aware robotics and embodied-agent grounding operating system currently being rebuilt from the ground up.
+ParaEGOX is a distributed Agent OS for robotics and embodied agents, currently being rebuilt from the ground up.
 
 ParaEGOX is based on [PhanthyMotus](https://github.com/4paradigm/phanthymotus). The original baseline remains available on the `archive/phanthymotus-baseline` branch, with its license attribution preserved.
 
-> Status: clean-slate architecture and implementation in progress. ParaEGOX is adopting a Rust-first core with polyglot managed workloads; no stable release is currently available.
+> Status: the current worktree contains the first DeveloperLocal backend, Textual chat composition,
+> and typed one-shot Inspection startup view. Native Intel macOS r29 artifact run `31238285076`
+> remains the local Textual-to-Runtime Echo evidence. Ubuntu r130 commit
+> `92923eef016e6ce060c32113ad3cf5e59ee8520c` is the latest validated public Node/Deployment ref:
+> Node schema v3 publishes PXEA v2, and Deployment schema v2 durably completes the managed
+> Fabric, managed Agent stack, and bootstrap descriptor sequence. Its bounded single-host process
+> smoke passed, while Agent access/session/Echo, two-host execution, and reconnect remain unproved.
+> ParaEGOX is adopting a Rust-first core with polyglot managed workloads; no stable release is
+> currently available.
+
+## Runnable DeveloperLocal slice
+
+The `paraegox` binary composes the real Authority, DeploymentController, Runtime, Runtime-managed
+Zenoh Fabric, ModelService, AgentService, a separate NodeDaemon reference child, owner-private Agent
+and Inspection IPC, and an internal Python Textual child. Runtime starts Fabric, then Model, then
+Agent, and exposes a conversation capability only after the exact signed PXMT ActiveReady receipt is
+durably committed.
+
+There is one public conversation command:
+
+```text
+paraegox chat --config <absolute-paraegox.toml>
+```
+
+Provider, model, state root, and Fabric listener are selected by the strict versioned TOML config,
+not by provider-specific subcommands or override flags. Secret values never belong in config or
+argv; config contains only an exact SecretRef. The chat configuration has one credential-free example at
+[`configs/paraegox.example.toml`](configs/paraegox.example.toml). It currently selects DeepSeek as a
+replaceable validation backend, not as a CLI mode or default model.
+
+The Textual child is installed from this repository's Python project. In a development checkout,
+prepare and activate the locked environment before starting `paraegox`; the Rust parent deliberately
+has no alternate frontend or transport fallback if the internal `paraegox-console` executable is
+absent:
+
+```zsh
+uv sync --locked
+source .venv/bin/activate
+command -v paraegox-console
+```
+
+`paraegox-console` is internal packaging, not a second public conversation command. On macOS, keep
+the example's state root under canonical `/private/tmp` because `/tmp` is a symlink rejected by the
+path policy. The macOS CI artifact contains a SHA-256-checked `tar.gz`; verify its adjacent
+`.sha256` file before extraction. The extracted relocatable directory contains `paraegox`, its
+executable `paraegox-console` sibling, and vendored packages under `python/`; keep them together and
+provide Python 3.11 or newer as `python3` on `PATH`. To exercise the configured DeepSeek path,
+supply the referenced Secret through the process environment and pass an absolute config path:
+
+```zsh
+read -s 'DEEPSEEK_API_KEY?DeepSeek API key: '; echo
+export DEEPSEEK_API_KEY
+CONFIG_PATH="$(pwd)/configs/paraegox.example.toml"
+PARAEGOX_BIN=/absolute/path/to/native/paraegox
+test -x "$PARAEGOX_BIN"
+"$PARAEGOX_BIN" chat --config "$CONFIG_PATH"
+unset DEEPSEEK_API_KEY
+```
+
+Build the native binary on the designated server or GitHub CI and download the complete bundle to
+the Mac. Do not run Cargo on the Mac for this workflow.
+
+Historical Ubuntu validation of r22 source snapshot `ff2d8109` passed workspace formatting, locked
+metadata, and locked all-targets check. It also passed all 39 Inspection tests, all 89
+DeveloperLocal tests under a non-root identity, and all 364 Deployment tests under a non-root
+identity. That r22 workspace Clippy run exposed approximately 30 historical structural lints rather
+than passing. Their corrections are present in later source snapshots, but the r29 macOS artifact
+workflow did not run workspace Clippy and is not presented as a fresh Clippy pass.
+
+Native Intel macOS r29 commit `944ce332` run `31238285076` passed the locked Textual tests and full
+governance checker, built and verified the public native CLI, staged the relocatable bundle, and ran
+the real PTY path through typed Inspection markers, Runtime readiness, Textual-to-Runtime Echo,
+priority Ctrl-C, terminal restoration, and joined parent shutdown. It also verified the bundle
+checksums, executable modes, archive, and artifact upload. A credentialed external DeepSeek smoke is
+still pending, so the configured DeepSeek path must not yet be described as externally validated or
+production ready. For an offline substrate check, use the same config schema with
+`model.provider = "deterministic-echo-v1"` and omit model/SecretRef; `echo: <message>` proves only the
+DeveloperLocal owner chain. The earlier standalone Rust reference frontend has now been removed;
+the internal Textual child is the only current presentation path and there is no alternate public
+`paraegox chat` entry.
+
+The current A2 slice is non-streaming, permits one Model call in flight, and sends only the current
+turn's prompt; conversation-history recall, Memory, Tools, planning, and multi-agent orchestration
+remain later Agent Core work. The parent supplies the internal Textual child only owner-private
+bootstrap-file paths: one for Agent conversation and, when available, one for read-only local
+Inspection. The Python `AgentConversationClient` consumes only the Runtime Agent path and never opens
+raw Zenoh or sees provider/model credentials. A separate strict typed client validates the owner-private
+PXIB v2 bootstrap and performs exactly one no-retry PXIQ Latest exchange before the Textual App starts;
+it strictly correlates the PXIP response and decodes the complete PXIS v2 snapshot. Any bootstrap,
+transport, correlation, or snapshot failure prevents the UI from starting. A successful read is shown
+as three read-only startup-status lines; there is no watch, retry, cache, background refresh, action,
+continuous monitoring, Ops, or federated view. The parent removes both `OPENAI_API_KEY` and
+`DEEPSEEK_API_KEY` from the child environment, and argv carries no raw identity, Node management
+capability, Zenoh route, capability token, or Secret. This typed boundary is not a revived all-in-one
+ConsoleBridge.
+
+The Node contract, Unix same-tenure durable NodeDaemon state, and read-only management protocol are
+now consumed by `paraegox-local`, rather than existing only as a standalone mechanism. The launcher
+creates or securely reopens the exact local Node tenure, commits an initial feature-only status,
+starts a real separate reference child, and accepts its bounded PXNQ/PXNS Latest response only after
+the local management channel, target, tenure, and status fences authenticate. That initial
+single-target NodeStatus deliberately contains zero Runtime observations. It therefore does **not**
+prove Runtime discovery, continuous observation or reconciliation, a production Zenoh carrier,
+registration acquisition, multi-host operation, or distributed readiness. Normal exit joins the
+Textual child and Agent IPC boundary first, then Runtime-managed Agent→Model→Fabric shutdown, the
+NodeDaemon, and finally Authority.
+
+## Runnable Node host substrate: schemas v1, v2, and v3
+
+The separate public command below always starts one split-trust Runtime and one NodeDaemon child.
+Its strict config schema selects the host profile; there is no second G2 command:
+
+```text
+paraegox node --config <absolute-node.toml>
+```
+
+With `schema_version = 1`, the command retains the validated G1 path: it binds the restricted mTLS
+Runtime-apply listener on its fixed legacy generic-rejection behavior, publishes a feature-only Node
+status with zero RuntimeHost observations, and verifies the child through one authenticated typed
+Latest exchange.
+
+With `schema_version = 2`, the same command additively starts the G2 **host-side** path. The Runtime
+listener accepts the bounded Controller-signed PXCC control carrier and returns Runtime-signed PXDR
+Describe facts; while LegacyReady it also carries the frozen PXQR query and accepts the authenticated
+PXFB one-way cutover. A separate Node listener authenticates the Controller before dispatching
+Describe, Latest, Watch, observation-challenge, or Runtime-observation publication through the
+existing sole-owner NodeDaemon store and observation capability. Runtime readiness facts are
+cross-checked before the observation bridge is created. Schema v2 therefore provides the real
+Ubuntu-side listeners, durable owners, and bridge needed by a later external Controller; it does not
+embed that Controller in the node process.
+
+With `schema_version = 3`, the Node retains the complete schema-v2 control path and additionally
+requires `[managed_agent_bootstrap]` with the exact compiled-in
+`provider = "deterministic-echo-v1"` profile. That provider selection, its derived provider ref, and
+the Node config digest are committed into the public-safe Runtime-attested PXEA v2 successor at
+`<node-state-root>/node/enrollment-v2.pxea`. Desired Fabric/Agent service identities, listen endpoint,
+and limits remain Deployment-owned and are not valid Node fields.
+
+All three schemas print `paraegox: node ready` only after their configured local owners and listeners
+have started. The marker does not prove that a Controller connected, PXFB cutover completed, a Runtime
+observation was published, or a desired Agent stack was applied. None of the schemas starts Authority,
+DeploymentController, managed Fabric, Model, Agent, Inspection, Textual, or the chat chain. The
+separate public Controller command described below now exists, but there is still no end-to-end
+two-host process proof, remote Agent conversation path, remote TUI, or partition/reconnect policy.
+The later single-Ubuntu-host smoke exercises the semantic Controller sequence, but does not widen
+the meaning of this Node-local marker.
+
+For the T1 profile, start from
+[`configs/paraegox-node.agent-bootstrap.example.toml`](configs/paraegox-node.agent-bootstrap.example.toml).
+The predecessor schema-v2 example remains at
+[`configs/paraegox-node.example.toml`](configs/paraegox-node.example.toml). Copy the selected file to an
+absolute regular-file path, replace both documentation-only `192.0.2.10` listener addresses with
+IPv4 addresses actually assigned to the host, and update `state_root` plus all six credential paths
+together. Before launch, the same non-root account must create the canonical state root and its exact
+`credentials` child at mode `0700`. Provision distinct PEM CA/certificate/key files for the Runtime
+and Node listeners in that one directory; both certificate SANs must contain their configured IP,
+both keys must be mode `0600`, and CA/certificate files must not be group- or other-writable. The
+agent-bootstrap example selects schema v3, while the predecessor example selects schema v2. To
+retain G1, set `schema_version = 1`, remove both the complete
+`[node_control]` and `[managed_agent_bootstrap]` tables, and provision only the three
+Runtime-listener files. To retain schema v2, omit only `[managed_agent_bootstrap]`. Both examples
+contain only non-secret reference values and public verification keys; replace those pins only from the owning
+Controller/Authority enrollment workflow, never with private seeds. Full credential preparation and
+launch commands are in the local `docs/runbooks/developer-local.md` runbook.
+
+Ubuntu r33 commit `7618f6a51c5eb5731874d2cdf3231603e3a824f7` passed workspace formatting,
+locked metadata, workspace all-target checking, and workspace all-target Clippy with warnings denied.
+The complete `paraegox-local` unit binary passed 98/98 tests as a non-root user; nine focused Local
+filters and three focused non-root Runtime split-trust/provisioning filters also passed. A real
+non-root process smoke reached the readiness marker with exactly one child, one non-loopback TLS
+listener and the two expected private Unix sockets. SIGTERM and SIGINT each exited zero, restart
+preserved byte-identical PXNI/PXNB hashes, forced child death made the parent fail closed with
+`PXLC-NODE-CHILD`, and root launch failed before state with `PXLC-EXECUTION-IDENTITY`. These facts
+prove the G1 host-local substrate and cleanup/restart boundary only.
+
+The host-side G2 validation ref is r51 `b1d1206d2187b85d335ae352c226274d8e9d5827`. Ubuntu passed workspace
+format checking, the focused public-help test 1/1, the complete governance checker, workspace
+all-target checking, workspace all-target Clippy with warnings denied, and the complete non-root
+`paraegox-local` suite 111/111. All workspace all-target test executables also compiled and linked
+successfully under `--no-run`. Workspace doc tests passed, including two Fabric, one Kernel, and one
+runtime-contracts compile-fail doctest; other crates had no doctests. `--no-run` is not a claim that
+the complete workspace test suite executed.
+
+Separately, after the PXQR authentication nonce was bound to the exact Node observation challenge,
+the corresponding Deployment source/binary lineage passed the complete non-root Deployment suite
+374/374. No later change through r51 modified Deployment source, but the handoff did not preserve the
+exact immutable ref of that 374/374 invocation. It is therefore lineage evidence, not a claim that
+r51 itself reran the Deployment suite.
+
+The real non-root r48 schema-v2 process smoke reached Ready with exactly one hidden Node child, two
+non-loopback TLS listeners (`172.17.0.2:28448` and `:28449`), and the expected Runtime, management,
+and observation Unix sockets. A provisioned Controller client certificate completed a TLS handshake
+with each listener; both rejected a client without a certificate. SIGTERM exited zero and cleaned
+up; a same-state restart reached Ready and exited zero with stable PXNI/PXNB/PXND digests. Killing the
+Node child made the parent exit one with `PXLC-NODE-CHILD` and removed listeners, PXOB, and processes;
+the same state then restarted successfully and SIGINT exited zero. Root launch failed before state
+mutation with `PXLC-EXECUTION-IDENTITY`. This proves the r48 host process and mTLS/lifecycle boundary,
+not a PXCC/PXNR semantic exchange or cutover. The later public Controller composition does not
+retroactively turn this host-only smoke into a two-host control-sequence, remote Agent conversation,
+remote TUI, or reconnect result. The older two-target DeveloperLocal fixture remains internal; there
+is no public `developer-distributed-fixture-v1` command and no runnable full distributed-system claim
+yet.
+
+## Public Developer DeploymentController and T1 Agent bootstrap
+
+The third public command starts one bounded Controller-side owner graph:
+
+```text
+paraegox deployment --config <absolute-paraegox-deployment.toml>
+```
+
+Its strict TOML schema v1 contains only local filesystem authorities: `state_root`, an exact PXEA
+`enrollment_artifact_file` plus its lowercase whole-file `enrollment_artifact_sha256`, separate
+Controller and tenure-Authority signing-seed files, the Authority state directory/socket, and
+`[runtime_connector]` / `[node_connector]` CA, client-certificate, and client-private-key paths.
+Unknown fields and alternate CLI submodes fail closed. Endpoint, route, target, principal, trust,
+manifest, and credential-reference semantics are accepted only from the independently pinned PXEA;
+they cannot be restated in TOML as a second configuration authority. Additive schema v2 retains
+those exact fields and strictly requires `[managed_agent_bootstrap]` with distinct nonzero Fabric
+and Agent service IDs, a loopback Fabric listen endpoint, and the fixed
+`developer-agent-bootstrap-v1` limits profile. Start T1 from
+[`configs/paraegox-deployment.agent-bootstrap.example.toml`](configs/paraegox-deployment.agent-bootstrap.example.toml);
+the predecessor schema-v1 example remains at
+[`configs/paraegox-deployment.example.toml`](configs/paraegox-deployment.example.toml).
+
+The schema-v2 Node process publishes canonical `<node-state-root>/node/enrollment-v1.pxea`; schema v3
+instead publishes `<node-state-root>/node/enrollment-v2.pxea`. Both are published only after the
+Runtime and Node bootstraps have been proved. PXEA v2 retains the public-safe Runtime-attested v1
+facts and additionally commits the exact provider profile/ref/config digest. It
+contains the immutable Runtime manifest and the complete public Runtime/Node transport, identity,
+and enrollment pins, but no bearer token, signing seed, private-key bytes, or private-key path. The
+Controller side checks an independently transported whole-file SHA-256 before decoding any frame
+length, signature, or semantic field, and then cross-checks its separately provisioned Controller
+and Authority keys. The artifact signature is continuity evidence, not first-use trust.
+
+`paraegox: deployment ready` has a deliberately narrow meaning. Local can print and flush it only
+from the facade's `Ready` outcome, after the remote connector/cutover state is durable, the exact
+PXFR managed-serving terminal is durably `ResponseDurable`, and a fresh post-PXFR PXDR Describe has
+been verified as `ManagedReady` and durably committed. Delivery uncertainty, a publish state that
+needs operator reconciliation, an invalid response, or a ManagedReady Describe without durable PXFR
+cannot synthesize readiness; the command joins its owners and exits nonzero with a stable Deployment
+error instead. The process performs one bounded non-retrying attempt and is not a continuous
+reconciler.
+
+For schema v2, Local prints and flushes exactly
+`paraegox: deployment agent bootstrap ready` only after the base managed-ready state and all three
+ordered PXAG/PXAH operations are durably terminal: Fabric apply carries the exact PXAR v6 and returns
+PXFT ActiveReady; Agent-stack apply carries the exact PXAR v7 and returns PXST ActiveReady; descriptor
+Describe returns a PXAH rooted in that exact PXST and current Fabric/Agent generations. The PXFJ v7
+journal preserves the exact outer requests and receipts. Same-state Resume revalidates terminal
+bytes and reaches the same Ready result without synthesizing a replacement terminal.
+
+Ubuntu validated exact r130 commit `92923eef016e6ce060c32113ad3cf5e59ee8520c` with workspace
+format checking, Local all-target checking and warnings-denied Clippy, the complete non-root Local
+suite at 138/138 in 49.57 seconds, workspace all-target checking and warnings-denied Clippy, and
+compilation/linking of all workspace all-target test executables under `--no-run`. The `--no-run`
+result is not a claim that the complete workspace test suite executed. The complete Deployment suite
+also passed 393/393 in 172.97 seconds as `nobody`, using a link-count-1 binary, a 16 MiB stack, and one
+test thread.
+
+The exact-ref public process smoke passed 1/1 on one Ubuntu host with the same `nobody` UID/GID and
+real non-loopback mTLS. It covered schema-v3 Node/PXEA-v2 fresh start, isolated wrong-SHA rejection,
+schema-v2 Deployment Fresh Ready and joined SIGTERM, same-state Node and Deployment Resume Ready,
+and a Node-unavailable failure with no Ready marker and socket cleanup. The pytest parent used the
+default 8192 KiB stack; the harness retained its 16 MiB `RUST_MIN_STACK` fixture setting, and r130
+production runs the Deployment root future on its own named bounded 16 MiB executor thread.
+
+The descriptor is bootstrap evidence only. These results do not prove descriptor access or
+authorization, an Agent session, Agent data-plane traffic, Echo or conversation, reconnect, a remote
+TUI, distributed/two-host execution, provider-mismatch handling, or Authority-owner failure. T2-A
+defines the remote-Agent contracts and state graph. T2-B now adds the Fabric transport substrate
+described below; Echo, reconnect, and TUI remain later work.
+
+## T2-B asymmetric Fabric transport substrate
+
+Exact ref `0bcc49d03d15cca720021868a08d37912f62128a` adds two role-specific, asymmetric mTLS profiles in
+[`paraegox-fabric`](crates/paraegox-fabric/src/service.rs). A single `FabricService` still owns a
+single private Zenoh 1.9 `Session`. The Ubuntu-side profile keeps the T1 loopback listener, adds one
+non-loopback TLS listener, and has no connectors. The nominal Mac-side profile has one TLS-only
+connector and no listeners.
+
+Both profiles use a default-deny policy keyed by the exact peer certificate CN and allow only the
+exact remote-Agent submit and control query paths, with the corresponding query, reply, and
+queryable directions. The `**` wildcard input is rejected by construction, and the policy has no
+put/subscriber allow rule. This is transport configuration, not Runtime activation or authority.
+
+On Ubuntu, the full Fabric suite passed 50/50 tests, with formatting and Clippy clean. The focused
+[real-network test](crates/paraegox-fabric/tests/remote_agent_mtls.rs) completed in 7.05 seconds: the
+correct CN reached both exact routes; sentinel, parent, and child routes were denied; a same-CA wrong
+CN completed TLS/session establishment but was denied by the ACL; the existing same-session local
+T1 routes still succeeded; an independent plaintext loopback peer was denied; and shutdown released
+both ports. The `**` rejection is constructor/static evidence, not a network case. Likewise, the
+absence of put/subscriber allows is statically checked but was not exercised over the network.
+
+The local T1 result relies on the same-session local-face boundary in exactly pinned Zenoh 1.9;
+upgrading Zenoh requires rerunning this matrix. A wrong-CN peer can occupy the sole session before
+ACL denial, so `max_sessions = 1` remains an availability risk rather than an authentication bypass.
+The evidence is a single-Ubuntu-host network test, not proof from a real two-host Mac process.
+
+## T2-B1 internal independent S1 start substrate (not activated)
+
+The crate-private Fabric lifecycle prepares one independent TLS-only S1 without touching the
+existing S0 session. Its move-only prepared owner builds the private Zenoh config and reserves a
+nonzero session epoch without reading credential files, binding a socket, declaring a queryable, or
+spawning a worker. Consuming start is the first transport effect. The resulting internal live token
+exposes only the reserved epoch and consuming shutdown, while the general `FabricService::start`
+rejects this private profile.
+
+The focused single-Ubuntu real-network test exercises S0 before, during, and after the separate S1
+lifecycle, including an unbound S1 endpoint after prepare, the same reserved/live epoch, and port
+reuse after shutdown. It does not install either S1 queryable or send an S1 request. Runtime
+owner/orchestration, S1 queryable installation, PXRA dispatch, and the Mac connector are not
+implemented, so this is not remote-Agent activation and provides no conversation/Echo, restart
+recovery, or two-host proof. This candidate must be consumed by one real Runtime owner with semantic
+lifecycle and cleanup evidence in the next bounded batch, or be folded back or removed.
+
+## T2-C0 durable PXAG/PXAH descriptor evidence
+
+Exact r176 `9eb8e6a7e61d0ba6149d4313dd66bce1b2f2ff3f` adds a crate-private, bounded
+PXDE v1 latest-slot ledger to the existing Runtime store under the same `runtime.lock`. Each slot
+retains the byte-exact authenticated PXAG and PXAH, the whole-PXAH receipt digest, shared-domain
+PXAP payload digest, active PXST digest, target, Runtime store instance, RuntimeHost epoch,
+Fabric/Agent generations, request digest, slot sequence, previous-slot digest, and complete-record
+checksum. It is a single replaceable slot, not an append-only history.
+
+For an authenticated Describe, Runtime exports the current descriptor rooted in the exact active
+PXST, signs the PXAH, constructs PXDE, and publishes a private mode-0600, single-link temporary file.
+It syncs the temporary file, rechecks the directory, held writer lock, Agent-stack authority and old
+slot identity, renames the file, syncs the directory, and reads back the exact strict final bytes.
+Only then does the endpoint perform post-commit live reverification of both retained signatures and
+the independently exported descriptor, PXST, target/store/epoch and generations before returning the
+exact PXAH. Temporary files are never recovery candidates. Pre-publication failure and post-rename
+uncertainty fail-stop the in-memory owner until strict reopen selects the named final state.
+
+The slot sequence and previous digest express only owner-private replacement continuity inside the
+current slot; they prove neither historical authenticity nor anti-rollback, a durable high-water, or
+key-rotation continuity. Once the first PXDE exists, an older binary fails closed on reopen, and
+downgrade compatibility is not guaranteed. Retrying the exact PXAG creates the next sequence and
+repeats the temporary write, file sync, rename, directory sync, and readback even when the signed
+PXAH is byte-identical: there is no idempotent no-write guarantee, bounded write-amplification
+guarantee, or SSD lifetime/performance SLO.
+
+Ubuntu r176 passed formatting, Runtime all-target checking, warnings-denied Clippy, and the exact
+endpoint test 1/1 as `nobody` with a link-count-1 test binary. The r174 mechanism baseline
+`baa64655f1f15c6ec03c6ad170fc3b0bbfd1a3fc` passed all seven focused PXDE/store tests and the full
+Runtime suite with 633 passed, zero failed, and two ignored. Those seven focused tests prove strict
+codec, replacement, temporary-file, and injected pre/post-rename branch semantics; they are not
+process-abort or power-cut certification.
+
+PXDE is not a PXRA dispatcher, not a descriptor or access capability, and not proof of deployed
+remote-Agent reachability. It adds no authorization, live session, remote conversation or Echo,
+connector activation, reconnect/partition recovery, TUI, two-host, or production-platform claim.
+
+## T2-D0 one-Echo owner boundary
+
+T2-D0 now adds only a crate-private PXOJ v1 bounded codec and a fakeable owner for one exact Open
+plus literal `Echo` attempt. Prepared pins the complete attempt and request scope, trusted PXCB proof
+scope, and two distinct preallocated Describe challenges. A verified, non-cloneable bundle binds both
+signatures, strict PXAP projection, signed generations, and the sole action-owned data-plane binding;
+claim is committed before a fake once-send, Uncertain never recreates send authority, and an unknown
+commit outcome forces reload from durable bytes. PXCB is proof scope only, never connector
+configuration. Ubuntu r164 (`03c67bdda436e89a1d06f38706984a6bbf3a0d9c`) passed formatting,
+Runtime all-target check, Clippy with warnings denied, all 21 focused D0 tests, and the full Runtime
+suite with 626 passed, zero failed, and two ignored.
+
+This is still a codec, trait boundary, and deterministic in-memory fake—not a filesystem or APFS
+outbox, atomic durable store, real Controller Describe source, discovery-currentness proof, Mac
+data-plane connector, Zenoh composition, public CLI, deployed remote Agent or Echo, reconnect or
+partition owner, TUI, two-host result, or production-platform claim. Those remain D1 gates.
+
+A Unix-only `paraegox-noded developer-local-reference-v1` process can also reopen one externally
+authorized exact tenure and serve its last committed status through a same-user, token-bound local socket.
+An additive `developer-local-runtime-observation-v1` mode verifies an existing Runtime-signed PXQR/PXQS
+exchange on a separate owner-private local capability socket and atomically publishes the resulting fresh
+Node status before acknowledging it. Its short-lived query challenge is bound to the exact Node tenure,
+observation endpoint, Runtime authority, apply descriptor, and proposed status sequence. The authenticated
+absolute expiry is carried in the status digest and durable state: consumers enforce it in addition to the
+relative budget, and after it the management endpoint will not re-serve that observation-backed status. A
+multi-Runtime publication uses the earliest retained deadline, so observing one Runtime cannot renew another;
+an exact committed request can still recover a lost acknowledgement without renewing freshness. This is a
+local authenticated observation adapter, not production Zenoh observation or Runtime apply. Registration
+acquisition, continuous reconciliation, two-host proof, federated Inspection/Ops, and the Web Console
+remain in progress.
 
 ## License
 

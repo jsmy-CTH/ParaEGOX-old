@@ -22,11 +22,33 @@ use nix::fcntl::{RenameFlags, renameat2};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
 use paraegox_kernel::digest::{Digest32, Digest32Builder};
+use paraegox_kernel::identity::RuntimeHostId;
+use paraegox_node::observation::{
+    RuntimeObservationAckV1, RuntimeObservationAuthorityV1, RuntimeObservationEndpointRefV1,
+    RuntimeObservationRequestV1,
+};
+use paraegox_runtime_contracts::reference_control::ReferenceQueryResponseV1;
+use paraegox_runtime_contracts::wire::ApplyAuthAlgorithm;
 
 use crate::controller_journal::{
-    CONTROLLER_PAYLOAD_VERSION, ControllerJournalError, ControllerJournalPayloadV7Migration,
-    ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint, MAX_CONTROLLER_SNAPSHOT_BYTES,
+    CONTROLLER_PAYLOAD_VERSION, CONTROLLER_PREVIOUS_PAYLOAD_VERSION, ControllerJournalError,
+    ControllerJournalPayloadV7Migration, ControllerJournalPayloadV8Migration,
+    ControllerJournalSnapshot, ControllerOwnerIdentityFingerprint,
+    ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorCutoverReadyFactsV1,
+    ControllerRemoteConnectorRestartRequirementV1, ControllerRemoteConnectorResumeProjectionV1,
+    ControllerRemoteConnectorStepV1, MAX_CONTROLLER_SNAPSHOT_BYTES,
 };
+use crate::distributed_agent_stack_apply::{
+    DistributedAgentStackApplyError, DistributedAgentStackApplyJournalV1,
+};
+use crate::distributed_agent_stack_node_reconcile::{
+    DistributedAgentStackNodeDiscoveryStateV1, DistributedAgentStackNodeReconcileError,
+    DistributedAgentStackRuntimeQueryMaterialV1, DistributedAgentStackRuntimeQueryPhaseV1,
+    DistributedRuntimeObservationCompletionIngressV1,
+    TrustedLocalRuntimeObservationExchangeErrorV1,
+};
+use crate::distributed_agent_stack_producer::VerifiedDistributedAgentStackPredecessorV1;
+use crate::runtime_control_client::PreparedRuntimeQueryRequest;
 
 pub(crate) const CONTROLLER_LOCK_FILE_NAME: &str = "controller.lock";
 pub(crate) const CONTROLLER_ACTIVE_FILE_NAME: &str = "controller.snapshot";
@@ -35,10 +57,16 @@ const MIGRATION_SOURCE_FILE_PREFIX: &str = "controller.snapshot.source-v7-";
 const MIGRATION_SOURCE_FILE_SUFFIX: &str = ".evidence";
 const MIGRATION_RECEIPT_FILE_PREFIX: &str = "controller.snapshot.migration-v1-";
 const MIGRATION_RECEIPT_FILE_SUFFIX: &str = ".receipt";
+const PAYLOAD_V8_MIGRATION_SOURCE_FILE_PREFIX: &str = "controller.snapshot.source-v8-";
+const PAYLOAD_V8_MIGRATION_RECEIPT_FILE_PREFIX: &str = "controller.snapshot.migration-v2-";
 const MIGRATION_EVIDENCE_TEMP_PREFIX: &str = ".controller.snapshot.migration.tmp-";
 const CONTROLLER_MIGRATION_RECEIPT_MAGIC: &[u8; 4] = b"PXCM";
 const CONTROLLER_MIGRATION_RECEIPT_VERSION: u16 = 1;
 const CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION: u16 = 7;
+const CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION: u16 = 8;
+const CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION: u16 = 2;
+const CONTROLLER_PAYLOAD_V8_MIGRATION_SOURCE_VERSION: u16 = 8;
+const CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION: u16 = 9;
 const CONTROLLER_MIGRATION_EVIDENCE_DOMAIN: &[u8] =
     b"paraegox.deployment.controller-journal.migration-evidence.sha256.v1";
 const CONTROLLER_MIGRATION_RECEIPT_DOMAIN: &[u8] =
@@ -57,6 +85,8 @@ const PRIVATE_FILE_MODE_MASK: u32 = 0o7777;
 const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
 const READ_ONLY_EVIDENCE_MODE_BITS: u32 = 0o400;
 const READ_ONLY_EVIDENCE_MODE: Mode = Mode::S_IRUSR;
+const ED25519_ALGORITHM: u16 = 1;
+const ED25519_ALGORITHM_VERSION: u16 = 1;
 #[cfg(any(target_os = "linux", test))]
 const MAX_LINUX_FDINFO_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "linux", test))]
@@ -73,6 +103,7 @@ const MAX_LINUX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerFilesystemPolicy {
     ProductionReference,
+    DeveloperLocal,
     #[cfg(test)]
     ExplicitFixture,
 }
@@ -100,6 +131,15 @@ impl FileIdentity {
     }
 }
 
+/// Exact filesystem capability identity held by one operational Controller writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ControllerStoreCutoverIdentity {
+    pub(crate) directory_device: u64,
+    pub(crate) directory_inode: u64,
+    pub(crate) lock_device: u64,
+    pub(crate) lock_inode: u64,
+}
+
 impl fmt::Debug for ControllerDirectoryHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -115,6 +155,7 @@ impl fmt::Debug for ControllerDirectoryHandle {
 /// Fixed-width receipt binding exact v7 source bytes to exact v8 target bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControllerStoreMigrationReceipt {
+    receipt_version: u16,
     migration_id: [u8; 32],
     source_payload_version: u16,
     source_checksum: Digest32,
@@ -127,6 +168,19 @@ pub(crate) struct ControllerStoreMigrationReceipt {
     target_snapshot_length: u64,
     target_snapshot_digest: Digest32,
     canonical_wire: [u8; MIGRATION_RECEIPT_BYTES],
+}
+
+struct ControllerMigrationReceiptInput<'a> {
+    receipt_version: u16,
+    migration_id: [u8; 32],
+    source_payload_version: u16,
+    source_checksum: Digest32,
+    source_store_instance_id: [u8; 32],
+    source_owner_identity_fingerprint: Digest32,
+    source_snapshot_sequence: u64,
+    source_wire: &'a [u8],
+    target_payload_version: u16,
+    target_wire: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +205,7 @@ impl ControllerStoreMigrationReceipt {
     ) -> Result<Self, ControllerStoreMigrationError> {
         if migration_id.iter().all(|byte| *byte == 0)
             || source.source_payload_version() != CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION
+            || CONTROLLER_PREVIOUS_PAYLOAD_VERSION != CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION
             || source.source_store_instance_id() != target.store_instance_id()
             || source.source_owner_identity_fingerprint() != target.owner_identity_fingerprint()
             || source.source_snapshot_sequence() != target.snapshot_sequence()
@@ -162,29 +217,76 @@ impl ControllerStoreMigrationReceipt {
         {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
-        let source_snapshot_length = u64::try_from(source_wire.len())
+        Self::try_new_from_parts(ControllerMigrationReceiptInput {
+            receipt_version: CONTROLLER_MIGRATION_RECEIPT_VERSION,
+            migration_id,
+            source_payload_version: source.source_payload_version(),
+            source_checksum: source.source_checksum(),
+            source_store_instance_id: *source.source_store_instance_id(),
+            source_owner_identity_fingerprint: source.source_owner_identity_fingerprint().value(),
+            source_snapshot_sequence: source.source_snapshot_sequence(),
+            source_wire,
+            target_payload_version: CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION,
+            target_wire,
+        })
+    }
+
+    fn try_new_payload_v8(
+        migration_id: [u8; 32],
+        source: &ControllerJournalPayloadV8Migration,
+        source_wire: &[u8],
+        target: &ControllerJournalSnapshot,
+        target_wire: &[u8],
+    ) -> Result<Self, ControllerStoreMigrationError> {
+        if migration_id.iter().all(|byte| *byte == 0)
+            || source.source_payload_version() != CONTROLLER_PAYLOAD_V8_MIGRATION_SOURCE_VERSION
+            || CONTROLLER_PAYLOAD_VERSION != CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION
+            || source.source_store_instance_id() != target.store_instance_id()
+            || source.source_owner_identity_fingerprint() != target.owner_identity_fingerprint()
+            || source.source_snapshot_sequence() != target.snapshot_sequence()
+            || source.snapshot() != target
+            || source_wire.is_empty()
+            || source_wire.len() > MAX_CONTROLLER_SNAPSHOT_BYTES
+            || target_wire.is_empty()
+            || target_wire.len() > MAX_CONTROLLER_SNAPSHOT_BYTES
+        {
+            return Err(ControllerStoreMigrationError::InvalidReceipt);
+        }
+        Self::try_new_from_parts(ControllerMigrationReceiptInput {
+            receipt_version: CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION,
+            migration_id,
+            source_payload_version: source.source_payload_version(),
+            source_checksum: source.source_checksum(),
+            source_store_instance_id: *source.source_store_instance_id(),
+            source_owner_identity_fingerprint: source.source_owner_identity_fingerprint().value(),
+            source_snapshot_sequence: source.source_snapshot_sequence(),
+            source_wire,
+            target_payload_version: CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION,
+            target_wire,
+        })
+    }
+
+    fn try_new_from_parts(
+        input: ControllerMigrationReceiptInput<'_>,
+    ) -> Result<Self, ControllerStoreMigrationError> {
+        let source_snapshot_length = u64::try_from(input.source_wire.len())
             .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
-        let target_snapshot_length = u64::try_from(target_wire.len())
+        let target_snapshot_length = u64::try_from(input.target_wire.len())
             .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
-        let source_snapshot_digest = migration_evidence_digest(source_wire)?;
-        let target_snapshot_digest = migration_evidence_digest(target_wire)?;
+        let source_snapshot_digest = migration_evidence_digest(input.source_wire)?;
+        let target_snapshot_digest = migration_evidence_digest(input.target_wire)?;
         let mut prefix = Vec::with_capacity(MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES);
         prefix.extend_from_slice(CONTROLLER_MIGRATION_RECEIPT_MAGIC);
-        prefix.extend_from_slice(&CONTROLLER_MIGRATION_RECEIPT_VERSION.to_be_bytes());
-        prefix.extend_from_slice(&migration_id);
-        prefix.extend_from_slice(&source.source_payload_version().to_be_bytes());
-        prefix.extend_from_slice(source.source_checksum().as_bytes());
-        prefix.extend_from_slice(source.source_store_instance_id());
-        prefix.extend_from_slice(
-            source
-                .source_owner_identity_fingerprint()
-                .value()
-                .as_bytes(),
-        );
-        prefix.extend_from_slice(&source.source_snapshot_sequence().to_be_bytes());
+        prefix.extend_from_slice(&input.receipt_version.to_be_bytes());
+        prefix.extend_from_slice(&input.migration_id);
+        prefix.extend_from_slice(&input.source_payload_version.to_be_bytes());
+        prefix.extend_from_slice(input.source_checksum.as_bytes());
+        prefix.extend_from_slice(&input.source_store_instance_id);
+        prefix.extend_from_slice(input.source_owner_identity_fingerprint.as_bytes());
+        prefix.extend_from_slice(&input.source_snapshot_sequence.to_be_bytes());
         prefix.extend_from_slice(&source_snapshot_length.to_be_bytes());
         prefix.extend_from_slice(source_snapshot_digest.as_bytes());
-        prefix.extend_from_slice(&CONTROLLER_PAYLOAD_VERSION.to_be_bytes());
+        prefix.extend_from_slice(&input.target_payload_version.to_be_bytes());
         prefix.extend_from_slice(&target_snapshot_length.to_be_bytes());
         prefix.extend_from_slice(target_snapshot_digest.as_bytes());
         if prefix.len() != MIGRATION_RECEIPT_WITHOUT_CHECKSUM_BYTES {
@@ -196,15 +298,16 @@ impl ControllerStoreMigrationReceipt {
             .try_into()
             .map_err(|_| ControllerStoreMigrationError::InvalidReceipt)?;
         Ok(Self {
-            migration_id,
-            source_payload_version: source.source_payload_version(),
-            source_checksum: source.source_checksum(),
-            source_store_instance_id: *source.source_store_instance_id(),
-            source_owner_identity_fingerprint: source.source_owner_identity_fingerprint().value(),
-            source_snapshot_sequence: source.source_snapshot_sequence(),
+            receipt_version: input.receipt_version,
+            migration_id: input.migration_id,
+            source_payload_version: input.source_payload_version,
+            source_checksum: input.source_checksum,
+            source_store_instance_id: input.source_store_instance_id,
+            source_owner_identity_fingerprint: input.source_owner_identity_fingerprint,
+            source_snapshot_sequence: input.source_snapshot_sequence,
             source_snapshot_length,
             source_snapshot_digest,
-            target_payload_version: CONTROLLER_PAYLOAD_VERSION,
+            target_payload_version: input.target_payload_version,
             target_snapshot_length,
             target_snapshot_digest,
             canonical_wire,
@@ -216,11 +319,10 @@ impl ControllerStoreMigrationReceipt {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
         let mut cursor = MigrationReceiptCursor::new(frame);
-        if cursor.array::<4>()? != *CONTROLLER_MIGRATION_RECEIPT_MAGIC
-            || cursor.u16()? != CONTROLLER_MIGRATION_RECEIPT_VERSION
-        {
+        if cursor.array::<4>()? != *CONTROLLER_MIGRATION_RECEIPT_MAGIC {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
+        let receipt_version = cursor.u16()?;
         let migration_id = cursor.array::<32>()?;
         let source_payload_version = cursor.u16()?;
         let source_checksum = Digest32::from_bytes(cursor.array::<32>()?);
@@ -234,9 +336,24 @@ impl ControllerStoreMigrationReceipt {
         let target_snapshot_digest = Digest32::from_bytes(cursor.array::<32>()?);
         let checksum = Digest32::from_bytes(cursor.array::<32>()?);
         cursor.finish()?;
+        let supported_versions = matches!(
+            (
+                receipt_version,
+                source_payload_version,
+                target_payload_version
+            ),
+            (
+                CONTROLLER_MIGRATION_RECEIPT_VERSION,
+                CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION,
+                CONTROLLER_MIGRATION_TARGET_PAYLOAD_VERSION
+            ) | (
+                CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION,
+                CONTROLLER_PAYLOAD_V8_MIGRATION_SOURCE_VERSION,
+                CONTROLLER_PAYLOAD_V8_MIGRATION_TARGET_VERSION
+            )
+        );
         if migration_id.iter().all(|byte| *byte == 0)
-            || source_payload_version != CONTROLLER_MIGRATION_SOURCE_PAYLOAD_VERSION
-            || target_payload_version != CONTROLLER_PAYLOAD_VERSION
+            || !supported_versions
             || source_store_instance_id.iter().all(|byte| *byte == 0)
             || source_owner_identity_fingerprint
                 .as_bytes()
@@ -253,6 +370,7 @@ impl ControllerStoreMigrationReceipt {
             return Err(ControllerStoreMigrationError::InvalidReceipt);
         }
         Ok(Self {
+            receipt_version,
             migration_id,
             source_payload_version,
             source_checksum,
@@ -274,6 +392,10 @@ impl ControllerStoreMigrationReceipt {
         &self.migration_id
     }
 
+    pub(crate) const fn receipt_version(&self) -> u16 {
+        self.receipt_version
+    }
+
     pub(crate) const fn source_payload_version(&self) -> u16 {
         self.source_payload_version
     }
@@ -292,6 +414,10 @@ impl ControllerStoreMigrationReceipt {
 
     pub(crate) const fn source_snapshot_sequence(&self) -> u64 {
         self.source_snapshot_sequence
+    }
+
+    pub(crate) const fn target_payload_version(&self) -> u16 {
+        self.target_payload_version
     }
 
     pub(crate) const fn canonical_wire(&self) -> &[u8; MIGRATION_RECEIPT_BYTES] {
@@ -364,6 +490,198 @@ pub(crate) struct ControllerStore {
     lock_file: File,
     snapshot: ControllerJournalSnapshot,
     state: ControllerStoreState,
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    runtime_observation_grants: Vec<RuntimeObservationResidentGrantV1>,
+    active_runtime_observation_claim: Option<RuntimeObservationActiveClaimV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeObservationResidentGrantV1 {
+    attempt_count: usize,
+    target: RuntimeHostId,
+    request_digest: Digest32,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    claimed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeObservationActiveClaimV1 {
+    snapshot_sequence: u64,
+    attempt_count: usize,
+    target: RuntimeHostId,
+    request_digest: Digest32,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+}
+
+#[derive(Debug)]
+pub(crate) struct ControllerDistributedAgentStackOwnerStateV1 {
+    apply_journal: DistributedAgentStackApplyJournalV1,
+    node_discovery: DistributedAgentStackNodeDiscoveryStateV1,
+}
+
+impl ControllerDistributedAgentStackOwnerStateV1 {
+    #[must_use]
+    pub(crate) const fn apply_journal(&self) -> &DistributedAgentStackApplyJournalV1 {
+        &self.apply_journal
+    }
+
+    #[must_use]
+    pub(crate) const fn node_discovery(&self) -> &DistributedAgentStackNodeDiscoveryStateV1 {
+        &self.node_discovery
+    }
+
+    pub(crate) fn parts_mut(
+        &mut self,
+    ) -> (
+        &mut DistributedAgentStackApplyJournalV1,
+        &mut DistributedAgentStackNodeDiscoveryStateV1,
+    ) {
+        (&mut self.apply_journal, &mut self.node_discovery)
+    }
+}
+
+/// Resident one-shot authority created only by the successful
+/// None-to-request-pair commit seam below. Decode/reopen never constructs it.
+pub(crate) struct CommittedDistributedRuntimeQueryPairV1 {
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    store_instance_id: [u8; 32],
+    snapshot_sequence: u64,
+    node_state_digest: Digest32,
+    attempt_count: usize,
+    rows: [DistributedAgentStackRuntimeQueryMaterialV1; 2],
+}
+
+impl fmt::Debug for CommittedDistributedRuntimeQueryPairV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedDistributedRuntimeQueryPairV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("attempt_count", &self.attempt_count)
+            .field("targets", &[self.rows[0].target(), self.rows[1].target()])
+            .finish_non_exhaustive()
+    }
+}
+
+/// Sealed authority for one exact already-durable PXNO. Unlike PXQR, this may
+/// be reconstructed by the explicit exact-replay seam after restart.
+pub(crate) struct CommittedDistributedRuntimeObservationV1 {
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    store_instance_id: [u8; 32],
+    snapshot_sequence: u64,
+    node_state_digest: Digest32,
+    attempt_count: usize,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    target: RuntimeHostId,
+    observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+    request: RuntimeObservationRequestV1,
+}
+
+impl fmt::Debug for CommittedDistributedRuntimeObservationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedDistributedRuntimeObservationV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("target", &self.target)
+            .field("request_digest", &self.request.request_digest())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact PXNO released for one transport exchange after current-store
+/// revalidation. It retains the snapshot witness required by PXNA commit.
+pub(crate) struct ClaimedDistributedRuntimeObservationV1 {
+    resident_generation: [u8; CONTROLLER_TEMP_TOKEN_BYTES],
+    store_instance_id: [u8; 32],
+    snapshot_sequence: u64,
+    node_state_digest: Digest32,
+    attempt_count: usize,
+    phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    target: RuntimeHostId,
+    observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+    request: RuntimeObservationRequestV1,
+}
+
+impl ClaimedDistributedRuntimeObservationV1 {
+    #[must_use]
+    pub(crate) const fn target(&self) -> RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &RuntimeObservationRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) const fn observation_endpoint_ref(&self) -> RuntimeObservationEndpointRefV1 {
+        self.observation_endpoint_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_transport_test(
+        observation_endpoint_ref: RuntimeObservationEndpointRefV1,
+        request: RuntimeObservationRequestV1,
+    ) -> Self {
+        Self {
+            resident_generation: [0x91; CONTROLLER_TEMP_TOKEN_BYTES],
+            store_instance_id: [0x92; 32],
+            snapshot_sequence: 1,
+            node_state_digest: Digest32::from_bytes([0x93; 32]),
+            attempt_count: 1,
+            phase: DistributedAgentStackRuntimeQueryPhaseV1::ObservationDurableNotSent,
+            target: request.runtime_host_id(),
+            observation_endpoint_ref,
+            request,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DistributedRuntimeObservationCommitDispositionV1 {
+    AckDurable,
+    NotSent,
+    Uncertain,
+    Rejected,
+}
+
+impl fmt::Debug for ClaimedDistributedRuntimeObservationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimedDistributedRuntimeObservationV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("target", &self.target)
+            .field("request_digest", &self.request.request_digest())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Move-only authority to perform exactly one transport exchange whose
+/// `AttemptInFlight` phase has already been atomically published.
+pub(crate) struct ClaimedControllerRemoteConnectorAttemptV1 {
+    snapshot_sequence: u64,
+    step: ControllerRemoteConnectorStepV1,
+    request_wire: Box<[u8]>,
+}
+
+impl ClaimedControllerRemoteConnectorAttemptV1 {
+    pub(crate) const fn step(&self) -> ControllerRemoteConnectorStepV1 {
+        self.step
+    }
+
+    pub(crate) fn request_wire(&self) -> &[u8] {
+        &self.request_wire
+    }
+}
+
+impl fmt::Debug for ClaimedControllerRemoteConnectorAttemptV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimedControllerRemoteConnectorAttemptV1")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("step", &self.step)
+            .field("request_bytes", &self.request_wire.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -494,7 +812,7 @@ impl ControllerStore {
         }
         let active = read_active_controller_snapshot_bytes(&guard.directory)
             .map_err(ControllerStoreMigrationError::Store)?;
-        match ControllerJournalSnapshot::decode(&active.encoded) {
+        match ControllerJournalSnapshot::migrate_payload_v8(&active.encoded) {
             Ok(target) => resume_completed_controller_migration(
                 &guard,
                 &evidence_directory,
@@ -507,6 +825,82 @@ impl ControllerStore {
                     ControllerJournalSnapshot::migrate_payload_v7_with_metadata(&active.encoded)
                         .map_err(ControllerStoreMigrationError::Journal)?;
                 publish_controller_migration(
+                    &guard,
+                    &evidence_directory,
+                    request,
+                    active,
+                    source,
+                    failpoints,
+                )
+            }
+            Err(error) => Err(ControllerStoreMigrationError::Journal(error)),
+        }
+    }
+
+    /// Explicitly migrates one stopped Controller store from payload v8 to
+    /// v9. Normal open is v9-only and never invokes this path implicitly.
+    pub(crate) fn migrate_payload_v8_offline(
+        directory: &Path,
+        evidence_directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+        migration_id: [u8; 32],
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        Self::migrate_payload_v8_offline_with_policy(
+            ControllerMigrationRequest {
+                directory,
+                evidence_directory,
+                expected_store_instance_id,
+                expected_owner_identity,
+                migration_id,
+            },
+            ControllerFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    fn migrate_payload_v8_offline_with_policy(
+        request: ControllerMigrationRequest<'_>,
+        filesystem_policy: ControllerFilesystemPolicy,
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        Self::migrate_payload_v8_offline_with_policy_and_failpoints(
+            request,
+            filesystem_policy,
+            ControllerMigrationFailpoints::NONE,
+        )
+    }
+
+    fn migrate_payload_v8_offline_with_policy_and_failpoints(
+        request: ControllerMigrationRequest<'_>,
+        filesystem_policy: ControllerFilesystemPolicy,
+        failpoints: ControllerMigrationFailpoints,
+    ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+        validate_migration_inputs(
+            request.expected_store_instance_id,
+            request.expected_owner_identity,
+            request.migration_id,
+        )?;
+        let guard = acquire_controller_migration_guard(request.directory, filesystem_policy)?;
+        let evidence_directory =
+            open_controller_directory(request.evidence_directory, filesystem_policy)
+                .map_err(ControllerStoreMigrationError::EvidenceDirectory)?;
+        if guard.directory.identity == evidence_directory.identity {
+            return Err(ControllerStoreMigrationError::EvidenceDirectoryMatchesStore);
+        }
+        let active = read_active_controller_snapshot_bytes(&guard.directory)
+            .map_err(ControllerStoreMigrationError::Store)?;
+        match ControllerJournalSnapshot::decode(&active.encoded) {
+            Ok(target) => resume_completed_payload_v8_controller_migration(
+                &guard,
+                &evidence_directory,
+                request,
+                active,
+                target,
+            ),
+            Err(ControllerJournalError::UnknownPayloadVersion) => {
+                let source =
+                    ControllerJournalSnapshot::migrate_payload_v8_with_metadata(&active.encoded)
+                        .map_err(ControllerStoreMigrationError::Journal)?;
+                publish_payload_v8_controller_migration(
                     &guard,
                     &evidence_directory,
                     request,
@@ -532,6 +926,34 @@ impl ControllerStore {
         )
     }
 
+    pub(crate) fn open_developer_local(
+        directory: &Path,
+        expected_store_instance_id: [u8; 32],
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    ) -> Result<Self, ControllerStoreOpenError> {
+        Self::open_with_policy(
+            directory,
+            expected_store_instance_id,
+            expected_owner_identity,
+            ControllerFilesystemPolicy::DeveloperLocal,
+        )
+    }
+
+    /// Reopens a developer-local legacy store when its random store identity
+    /// is owned only by the durable snapshot. The owner fingerprint and every
+    /// snapshot invariant are still verified before the identity is observed.
+    pub(crate) fn open_developer_local_observed_identity(
+        directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    ) -> Result<Self, ControllerStoreOpenError> {
+        Self::open_validated(
+            directory,
+            None,
+            expected_owner_identity,
+            ControllerFilesystemPolicy::DeveloperLocal,
+        )
+    }
+
     pub(crate) fn open_for_sequence_one_receipt(
         directory: &Path,
         expected_owner_identity: ControllerOwnerIdentityFingerprint,
@@ -541,6 +963,18 @@ impl ControllerStore {
             None,
             expected_owner_identity,
             ControllerFilesystemPolicy::ProductionReference,
+        )
+    }
+
+    pub(crate) fn open_for_sequence_one_receipt_developer_local(
+        directory: &Path,
+        expected_owner_identity: ControllerOwnerIdentityFingerprint,
+    ) -> Result<Self, ControllerStoreOpenError> {
+        Self::open_validated(
+            directory,
+            None,
+            expected_owner_identity,
+            ControllerFilesystemPolicy::DeveloperLocal,
         )
     }
 
@@ -609,17 +1043,1135 @@ impl ControllerStore {
             return Err(ControllerStoreOpenError::OwnerIdentityMismatch);
         }
         clean_valid_orphan_temps(&directory)?;
+        let resident_generation = system_random_token().map_err(|error| {
+            ControllerStoreOpenError::Io(ControllerIoFailure::new(
+                ControllerFileStage::GenerateTempName,
+                &error,
+            ))
+        })?;
         Ok(Self {
             directory,
             lock_file,
             snapshot,
             state: ControllerStoreState::Operational,
+            resident_generation,
+            runtime_observation_grants: Vec::new(),
+            active_runtime_observation_claim: None,
         })
     }
 
     pub(crate) fn snapshot(&self) -> Result<&ControllerJournalSnapshot, ControllerStoreError> {
         self.ensure_operational()?;
         Ok(&self.snapshot)
+    }
+
+    /// Atomically persists the owner-private PXCR identity/configuration
+    /// before any remote connector request can be prepared.
+    pub(crate) fn initialize_remote_connector(
+        &mut self,
+        configuration_digest: Digest32,
+        target: RuntimeHostId,
+        successor_store_instance_id: [u8; 32],
+        authority_store_instance_id: [u8; 32],
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_initialize_remote_connector(
+                configuration_digest,
+                target,
+                successor_store_instance_id,
+                authority_store_instance_id,
+            )
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// First half of request-before-send: the exact outer wire is durable but
+    /// is not yet transport-authorized.
+    pub(crate) fn prepare_remote_connector_request(
+        &mut self,
+        step: ControllerRemoteConnectorStepV1,
+        request_wire: &[u8],
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_prepare_remote_connector_request(step, request_wire)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Second half of request-before-send. The returned non-cloneable value is
+    /// created only after the `AttemptInFlight` snapshot is published.
+    pub(crate) fn claim_remote_connector_attempt(
+        &mut self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<ClaimedControllerRemoteConnectorAttemptV1, ControllerStoreError> {
+        self.revalidate_current()?;
+        let request_wire = self
+            .snapshot
+            .remote_connector_current_attempt()
+            .filter(|(current_step, phase, _)| {
+                *current_step == step
+                    && (*phase == ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent
+                        || step == ControllerRemoteConnectorStepV1::NodePublish
+                            && matches!(
+                                *phase,
+                                ControllerRemoteConnectorAttemptPhaseV1::Uncertain
+                                    | ControllerRemoteConnectorAttemptPhaseV1::ResidentAuthorityLost
+                            ))
+            })
+            .map(|(_, _, wire)| Box::<[u8]>::from(wire))
+            .ok_or(ControllerStoreError::InvalidSuccessor(
+                ControllerJournalError::InvalidRemoteConnectorSuccessor,
+            ))?;
+        let next = self
+            .snapshot
+            .try_claim_remote_connector_attempt(step)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)?;
+        let snapshot = self.revalidate_current()?;
+        let (current_step, current_phase, current_wire) = snapshot
+            .remote_connector_current_attempt()
+            .ok_or(ControllerStoreError::Codec(
+                ControllerJournalError::InvalidRemoteConnectorState,
+            ))?;
+        if current_step != step
+            || current_phase != ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+            || current_wire != request_wire.as_ref()
+        {
+            self.state = ControllerStoreState::Stopped;
+            return Err(ControllerStoreError::ActiveSnapshotChanged);
+        }
+        Ok(ClaimedControllerRemoteConnectorAttemptV1 {
+            snapshot_sequence: snapshot.snapshot_sequence(),
+            step,
+            request_wire,
+        })
+    }
+
+    /// Commits the exact response for one consumed claim. A stale or already
+    /// consumed claim cannot mutate the active snapshot.
+    pub(crate) fn commit_remote_connector_response(
+        &mut self,
+        claim: ClaimedControllerRemoteConnectorAttemptV1,
+        response_wire: &[u8],
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_remote_connector_claim(&claim)?;
+        let next = self
+            .snapshot
+            .try_record_remote_connector_response(claim.step, response_wire)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Commits one explicit transport closure for a consumed claim.
+    pub(crate) fn close_remote_connector_attempt(
+        &mut self,
+        claim: ClaimedControllerRemoteConnectorAttemptV1,
+        closure: ControllerRemoteConnectorAttemptPhaseV1,
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_remote_connector_claim(&claim)?;
+        let next = self
+            .snapshot
+            .try_close_remote_connector_attempt(claim.step, closure)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Restart closure is deliberately a separate durable operation. It never
+    /// produces transport authority or prepares a replacement request.
+    pub(crate) fn recover_remote_connector_attempt(
+        &mut self,
+        step: ControllerRemoteConnectorStepV1,
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_recover_remote_connector_attempt(step)
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    /// Retires an expired challenge only where the journal proves PXNO was
+    /// never sent. A full fresh Node/Runtime discovery round must then be
+    /// prepared separately before a new challenge is accepted.
+    pub(crate) fn abandon_remote_connector_challenge_round(
+        &mut self,
+    ) -> Result<(), ControllerStoreError> {
+        self.revalidate_current()?;
+        let next = self
+            .snapshot
+            .try_abandon_remote_connector_challenge_round()
+            .map_err(ControllerStoreError::InvalidSuccessor)?;
+        self.commit(next)
+    }
+
+    pub(crate) fn remote_connector_restart_requirement(
+        &mut self,
+    ) -> Result<ControllerRemoteConnectorRestartRequirementV1, ControllerStoreError> {
+        Ok(self
+            .revalidate_current()?
+            .remote_connector_restart_requirement())
+    }
+
+    /// Re-reads the active path while retaining the sole writer lock, then
+    /// returns only strictly replayed, transport-authority-free restart facts.
+    pub(crate) fn revalidate_remote_connector_resume_projection(
+        &mut self,
+    ) -> Result<Option<ControllerRemoteConnectorResumeProjectionV1>, ControllerStoreError> {
+        self.revalidate_current()?
+            .remote_connector_resume_projection()
+            .map_err(ControllerStoreError::Codec)
+    }
+
+    /// Returns terminal facts only after re-reading the active path while this
+    /// store still owns its original lock.
+    pub(crate) fn revalidate_remote_connector_cutover_ready(
+        &mut self,
+    ) -> Result<ControllerRemoteConnectorCutoverReadyFactsV1, ControllerStoreError> {
+        self.revalidate_current()?
+            .remote_connector_cutover_ready_facts()
+            .map_err(ControllerStoreError::Codec)?
+            .ok_or(ControllerStoreError::Codec(
+                ControllerJournalError::RemoteConnectorCutoverNotReady,
+            ))
+    }
+
+    fn revalidate_remote_connector_claim(
+        &mut self,
+        claim: &ClaimedControllerRemoteConnectorAttemptV1,
+    ) -> Result<(), ControllerStoreError> {
+        let snapshot = self.revalidate_current()?;
+        let valid = snapshot.snapshot_sequence() == claim.snapshot_sequence
+            && snapshot
+                .remote_connector_current_attempt()
+                .is_some_and(|(step, phase, wire)| {
+                    step == claim.step
+                        && phase == ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+                        && wire == claim.request_wire.as_ref()
+                });
+        if !valid {
+            self.state = ControllerStoreState::Stopped;
+            return Err(ControllerStoreError::ActiveSnapshotChanged);
+        }
+        Ok(())
+    }
+
+    /// Reopens only an owner extension that has not yet introduced PXQR. Once
+    /// query history exists, callers must supply exact PXOB authorities and
+    /// PXOB endpoint refs through the bound reopen seam below.
+    pub(crate) fn reopen_distributed_agent_stack(
+        &self,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+    ) -> Result<
+        Option<ControllerDistributedAgentStackOwnerStateV1>,
+        ControllerDistributedAgentStackError,
+    > {
+        let owner =
+            self.reopen_distributed_agent_stack_unbound(expected_owner_anchor, predecessors)?;
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.node_discovery.runtime_query_attempt_count() != 0)
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        Ok(owner)
+    }
+
+    pub(crate) fn reopen_distributed_agent_stack_with_runtime_observation(
+        &self,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<
+        Option<ControllerDistributedAgentStackOwnerStateV1>,
+        ControllerDistributedAgentStackError,
+    > {
+        let owner =
+            self.reopen_distributed_agent_stack_unbound(expected_owner_anchor, predecessors)?;
+        if let Some(owner) = &owner {
+            owner
+                .node_discovery
+                .validate_runtime_queries(predecessors, authorities, observation_endpoint_refs)
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+        }
+        Ok(owner)
+    }
+
+    /// PXJR/PXDE checksum validation performed during store open is followed
+    /// here by PXDJ predecessor and Runtime signature reauthentication. This
+    /// unbound helper never escapes ControllerStore.
+    fn reopen_distributed_agent_stack_unbound(
+        &self,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+    ) -> Result<
+        Option<ControllerDistributedAgentStackOwnerStateV1>,
+        ControllerDistributedAgentStackError,
+    > {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        let journal_wire = self.snapshot.distributed_agent_stack_journal_wire();
+        let node_wire = self.snapshot.distributed_agent_stack_node_discovery_wire();
+        let (Some(journal_wire), Some(node_wire)) = (journal_wire, node_wire) else {
+            if journal_wire.is_some() || node_wire.is_some() {
+                return Err(ControllerDistributedAgentStackError::IncompleteExtension);
+            }
+            return Ok(None);
+        };
+        let apply_journal = DistributedAgentStackApplyJournalV1::try_reopen(
+            journal_wire,
+            expected_owner_anchor,
+            predecessors,
+        )
+        .map_err(ControllerDistributedAgentStackError::Apply)?;
+        let node_discovery = DistributedAgentStackNodeDiscoveryStateV1::decode(node_wire)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        node_discovery
+            .validate_runtime_queries_against_predecessors(predecessors)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let apply_state = apply_journal
+            .state()
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if node_discovery.owner_anchor() != expected_owner_anchor
+            || node_discovery.owner_anchor() != apply_state.owner_anchor()
+            || node_discovery.rollout_id() != apply_state.rollout().rollout_id()
+            || node_discovery.runtime_targets()
+                != [predecessors[0].target(), predecessors[1].target()]
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        Ok(Some(ControllerDistributedAgentStackOwnerStateV1 {
+            apply_journal,
+            node_discovery,
+        }))
+    }
+
+    /// Commits exact PXDJ and PXDN bytes inside this store's existing atomic
+    /// replace/fsync boundary. No second path, lock, or journal is created.
+    pub(crate) fn commit_distributed_agent_stack_wires(
+        &mut self,
+        journal_wire: &[u8],
+        node_discovery_wire: &[u8],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if self.active_runtime_observation_claim.is_some() {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let next = self
+            .snapshot
+            .try_distributed_agent_stack_successor(journal_wire, node_discovery_wire)
+            .map_err(ControllerDistributedAgentStackError::Journal)?;
+        self.commit(next)
+            .map_err(ControllerDistributedAgentStackError::Store)
+    }
+
+    fn commit_claimed_runtime_observation_successor(
+        &mut self,
+        journal_wire: &[u8],
+        node_discovery_wire: &[u8],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if self.active_runtime_observation_claim.is_none() {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let next = self
+            .snapshot
+            .try_distributed_agent_stack_successor(journal_wire, node_discovery_wire)
+            .map_err(ControllerDistributedAgentStackError::Journal)?;
+        let result = self
+            .commit(next)
+            .map_err(ControllerDistributedAgentStackError::Store);
+        let result = result.and_then(|()| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_journal_wire() != Some(journal_wire)
+                || self.snapshot.distributed_agent_stack_node_discovery_wire()
+                    != Some(node_discovery_wire)
+            {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            Ok(())
+        });
+        if result.is_ok() {
+            self.active_runtime_observation_claim = None;
+        } else {
+            self.state = ControllerStoreState::Stopped;
+        }
+        result
+    }
+
+    /// Atomically appends one request-only A/B PXQR attempt, then performs an
+    /// exact active-snapshot readback before creating resident send authority.
+    /// No reopen path calls this constructor.
+    pub(crate) fn commit_distributed_runtime_query_pair(
+        &mut self,
+        next_node_discovery: &DistributedAgentStackNodeDiscoveryStateV1,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<CommittedDistributedRuntimeQueryPairV1, ControllerDistributedAgentStackError> {
+        next_node_discovery
+            .validate_runtime_queries(predecessors, authorities, observation_endpoint_refs)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let owner_anchor = next_node_discovery.owner_anchor();
+        let before = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if next_node_discovery.runtime_query_attempt_count()
+            != before
+                .node_discovery
+                .runtime_query_attempt_count()
+                .saturating_add(1)
+            || next_node_discovery.runtime_query_phases()
+                != Some([
+                    DistributedAgentStackRuntimeQueryPhaseV1::RequestDurableNotSent,
+                    DistributedAgentStackRuntimeQueryPhaseV1::RequestDurableNotSent,
+                ])
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let expected_wire = next_node_discovery
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &expected_wire)?;
+        let readback_result = (|| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_node_discovery_wire()
+                != Some(expected_wire.as_ref())
+            {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            let readback = self
+                .reopen_distributed_agent_stack_with_runtime_observation(
+                    owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?
+                .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+            let targets = readback.node_discovery.runtime_targets();
+            let rows = [
+                readback
+                    .node_discovery
+                    .current_runtime_query_material(targets[0], predecessors[0])
+                    .map_err(ControllerDistributedAgentStackError::Node)?,
+                readback
+                    .node_discovery
+                    .current_runtime_query_material(targets[1], predecessors[1])
+                    .map_err(ControllerDistributedAgentStackError::Node)?,
+            ];
+            Ok(CommittedDistributedRuntimeQueryPairV1 {
+                resident_generation: self.resident_generation,
+                store_instance_id: *self.snapshot.store_instance_id(),
+                snapshot_sequence: self.snapshot.snapshot_sequence(),
+                node_state_digest: readback
+                    .node_discovery
+                    .durable_digest()
+                    .map_err(ControllerDistributedAgentStackError::Node)?,
+                attempt_count: readback.node_discovery.runtime_query_attempt_count(),
+                rows,
+            })
+        })();
+        if readback_result.is_err() {
+            self.state = ControllerStoreState::Stopped;
+        }
+        readback_result
+    }
+
+    /// Consumes the resident post-commit pair token and releases both PXQR
+    /// requests together. The token becomes stale after any successor commit.
+    pub(crate) fn claim_distributed_runtime_query_pair(
+        &mut self,
+        prepared: CommittedDistributedRuntimeQueryPairV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<[PreparedRuntimeQueryRequest; 2], ControllerDistributedAgentStackError> {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if prepared.resident_generation != self.resident_generation
+            || prepared.store_instance_id != *self.snapshot.store_instance_id()
+            || prepared.snapshot_sequence != self.snapshot.snapshot_sequence()
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let readback = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if prepared.node_state_digest
+            != readback
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?
+            || prepared.attempt_count != readback.node_discovery.runtime_query_attempt_count()
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let targets = readback.node_discovery.runtime_targets();
+        let current_rows = [
+            readback
+                .node_discovery
+                .current_runtime_query_material(targets[0], predecessors[0])
+                .map_err(ControllerDistributedAgentStackError::Node)?,
+            readback
+                .node_discovery
+                .current_runtime_query_material(targets[1], predecessors[1])
+                .map_err(ControllerDistributedAgentStackError::Node)?,
+        ];
+        if prepared.rows != current_rows {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let algorithm = ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM).map_err(|_| {
+            ControllerDistributedAgentStackError::Node(
+                DistributedAgentStackNodeReconcileError::InvalidState,
+            )
+        })?;
+        Ok([
+            PreparedRuntimeQueryRequest::try_new(
+                prepared.rows[0].request().clone(),
+                predecessors[0].runtime_channel(),
+                predecessors[0].runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+                prepared.rows[0].serving_baseline(),
+            )
+            .map_err(|_| {
+                ControllerDistributedAgentStackError::Node(
+                    DistributedAgentStackNodeReconcileError::InvalidState,
+                )
+            })?,
+            PreparedRuntimeQueryRequest::try_new(
+                prepared.rows[1].request().clone(),
+                predecessors[1].runtime_channel(),
+                predecessors[1].runtime_response_key(),
+                algorithm,
+                ED25519_ALGORITHM_VERSION,
+                prepared.rows[1].serving_baseline(),
+            )
+            .map_err(|_| {
+                ControllerDistributedAgentStackError::Node(
+                    DistributedAgentStackNodeReconcileError::InvalidState,
+                )
+            })?,
+        ])
+    }
+
+    /// Commits one validated PXQS as its own successor before any PXNO for
+    /// either target can be introduced.
+    pub(crate) fn commit_distributed_runtime_query_response(
+        &mut self,
+        target: RuntimeHostId,
+        response: ReferenceQueryResponseV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let index = if target == predecessors[0].target() {
+            0
+        } else if target == predecessors[1].target() {
+            1
+        } else {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        };
+        let next = current
+            .node_discovery
+            .try_record_runtime_query_response(target, response, predecessors[index])
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &next_wire)?;
+        self.verify_runtime_query_successor_readback(
+            &next,
+            &next_wire,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )
+    }
+
+    /// Durably closes one request-only PXQR row with its classified outcome.
+    /// Restart callers must select ResidentAuthorityLost; no method here can
+    /// recreate the consumed pair token.
+    pub(crate) fn commit_distributed_runtime_query_closure(
+        &mut self,
+        target: RuntimeHostId,
+        closure: DistributedAgentStackRuntimeQueryPhaseV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let next = current
+            .node_discovery
+            .try_close_runtime_query(target, closure)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &next_wire)?;
+        self.verify_runtime_query_successor_readback(
+            &next,
+            &next_wire,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )
+    }
+
+    fn verify_runtime_query_successor_readback(
+        &mut self,
+        expected: &DistributedAgentStackNodeDiscoveryStateV1,
+        expected_wire: &[u8],
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let result = (|| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_node_discovery_wire() != Some(expected_wire) {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            let readback = self
+                .reopen_distributed_agent_stack_with_runtime_observation(
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?
+                .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+            if &readback.node_discovery != expected {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state = ControllerStoreState::Stopped;
+        }
+        result
+    }
+
+    /// Commits one exact PXNO before minting any authority to send it.
+    pub(crate) fn commit_distributed_runtime_observation(
+        &mut self,
+        next_node_discovery: &DistributedAgentStackNodeDiscoveryStateV1,
+        target: RuntimeHostId,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<CommittedDistributedRuntimeObservationV1, ControllerDistributedAgentStackError>
+    {
+        next_node_discovery
+            .validate_runtime_queries(predecessors, authorities, observation_endpoint_refs)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let owner_anchor = next_node_discovery.owner_anchor();
+        let before = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        if before
+            .node_discovery
+            .runtime_query_phase(target)
+            .map_err(ControllerDistributedAgentStackError::Node)?
+            != DistributedAgentStackRuntimeQueryPhaseV1::ResponseDurable
+            || next_node_discovery
+                .runtime_query_phase(target)
+                .map_err(ControllerDistributedAgentStackError::Node)?
+                != DistributedAgentStackRuntimeQueryPhaseV1::ObservationDurableNotSent
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let expected_wire = next_node_discovery
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_distributed_agent_stack_wires(&journal_wire, &expected_wire)?;
+        let readback_result = (|| {
+            self.revalidate_current()
+                .map_err(ControllerDistributedAgentStackError::Store)?;
+            if self.snapshot.distributed_agent_stack_node_discovery_wire()
+                != Some(expected_wire.as_ref())
+            {
+                return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+            }
+            let readback = self
+                .reopen_distributed_agent_stack_with_runtime_observation(
+                    owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?
+                .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+            let request = readback
+                .node_discovery
+                .current_runtime_observation(target)
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+            let snapshot_sequence = self.snapshot.snapshot_sequence();
+            let node_state_digest = readback
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+            let attempt_count = readback.node_discovery.runtime_query_attempt_count();
+            let phase = readback
+                .node_discovery
+                .runtime_query_phase(target)
+                .map_err(ControllerDistributedAgentStackError::Node)?;
+            let observation_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+                target,
+                predecessors,
+                observation_endpoint_refs,
+            )?;
+            self.grant_runtime_observation_once(
+                attempt_count,
+                target,
+                request.request_digest(),
+                phase,
+            )?;
+            Ok(CommittedDistributedRuntimeObservationV1 {
+                resident_generation: self.resident_generation,
+                store_instance_id: *self.snapshot.store_instance_id(),
+                snapshot_sequence,
+                node_state_digest,
+                attempt_count,
+                phase,
+                target,
+                observation_endpoint_ref,
+                request,
+            })
+        })();
+        if readback_result.is_err() {
+            self.state = ControllerStoreState::Stopped;
+        }
+        readback_result
+    }
+
+    /// Explicit restart seam for exact PXNO replay. It never returns PXQR
+    /// authority and accepts only a durable-not-sent or uncertain PXNO row.
+    pub(crate) fn recover_distributed_runtime_observation(
+        &mut self,
+        expected_owner_anchor: Digest32,
+        target: RuntimeHostId,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<CommittedDistributedRuntimeObservationV1, ControllerDistributedAgentStackError>
+    {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        let readback = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let request = readback
+            .node_discovery
+            .current_runtime_observation(target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let snapshot_sequence = self.snapshot.snapshot_sequence();
+        let node_state_digest = readback
+            .node_discovery
+            .durable_digest()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let attempt_count = readback.node_discovery.runtime_query_attempt_count();
+        let phase = readback
+            .node_discovery
+            .runtime_query_phase(target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let observation_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+            target,
+            predecessors,
+            observation_endpoint_refs,
+        )?;
+        self.grant_runtime_observation_once(
+            attempt_count,
+            target,
+            request.request_digest(),
+            phase,
+        )?;
+        Ok(CommittedDistributedRuntimeObservationV1 {
+            resident_generation: self.resident_generation,
+            store_instance_id: *self.snapshot.store_instance_id(),
+            snapshot_sequence,
+            node_state_digest,
+            attempt_count,
+            phase,
+            target,
+            observation_endpoint_ref,
+            request,
+        })
+    }
+
+    /// Revalidates one sealed PXNO against the exact current snapshot before
+    /// releasing its canonical request bytes to the transport owner.
+    pub(crate) fn claim_distributed_runtime_observation(
+        &mut self,
+        prepared: CommittedDistributedRuntimeObservationV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<ClaimedDistributedRuntimeObservationV1, ControllerDistributedAgentStackError> {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if prepared.resident_generation != self.resident_generation
+            || prepared.store_instance_id != *self.snapshot.store_instance_id()
+            || prepared.snapshot_sequence != self.snapshot.snapshot_sequence()
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let readback = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let request = readback
+            .node_discovery
+            .current_runtime_observation(prepared.target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let phase = readback
+            .node_discovery
+            .runtime_query_phase(prepared.target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let observation_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+            prepared.target,
+            predecessors,
+            observation_endpoint_refs,
+        )?;
+        if prepared.node_state_digest
+            != readback
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?
+            || prepared.request != request
+            || prepared.attempt_count != readback.node_discovery.runtime_query_attempt_count()
+            || prepared.phase != phase
+            || prepared.observation_endpoint_ref != observation_endpoint_ref
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        self.consume_runtime_observation_grant(
+            prepared.attempt_count,
+            prepared.target,
+            prepared.request.request_digest(),
+            prepared.phase,
+        )?;
+        self.active_runtime_observation_claim = Some(RuntimeObservationActiveClaimV1 {
+            snapshot_sequence: prepared.snapshot_sequence,
+            attempt_count: prepared.attempt_count,
+            target: prepared.target,
+            request_digest: prepared.request.request_digest(),
+            phase: prepared.phase,
+        });
+        Ok(ClaimedDistributedRuntimeObservationV1 {
+            resident_generation: prepared.resident_generation,
+            store_instance_id: prepared.store_instance_id,
+            snapshot_sequence: prepared.snapshot_sequence,
+            node_state_digest: prepared.node_state_digest,
+            attempt_count: prepared.attempt_count,
+            phase: prepared.phase,
+            target: prepared.target,
+            observation_endpoint_ref: prepared.observation_endpoint_ref,
+            request,
+        })
+    }
+
+    pub(crate) fn commit_distributed_runtime_observation_ingress(
+        &mut self,
+        ingress: DistributedRuntimeObservationCompletionIngressV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<
+        DistributedRuntimeObservationCommitDispositionV1,
+        ControllerDistributedAgentStackError,
+    > {
+        let (claimed, result) = ingress.into_store_parts();
+        match result {
+            Ok(ack) => {
+                self.commit_distributed_runtime_observation_ack(
+                    claimed,
+                    ack,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::AckDurable)
+            }
+            Err(TrustedLocalRuntimeObservationExchangeErrorV1::NotSent(_)) => {
+                self.commit_distributed_runtime_observation_closure(
+                    claimed,
+                    DistributedAgentStackRuntimeQueryPhaseV1::ObservationNotSent,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::NotSent)
+            }
+            Err(TrustedLocalRuntimeObservationExchangeErrorV1::Uncertain(_)) => {
+                self.commit_distributed_runtime_observation_closure(
+                    claimed,
+                    DistributedAgentStackRuntimeQueryPhaseV1::ObservationUncertain,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::Uncertain)
+            }
+            Err(TrustedLocalRuntimeObservationExchangeErrorV1::Rejected(_)) => {
+                self.commit_distributed_runtime_observation_closure(
+                    claimed,
+                    DistributedAgentStackRuntimeQueryPhaseV1::ObservationRejected,
+                    expected_owner_anchor,
+                    predecessors,
+                    authorities,
+                    observation_endpoint_refs,
+                )?;
+                Ok(DistributedRuntimeObservationCommitDispositionV1::Rejected)
+            }
+        }
+    }
+
+    /// Commits PXNA only while the claimed PXNO still names the exact current
+    /// store instance, snapshot sequence, and PXDN digest.
+    fn commit_distributed_runtime_observation_ack(
+        &mut self,
+        claimed: ClaimedDistributedRuntimeObservationV1,
+        ack: RuntimeObservationAckV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self.validate_claimed_runtime_observation(
+            &claimed,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )?;
+        let next = current
+            .node_discovery
+            .try_record_runtime_observation_ack(claimed.target, &claimed.request, ack)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_claimed_runtime_observation_successor(&journal_wire, &next_wire)
+    }
+
+    /// Durably records the classified PXNO transport outcome while the exact
+    /// claimed store witness is still current.
+    fn commit_distributed_runtime_observation_closure(
+        &mut self,
+        claimed: ClaimedDistributedRuntimeObservationV1,
+        closure: DistributedAgentStackRuntimeQueryPhaseV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        let current = self.validate_claimed_runtime_observation(
+            &claimed,
+            expected_owner_anchor,
+            predecessors,
+            authorities,
+            observation_endpoint_refs,
+        )?;
+        let next = current
+            .node_discovery
+            .try_close_runtime_observation(claimed.target, closure)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let next_wire = next
+            .encode()
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let journal_wire = self.current_distributed_agent_stack_journal_wire()?;
+        self.commit_claimed_runtime_observation_successor(&journal_wire, &next_wire)
+    }
+
+    fn validate_claimed_runtime_observation(
+        &mut self,
+        claimed: &ClaimedDistributedRuntimeObservationV1,
+        expected_owner_anchor: Digest32,
+        predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+        authorities: [&RuntimeObservationAuthorityV1; 2],
+        observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+    ) -> Result<ControllerDistributedAgentStackOwnerStateV1, ControllerDistributedAgentStackError>
+    {
+        self.revalidate_current()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        if claimed.resident_generation != self.resident_generation
+            || claimed.store_instance_id != *self.snapshot.store_instance_id()
+            || claimed.snapshot_sequence != self.snapshot.snapshot_sequence()
+            || self.active_runtime_observation_claim
+                != Some(RuntimeObservationActiveClaimV1 {
+                    snapshot_sequence: claimed.snapshot_sequence,
+                    attempt_count: claimed.attempt_count,
+                    target: claimed.target,
+                    request_digest: claimed.request.request_digest(),
+                    phase: claimed.phase,
+                })
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let current = self
+            .reopen_distributed_agent_stack_with_runtime_observation(
+                expected_owner_anchor,
+                predecessors,
+                authorities,
+                observation_endpoint_refs,
+            )?
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)?;
+        let current_phase = current
+            .node_discovery
+            .runtime_query_phase(claimed.target)
+            .map_err(ControllerDistributedAgentStackError::Node)?;
+        let current_endpoint_ref = runtime_observation_endpoint_ref_for_target(
+            claimed.target,
+            predecessors,
+            observation_endpoint_refs,
+        )?;
+        if claimed.node_state_digest
+            != current
+                .node_discovery
+                .durable_digest()
+                .map_err(ControllerDistributedAgentStackError::Node)?
+            || current
+                .node_discovery
+                .current_runtime_observation(claimed.target)
+                .map_err(ControllerDistributedAgentStackError::Node)?
+                != claimed.request
+            || claimed.attempt_count != current.node_discovery.runtime_query_attempt_count()
+            || claimed.phase != current_phase
+            || claimed.observation_endpoint_ref != current_endpoint_ref
+        {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        Ok(current)
+    }
+
+    fn grant_runtime_observation_once(
+        &mut self,
+        attempt_count: usize,
+        target: RuntimeHostId,
+        request_digest: Digest32,
+        phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        if self.runtime_observation_grants.iter().any(|grant| {
+            grant.attempt_count == attempt_count
+                && grant.target == target
+                && grant.request_digest == request_digest
+                && grant.phase == phase
+        }) {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        self.runtime_observation_grants
+            .try_reserve(1)
+            .map_err(|_| ControllerDistributedAgentStackError::CrossBindingMismatch)?;
+        self.runtime_observation_grants
+            .push(RuntimeObservationResidentGrantV1 {
+                attempt_count,
+                target,
+                request_digest,
+                phase,
+                claimed: false,
+            });
+        Ok(())
+    }
+
+    fn current_distributed_agent_stack_journal_wire(
+        &self,
+    ) -> Result<Vec<u8>, ControllerDistributedAgentStackError> {
+        self.ensure_operational()
+            .map_err(ControllerDistributedAgentStackError::Store)?;
+        self.snapshot
+            .distributed_agent_stack_journal_wire()
+            .map(ToOwned::to_owned)
+            .ok_or(ControllerDistributedAgentStackError::IncompleteExtension)
+    }
+
+    fn consume_runtime_observation_grant(
+        &mut self,
+        attempt_count: usize,
+        target: RuntimeHostId,
+        request_digest: Digest32,
+        phase: DistributedAgentStackRuntimeQueryPhaseV1,
+    ) -> Result<(), ControllerDistributedAgentStackError> {
+        if self.active_runtime_observation_claim.is_some() {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        let grant = self
+            .runtime_observation_grants
+            .iter_mut()
+            .find(|grant| {
+                grant.attempt_count == attempt_count
+                    && grant.target == target
+                    && grant.request_digest == request_digest
+                    && grant.phase == phase
+            })
+            .ok_or(ControllerDistributedAgentStackError::CrossBindingMismatch)?;
+        if grant.claimed {
+            return Err(ControllerDistributedAgentStackError::CrossBindingMismatch);
+        }
+        grant.claimed = true;
+        Ok(())
     }
 
     pub(crate) fn revalidate_current(
@@ -635,6 +2187,38 @@ impl ControllerStore {
             return Err(ControllerStoreError::ActiveSnapshotChanged);
         }
         Ok(&self.snapshot)
+    }
+
+    /// Revalidates and exposes only the exact directory/lock capability needed
+    /// to bind a one-way successor cutover to this consumed writer.
+    pub(crate) fn managed_fabric_cutover_identity(
+        &mut self,
+    ) -> Result<ControllerStoreCutoverIdentity, ControllerStoreError> {
+        self.revalidate_current()?;
+        let lock_metadata = self.lock_file.metadata().map_err(|error| {
+            self.state = ControllerStoreState::Stopped;
+            ControllerStoreError::Open(ControllerStoreOpenError::Io(ControllerIoFailure::new(
+                ControllerFileStage::ValidateLockIdentity,
+                &error,
+            )))
+        })?;
+        let lock_identity = FileIdentity::from_metadata(&lock_metadata);
+        validate_named_file_identity(
+            &self.directory,
+            CONTROLLER_LOCK_FILE_NAME,
+            lock_identity,
+            ControllerFileStage::ValidateLockIdentity,
+        )
+        .map_err(|error| {
+            self.state = ControllerStoreState::Stopped;
+            ControllerStoreError::Open(error)
+        })?;
+        Ok(ControllerStoreCutoverIdentity {
+            directory_device: self.directory.identity.device,
+            directory_inode: self.directory.identity.inode,
+            lock_device: lock_identity.device,
+            lock_inode: lock_identity.inode,
+        })
     }
 
     pub(crate) fn commit(
@@ -708,6 +2292,20 @@ impl ControllerStore {
             return Err(ControllerStoreError::Stopped);
         }
         Ok(())
+    }
+}
+
+fn runtime_observation_endpoint_ref_for_target(
+    target: RuntimeHostId,
+    predecessors: [&VerifiedDistributedAgentStackPredecessorV1; 2],
+    observation_endpoint_refs: [RuntimeObservationEndpointRefV1; 2],
+) -> Result<RuntimeObservationEndpointRefV1, ControllerDistributedAgentStackError> {
+    if target == predecessors[0].target() {
+        Ok(observation_endpoint_refs[0])
+    } else if target == predecessors[1].target() {
+        Ok(observation_endpoint_refs[1])
+    } else {
+        Err(ControllerDistributedAgentStackError::CrossBindingMismatch)
     }
 }
 
@@ -835,6 +2433,19 @@ fn validate_migration_source_identity(
     Ok(())
 }
 
+fn validate_payload_v8_migration_source_identity(
+    source: &ControllerJournalPayloadV8Migration,
+    request: ControllerMigrationRequest<'_>,
+) -> Result<(), ControllerStoreMigrationError> {
+    if source.source_store_instance_id() != &request.expected_store_instance_id {
+        return Err(ControllerStoreMigrationError::StoreInstanceMismatch);
+    }
+    if source.source_owner_identity_fingerprint() != request.expected_owner_identity {
+        return Err(ControllerStoreMigrationError::OwnerIdentityMismatch);
+    }
+    Ok(())
+}
+
 fn validate_migration_target_identity(
     target: &ControllerJournalSnapshot,
     request: ControllerMigrationRequest<'_>,
@@ -857,7 +2468,7 @@ fn resume_completed_controller_migration(
 ) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
     validate_migration_target_identity(&target, request)?;
     let target_wire = target
-        .encode()
+        .encode_payload_v8_for_migration()
         .map_err(ControllerStoreMigrationError::Journal)?;
     if target_wire.as_ref() != active.encoded {
         return Err(ControllerStoreMigrationError::TargetMismatch);
@@ -918,9 +2529,9 @@ fn publish_controller_migration(
     validate_migration_source_identity(&source, request)?;
     let target_wire = source
         .snapshot()
-        .encode()
+        .encode_payload_v8_for_migration()
         .map_err(ControllerStoreMigrationError::Journal)?;
-    let target = ControllerJournalSnapshot::decode(&target_wire)
+    let target = ControllerJournalSnapshot::migrate_payload_v8(&target_wire)
         .map_err(ControllerStoreMigrationError::Journal)?;
     validate_migration_target_identity(&target, request)?;
     let receipt = ControllerStoreMigrationReceipt::try_new(
@@ -982,12 +2593,166 @@ fn publish_controller_migration(
             ControllerFileStage::ReadBackPublished,
         ));
     }
-    ControllerJournalSnapshot::decode(&published.encoded)
+    ControllerJournalSnapshot::migrate_payload_v8(&published.encoded)
         .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
     validate_migration_handles(guard, evidence_directory)
         .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
     let (post_source, post_receipt) =
         read_controller_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    if post_source != active.encoded || post_receipt != receipt {
+        return Err(published_but_unverified(
+            ControllerFileStage::VerifyPublishedMigration,
+        ));
+    }
+    Ok(ControllerStoreMigrationOutcome {
+        disposition: ControllerStoreMigrationDisposition::Migrated,
+        receipt,
+    })
+}
+
+fn resume_completed_payload_v8_controller_migration(
+    guard: &ControllerMigrationGuard,
+    evidence_directory: &ControllerDirectoryHandle,
+    request: ControllerMigrationRequest<'_>,
+    active: ActiveSnapshotBytes,
+    target: ControllerJournalSnapshot,
+) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+    validate_migration_target_identity(&target, request)?;
+    let target_wire = target
+        .encode()
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    if target_wire.as_ref() != active.encoded {
+        return Err(ControllerStoreMigrationError::TargetMismatch);
+    }
+    clean_controller_migration_evidence_temps(evidence_directory, request.migration_id)
+        .map_err(|_| published_but_unverified(ControllerFileStage::InspectMigrationEvidence))?;
+    let (source_wire, stored_receipt) =
+        read_payload_v8_controller_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| {
+                published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence)
+            })?;
+    let source = ControllerJournalSnapshot::migrate_payload_v8_with_metadata(&source_wire)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    validate_payload_v8_migration_source_identity(&source, request)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    if source.snapshot() != &target {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    let expected_receipt = ControllerStoreMigrationReceipt::try_new_payload_v8(
+        request.migration_id,
+        &source,
+        &source_wire,
+        &target,
+        &target_wire,
+    )
+    .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackMigrationEvidence))?;
+    if stored_receipt != expected_receipt {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    clean_valid_orphan_temps(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    let revalidated = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    if revalidated.identity != active.identity || revalidated.encoded != active.encoded {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    Ok(ControllerStoreMigrationOutcome {
+        disposition: ControllerStoreMigrationDisposition::AlreadyMigrated,
+        receipt: stored_receipt,
+    })
+}
+
+fn publish_payload_v8_controller_migration(
+    guard: &ControllerMigrationGuard,
+    evidence_directory: &ControllerDirectoryHandle,
+    request: ControllerMigrationRequest<'_>,
+    active: ActiveSnapshotBytes,
+    source: ControllerJournalPayloadV8Migration,
+    failpoints: ControllerMigrationFailpoints,
+) -> Result<ControllerStoreMigrationOutcome, ControllerStoreMigrationError> {
+    validate_payload_v8_migration_source_identity(&source, request)?;
+    let target_wire = source
+        .snapshot()
+        .encode()
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    let target = ControllerJournalSnapshot::decode(&target_wire)
+        .map_err(ControllerStoreMigrationError::Journal)?;
+    validate_migration_target_identity(&target, request)?;
+    let receipt = ControllerStoreMigrationReceipt::try_new_payload_v8(
+        request.migration_id,
+        &source,
+        &active.encoded,
+        &target,
+        &target_wire,
+    )?;
+
+    clean_valid_orphan_temps(&guard.directory).map_err(ControllerStoreMigrationError::Store)?;
+    clean_controller_migration_evidence_temps(evidence_directory, request.migration_id)?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &payload_v8_migration_source_file_name(request.migration_id),
+        &active.encoded,
+        MigrationEvidenceKind::Source,
+        migration_random_token()?,
+        failpoints.source_evidence,
+    )?;
+    ensure_read_only_migration_evidence(
+        evidence_directory,
+        request.migration_id,
+        &payload_v8_migration_receipt_file_name(request.migration_id),
+        receipt.canonical_wire(),
+        MigrationEvidenceKind::Receipt,
+        migration_random_token()?,
+        failpoints.receipt_evidence,
+    )?;
+    let (stored_source, stored_receipt) =
+        read_payload_v8_controller_migration_evidence(evidence_directory, request.migration_id)
+            .map_err(|_| {
+                uncertain_migration_evidence(ControllerFileStage::ReadBackMigrationEvidence)
+            })?;
+    if stored_source != active.encoded || stored_receipt != receipt {
+        return Err(uncertain_migration_evidence(
+            ControllerFileStage::ReadBackMigrationEvidence,
+        ));
+    }
+
+    validate_migration_handles(guard, evidence_directory)?;
+    let current = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(ControllerStoreMigrationError::Store)?;
+    if current.identity != active.identity || current.encoded != active.encoded {
+        return Err(ControllerStoreMigrationError::TargetMismatch);
+    }
+    publish_controller_snapshot(
+        &guard.directory,
+        &target_wire,
+        migration_random_token()?,
+        ControllerPublishMode::ReplaceExisting(active.identity),
+        failpoints.active_snapshot,
+    )
+    .map_err(ControllerStoreMigrationError::Publish)?;
+    let published = read_active_controller_snapshot_bytes(&guard.directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    if published.encoded != target_wire.as_ref() {
+        return Err(published_but_unverified(
+            ControllerFileStage::ReadBackPublished,
+        ));
+    }
+    ControllerJournalSnapshot::decode(&published.encoded)
+        .map_err(|_| published_but_unverified(ControllerFileStage::ReadBackPublished))?;
+    validate_migration_handles(guard, evidence_directory)
+        .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
+    let (post_source, post_receipt) =
+        read_payload_v8_controller_migration_evidence(evidence_directory, request.migration_id)
             .map_err(|_| published_but_unverified(ControllerFileStage::VerifyPublishedMigration))?;
     if post_source != active.encoded || post_receipt != receipt {
         return Err(published_but_unverified(
@@ -1031,6 +2796,26 @@ fn migration_receipt_file_name(migration_id: [u8; 32]) -> String {
         MIGRATION_RECEIPT_FILE_PREFIX.len() + 64 + MIGRATION_RECEIPT_FILE_SUFFIX.len(),
     );
     name.push_str(MIGRATION_RECEIPT_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_RECEIPT_FILE_SUFFIX);
+    name
+}
+
+fn payload_v8_migration_source_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        PAYLOAD_V8_MIGRATION_SOURCE_FILE_PREFIX.len() + 64 + MIGRATION_SOURCE_FILE_SUFFIX.len(),
+    );
+    name.push_str(PAYLOAD_V8_MIGRATION_SOURCE_FILE_PREFIX);
+    append_lower_hex(&mut name, &migration_id);
+    name.push_str(MIGRATION_SOURCE_FILE_SUFFIX);
+    name
+}
+
+fn payload_v8_migration_receipt_file_name(migration_id: [u8; 32]) -> String {
+    let mut name = String::with_capacity(
+        PAYLOAD_V8_MIGRATION_RECEIPT_FILE_PREFIX.len() + 64 + MIGRATION_RECEIPT_FILE_SUFFIX.len(),
+    );
+    name.push_str(PAYLOAD_V8_MIGRATION_RECEIPT_FILE_PREFIX);
     append_lower_hex(&mut name, &migration_id);
     name.push_str(MIGRATION_RECEIPT_FILE_SUFFIX);
     name
@@ -1388,9 +3173,37 @@ fn read_controller_migration_evidence(
         MIGRATION_RECEIPT_BYTES,
     )?;
     let receipt = ControllerStoreMigrationReceipt::decode(&receipt_wire)?;
-    if receipt.migration_id != migration_id
+    if receipt.receipt_version != CONTROLLER_MIGRATION_RECEIPT_VERSION
+        || receipt.migration_id != migration_id
         || receipt.source_snapshot_length != source.len() as u64
         || receipt.source_snapshot_digest != migration_evidence_digest(&source)?
+    {
+        return Err(ControllerStoreMigrationError::EvidenceMismatch);
+    }
+    Ok((source, receipt))
+}
+
+fn read_payload_v8_controller_migration_evidence(
+    directory: &ControllerDirectoryHandle,
+    migration_id: [u8; 32],
+) -> Result<(Vec<u8>, ControllerStoreMigrationReceipt), ControllerStoreMigrationError> {
+    let source = read_read_only_migration_evidence(
+        directory,
+        &payload_v8_migration_source_file_name(migration_id),
+        MAX_CONTROLLER_SNAPSHOT_BYTES,
+    )?;
+    let receipt_wire = read_read_only_migration_evidence(
+        directory,
+        &payload_v8_migration_receipt_file_name(migration_id),
+        MIGRATION_RECEIPT_BYTES,
+    )?;
+    let receipt = ControllerStoreMigrationReceipt::decode(&receipt_wire)?;
+    if receipt.receipt_version() != CONTROLLER_PAYLOAD_V8_MIGRATION_RECEIPT_VERSION
+        || receipt.migration_id() != &migration_id
+        || migration_evidence_digest(&source)? != receipt.source_snapshot_digest
+        || u64::try_from(source.len())
+            .map_err(|_| ControllerStoreMigrationError::EvidenceTooLarge)?
+            != receipt.source_snapshot_length
     {
         return Err(ControllerStoreMigrationError::EvidenceMismatch);
     }
@@ -2221,8 +4034,7 @@ fn verify_filesystem(
     directory: &File,
     _policy: ControllerFilesystemPolicy,
 ) -> Result<(), ControllerStoreOpenError> {
-    #[cfg(test)]
-    if _policy == ControllerFilesystemPolicy::ExplicitFixture {
+    if _policy != ControllerFilesystemPolicy::ProductionReference {
         return Ok(());
     }
     #[cfg(not(target_os = "macos"))]
@@ -2700,6 +4512,27 @@ pub(crate) enum ControllerStoreError {
     Publish(ControllerPublishFailure),
 }
 
+#[derive(Debug)]
+pub(crate) enum ControllerDistributedAgentStackError {
+    Store(ControllerStoreError),
+    Journal(ControllerJournalError),
+    Apply(DistributedAgentStackApplyError),
+    Node(DistributedAgentStackNodeReconcileError),
+    IncompleteExtension,
+    CrossBindingMismatch,
+}
+
+impl fmt::Display for ControllerDistributedAgentStackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Controller distributed Agent stack extension failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for ControllerDistributedAgentStackError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerStoreMigrationError {
     InvalidExpectedStoreIdentity,
@@ -2776,11 +4609,12 @@ mod tests {
     use crate::controller_journal::{
         ControllerAuthKeyFingerprint, ControllerJournalError, ControllerJournalSnapshot,
         ControllerJournalState, ControllerOperationId, ControllerOwnerIdentityFingerprint,
-        ControllerRequestAuthPin, ControllerTenurePhase, controller_test_manifest,
-        refresh_controller_test_checksum,
+        ControllerRemoteConnectorAttemptPhaseV1, ControllerRemoteConnectorRestartRequirementV1,
+        ControllerRemoteConnectorStepV1, ControllerRequestAuthPin, ControllerTenurePhase,
+        controller_test_manifest, refresh_controller_test_checksum,
         tests::{
             decode_frozen_base64, frozen_v7_opaque_query_wire, frozen_v7_zero_wire,
-            frozen_v8_zero_target_wire,
+            frozen_v8_zero_target_wire, remote_node_describe_wire,
         },
     };
     use crate::controller_tenure::{
@@ -3188,12 +5022,133 @@ mod tests {
     }
 
     #[test]
-    fn offline_v7_migration_retains_exact_read_only_evidence_and_resumes_exactly() {
+    fn remote_connector_store_commits_before_send_and_restart_only_closes_authority() {
+        let directory = TestDirectory::new();
+        let initial = initial_snapshot();
+        install(&initial, &directory);
+        let first = remote_node_describe_wire(0xb1);
+        {
+            let mut store = open_fixture(&directory);
+            assert_eq!(
+                store
+                    .revalidate_remote_connector_resume_projection()
+                    .expect("absent projection must validate"),
+                None
+            );
+            store
+                .initialize_remote_connector(
+                    digest(0xa1),
+                    RuntimeHostId::from_bytes([0x31; 16]),
+                    [0xa2; 32],
+                    [0xa3; 32],
+                )
+                .expect("remote connector identity must become durable");
+            let initialized = store
+                .revalidate_remote_connector_resume_projection()
+                .expect("initialized projection must validate")
+                .expect("remote extension must exist");
+            assert!(initialized.exchanges().is_empty());
+            assert_eq!(
+                initialized.next_request_step(),
+                Some(ControllerRemoteConnectorStepV1::NodeDescribe)
+            );
+            store
+                .prepare_remote_connector_request(
+                    ControllerRemoteConnectorStepV1::NodeDescribe,
+                    &first,
+                )
+                .expect("request must commit before send authority exists");
+            assert_eq!(
+                active_snapshot(&directory).remote_connector_current_attempt(),
+                Some((
+                    ControllerRemoteConnectorStepV1::NodeDescribe,
+                    ControllerRemoteConnectorAttemptPhaseV1::RequestDurableNotSent,
+                    first.as_ref(),
+                ))
+            );
+            let prepared = store
+                .revalidate_remote_connector_resume_projection()
+                .expect("prepared projection must validate")
+                .expect("remote extension must exist");
+            assert_eq!(prepared.exchanges().len(), 1);
+            assert_eq!(
+                prepared
+                    .current_exchange()
+                    .expect("prepared exchange")
+                    .request_wire(),
+                first.as_ref()
+            );
+            let claim = store
+                .claim_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe)
+                .expect("atomic claim");
+            assert_eq!(claim.step(), ControllerRemoteConnectorStepV1::NodeDescribe);
+            assert_eq!(claim.request_wire(), first.as_ref());
+            assert_eq!(
+                active_snapshot(&directory).remote_connector_current_attempt(),
+                Some((
+                    ControllerRemoteConnectorStepV1::NodeDescribe,
+                    ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight,
+                    first.as_ref(),
+                ))
+            );
+            let in_flight = store
+                .revalidate_remote_connector_resume_projection()
+                .expect("in-flight projection must validate")
+                .expect("remote extension must exist");
+            assert_eq!(
+                in_flight
+                    .current_exchange()
+                    .expect("in-flight exchange")
+                    .phase(),
+                ControllerRemoteConnectorAttemptPhaseV1::AttemptInFlight
+            );
+        }
+
+        let mut restarted = open_fixture(&directory);
+        let reopened = restarted
+            .revalidate_remote_connector_resume_projection()
+            .expect("reopened projection must validate")
+            .expect("remote extension must exist");
+        assert_eq!(
+            reopened.restart_requirement(),
+            ControllerRemoteConnectorRestartRequirementV1::RecoverInFlight(
+                ControllerRemoteConnectorStepV1::NodeDescribe
+            )
+        );
+        assert_eq!(
+            restarted
+                .remote_connector_restart_requirement()
+                .expect("restart requirement"),
+            ControllerRemoteConnectorRestartRequirementV1::RecoverInFlight(
+                ControllerRemoteConnectorStepV1::NodeDescribe
+            )
+        );
+        restarted
+            .recover_remote_connector_attempt(ControllerRemoteConnectorStepV1::NodeDescribe)
+            .expect("separate restart command closes old resident authority");
+        let second = remote_node_describe_wire(0xb2);
+        restarted
+            .prepare_remote_connector_request(
+                ControllerRemoteConnectorStepV1::NodeDescribe,
+                &second,
+            )
+            .expect("fresh read-only request is a separate durable attempt");
+        assert!(matches!(
+            restarted.revalidate_remote_connector_cutover_ready(),
+            Err(ControllerStoreError::Codec(
+                ControllerJournalError::RemoteConnectorCutoverNotReady
+            ))
+        ));
+    }
+
+    #[test]
+    fn offline_v7_and_v8_migrations_retain_exact_evidence_and_resume_exactly() {
         let directory = TestDirectory::new();
         let evidence = TestDirectory::new();
         let source_wire = frozen_v7_zero_wire();
-        let expected_target = ControllerJournalSnapshot::decode(&frozen_v8_zero_target_wire())
-            .expect("frozen v8 target must decode");
+        let expected_target_wire = frozen_v8_zero_target_wire();
+        let expected_target = ControllerJournalSnapshot::migrate_payload_v8(&expected_target_wire)
+            .expect("frozen v8 target must parse explicitly");
         install_wire(&source_wire, &directory);
         assert_eq!(
             ControllerStore::open_with_policy(
@@ -3202,7 +5157,7 @@ mod tests {
                 owner(),
                 ControllerFilesystemPolicy::ExplicitFixture,
             )
-            .expect_err("normal v8 open must reject v7"),
+            .expect_err("normal v9 open must reject v7"),
             ControllerStoreOpenError::Codec(ControllerJournalError::UnknownPayloadVersion)
         );
 
@@ -3228,7 +5183,10 @@ mod tests {
             decode_frozen_base64(include_str!("testdata/controller_v7_v8_receipt.b64")).as_ref(),
             "receipt bytes are frozen against the accepted HEAD-v7 source and exact v8 target"
         );
-        assert_eq!(active_snapshot(&directory), expected_target);
+        assert_eq!(
+            fs::read(directory.path().join(CONTROLLER_ACTIVE_FILE_NAME)).expect("v8 active bytes"),
+            expected_target_wire.as_ref()
+        );
         let source_path = evidence
             .path()
             .join(super::migration_source_file_name([0x91; 32]));
@@ -3266,6 +5224,45 @@ mod tests {
             ControllerStoreMigrationDisposition::AlreadyMigrated
         );
         assert_eq!(resumed.receipt, migrated.receipt);
+
+        let v8_request = super::ControllerMigrationRequest {
+            migration_id: [0x95; 32],
+            ..request
+        };
+        let v9 = ControllerStore::migrate_payload_v8_offline_with_policy(
+            v8_request,
+            ControllerFilesystemPolicy::ExplicitFixture,
+        )
+        .expect("v8 to v9 migration must succeed");
+        assert_eq!(
+            v9.disposition,
+            ControllerStoreMigrationDisposition::Migrated
+        );
+        assert_eq!(v9.receipt.receipt_version(), 2);
+        assert_eq!(v9.receipt.source_payload_version(), 8);
+        assert_eq!(v9.receipt.target_payload_version(), 9);
+        assert_eq!(active_snapshot(&directory), expected_target);
+        assert_eq!(
+            ControllerStore::migrate_payload_v8_offline_with_policy(
+                v8_request,
+                ControllerFilesystemPolicy::ExplicitFixture,
+            )
+            .expect("exact v8 migration retry must resume")
+            .disposition,
+            ControllerStoreMigrationDisposition::AlreadyMigrated
+        );
+        assert!(
+            evidence
+                .path()
+                .join(super::payload_v8_migration_source_file_name([0x95; 32]))
+                .is_file()
+        );
+        assert!(
+            evidence
+                .path()
+                .join(super::payload_v8_migration_receipt_file_name([0x95; 32]))
+                .is_file()
+        );
 
         let held = open_fixture(&directory);
         assert_eq!(
@@ -3388,7 +5385,18 @@ mod tests {
                 ControllerPublishFailure::UncertainAfterPublish(_)
             ))
         ));
-        assert_eq!(active_snapshot(&active_uncertain_store), source);
+        assert_eq!(
+            fs::read(
+                active_uncertain_store
+                    .path()
+                    .join(CONTROLLER_ACTIVE_FILE_NAME)
+            )
+            .expect("v8 active after uncertain publish"),
+            source
+                .encode_payload_v8_for_migration()
+                .expect("exact v8 target")
+                .as_ref()
+        );
         assert_eq!(
             ControllerStore::migrate_payload_v7_offline_with_policy(
                 active_request,
