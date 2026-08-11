@@ -3256,7 +3256,9 @@ mod tests {
     use paraegox_runtime_contracts::execution::{
         CardDefinitionRef, CardImplementationRef, RuntimeApplyRequestV2,
     };
-    use paraegox_runtime_contracts::managed_model_agent_stack_plan::ArtifactBoundManagedModelAgentStackApplyRequestV1;
+    use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+        ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    };
     use paraegox_runtime_contracts::process_execution::{
         RequestV4WireErrorCode, RuntimeApplyRequestV4,
     };
