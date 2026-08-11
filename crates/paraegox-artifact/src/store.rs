@@ -1365,7 +1365,7 @@ fn root_selection(state_root: &DirectoryHandle) -> Result<(bool, bool), StoreErr
 
 enum InitialStagingInspection {
     NotFound,
-    Operation(MaterializationOperationV1),
+    Operation(Box<MaterializationOperationV1>),
     FinalAppeared,
 }
 
@@ -1437,7 +1437,7 @@ fn inspect_initial_staging(
             drop(objects);
             Ok(operation.map_or(
                 InitialStagingInspection::NotFound,
-                InitialStagingInspection::Operation,
+                |operation| InitialStagingInspection::Operation(Box::new(operation)),
             ))
         } else {
             Err(StoreError::Owner)
@@ -1514,7 +1514,7 @@ fn run_query(
                     return ArtifactStoreInvocationV1::failure(
                         ArtifactStoreChangeV1::Unchanged,
                         ArtifactStoreFailureV1::PublicationUncertain {
-                            operation: Some(Box::new(operation)),
+                            operation: Some(operation),
                         },
                     );
                 }
