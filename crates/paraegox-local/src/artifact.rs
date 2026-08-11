@@ -1412,10 +1412,11 @@ mod unix {
         parent: &DirectoryHandle,
         name: &OsStr,
         maximum: usize,
+        strict_mode: bool,
         inspect_noatime: bool,
     ) -> Result<(Box<[u8]>, FileIdentity), LocalProcessError> {
         let (bytes, identity, file) =
-            read_regular_at_with_mode(parent, name, maximum, false, inspect_noatime)?;
+            read_regular_at_with_mode(parent, name, maximum, strict_mode, inspect_noatime)?;
         drop(file);
         Ok((bytes, identity))
     }
@@ -1527,6 +1528,7 @@ mod unix {
                     &parent.parent,
                     manifest_name,
                     MANIFEST_BYTES,
+                    false,
                     inspect_noatime,
                 ),
                 &mut failures,
@@ -1538,6 +1540,7 @@ mod unix {
                     &parent.parent,
                     payload_name,
                     MAX_SOURCE_BYTES,
+                    false,
                     inspect_noatime,
                 ),
                 &mut failures,
@@ -1575,6 +1578,7 @@ mod unix {
                     &parent.parent,
                     manifest_name,
                     MANIFEST_BYTES,
+                    false,
                     inspect_noatime,
                 ),
                 &mut failures,
@@ -1586,6 +1590,7 @@ mod unix {
                     &parent.parent,
                     payload_name,
                     MAX_SOURCE_BYTES,
+                    false,
                     inspect_noatime,
                 ),
                 &mut failures,
@@ -1670,8 +1675,14 @@ mod unix {
         let final_dir = open_build_directory(parent, output_leaf)?;
         let mut failures = ArtifactPairReadFailuresV1::default();
         let manifest = collect_pair_evidence(
-            read_pair_member(&final_dir, OsStr::new(MANIFEST_NAME), MANIFEST_BYTES, false)
-                .map_err(|error| map_existing_build_read_failure(error).error),
+            read_pair_member(
+                &final_dir,
+                OsStr::new(MANIFEST_NAME),
+                MANIFEST_BYTES,
+                true,
+                false,
+            )
+            .map_err(|error| map_existing_build_read_failure(error).error),
             &mut failures,
         );
         let payload = collect_pair_evidence(
@@ -1679,6 +1690,7 @@ mod unix {
                 &final_dir,
                 OsStr::new(PAYLOAD_NAME),
                 MAX_SOURCE_BYTES,
+                true,
                 false,
             )
             .map_err(|error| map_existing_build_read_failure(error).error),
