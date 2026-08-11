@@ -44,17 +44,13 @@ const ENTRYPOINT: &[u8; 17] = b"literal-prefix-v1";
 
 const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.payload.sha256.v1";
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.manifest.sha256.v1";
-const REQUEST_DIGEST_DOMAIN: &[u8] =
-    b"paraegox.artifact.materialization-request.sha256.v1";
-const ADMISSION_DIGEST_DOMAIN: &[u8] =
-    b"paraegox.artifact.materialization-admission.sha256.v1";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.materialization-request.sha256.v1";
+const ADMISSION_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.materialization-admission.sha256.v1";
 const MATERIALIZING_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.materializing.sha256.v1";
-const OBJECT_TERMINAL_DIGEST_DOMAIN: &[u8] =
-    b"paraegox.artifact.object-terminal.sha256.v1";
+const OBJECT_TERMINAL_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.object-terminal.sha256.v1";
 const OPERATION_TERMINAL_DIGEST_DOMAIN: &[u8] =
     b"paraegox.artifact.materialization-terminal.sha256.v1";
-const RECEIPT_DIGEST_DOMAIN: &[u8] =
-    b"paraegox.artifact.materialization-receipt.sha256.v1";
+const RECEIPT_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.materialization-receipt.sha256.v1";
 const SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"paraegox.artifact.store-snapshot.sha256.v1";
 
 const MAX_PROMPT_BYTES: u32 = 16_384;
@@ -128,9 +124,7 @@ macro_rules! nonzero_bytes {
         pub struct $name([u8; $size]);
 
         impl $name {
-            pub const fn try_from_bytes(
-                bytes: [u8; $size],
-            ) -> Result<Self, ArtifactContractError> {
+            pub const fn try_from_bytes(bytes: [u8; $size]) -> Result<Self, ArtifactContractError> {
                 let mut index = 0;
                 while index < bytes.len() {
                     if bytes[index] != 0 {
@@ -180,7 +174,10 @@ fn validate_payload_bytes(payload: &[u8]) -> Result<(), ArtifactContractError> {
     Ok(())
 }
 
-fn read_array<const N: usize>(bytes: &[u8], start: usize) -> Result<[u8; N], ArtifactContractError> {
+fn read_array<const N: usize>(
+    bytes: &[u8],
+    start: usize,
+) -> Result<[u8; N], ArtifactContractError> {
     let end = start
         .checked_add(N)
         .ok_or(ArtifactContractError::InvalidLength)?;
@@ -412,9 +409,7 @@ impl ArtifactObjectRefV1 {
         })
     }
 
-    pub fn from_manifest(
-        manifest: &ArtifactManifestV1,
-    ) -> Result<Self, ArtifactContractError> {
+    pub fn from_manifest(manifest: &ArtifactManifestV1) -> Result<Self, ArtifactContractError> {
         Self::try_new(manifest.payload_digest(), manifest.manifest_digest())
     }
 
@@ -480,8 +475,12 @@ impl FromStr for ArtifactObjectRefV1 {
         if fields.next() != Some("sha256") {
             return Err(ArtifactContractError::InvalidReference);
         }
-        let payload = fields.next().ok_or(ArtifactContractError::InvalidReference)?;
-        let manifest = fields.next().ok_or(ArtifactContractError::InvalidReference)?;
+        let payload = fields
+            .next()
+            .ok_or(ArtifactContractError::InvalidReference)?;
+        let manifest = fields
+            .next()
+            .ok_or(ArtifactContractError::InvalidReference)?;
         if fields.next().is_some() {
             return Err(ArtifactContractError::InvalidReference);
         }
@@ -569,9 +568,7 @@ fn check_frame_prefix(
     if bytes[6] != action || bytes[7] != state {
         return Err(ArtifactContractError::InvalidState);
     }
-    if read_u16(bytes, 8)? != expected_len as u16
-        || read_u32(bytes, 12)? != expected_len as u32
-    {
+    if read_u16(bytes, 8)? != expected_len as u16 || read_u32(bytes, 12)? != expected_len as u32 {
         return Err(ArtifactContractError::InvalidHeader);
     }
     require_zero(&bytes[10..12])
@@ -718,11 +715,15 @@ impl MaterializationAdmissionV1 {
             operation_sequence: NonZeroU64::new(read_u64(bytes, 48)?)
                 .ok_or(ArtifactContractError::ZeroSequence)?,
             operation_id: ArtifactOperationIdV1::try_from_bytes(read_array(bytes, 56)?)?,
-            request_digest: Digest32::from_bytes(read_array(bytes, 72)?),
+            request_digest: nonzero_digest(read_array(bytes, 72)?)?,
             object_ref: ArtifactObjectRefV1::decode(&bytes[104..176])?,
             admission_digest: Digest32::from_bytes(read_array(bytes, 176)?),
         };
-        require_digest(value.admission_digest, ADMISSION_DIGEST_DOMAIN, &bytes[..176])?;
+        require_digest(
+            value.admission_digest,
+            ADMISSION_DIGEST_DOMAIN,
+            &bytes[..176],
+        )?;
         canonical_round_trip(bytes, &value.encode())?;
         Ok(value)
     }
@@ -749,17 +750,29 @@ impl MaterializationAdmissionV1 {
     }
 
     #[must_use]
-    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 { self.store_instance }
+    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 {
+        self.store_instance
+    }
     #[must_use]
-    pub const fn operation_sequence(&self) -> NonZeroU64 { self.operation_sequence }
+    pub const fn operation_sequence(&self) -> NonZeroU64 {
+        self.operation_sequence
+    }
     #[must_use]
-    pub const fn operation_id(&self) -> ArtifactOperationIdV1 { self.operation_id }
+    pub const fn operation_id(&self) -> ArtifactOperationIdV1 {
+        self.operation_id
+    }
     #[must_use]
-    pub const fn request_digest(&self) -> Digest32 { self.request_digest }
+    pub const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
     #[must_use]
-    pub const fn object_ref(&self) -> ArtifactObjectRefV1 { self.object_ref }
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
     #[must_use]
-    pub const fn admission_digest(&self) -> Digest32 { self.admission_digest }
+    pub const fn admission_digest(&self) -> Digest32 {
+        self.admission_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -797,12 +810,16 @@ impl MaterializingRecordV1 {
             operation_sequence: NonZeroU64::new(read_u64(bytes, 48)?)
                 .ok_or(ArtifactContractError::ZeroSequence)?,
             operation_id: ArtifactOperationIdV1::try_from_bytes(read_array(bytes, 56)?)?,
-            request_digest: Digest32::from_bytes(read_array(bytes, 72)?),
-            admission_digest: Digest32::from_bytes(read_array(bytes, 104)?),
+            request_digest: nonzero_digest(read_array(bytes, 72)?)?,
+            admission_digest: nonzero_digest(read_array(bytes, 104)?)?,
             object_ref: ArtifactObjectRefV1::decode(&bytes[136..208])?,
             materializing_digest: Digest32::from_bytes(read_array(bytes, 208)?),
         };
-        require_digest(value.materializing_digest, MATERIALIZING_DIGEST_DOMAIN, &bytes[..208])?;
+        require_digest(
+            value.materializing_digest,
+            MATERIALIZING_DIGEST_DOMAIN,
+            &bytes[..208],
+        )?;
         canonical_round_trip(bytes, &value.encode())?;
         Ok(value)
     }
@@ -830,19 +847,33 @@ impl MaterializingRecordV1 {
     }
 
     #[must_use]
-    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 { self.store_instance }
+    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 {
+        self.store_instance
+    }
     #[must_use]
-    pub const fn operation_sequence(&self) -> NonZeroU64 { self.operation_sequence }
+    pub const fn operation_sequence(&self) -> NonZeroU64 {
+        self.operation_sequence
+    }
     #[must_use]
-    pub const fn operation_id(&self) -> ArtifactOperationIdV1 { self.operation_id }
+    pub const fn operation_id(&self) -> ArtifactOperationIdV1 {
+        self.operation_id
+    }
     #[must_use]
-    pub const fn request_digest(&self) -> Digest32 { self.request_digest }
+    pub const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
     #[must_use]
-    pub const fn admission_digest(&self) -> Digest32 { self.admission_digest }
+    pub const fn admission_digest(&self) -> Digest32 {
+        self.admission_digest
+    }
     #[must_use]
-    pub const fn object_ref(&self) -> ArtifactObjectRefV1 { self.object_ref }
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
     #[must_use]
-    pub const fn materializing_digest(&self) -> Digest32 { self.materializing_digest }
+    pub const fn materializing_digest(&self) -> Digest32 {
+        self.materializing_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -921,15 +952,25 @@ impl ArtifactObjectRecordV1 {
     }
 
     #[must_use]
-    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 { self.store_instance }
+    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 {
+        self.store_instance
+    }
     #[must_use]
-    pub const fn object_sequence(&self) -> NonZeroU64 { self.object_sequence }
+    pub const fn object_sequence(&self) -> NonZeroU64 {
+        self.object_sequence
+    }
     #[must_use]
-    pub const fn object_ref(&self) -> ArtifactObjectRefV1 { self.object_ref }
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
     #[must_use]
-    pub const fn payload_len(&self) -> u64 { self.payload_len }
+    pub const fn payload_len(&self) -> u64 {
+        self.payload_len
+    }
     #[must_use]
-    pub const fn object_terminal_digest(&self) -> Digest32 { self.object_terminal_digest }
+    pub const fn object_terminal_digest(&self) -> Digest32 {
+        self.object_terminal_digest
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1043,8 +1084,8 @@ impl MaterializationTerminalV1 {
             operation_sequence: NonZeroU64::new(read_u64(bytes, 48)?)
                 .ok_or(ArtifactContractError::ZeroSequence)?,
             operation_id: ArtifactOperationIdV1::try_from_bytes(read_array(bytes, 56)?)?,
-            request_digest: Digest32::from_bytes(read_array(bytes, 72)?),
-            admission_digest: Digest32::from_bytes(read_array(bytes, 104)?),
+            request_digest: nonzero_digest(read_array(bytes, 72)?)?,
+            admission_digest: nonzero_digest(read_array(bytes, 104)?)?,
             materializing_digest: optional_digest(read_array(bytes, 136)?),
             object_terminal_digest: optional_digest(read_array(bytes, 168)?),
             object_ref: ArtifactObjectRefV1::decode(&bytes[200..272])?,
@@ -1069,7 +1110,11 @@ impl MaterializationTerminalV1 {
                 }
             }
         }
-        require_digest(value.terminal_digest, OPERATION_TERMINAL_DIGEST_DOMAIN, &bytes[..272])?;
+        require_digest(
+            value.terminal_digest,
+            OPERATION_TERMINAL_DIGEST_DOMAIN,
+            &bytes[..272],
+        )?;
         canonical_round_trip(bytes, &value.encode())?;
         Ok(value)
     }
@@ -1103,25 +1148,45 @@ impl MaterializationTerminalV1 {
     }
 
     #[must_use]
-    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 { self.store_instance }
+    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 {
+        self.store_instance
+    }
     #[must_use]
-    pub const fn operation_sequence(&self) -> NonZeroU64 { self.operation_sequence }
+    pub const fn operation_sequence(&self) -> NonZeroU64 {
+        self.operation_sequence
+    }
     #[must_use]
-    pub const fn operation_id(&self) -> ArtifactOperationIdV1 { self.operation_id }
+    pub const fn operation_id(&self) -> ArtifactOperationIdV1 {
+        self.operation_id
+    }
     #[must_use]
-    pub const fn request_digest(&self) -> Digest32 { self.request_digest }
+    pub const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
     #[must_use]
-    pub const fn admission_digest(&self) -> Digest32 { self.admission_digest }
+    pub const fn admission_digest(&self) -> Digest32 {
+        self.admission_digest
+    }
     #[must_use]
-    pub const fn materializing_digest(&self) -> Option<Digest32> { self.materializing_digest }
+    pub const fn materializing_digest(&self) -> Option<Digest32> {
+        self.materializing_digest
+    }
     #[must_use]
-    pub const fn object_terminal_digest(&self) -> Option<Digest32> { self.object_terminal_digest }
+    pub const fn object_terminal_digest(&self) -> Option<Digest32> {
+        self.object_terminal_digest
+    }
     #[must_use]
-    pub const fn object_ref(&self) -> ArtifactObjectRefV1 { self.object_ref }
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
     #[must_use]
-    pub const fn state(&self) -> MaterializationTerminalStateV1 { self.state }
+    pub const fn state(&self) -> MaterializationTerminalStateV1 {
+        self.state
+    }
     #[must_use]
-    pub const fn terminal_digest(&self) -> Digest32 { self.terminal_digest }
+    pub const fn terminal_digest(&self) -> Digest32 {
+        self.terminal_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1165,8 +1230,8 @@ impl MaterializationReceiptV1 {
             operation_sequence: NonZeroU64::new(read_u64(bytes, 48)?)
                 .ok_or(ArtifactContractError::ZeroSequence)?,
             operation_id: ArtifactOperationIdV1::try_from_bytes(read_array(bytes, 56)?)?,
-            request_digest: Digest32::from_bytes(read_array(bytes, 72)?),
-            terminal_digest: Digest32::from_bytes(read_array(bytes, 104)?),
+            request_digest: nonzero_digest(read_array(bytes, 72)?)?,
+            terminal_digest: nonzero_digest(read_array(bytes, 104)?)?,
             object_ref: ArtifactObjectRefV1::decode(&bytes[136..208])?,
             state,
             receipt_digest: Digest32::from_bytes(read_array(bytes, 208)?),
@@ -1199,21 +1264,37 @@ impl MaterializationReceiptV1 {
     }
 
     #[must_use]
-    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 { self.store_instance }
+    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 {
+        self.store_instance
+    }
     #[must_use]
-    pub const fn operation_sequence(&self) -> NonZeroU64 { self.operation_sequence }
+    pub const fn operation_sequence(&self) -> NonZeroU64 {
+        self.operation_sequence
+    }
     #[must_use]
-    pub const fn operation_id(&self) -> ArtifactOperationIdV1 { self.operation_id }
+    pub const fn operation_id(&self) -> ArtifactOperationIdV1 {
+        self.operation_id
+    }
     #[must_use]
-    pub const fn request_digest(&self) -> Digest32 { self.request_digest }
+    pub const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
     #[must_use]
-    pub const fn terminal_digest(&self) -> Digest32 { self.terminal_digest }
+    pub const fn terminal_digest(&self) -> Digest32 {
+        self.terminal_digest
+    }
     #[must_use]
-    pub const fn object_ref(&self) -> ArtifactObjectRefV1 { self.object_ref }
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
     #[must_use]
-    pub const fn state(&self) -> MaterializationTerminalStateV1 { self.state }
+    pub const fn state(&self) -> MaterializationTerminalStateV1 {
+        self.state
+    }
     #[must_use]
-    pub const fn receipt_digest(&self) -> Digest32 { self.receipt_digest }
+    pub const fn receipt_digest(&self) -> Digest32 {
+        self.receipt_digest
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1236,13 +1317,21 @@ impl MaterializationReceiptRefV1 {
     }
 
     #[must_use]
-    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 { self.store_instance }
+    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 {
+        self.store_instance
+    }
     #[must_use]
-    pub const fn operation_sequence(&self) -> NonZeroU64 { self.operation_sequence }
+    pub const fn operation_sequence(&self) -> NonZeroU64 {
+        self.operation_sequence
+    }
     #[must_use]
-    pub const fn operation_id(&self) -> ArtifactOperationIdV1 { self.operation_id }
+    pub const fn operation_id(&self) -> ArtifactOperationIdV1 {
+        self.operation_id
+    }
     #[must_use]
-    pub const fn receipt_digest(&self) -> Digest32 { self.receipt_digest }
+    pub const fn receipt_digest(&self) -> Digest32 {
+        self.receipt_digest
+    }
 }
 
 impl fmt::Display for MaterializationReceiptRefV1 {
@@ -1268,10 +1357,18 @@ impl FromStr for MaterializationReceiptRefV1 {
         if fields.next() != Some("pxamr1") {
             return Err(ArtifactContractError::InvalidReference);
         }
-        let store = fields.next().ok_or(ArtifactContractError::InvalidReference)?;
-        let sequence = fields.next().ok_or(ArtifactContractError::InvalidReference)?;
-        let operation = fields.next().ok_or(ArtifactContractError::InvalidReference)?;
-        let receipt = fields.next().ok_or(ArtifactContractError::InvalidReference)?;
+        let store = fields
+            .next()
+            .ok_or(ArtifactContractError::InvalidReference)?;
+        let sequence = fields
+            .next()
+            .ok_or(ArtifactContractError::InvalidReference)?;
+        let operation = fields
+            .next()
+            .ok_or(ArtifactContractError::InvalidReference)?;
+        let receipt = fields
+            .next()
+            .ok_or(ArtifactContractError::InvalidReference)?;
         if fields.next().is_some()
             || sequence.is_empty()
             || (sequence.len() > 1 && sequence.starts_with('0'))
@@ -1282,7 +1379,9 @@ impl FromStr for MaterializationReceiptRefV1 {
         let value = Self {
             store_instance: ArtifactStoreInstanceV1::try_from_bytes(decode_lower_hex(store)?)?,
             operation_sequence: NonZeroU64::new(
-                sequence.parse().map_err(|_| ArtifactContractError::InvalidReference)?,
+                sequence
+                    .parse()
+                    .map_err(|_| ArtifactContractError::InvalidReference)?,
             )
             .ok_or(ArtifactContractError::InvalidReference)?,
             operation_id: ArtifactOperationIdV1::try_from_bytes(decode_lower_hex(operation)?)?,
@@ -1414,7 +1513,10 @@ impl MaterializationOperationV1 {
                 || terminal.admission_digest() != self.admission.admission_digest()
                 || terminal.object_ref() != self.request.object_ref()
                 || terminal.materializing_digest()
-                    != self.materializing.as_ref().map(MaterializingRecordV1::materializing_digest)
+                    != self
+                        .materializing
+                        .as_ref()
+                        .map(MaterializingRecordV1::materializing_digest)
             {
                 return Err(ArtifactContractError::CrossFrameMismatch);
             }
@@ -1475,17 +1577,29 @@ impl MaterializationOperationV1 {
     }
 
     #[must_use]
-    pub const fn operation_id(&self) -> ArtifactOperationIdV1 { self.request.operation_id() }
+    pub const fn operation_id(&self) -> ArtifactOperationIdV1 {
+        self.request.operation_id()
+    }
     #[must_use]
-    pub const fn request(&self) -> &MaterializationRequestV1 { &self.request }
+    pub const fn request(&self) -> &MaterializationRequestV1 {
+        &self.request
+    }
     #[must_use]
-    pub const fn admission(&self) -> &MaterializationAdmissionV1 { &self.admission }
+    pub const fn admission(&self) -> &MaterializationAdmissionV1 {
+        &self.admission
+    }
     #[must_use]
-    pub const fn materializing(&self) -> Option<&MaterializingRecordV1> { self.materializing.as_ref() }
+    pub const fn materializing(&self) -> Option<&MaterializingRecordV1> {
+        self.materializing.as_ref()
+    }
     #[must_use]
-    pub const fn terminal(&self) -> Option<&MaterializationTerminalV1> { self.terminal.as_ref() }
+    pub const fn terminal(&self) -> Option<&MaterializationTerminalV1> {
+        self.terminal.as_ref()
+    }
     #[must_use]
-    pub const fn receipt(&self) -> Option<&MaterializationReceiptV1> { self.receipt.as_ref() }
+    pub const fn receipt(&self) -> Option<&MaterializationReceiptV1> {
+        self.receipt.as_ref()
+    }
 }
 
 fn operation_entry_len(flags: u32) -> Result<usize, ArtifactContractError> {
@@ -1514,7 +1628,9 @@ impl ArtifactQuarantineFactsV1 {
     pub const fn regular_file_bytes(self) -> u64 {
         match self {
             Self::Absent => 0,
-            Self::Present { regular_file_bytes, .. } => regular_file_bytes,
+            Self::Present {
+                regular_file_bytes, ..
+            } => regular_file_bytes,
         }
     }
 }
@@ -1585,7 +1701,7 @@ pub struct VerifiedMaterializationReadBundleV1 {
 }
 
 impl VerifiedMaterializationReadBundleV1 {
-    pub fn verify(
+    fn verify(
         request: MaterializationRequestV1,
         admission: MaterializationAdmissionV1,
         materializing: Option<MaterializingRecordV1>,
@@ -1624,13 +1740,14 @@ impl VerifiedMaterializationReadBundleV1 {
                     return Err(ArtifactContractError::CrossFrameMismatch);
                 }
             }
-            MaterializationTerminalStateV1::Failed
-            | MaterializationTerminalStateV1::Uncertain => {
+            MaterializationTerminalStateV1::Failed | MaterializationTerminalStateV1::Uncertain => {
                 if object.is_some() || pair.is_some() {
                     return Err(ArtifactContractError::CrossFrameMismatch);
                 }
                 if terminal.materializing_digest()
-                    != materializing.as_ref().map(MaterializingRecordV1::materializing_digest)
+                    != materializing
+                        .as_ref()
+                        .map(MaterializingRecordV1::materializing_digest)
                 {
                     return Err(ArtifactContractError::CrossFrameMismatch);
                 }
@@ -1648,19 +1765,33 @@ impl VerifiedMaterializationReadBundleV1 {
     }
 
     #[must_use]
-    pub const fn request(&self) -> &MaterializationRequestV1 { &self.request }
+    pub const fn request(&self) -> &MaterializationRequestV1 {
+        &self.request
+    }
     #[must_use]
-    pub const fn admission(&self) -> &MaterializationAdmissionV1 { &self.admission }
+    pub const fn admission(&self) -> &MaterializationAdmissionV1 {
+        &self.admission
+    }
     #[must_use]
-    pub const fn materializing(&self) -> Option<&MaterializingRecordV1> { self.materializing.as_ref() }
+    pub const fn materializing(&self) -> Option<&MaterializingRecordV1> {
+        self.materializing.as_ref()
+    }
     #[must_use]
-    pub const fn object(&self) -> Option<&ArtifactObjectRecordV1> { self.object.as_ref() }
+    pub const fn object(&self) -> Option<&ArtifactObjectRecordV1> {
+        self.object.as_ref()
+    }
     #[must_use]
-    pub const fn terminal(&self) -> &MaterializationTerminalV1 { &self.terminal }
+    pub const fn terminal(&self) -> &MaterializationTerminalV1 {
+        &self.terminal
+    }
     #[must_use]
-    pub const fn receipt(&self) -> &MaterializationReceiptV1 { &self.receipt }
+    pub const fn receipt(&self) -> &MaterializationReceiptV1 {
+        &self.receipt
+    }
     #[must_use]
-    pub const fn pair(&self) -> Option<&VerifiedArtifactPairV1> { self.pair.as_ref() }
+    pub const fn pair(&self) -> Option<&VerifiedArtifactPairV1> {
+        self.pair.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1807,10 +1938,10 @@ fn infer_quarantine_facts(
     if body.len() < PXAY_HEADER_BYTES {
         return Err(ArtifactContractError::InvalidLength);
     }
-    let object_count = usize::try_from(read_u32(body, 16)?)
-        .map_err(|_| ArtifactContractError::InvalidLength)?;
-    let operation_count = usize::try_from(read_u32(body, 20)?)
-        .map_err(|_| ArtifactContractError::InvalidLength)?;
+    let object_count =
+        usize::try_from(read_u32(body, 16)?).map_err(|_| ArtifactContractError::InvalidLength)?;
+    let operation_count =
+        usize::try_from(read_u32(body, 20)?).map_err(|_| ArtifactContractError::InvalidLength)?;
     if operation_count == 0
         || object_count > MAX_ARTIFACT_OBJECTS
         || operation_count > MAX_ARTIFACT_OPERATIONS
@@ -1919,10 +2050,14 @@ impl ArtifactStoreSnapshotV1 {
         let quarantine_bytes = read_u64(bytes, 144)?;
         let expected_flag = match quarantine {
             ArtifactQuarantineFactsV1::Absent => {
-                if quarantine_bytes != 0 { return Err(ArtifactContractError::InvalidQuarantineFacts); }
+                if quarantine_bytes != 0 {
+                    return Err(ArtifactContractError::InvalidQuarantineFacts);
+                }
                 0
             }
-            ArtifactQuarantineFactsV1::Present { regular_file_bytes, .. } => {
+            ArtifactQuarantineFactsV1::Present {
+                regular_file_bytes, ..
+            } => {
                 if regular_file_bytes != quarantine_bytes
                     || regular_file_bytes > MAX_ARTIFACT_QUARANTINE_BYTES
                 {
@@ -1976,7 +2111,9 @@ impl ArtifactStoreSnapshotV1 {
         let mut cursor = PXAY_HEADER_BYTES;
         let mut objects = Vec::with_capacity(object_count);
         for _ in 0..object_count {
-            objects.push(ArtifactObjectRecordV1::decode(&body[cursor..cursor + PXAV_BYTES])?);
+            objects.push(ArtifactObjectRecordV1::decode(
+                &body[cursor..cursor + PXAV_BYTES],
+            )?);
             cursor += PXAV_BYTES;
         }
         let mut operations = Vec::with_capacity(operation_count);
@@ -1987,7 +2124,8 @@ impl ArtifactStoreSnapshotV1 {
                 .checked_add(entry_len)
                 .ok_or(ArtifactContractError::InvalidLength)?;
             operations.push(MaterializationOperationV1::decode_canonical(
-                body.get(cursor..end).ok_or(ArtifactContractError::InvalidLength)?,
+                body.get(cursor..end)
+                    .ok_or(ArtifactContractError::InvalidLength)?,
             )?);
             cursor = end;
         }
@@ -2053,7 +2191,9 @@ impl ArtifactStoreSnapshotV1 {
         put_u16(&mut bytes, 22, 1);
         let quarantine_bytes = match self.quarantine {
             ArtifactQuarantineFactsV1::Absent => 0,
-            ArtifactQuarantineFactsV1::Present { regular_file_bytes, .. } => {
+            ArtifactQuarantineFactsV1::Present {
+                regular_file_bytes, ..
+            } => {
                 put_u32(&mut bytes, 24, OBJECT_PUBLICATION_BLOCKED);
                 regular_file_bytes
             }
@@ -2136,16 +2276,51 @@ impl ArtifactStoreSnapshotV1 {
             self.operations.len(),
             self.quarantine.regular_file_bytes(),
         )
-            .checked_total()
-            .map(|_| ())
+        .checked_total()
+        .map(|_| ())
     }
 
     fn validate(&self) -> Result<(), ArtifactContractError> {
+        let materializing_count = self.operations.iter().try_fold(0_u64, |count, operation| {
+            if operation.materializing().is_some() {
+                count.checked_add(1)
+            } else {
+                Some(count)
+            }
+            .ok_or(ArtifactContractError::ArithmeticOverflow)
+        })?;
+        let terminal_count = self.operations.iter().try_fold(0_u64, |count, operation| {
+            if operation.terminal().is_some() {
+                count.checked_add(1)
+            } else {
+                Some(count)
+            }
+            .ok_or(ArtifactContractError::ArithmeticOverflow)
+        })?;
+        let receipt_count = self.operations.iter().try_fold(0_u64, |count, operation| {
+            if operation.receipt().is_some() {
+                count.checked_add(1)
+            } else {
+                Some(count)
+            }
+            .ok_or(ArtifactContractError::ArithmeticOverflow)
+        })?;
+        let operation_count = u64::try_from(self.operations.len())
+            .map_err(|_| ArtifactContractError::ArithmeticOverflow)?;
+        let object_count = u64::try_from(self.objects.len())
+            .map_err(|_| ArtifactContractError::ArithmeticOverflow)?;
+        let expected_snapshot_sequence = operation_count
+            .checked_add(materializing_count)
+            .and_then(|value| value.checked_add(object_count))
+            .and_then(|value| value.checked_add(terminal_count))
+            .and_then(|value| value.checked_add(receipt_count))
+            .ok_or(ArtifactContractError::ArithmeticOverflow)?;
         if self.operations.is_empty()
             || self.operations.len() > MAX_ARTIFACT_OPERATIONS
             || self.objects.len() > MAX_ARTIFACT_OBJECTS
             || self.operation_high_water != self.operations.len() as u64
             || self.object_high_water != self.objects.len() as u64
+            || self.snapshot_sequence.get() != expected_snapshot_sequence
         {
             return Err(ArtifactContractError::InvalidSnapshot);
         }
@@ -2188,11 +2363,15 @@ impl ArtifactStoreSnapshotV1 {
                             .iter()
                             .filter(|object| object.object_terminal_digest() == digest)
                             .collect();
-                        if matches.len() != 1 || matches[0].object_ref() != operation.request().object_ref() {
+                        if matches.len() != 1
+                            || matches[0].object_ref() != operation.request().object_ref()
+                        {
                             return Err(ArtifactContractError::InvalidSnapshot);
                         }
                         let referenced_earlier = self.operations[..index].iter().any(|prior| {
-                            prior.terminal().and_then(MaterializationTerminalV1::object_terminal_digest)
+                            prior
+                                .terminal()
+                                .and_then(MaterializationTerminalV1::object_terminal_digest)
                                 == Some(digest)
                         });
                         if (terminal.state() == MaterializationTerminalStateV1::Materialized
@@ -2240,7 +2419,10 @@ impl ArtifactStoreSnapshotV1 {
             return Err(ArtifactContractError::InvalidSnapshot);
         }
         if let Some(object) = unreferenced.first() {
-            let last = self.operations.last().ok_or(ArtifactContractError::InvalidSnapshot)?;
+            let last = self
+                .operations
+                .last()
+                .ok_or(ArtifactContractError::InvalidSnapshot)?;
             if last.receipt().is_some()
                 || last.terminal().is_some()
                 || last.request().object_ref() != object.object_ref()
@@ -2263,11 +2445,18 @@ impl ArtifactStoreSnapshotV1 {
                     return Err(ArtifactContractError::InvalidQuarantineFacts);
                 }
             }
-            ArtifactQuarantineFactsV1::Present { operation_id, regular_file_bytes } => {
+            ArtifactQuarantineFactsV1::Present {
+                operation_id,
+                regular_file_bytes,
+            } => {
                 if regular_file_bytes > MAX_ARTIFACT_QUARANTINE_BYTES
+                    || !self.objects.is_empty()
                     || uncertain_operations.len() != 1
                     || uncertain_operations[0].operation_id() != operation_id
-                    || self.operations.last().map(MaterializationOperationV1::operation_id)
+                    || self
+                        .operations
+                        .last()
+                        .map(MaterializationOperationV1::operation_id)
                         != Some(operation_id)
                     || self.objects.iter().any(|object| {
                         object.object_ref() == uncertain_operations[0].request().object_ref()
@@ -2303,16 +2492,19 @@ impl ArtifactStoreSnapshotV1 {
                     || request.config_commitment() != self.config_commitment
                     || admission.store_instance() != self.store_instance
                     || admission.operation_sequence().get()
-                        != self.operation_high_water
+                        != self
+                            .operation_high_water
                             .checked_add(1)
                             .ok_or(ArtifactContractError::ArithmeticOverflow)?
-                    || self.operations.iter().any(|operation| {
-                        operation.operation_id() == request.operation_id()
-                    })
+                    || self
+                        .operations
+                        .iter()
+                        .any(|operation| operation.operation_id() == request.operation_id())
                 {
                     return Err(ArtifactContractError::InvalidSuccessor);
                 }
-                next.operations.push(MaterializationOperationV1::admitted(request, admission)?);
+                next.operations
+                    .push(MaterializationOperationV1::admitted(request, admission)?);
                 next.operation_high_water = next
                     .operation_high_water
                     .checked_add(1)
@@ -2330,20 +2522,26 @@ impl ArtifactStoreSnapshotV1 {
                 operation.materializing = Some(materializing);
                 operation.validate_presence()?;
             }
-            ArtifactSnapshotSuccessorV1::Object { operation_id, object } => {
+            ArtifactSnapshotSuccessorV1::Object {
+                operation_id,
+                object,
+            } => {
                 if self.objects.len() >= MAX_ARTIFACT_OBJECTS
                     || object.store_instance() != self.store_instance
                     || object.object_sequence().get()
-                        != self.object_high_water
+                        != self
+                            .object_high_water
                             .checked_add(1)
                             .ok_or(ArtifactContractError::ArithmeticOverflow)?
-                    || self.objects.iter().any(|existing| {
-                        existing.object_ref() == object.object_ref()
-                    })
+                    || self
+                        .objects
+                        .iter()
+                        .any(|existing| existing.object_ref() == object.object_ref())
                 {
                     return Err(ArtifactContractError::InvalidSuccessor);
                 }
-                let operation = self.operation(operation_id)
+                let operation = self
+                    .operation(operation_id)
                     .ok_or(ArtifactContractError::InvalidSuccessor)?;
                 if operation.materializing().is_none()
                     || operation.terminal().is_some()
@@ -2357,7 +2555,10 @@ impl ArtifactStoreSnapshotV1 {
                     .checked_add(1)
                     .ok_or(ArtifactContractError::ArithmeticOverflow)?;
             }
-            ArtifactSnapshotSuccessorV1::Terminal { terminal, quarantine } => {
+            ArtifactSnapshotSuccessorV1::Terminal {
+                terminal,
+                quarantine,
+            } => {
                 let operation = next
                     .operations
                     .iter_mut()
@@ -2383,30 +2584,50 @@ impl ArtifactStoreSnapshotV1 {
                 operation.validate_presence()?;
             }
         }
-        next.validate().map_err(|_| ArtifactContractError::InvalidSuccessor)?;
+        next.validate()
+            .map_err(|_| ArtifactContractError::InvalidSuccessor)?;
         next.ensure_capacity()?;
         Ok(next)
     }
 
     #[must_use]
-    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 { self.store_instance }
+    pub const fn store_instance(&self) -> ArtifactStoreInstanceV1 {
+        self.store_instance
+    }
     #[must_use]
-    pub const fn config_commitment(&self) -> ArtifactConfigCommitmentV1 { self.config_commitment }
+    pub const fn config_commitment(&self) -> ArtifactConfigCommitmentV1 {
+        self.config_commitment
+    }
     #[must_use]
-    pub const fn snapshot_sequence(&self) -> NonZeroU64 { self.snapshot_sequence }
+    pub const fn snapshot_sequence(&self) -> NonZeroU64 {
+        self.snapshot_sequence
+    }
     #[must_use]
-    pub const fn operation_high_water(&self) -> u64 { self.operation_high_water }
+    pub const fn operation_high_water(&self) -> u64 {
+        self.operation_high_water
+    }
     #[must_use]
-    pub const fn object_high_water(&self) -> u64 { self.object_high_water }
+    pub const fn object_high_water(&self) -> u64 {
+        self.object_high_water
+    }
     #[must_use]
-    pub fn objects(&self) -> &[ArtifactObjectRecordV1] { &self.objects }
+    pub fn objects(&self) -> &[ArtifactObjectRecordV1] {
+        &self.objects
+    }
     #[must_use]
-    pub fn operations(&self) -> &[MaterializationOperationV1] { &self.operations }
+    pub fn operations(&self) -> &[MaterializationOperationV1] {
+        &self.operations
+    }
     #[must_use]
-    pub const fn quarantine(&self) -> ArtifactQuarantineFactsV1 { self.quarantine }
+    pub const fn quarantine(&self) -> ArtifactQuarantineFactsV1 {
+        self.quarantine
+    }
 
     #[must_use]
-    pub fn operation(&self, operation_id: ArtifactOperationIdV1) -> Option<&MaterializationOperationV1> {
+    pub fn operation(
+        &self,
+        operation_id: ArtifactOperationIdV1,
+    ) -> Option<&MaterializationOperationV1> {
         self.operations
             .iter()
             .find(|operation| operation.operation_id() == operation_id)
@@ -2450,19 +2671,40 @@ impl ArtifactStoreSnapshotV1 {
 
     pub fn verified_read_bundle(
         &self,
-        operation_id: ArtifactOperationIdV1,
+        receipt_ref: MaterializationReceiptRefV1,
+        expected_object_ref: ArtifactObjectRefV1,
         pair: Option<VerifiedArtifactPairV1>,
     ) -> Result<VerifiedMaterializationReadBundleV1, ArtifactContractError> {
-        let operation = self.operation(operation_id).ok_or(ArtifactContractError::InvalidReference)?;
-        let terminal = operation.terminal().cloned().ok_or(ArtifactContractError::InvalidState)?;
-        let receipt = operation.receipt().cloned().ok_or(ArtifactContractError::InvalidState)?;
-        let object = terminal.object_terminal_digest().map(|digest| {
-            self.objects
-                .iter()
-                .find(|object| object.object_terminal_digest() == digest)
-                .cloned()
-                .ok_or(ArtifactContractError::CrossFrameMismatch)
-        }).transpose()?;
+        let operation = self
+            .operation(receipt_ref.operation_id())
+            .ok_or(ArtifactContractError::CrossFrameMismatch)?;
+        let terminal = operation
+            .terminal()
+            .cloned()
+            .ok_or(ArtifactContractError::CrossFrameMismatch)?;
+        let receipt = operation
+            .receipt()
+            .cloned()
+            .ok_or(ArtifactContractError::CrossFrameMismatch)?;
+        if receipt_ref.store_instance() != self.store_instance
+            || receipt_ref.operation_sequence() != operation.admission().operation_sequence()
+            || receipt_ref.operation_id() != operation.operation_id()
+            || receipt_ref.receipt_digest() != receipt.receipt_digest()
+            || expected_object_ref != operation.request().object_ref()
+            || expected_object_ref != receipt.object_ref()
+        {
+            return Err(ArtifactContractError::CrossFrameMismatch);
+        }
+        let object = terminal
+            .object_terminal_digest()
+            .map(|digest| {
+                self.objects
+                    .iter()
+                    .find(|object| object.object_terminal_digest() == digest)
+                    .cloned()
+                    .ok_or(ArtifactContractError::CrossFrameMismatch)
+            })
+            .transpose()?;
         VerifiedMaterializationReadBundleV1::verify(
             operation.request().clone(),
             operation.admission().clone(),
@@ -2520,6 +2762,33 @@ mod tests {
         output
     }
 
+    fn zero_correlation_and_rehash(
+        bytes: &mut [u8],
+        correlation_offset: usize,
+        own_digest_offset: usize,
+        domain: &[u8],
+    ) {
+        bytes[correlation_offset..correlation_offset + 32].fill(0);
+        let digest = raw_sha256(domain, &[&bytes[..own_digest_offset]]);
+        bytes[own_digest_offset..own_digest_offset + 32].copy_from_slice(digest.as_bytes());
+    }
+
+    fn rehash_snapshot(bytes: &mut [u8]) {
+        let body_len = read_u64(bytes, 128).expect("snapshot body length");
+        let length_prefix = 160_u64.to_be_bytes();
+        let body_length_prefix = body_len.to_be_bytes();
+        let checksum = raw_sha256(
+            SNAPSHOT_DIGEST_DOMAIN,
+            &[
+                &length_prefix,
+                &bytes[..160],
+                &body_length_prefix,
+                &bytes[PXAZ_HEADER_BYTES..],
+            ],
+        );
+        bytes[160..192].copy_from_slice(checksum.as_bytes());
+    }
+
     fn store() -> ArtifactStoreInstanceV1 {
         ArtifactStoreInstanceV1::try_from_bytes([0xa0; 32]).expect("nonzero store")
     }
@@ -2540,10 +2809,7 @@ mod tests {
         MaterializationRequestV1::new(operation_id, config(), pair().object_ref())
     }
 
-    fn admission(
-        sequence: u64,
-        request: &MaterializationRequestV1,
-    ) -> MaterializationAdmissionV1 {
+    fn admission(sequence: u64, request: &MaterializationRequestV1) -> MaterializationAdmissionV1 {
         MaterializationAdmissionV1::new(
             store(),
             NonZeroU64::new(sequence).expect("nonzero sequence"),
@@ -2556,6 +2822,18 @@ mod tests {
         let admission = admission(1, &request);
         ArtifactStoreSnapshotV1::initial(store(), config(), request, admission)
             .expect("initial snapshot")
+    }
+
+    fn receipt_ref(
+        snapshot: &ArtifactStoreSnapshotV1,
+        operation_id: ArtifactOperationIdV1,
+    ) -> MaterializationReceiptRefV1 {
+        MaterializationReceiptRefV1::from_receipt(
+            snapshot
+                .operation(operation_id)
+                .and_then(MaterializationOperationV1::receipt)
+                .expect("terminal receipt"),
+        )
     }
 
     fn materialized() -> (
@@ -2641,21 +2919,26 @@ mod tests {
     fn binary_and_text_references_are_canonical_and_nonzero() {
         let pair = pair();
         let object_ref = pair.object_ref();
-        assert_eq!(ArtifactObjectRefV1::decode(&object_ref.encode()), Ok(object_ref));
+        assert_eq!(
+            ArtifactObjectRefV1::decode(&object_ref.encode()),
+            Ok(object_ref)
+        );
         assert_eq!(object_ref.to_string().parse(), Ok(object_ref));
         assert_eq!(
-            ArtifactObjectRefV1::try_new(Digest32::from_bytes([0; 32]), object_ref.manifest_digest()),
+            ArtifactObjectRefV1::try_new(
+                Digest32::from_bytes([0; 32]),
+                object_ref.manifest_digest()
+            ),
             Err(ArtifactContractError::DigestMismatch)
         );
         assert_eq!(
-            ArtifactObjectRefV1::try_new(object_ref.payload_digest(), Digest32::from_bytes([0; 32])),
+            ArtifactObjectRefV1::try_new(
+                object_ref.payload_digest(),
+                Digest32::from_bytes([0; 32])
+            ),
             Err(ArtifactContractError::DigestMismatch)
         );
-        let zero_payload_ref = format!(
-            "sha256:{}:{}",
-            "00".repeat(32),
-            "11".repeat(32)
-        );
+        let zero_payload_ref = format!("sha256:{}:{}", "00".repeat(32), "11".repeat(32));
         assert_eq!(
             zero_payload_ref.parse::<ArtifactObjectRefV1>(),
             Err(ArtifactContractError::DigestMismatch)
@@ -2682,11 +2965,8 @@ mod tests {
         let request = request(operation(0xa2));
         let admission = admission(1, &request);
         let materializing = MaterializingRecordV1::new(&admission);
-        let object = ArtifactObjectRecordV1::new(
-            store(),
-            NonZeroU64::new(1).expect("sequence"),
-            &pair,
-        );
+        let object =
+            ArtifactObjectRecordV1::new(store(), NonZeroU64::new(1).expect("sequence"), &pair);
         let terminal = MaterializationTerminalV1::new(
             &admission,
             Some(&materializing),
@@ -2695,23 +2975,39 @@ mod tests {
         )
         .expect("terminal");
         let receipt = MaterializationReceiptV1::new(&terminal);
-        let admitted_operation = MaterializationOperationV1::admitted(
-            request.clone(),
-            admission.clone(),
-        )
-        .expect("admitted operation");
+        let admitted_operation =
+            MaterializationOperationV1::admitted(request.clone(), admission.clone())
+                .expect("admitted operation");
         let operation_wire = admitted_operation.encode_canonical().expect("PXOP wire");
         assert_eq!(operation_wire.len(), 416);
         assert_eq!(
             MaterializationOperationV1::decode_canonical(&operation_wire),
             Ok(admitted_operation)
         );
-        assert_eq!(MaterializationRequestV1::decode(&request.encode()), Ok(request.clone()));
-        assert_eq!(MaterializationAdmissionV1::decode(&admission.encode()), Ok(admission.clone()));
-        assert_eq!(MaterializingRecordV1::decode(&materializing.encode()), Ok(materializing.clone()));
-        assert_eq!(ArtifactObjectRecordV1::decode(&object.encode()), Ok(object.clone()));
-        assert_eq!(MaterializationTerminalV1::decode(&terminal.encode()), Ok(terminal.clone()));
-        assert_eq!(MaterializationReceiptV1::decode(&receipt.encode()), Ok(receipt));
+        assert_eq!(
+            MaterializationRequestV1::decode(&request.encode()),
+            Ok(request.clone())
+        );
+        assert_eq!(
+            MaterializationAdmissionV1::decode(&admission.encode()),
+            Ok(admission.clone())
+        );
+        assert_eq!(
+            MaterializingRecordV1::decode(&materializing.encode()),
+            Ok(materializing.clone())
+        );
+        assert_eq!(
+            ArtifactObjectRecordV1::decode(&object.encode()),
+            Ok(object.clone())
+        );
+        assert_eq!(
+            MaterializationTerminalV1::decode(&terminal.encode()),
+            Ok(terminal.clone())
+        );
+        assert_eq!(
+            MaterializationReceiptV1::decode(&receipt.encode()),
+            Ok(receipt)
+        );
         let mut corrupt = request.encode().to_vec();
         corrupt[50] ^= 1;
         assert_eq!(
@@ -2724,6 +3020,94 @@ mod tests {
             MaterializationRequestV1::decode(&corrupt),
             Err(ArtifactContractError::InvalidLength)
         );
+    }
+
+    #[test]
+    fn verified_read_bundle_requires_exact_receipt_and_object_locators() {
+        let (snapshot, pair, _, receipt) = materialized();
+        let reference = MaterializationReceiptRefV1::from_receipt(&receipt);
+        assert!(snapshot
+            .verified_read_bundle(reference, pair.object_ref(), Some(pair.clone()))
+            .is_ok());
+
+        let mut store_drift = reference;
+        store_drift.store_instance =
+            ArtifactStoreInstanceV1::try_from_bytes([0xb0; 32]).expect("different store");
+        let mut sequence_drift = reference;
+        sequence_drift.operation_sequence = NonZeroU64::new(2).expect("different sequence");
+        let mut operation_drift = reference;
+        operation_drift.operation_id = operation(0xb1);
+        let mut receipt_drift = reference;
+        receipt_drift.receipt_digest = Digest32::from_bytes([0xb2; 32]);
+        for drift in [store_drift, sequence_drift, operation_drift, receipt_drift] {
+            assert_eq!(
+                snapshot.verified_read_bundle(drift, pair.object_ref(), Some(pair.clone())),
+                Err(ArtifactContractError::CrossFrameMismatch)
+            );
+        }
+
+        let other_pair = VerifiedArtifactPairV1::from_payload(b"other-prefix: ")
+            .expect("different canonical pair");
+        assert_eq!(
+            snapshot.verified_read_bundle(reference, other_pair.object_ref(), Some(pair)),
+            Err(ArtifactContractError::CrossFrameMismatch)
+        );
+    }
+
+    #[test]
+    fn standalone_frames_reject_zero_correlation_with_recomputed_own_digest() {
+        let pair = pair();
+        let request = request(operation(0xa2));
+        let admission = admission(1, &request);
+        let materializing = MaterializingRecordV1::new(&admission);
+        let object = ArtifactObjectRecordV1::new(
+            store(),
+            NonZeroU64::new(1).expect("object sequence"),
+            &pair,
+        );
+        let terminal = MaterializationTerminalV1::new(
+            &admission,
+            Some(&materializing),
+            Some(&object),
+            MaterializationTerminalStateV1::Materialized,
+        )
+        .expect("terminal");
+        let receipt = MaterializationReceiptV1::new(&terminal);
+
+        let mut pxaa = admission.encode();
+        zero_correlation_and_rehash(&mut pxaa, 72, 176, ADMISSION_DIGEST_DOMAIN);
+        assert_eq!(
+            MaterializationAdmissionV1::decode(&pxaa),
+            Err(ArtifactContractError::DigestMismatch)
+        );
+
+        for offset in [72, 104] {
+            let mut pxmu = materializing.encode();
+            zero_correlation_and_rehash(&mut pxmu, offset, 208, MATERIALIZING_DIGEST_DOMAIN);
+            assert_eq!(
+                MaterializingRecordV1::decode(&pxmu),
+                Err(ArtifactContractError::DigestMismatch)
+            );
+
+            let mut pxaw = terminal.encode();
+            zero_correlation_and_rehash(
+                &mut pxaw,
+                offset,
+                272,
+                OPERATION_TERMINAL_DIGEST_DOMAIN,
+            );
+            assert_eq!(
+                MaterializationTerminalV1::decode(&pxaw),
+                Err(ArtifactContractError::DigestMismatch)
+            );
+
+            let mut pxax = receipt.encode();
+            zero_correlation_and_rehash(&mut pxax, offset, 208, RECEIPT_DIGEST_DOMAIN);
+            assert_eq!(
+                MaterializationReceiptV1::decode(&pxax),
+                Err(ArtifactContractError::DigestMismatch)
+            );
+        }
     }
 
     #[test]
@@ -2757,22 +3141,36 @@ mod tests {
             Ok(progressing.clone())
         );
         let pair = pair();
-        let object = ArtifactObjectRecordV1::new(
-            store(),
-            NonZeroU64::new(1).expect("sequence"),
-            &pair,
-        );
+        let object =
+            ArtifactObjectRecordV1::new(store(), NonZeroU64::new(1).expect("sequence"), &pair);
         let object_snapshot = progressing
             .try_successor(ArtifactSnapshotSuccessorV1::Object {
                 operation_id: operation.operation_id(),
                 object: object.clone(),
             })
             .expect("object");
-        assert_eq!(object_snapshot.encode_canonical().expect("encode").len(), 1104);
+        assert_eq!(
+            object_snapshot.encode_canonical().expect("encode").len(),
+            1104
+        );
         assert_eq!(object_snapshot.accounted_rest_bytes(), Ok(1330));
         assert_eq!(
             object_snapshot.recovery_start(operation.operation_id()),
             Ok(ArtifactRecoveryStartV1::UnreferencedCurrent(object.clone()))
+        );
+        let invalid_e = MaterializationTerminalV1::new(
+            operation.admission(),
+            Some(&materializing),
+            Some(&object),
+            MaterializationTerminalStateV1::AlreadyMaterialized,
+        )
+        .expect("frame-local E terminal");
+        assert_eq!(
+            object_snapshot.try_successor(ArtifactSnapshotSuccessorV1::Terminal {
+                terminal: invalid_e,
+                quarantine: ArtifactQuarantineFactsV1::Absent,
+            }),
+            Err(ArtifactContractError::InvalidSuccessor)
         );
         let terminal = MaterializationTerminalV1::new(
             operation.admission(),
@@ -2787,7 +3185,10 @@ mod tests {
                 quarantine: ArtifactQuarantineFactsV1::Absent,
             })
             .expect("terminal successor");
-        assert_eq!(terminal_snapshot.encode_canonical().expect("encode").len(), 1408);
+        assert_eq!(
+            terminal_snapshot.encode_canonical().expect("encode").len(),
+            1408
+        );
         assert_eq!(terminal_snapshot.accounted_rest_bytes(), Ok(1634));
         let final_snapshot = terminal_snapshot
             .try_successor(ArtifactSnapshotSuccessorV1::Receipt {
@@ -2798,10 +3199,9 @@ mod tests {
         assert_eq!(wire.len(), 1648);
         assert_eq!(final_snapshot.accounted_rest_bytes(), Ok(1874));
         assert_eq!(
-            ArtifactStoreSnapshotCandidateV1::decode_canonical(&wire)
-                .and_then(|candidate| {
-                    candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
-                }),
+            ArtifactStoreSnapshotCandidateV1::decode_canonical(&wire).and_then(|candidate| {
+                candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
+            }),
             Ok(final_snapshot)
         );
     }
@@ -2857,7 +3257,10 @@ mod tests {
                 quarantine: ArtifactQuarantineFactsV1::Absent,
             })
             .expect("E terminal");
-        assert_eq!(terminal_snapshot.encode_canonical().expect("wire").len(), 2608);
+        assert_eq!(
+            terminal_snapshot.encode_canonical().expect("wire").len(),
+            2608
+        );
         assert_eq!(terminal_snapshot.accounted_rest_bytes(), Ok(2834));
         let final_snapshot = terminal_snapshot
             .try_successor(ArtifactSnapshotSuccessorV1::Receipt {
@@ -2866,9 +3269,52 @@ mod tests {
             .expect("E receipt");
         assert_eq!(final_snapshot.encode_canonical().expect("wire").len(), 2848);
         assert_eq!(final_snapshot.accounted_rest_bytes(), Ok(3074));
+        let reference = receipt_ref(&final_snapshot, operation(0xa3));
         assert!(final_snapshot
-            .verified_read_bundle(operation(0xa3), Some(pair))
+            .verified_read_bundle(reference, pair.object_ref(), Some(pair))
             .is_ok());
+    }
+
+    #[test]
+    fn quarantine_rejects_every_historical_pxav() {
+        let (snapshot, _, _, _) = materialized();
+        let second_pair = VerifiedArtifactPairV1::from_payload(b"other-prefix: ")
+            .expect("second canonical pair");
+        let second_request = MaterializationRequestV1::new(
+            operation(0xa3),
+            config(),
+            second_pair.object_ref(),
+        );
+        let second_admission = admission(2, &second_request);
+        let admitted = snapshot
+            .try_successor(ArtifactSnapshotSuccessorV1::Admission {
+                request: second_request,
+                admission: second_admission.clone(),
+            })
+            .expect("second admission");
+        let materializing = MaterializingRecordV1::new(&second_admission);
+        let progressing = admitted
+            .try_successor(ArtifactSnapshotSuccessorV1::Materializing {
+                materializing: materializing.clone(),
+            })
+            .expect("second materializing");
+        let uncertain = MaterializationTerminalV1::new(
+            &second_admission,
+            Some(&materializing),
+            None,
+            MaterializationTerminalStateV1::Uncertain,
+        )
+        .expect("frame-local uncertain terminal");
+        assert_eq!(
+            progressing.try_successor(ArtifactSnapshotSuccessorV1::Terminal {
+                terminal: uncertain,
+                quarantine: ArtifactQuarantineFactsV1::Present {
+                    operation_id: operation(0xa3),
+                    regular_file_bytes: 0,
+                },
+            }),
+            Err(ArtifactContractError::InvalidSuccessor)
+        );
     }
 
     #[test]
@@ -2894,9 +3340,14 @@ mod tests {
                 receipt: MaterializationReceiptV1::new(&failed),
             })
             .expect("failed receipt");
-        assert_eq!(failed_snapshot.encode_canonical().expect("wire").len(), 1216);
+        assert_eq!(
+            failed_snapshot.encode_canonical().expect("wire").len(),
+            1216
+        );
+        let failed_ref = receipt_ref(&failed_snapshot, operation(0xa2));
+        let failed_object_ref = failed_snapshot.operations()[0].request().object_ref();
         assert!(failed_snapshot
-            .verified_read_bundle(operation(0xa2), None)
+            .verified_read_bundle(failed_ref, failed_object_ref, None)
             .is_ok());
 
         let progressing = admitted();
@@ -2914,6 +3365,13 @@ mod tests {
             MaterializationTerminalStateV1::Uncertain,
         )
         .expect("uncertain terminal");
+        assert_eq!(
+            progressing.try_successor(ArtifactSnapshotSuccessorV1::Terminal {
+                terminal: uncertain.clone(),
+                quarantine: ArtifactQuarantineFactsV1::Absent,
+            }),
+            Err(ArtifactContractError::InvalidSuccessor)
+        );
         let quarantine = ArtifactQuarantineFactsV1::Present {
             operation_id: operation(0xa2),
             regular_file_bytes: 0,
@@ -2924,13 +3382,15 @@ mod tests {
                 quarantine,
             })
             .expect("uncertain successor");
-        assert_eq!(uncertain_snapshot.encode_canonical().expect("wire").len(), 1216);
+        assert_eq!(
+            uncertain_snapshot.encode_canonical().expect("wire").len(),
+            1216
+        );
         let wire = uncertain_snapshot.encode_canonical().expect("wire");
         assert_eq!(
-            ArtifactStoreSnapshotCandidateV1::decode_canonical(&wire)
-                .and_then(|candidate| {
-                    candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
-                }),
+            ArtifactStoreSnapshotCandidateV1::decode_canonical(&wire).and_then(|candidate| {
+                candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
+            }),
             Err(ArtifactContractError::InvalidQuarantineFacts)
         );
         assert_eq!(
@@ -2948,12 +3408,21 @@ mod tests {
                 receipt: MaterializationReceiptV1::new(&uncertain),
             })
             .expect("uncertain receipt");
-        assert_eq!(uncertain_snapshot.encode_canonical().expect("wire").len(), 1456);
+        assert_eq!(
+            uncertain_snapshot.encode_canonical().expect("wire").len(),
+            1456
+        );
+        let uncertain_ref = receipt_ref(&uncertain_snapshot, operation(0xa2));
+        let uncertain_object_ref = uncertain_snapshot.operations()[0].request().object_ref();
         assert!(uncertain_snapshot
-            .verified_read_bundle(operation(0xa2), None)
+            .verified_read_bundle(uncertain_ref, uncertain_object_ref, None)
             .is_ok());
         assert_eq!(
-            uncertain_snapshot.verified_read_bundle(operation(0xa2), Some(pair())),
+            uncertain_snapshot.verified_read_bundle(
+                uncertain_ref,
+                uncertain_object_ref,
+                Some(pair()),
+            ),
             Err(ArtifactContractError::CrossFrameMismatch)
         );
     }
@@ -2961,22 +3430,27 @@ mod tests {
     #[test]
     fn snapshot_checksum_exact_eof_and_capacity_components_fail_closed() {
         let snapshot = admitted();
+        let mut sequence_drift = snapshot.encode_canonical().expect("wire").into_vec();
+        put_u64(&mut sequence_drift, 96, 2);
+        rehash_snapshot(&mut sequence_drift);
+        assert_eq!(
+            ArtifactStoreSnapshotCandidateV1::decode_canonical(&sequence_drift),
+            Err(ArtifactContractError::InvalidSnapshot)
+        );
         let mut wire = snapshot.encode_canonical().expect("wire").into_vec();
         wire[160] ^= 1;
         assert_eq!(
-            ArtifactStoreSnapshotCandidateV1::decode_canonical(&wire)
-                .and_then(|candidate| {
-                    candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
-                }),
+            ArtifactStoreSnapshotCandidateV1::decode_canonical(&wire).and_then(|candidate| {
+                candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
+            }),
             Err(ArtifactContractError::DigestMismatch)
         );
         let mut trailing = snapshot.encode_canonical().expect("wire").into_vec();
         trailing.push(0);
         assert_eq!(
-            ArtifactStoreSnapshotCandidateV1::decode_canonical(&trailing)
-                .and_then(|candidate| {
-                    candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
-                }),
+            ArtifactStoreSnapshotCandidateV1::decode_canonical(&trailing).and_then(|candidate| {
+                candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
+            }),
             Err(ArtifactContractError::InvalidLength)
         );
         assert_eq!(
@@ -3040,16 +3514,7 @@ mod tests {
             );
         }
         assert_eq!(
-            ArtifactCapacityInputV1::new(
-                u64::MAX,
-                1,
-                0,
-                0,
-                0,
-                0,
-                0,
-            )
-            .checked_total(),
+            ArtifactCapacityInputV1::new(u64::MAX, 1, 0, 0, 0, 0, 0,).checked_total(),
             Err(ArtifactContractError::ArithmeticOverflow)
         );
     }
@@ -3094,7 +3559,9 @@ mod tests {
 
         for fixture in [
             include_str!("../../../tests/fixtures/wire/artifact_f0_pxaw_materialized_v1.hex"),
-            include_str!("../../../tests/fixtures/wire/artifact_f0_pxaw_already_materialized_v1.hex"),
+            include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxaw_already_materialized_v1.hex"
+            ),
             include_str!("../../../tests/fixtures/wire/artifact_f0_pxaw_failed_v1.hex"),
             include_str!("../../../tests/fixtures/wire/artifact_f0_pxaw_uncertain_v1.hex"),
         ] {
@@ -3104,7 +3571,9 @@ mod tests {
         }
         for fixture in [
             include_str!("../../../tests/fixtures/wire/artifact_f0_pxax_materialized_v1.hex"),
-            include_str!("../../../tests/fixtures/wire/artifact_f0_pxax_already_materialized_v1.hex"),
+            include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxax_already_materialized_v1.hex"
+            ),
             include_str!("../../../tests/fixtures/wire/artifact_f0_pxax_failed_v1.hex"),
             include_str!("../../../tests/fixtures/wire/artifact_f0_pxax_uncertain_v1.hex"),
         ] {
@@ -3113,10 +3582,10 @@ mod tests {
             assert_eq!(value.encode().as_slice(), bytes);
         }
 
-        let operation_a2 = ArtifactOperationIdV1::try_from_bytes([0xa2; 16])
-            .expect("ledger operation one");
-        let operation_a3 = ArtifactOperationIdV1::try_from_bytes([0xa3; 16])
-            .expect("ledger operation two");
+        let operation_a2 =
+            ArtifactOperationIdV1::try_from_bytes([0xa2; 16]).expect("ledger operation one");
+        let operation_a3 =
+            ArtifactOperationIdV1::try_from_bytes([0xa3; 16]).expect("ledger operation two");
         let materializing_a2 = ArtifactFilesystemClaimV1::Materializing {
             operation_id: operation_a2,
             object_ref,
@@ -3140,19 +3609,27 @@ mod tests {
                 materializing_a2.clone(),
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_object_terminal_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_object_terminal_v1.hex"
+                ),
                 materializing_a2,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_materialized_terminal_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_materialized_terminal_v1.hex"
+                ),
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_materialized_receipt_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_materialized_receipt_v1.hex"
+                ),
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_failed_terminal_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_failed_terminal_v1.hex"
+                ),
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
@@ -3160,31 +3637,45 @@ mod tests {
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_failed_after_materializing_terminal_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_failed_after_materializing_terminal_v1.hex"
+                ),
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_failed_after_materializing_receipt_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_failed_after_materializing_receipt_v1.hex"
+                ),
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_already_materialized_materializing_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_already_materialized_materializing_v1.hex"
+                ),
                 materializing_a3,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_already_materialized_terminal_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_already_materialized_terminal_v1.hex"
+                ),
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_already_materialized_receipt_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_already_materialized_receipt_v1.hex"
+                ),
                 ArtifactFilesystemClaimV1::Stable,
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_uncertain_blocked_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_uncertain_blocked_v1.hex"
+                ),
                 quarantined.clone(),
             ),
             (
-                include_str!("../../../tests/fixtures/wire/artifact_f0_pxaz_uncertain_receipt_blocked_v1.hex"),
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxaz_uncertain_receipt_blocked_v1.hex"
+                ),
                 quarantined,
             ),
         ] {
@@ -3196,7 +3687,10 @@ mod tests {
                 .validate_filesystem(facts)
                 .expect("hardcoded PXAZ filesystem facts");
             assert_eq!(
-                snapshot.encode_canonical().expect("canonical PXAZ").as_ref(),
+                snapshot
+                    .encode_canonical()
+                    .expect("canonical PXAZ")
+                    .as_ref(),
                 bytes.as_slice()
             );
         }
