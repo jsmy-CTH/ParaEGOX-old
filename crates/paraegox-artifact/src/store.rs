@@ -2544,19 +2544,16 @@ mod tests {
     fn initial_snapshot() -> (ArtifactStoreSnapshotV1, VerifiedArtifactPairV1) {
         let pair = VerifiedArtifactPairV1::from_payload(b"store-focused-test")
             .expect("valid fixture pair");
-        let request = MaterializationRequestV1::new(operation(0x22), config(0x33), pair.object_ref());
+        let request =
+            MaterializationRequestV1::new(operation(0x22), config(0x33), pair.object_ref());
         let admission = MaterializationAdmissionV1::new(
             store(0x44),
             NonZeroU64::new(1).expect("one is nonzero"),
             &request,
         );
-        let snapshot = ArtifactStoreSnapshotV1::initial(
-            store(0x44),
-            config(0x33),
-            request,
-            admission,
-        )
-        .expect("valid initial snapshot");
+        let snapshot =
+            ArtifactStoreSnapshotV1::initial(store(0x44), config(0x33), request, admission)
+                .expect("valid initial snapshot");
         (snapshot, pair)
     }
 
@@ -2575,11 +2572,9 @@ mod tests {
             ArtifactStoreAuthorityBindingV1::try_new(PathBuf::from(overlong), commitment),
             Err(ArtifactStoreAuthorityRecheckFailureV1::UnsafePath),
         );
-        let accepted = ArtifactStoreAuthorityBindingV1::try_new(
-            PathBuf::from("/strict/state"),
-            commitment,
-        )
-        .expect("canonical absolute path");
+        let accepted =
+            ArtifactStoreAuthorityBindingV1::try_new(PathBuf::from("/strict/state"), commitment)
+                .expect("canonical absolute path");
         assert_eq!(accepted.state_root(), Path::new("/strict/state"));
         assert_eq!(accepted.config_commitment(), commitment);
     }
@@ -2598,16 +2593,18 @@ mod tests {
 
     #[test]
     fn object_directory_name_is_fixed_lowercase_digest_name() {
-        let pair = VerifiedArtifactPairV1::from_payload(b"pair-name-test")
-            .expect("valid fixture pair");
+        let pair =
+            VerifiedArtifactPairV1::from_payload(b"pair-name-test").expect("valid fixture pair");
         let name = object_directory_name(pair.object_ref());
         assert_eq!(name.len(), 131);
         assert!(name.starts_with("o-"));
         assert_eq!(name.as_bytes()[66], b'-');
-        assert!(name[2..66]
-            .bytes()
-            .chain(name[67..].bytes())
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(
+            name[2..66]
+                .bytes()
+                .chain(name[67..].bytes())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
     }
 
     #[test]
