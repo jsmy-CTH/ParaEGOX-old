@@ -85,7 +85,8 @@ const ARTIFACT_TARGET_PROFILE: &[u8] = b"developer-local-managed-model-v1";
 const ARTIFACT_ENTRYPOINT: &[u8] = b"literal-prefix-v1";
 const ARTIFACT_ADAPTER_ID: [u8; 16] = *b"px-art-prefix-v1";
 const ARTIFACT_EMPTY_PXTA: [u8; 10] = EMPTY_PXTA;
-const ARTIFACT_TARGET_EXECUTION_FIXED_BYTES: usize = 4 + 2 + STACK_PROJECTION_BYTES + 32 + 2 + 2 + 4 + 4 + 192;
+const ARTIFACT_TARGET_EXECUTION_FIXED_BYTES: usize =
+    4 + 2 + STACK_PROJECTION_BYTES + 32 + 2 + 2 + 4 + 4 + 192;
 
 /// Exact projection version for the fixed Fabric/Model/Agent successor.
 pub const MANAGED_MODEL_AGENT_STACK_PROJECTION_VERSION: u16 = 1;
@@ -962,10 +963,8 @@ impl ArtifactExecutionBindingV1 {
             materialization_receipt_ref,
             execution_profile_commitment,
         );
-        let binding_digest = digest_wire(
-            ARTIFACT_EXECUTION_BINDING_DIGEST_DOMAIN,
-            &canonical_wire,
-        )?;
+        let binding_digest =
+            digest_wire(ARTIFACT_EXECUTION_BINDING_DIGEST_DOMAIN, &canonical_wire)?;
         Ok(Self {
             object_ref,
             materialization_receipt_ref,
@@ -987,13 +986,11 @@ impl ArtifactExecutionBindingV1 {
         let store_instance = paraegox_artifact::ArtifactStoreInstanceV1::try_from_bytes(
             read_array(&frame[72..104]),
         )?;
-        let operation_sequence = core::num::NonZeroU64::new(u64::from_be_bytes(read_array(
-            &frame[104..112],
-        )))
-        .ok_or(ManagedModelAgentStackPlanError::InvalidLength)?;
-        let operation_id = paraegox_artifact::ArtifactOperationIdV1::try_from_bytes(read_array(
-            &frame[112..128],
-        ))?;
+        let operation_sequence =
+            core::num::NonZeroU64::new(u64::from_be_bytes(read_array(&frame[104..112])))
+                .ok_or(ManagedModelAgentStackPlanError::InvalidLength)?;
+        let operation_id =
+            paraegox_artifact::ArtifactOperationIdV1::try_from_bytes(read_array(&frame[112..128]))?;
         let receipt_digest = Digest32::from_bytes(read_array(&frame[128..160]));
         if digest_is_zero(receipt_digest) {
             return Err(ManagedModelAgentStackPlanError::InvalidLength);
@@ -1127,8 +1124,7 @@ impl ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
         }
         let mut cursor = Cursor::new(frame);
         if cursor.take(4)? != TARGET_EXECUTION_MAGIC
-            || cursor.u16()?
-                != ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION
+            || cursor.u16()? != ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION
         {
             return Err(ManagedModelAgentStackPlanError::UnsupportedWire);
         }
@@ -1149,16 +1145,13 @@ impl ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
         {
             return Err(ManagedModelAgentStackPlanError::InvalidLength);
         }
-        let binding = ArtifactExecutionBindingV1::decode(
-            cursor.take(ARTIFACT_EXECUTION_BINDING_V1_BYTES)?,
-        )?;
-        let embedded = ManagedModelAgentStackTargetExecutionV1::decode(
-            cursor.take(embedded_length)?,
-        )?;
+        let binding =
+            ArtifactExecutionBindingV1::decode(cursor.take(ARTIFACT_EXECUTION_BINDING_V1_BYTES)?)?;
+        let embedded =
+            ManagedModelAgentStackTargetExecutionV1::decode(cursor.take(embedded_length)?)?;
         cursor.finish()?;
         let decoded = Self::try_new(projection, binding, embedded)?;
-        if decoded.compatibility_digest != compatibility_digest
-            || decoded.canonical_wire() != frame
+        if decoded.compatibility_digest != compatibility_digest || decoded.canonical_wire() != frame
         {
             return Err(ManagedModelAgentStackPlanError::NonCanonicalFrame);
         }
@@ -1217,8 +1210,7 @@ impl ArtifactBoundManagedModelAgentStackAssignmentsV1 {
         if !bindings.is_empty() || bindings.canonical_wire() != ARTIFACT_EMPTY_PXTA {
             return Err(ManagedModelAgentStackPlanError::BindingNotAllowed);
         }
-        let mut builder =
-            Digest32Builder::try_new(ARTIFACT_TARGET_PLAN_ASSIGNMENTS_DIGEST_DOMAIN)?;
+        let mut builder = Digest32Builder::try_new(ARTIFACT_TARGET_PLAN_ASSIGNMENTS_DIGEST_DOMAIN)?;
         builder.field_digest(bindings.assignment_digest().value())?;
         builder.field_digest(&execution.execution_digest())?;
         Ok(Self {
@@ -1291,10 +1283,8 @@ impl ArtifactBoundManagedModelAgentStackApplyRequestDraftV1 {
             assignments.assignment_digest,
         );
         let commitment = RuntimeSliceCommitment::try_new(header)?;
-        let slice = ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(
-            commitment,
-            assignments,
-        )?;
+        let slice =
+            ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(commitment, assignments)?;
         let control_commitment = RuntimeApplyControlCommitment::try_new(commitment, control)?;
         let store = RuntimeStoreInstanceId::try_from_bytes(expected_runtime_store_instance_id)?;
         let envelope =
@@ -1304,8 +1294,10 @@ impl ArtifactBoundManagedModelAgentStackApplyRequestDraftV1 {
 
     pub fn signing_transcript(
         &self,
-    ) -> Result<ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2, ManagedModelAgentStackPlanError>
-    {
+    ) -> Result<
+        ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2,
+        ManagedModelAgentStackPlanError,
+    > {
         Ok(ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2(
             self.envelope.signing_transcript()?,
         ))
@@ -1393,9 +1385,8 @@ impl ArtifactBoundManagedModelAgentStackApplyRequestV1 {
         }
         let bindings = TargetAssignments::decode(binding_frame)
             .map_err(|_| ManagedModelAgentStackPlanError::BindingNotAllowed)?;
-        let execution = ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(
-            &frame[bindings_end..],
-        )?;
+        let execution =
+            ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(&frame[bindings_end..])?;
         let assignments =
             ArtifactBoundManagedModelAgentStackAssignmentsV1::try_new(bindings, execution)?;
         let slice = ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(
@@ -1421,9 +1412,7 @@ impl ArtifactBoundManagedModelAgentStackApplyRequestV1 {
     }
 
     #[must_use]
-    pub const fn target_execution(
-        &self,
-    ) -> &ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+    pub const fn target_execution(&self) -> &ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
         &self.slice.assignments.execution
     }
 
@@ -1464,7 +1453,10 @@ impl ArtifactBoundManagedModelAgentStackApplyRequestV1 {
 
     #[must_use]
     pub const fn expected_runtime_store_instance_id(&self) -> [u8; 32] {
-        *self.envelope.expected_runtime_store_instance_id().as_bytes()
+        *self
+            .envelope
+            .expected_runtime_store_instance_id()
+            .as_bytes()
     }
 
     #[must_use]
@@ -1479,8 +1471,10 @@ impl ArtifactBoundManagedModelAgentStackApplyRequestV1 {
 
     pub fn signing_transcript(
         &self,
-    ) -> Result<ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2, ManagedModelAgentStackPlanError>
-    {
+    ) -> Result<
+        ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2,
+        ManagedModelAgentStackPlanError,
+    > {
         Ok(ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2(
             self.envelope.signing_transcript()?,
         ))
@@ -1502,16 +1496,14 @@ pub fn verify_artifact_bound_managed_model_agent_stack_durable_slice_v1(
     target: RuntimeHostId,
     provenance: PlanProvenance,
     expected_target_slice_digest: TargetSliceDigest,
-) -> Result<ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelAgentStackPlanError>
-{
+) -> Result<ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelAgentStackPlanError> {
     if canonical_slice_wire.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_PLAN_SLICE_BYTES {
         return Err(ManagedModelAgentStackPlanError::FrameTooLarge);
     }
     if canonical_slice_wire.len() < ARTIFACT_EMPTY_PXTA.len() {
         return Err(ManagedModelAgentStackPlanError::Truncated);
     }
-    let (binding_frame, execution_frame) =
-        canonical_slice_wire.split_at(ARTIFACT_EMPTY_PXTA.len());
+    let (binding_frame, execution_frame) = canonical_slice_wire.split_at(ARTIFACT_EMPTY_PXTA.len());
     if binding_frame != ARTIFACT_EMPTY_PXTA {
         return Err(ManagedModelAgentStackPlanError::BindingNotAllowed);
     }
@@ -1531,8 +1523,7 @@ pub fn verify_artifact_bound_managed_model_agent_stack_durable_slice_v1(
     if commitment.target_slice_digest() != expected_target_slice_digest {
         return Err(ManagedModelAgentStackPlanError::CommitmentMismatch);
     }
-    let slice =
-        ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(commitment, assignments)?;
+    let slice = ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(commitment, assignments)?;
     Ok(slice.assignments.execution)
 }
 
@@ -2978,15 +2969,14 @@ pub fn artifact_execution_profile_commitment_v1() -> Digest32 {
 }
 
 /// Computes the complete PXTE11/PXAR12 Artifact-bound compatibility fingerprint.
-pub fn artifact_bound_managed_model_agent_stack_compatibility_digest_v1(
-) -> Result<Digest32, DigestBuildError> {
+pub fn artifact_bound_managed_model_agent_stack_compatibility_digest_v1()
+-> Result<Digest32, DigestBuildError> {
     let mut builder = Digest32Builder::try_new(ARTIFACT_STACK_COMPATIBILITY_DIGEST_DOMAIN)?;
     builder.field_digest(&managed_model_agent_stack_compatibility_digest_v1()?)?;
     builder.field_bytes(TARGET_EXECUTION_MAGIC)?;
     builder.field_u16(ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION)?;
     builder.field_bytes(
-        &(MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES as u32)
-            .to_be_bytes(),
+        &(MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES as u32).to_be_bytes(),
     )?;
     builder.field_bytes(APPLY_REQUEST_MAGIC)?;
     builder.field_u16(ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION)?;
@@ -3280,9 +3270,9 @@ mod tests {
         assert_eq!(
             artifact_execution_profile_commitment_v1().as_bytes(),
             &[
-                0x1f, 0xe2, 0x43, 0xfd, 0x90, 0x34, 0xf0, 0x4d, 0xae, 0xc0, 0xc0, 0x23,
-                0x66, 0x1c, 0x6f, 0x3e, 0x8b, 0x48, 0x78, 0xf6, 0xea, 0xab, 0x6b, 0xa0,
-                0x59, 0x4b, 0x37, 0x16, 0x1e, 0xc8, 0x8c, 0x1e,
+                0x1f, 0xe2, 0x43, 0xfd, 0x90, 0x34, 0xf0, 0x4d, 0xae, 0xc0, 0xc0, 0x23, 0x66, 0x1c,
+                0x6f, 0x3e, 0x8b, 0x48, 0x78, 0xf6, 0xea, 0xab, 0x6b, 0xa0, 0x59, 0x4b, 0x37, 0x16,
+                0x1e, 0xc8, 0x8c, 0x1e,
             ],
         );
         let binding = artifact_binding();
