@@ -369,6 +369,7 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         {
             Ok(dependency) => dependency,
             Err(error) => {
+                record_d0b_runtime_diagnostic(&core.state_directory, &error);
                 let terminal = match model_start_cleanup_exact_zero(&error) {
                     Some(true) => Some(core.commit_model_terminal(
                         fabric,
@@ -2656,10 +2657,7 @@ fn record_d0b_runtime_diagnostic(
     else {
         return;
     };
-    let _ = std::fs::write(
-        test_home.join("d0b-runtime-diagnostic.txt"),
-        diagnostic,
-    );
+    let _ = std::fs::write(test_home.join("d0b-runtime-diagnostic.txt"), diagnostic);
 }
 
 fn validate_artifact_cutover_request(

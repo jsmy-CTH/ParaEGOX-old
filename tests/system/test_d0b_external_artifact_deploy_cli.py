@@ -146,7 +146,7 @@ def _invoke_json(
             pytest.exit(
                 "captured first D0b deploy failure: "
                 f"diagnostic={diagnostic}; stdout={process.stdout!r}; "
-                f"stderr={process.stderr!r}",
+                f"stderr={process.stderr!r}; state={_d0b_state_summary(environment)}",
                 returncode=1,
             )
     assert process.returncode == expected_returncode, (
@@ -200,6 +200,23 @@ def _print_d0b_failure_state(environment: dict[str, str]) -> None:
             f"census={int.from_bytes(header[141:143], 'big')}:"
             f"complete={header[143]}:ready={header[144:147].hex()}"
         )
+
+
+def _d0b_state_summary(environment: dict[str, str]) -> str:
+    state_root = Path(environment["HOME"]) / "state"
+    if not state_root.is_dir():
+        return "<absent>"
+    names: list[str] = []
+    snapshots: list[str] = []
+    for path in sorted(state_root.rglob("*")):
+        relative = path.relative_to(state_root)
+        names.append(os.fspath(relative))
+        if path.name == "managed-model-agent-stack.snapshot-v1":
+            try:
+                snapshots.append(f"{relative}:{path.read_bytes()[:208].hex()}")
+            except OSError as error:
+                snapshots.append(f"{relative}:read={error!r}")
+    return f"names={','.join(names)};pxma={'|'.join(snapshots)}"
 
 
 def _matching_processes(binary: Path) -> list[int]:
