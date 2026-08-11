@@ -1960,7 +1960,11 @@ fn record_d0b_exchange_diagnostic(
     let Ok(mut output) = fs::OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
-    let _ = writeln!(output, "client-error={error:?};elapsed-ms={}", elapsed.as_millis());
+    let _ = writeln!(
+        output,
+        "client-error={error:?};elapsed-ms={}",
+        elapsed.as_millis()
+    );
 }
 
 fn reopen_artifact_successor(
