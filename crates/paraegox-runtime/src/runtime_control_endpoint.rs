@@ -7935,7 +7935,7 @@ mod tests {
                 tail.find("endpoint.shutdown().await")
                     .unwrap_or_else(|| panic!("missing restricted shutdown"))
                     < tail
-                        .find("shutdown_managed_successor_chain")
+                        .find("shutdown_successor_chain().await")
                         .unwrap_or_else(|| panic!("missing managed owner cleanup"))
             );
         }
@@ -8173,7 +8173,10 @@ mod tests {
         assert_eq!(
             managed
                 .match_indices("shutdown_managed_successor_chain")
-                .count(),
+                .count()
+                + managed
+                    .match_indices("shutdown_successor_chain().await")
+                    .count(),
             7
         );
         assert!(!managed.contains(".and("));

@@ -3432,14 +3432,13 @@ mod tests {
             ))
             .expect("shared PXAR12 fixture");
         let projection = request.target_execution().projection().clone();
-        let projection_digest = stack_projection_digest(&projection).expect("projection digest");
         let active = ArtifactManagedModelAgentStackSnapshotV2::decode(
             &decode_fixture_hex(include_str!(
                 "../../../tests/fixtures/wire/artifact_f0_pxma_v2_active_ready.hex"
             )),
             [0x44; 32],
             Digest32::from_bytes([0x55; 32]),
-            projection_digest,
+            Digest32::from_bytes([0x66; 32]),
             &projection,
         )
         .expect("shared active-ready PXMA2 fixture");
@@ -3595,7 +3594,8 @@ mod tests {
         assert!(replay < gate && gate < phase && phase < deadline && deadline < admission);
 
         let shutdown = source
-            .split_once("    pub(crate) async fn shutdown(")
+            .split_once("impl ManagedModelAgentStackRuntimeCore {")
+            .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn shutdown("))
             .and_then(|(_, tail)| tail.split_once("\n}\n\nfn build_pre_cutover_no_effect_terminal"))
             .map(|(shutdown, _)| shutdown)
             .expect("missing Model+Agent shutdown boundary");
