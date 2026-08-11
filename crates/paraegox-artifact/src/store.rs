@@ -3682,14 +3682,12 @@ mod tests {
                 let path = canonical_base.join(name);
                 match fs::create_dir(&path) {
                     Ok(()) => {
-                        fs::set_permissions(
-                            &path,
-                            Permissions::from_mode(DIRECTORY_MODE_BITS),
-                        )
-                        .expect("strict test temporary mode");
+                        fs::set_permissions(&path, Permissions::from_mode(DIRECTORY_MODE_BITS))
+                            .expect("strict test temporary mode");
                         let canonical_path = path.canonicalize().expect("canonical test directory");
                         assert_eq!(canonical_path, path);
-                        let metadata = fs::symlink_metadata(&path).expect("test directory metadata");
+                        let metadata =
+                            fs::symlink_metadata(&path).expect("test directory metadata");
                         return Self {
                             canonical_base,
                             path,
@@ -3766,11 +3764,9 @@ mod tests {
         fn new(payload: &[u8], operation_byte: u8) -> Self {
             let temp = TestTempDir::new();
             let pair = VerifiedArtifactPairV1::from_payload(payload).expect("valid test pair");
-            let binding = ArtifactStoreAuthorityBindingV1::try_new(
-                temp.path().join("state"),
-                config(0x33),
-            )
-            .expect("valid test store binding");
+            let binding =
+                ArtifactStoreAuthorityBindingV1::try_new(temp.path().join("state"), config(0x33))
+                    .expect("valid test store binding");
             let request = MaterializationRequestV1::new(
                 operation(operation_byte),
                 binding.config_commitment(),
@@ -3866,21 +3862,13 @@ mod tests {
 
     fn open_materializing_fixture(
         fixture: &mut TestStoreFixture,
-    ) -> (
-        LockedStore,
-        ArtifactStoreAuthorityBindingV1,
-        ChangeTracker,
-    ) {
+    ) -> (LockedStore, ArtifactStoreAuthorityBindingV1, ChangeTracker) {
         let binding = fixture.authority.binding.clone();
         let request = fixture.request.clone();
         let mut tracker = ChangeTracker::default();
-        let mut store = open_or_initialize_store(
-            &mut fixture.authority,
-            &binding,
-            &request,
-            &mut tracker,
-        )
-        .expect("initialize test store");
+        let mut store =
+            open_or_initialize_store(&mut fixture.authority, &binding, &request, &mut tracker)
+                .expect("initialize test store");
         ensure_materializing(
             &mut store,
             &mut fixture.authority,
@@ -3915,12 +3903,7 @@ mod tests {
             MANIFEST_NAME,
             pair.manifest_bytes(),
         )?;
-        publish_pair_file(
-            &child,
-            PAYLOAD_NEXT_NAME,
-            PAYLOAD_NAME,
-            pair.payload(),
-        )?;
+        publish_pair_file(&child, PAYLOAD_NEXT_NAME, PAYLOAD_NAME, pair.payload())?;
         drop(child);
         Ok(())
     }
@@ -3928,10 +3911,8 @@ mod tests {
     fn assert_prefix_query_not_found_and_unchanged(fixture: &mut TestStoreFixture) {
         let state_root = fixture.state_root().to_path_buf();
         let before = tree_fingerprint(&state_root);
-        let invocation = ArtifactStoreV1::query(
-            &mut fixture.authority,
-            fixture.request.operation_id(),
-        );
+        let invocation =
+            ArtifactStoreV1::query(&mut fixture.authority, fixture.request.operation_id());
         assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unchanged);
         assert_eq!(
             invocation.into_result().expect_err("prefix is not found"),
@@ -3971,11 +3952,8 @@ mod tests {
     #[test]
     fn unix_virgin_materialize_query_read_and_replay_reacquire_lock() {
         let mut fixture = TestStoreFixture::new(b"unix-store-e2e ", 0x51);
-        let first = ArtifactStoreV1::materialize(
-            &mut fixture.authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let first =
+            ArtifactStoreV1::materialize(&mut fixture.authority, &fixture.request, &fixture.pair);
         assert_eq!(first.change(), ArtifactStoreChangeV1::Changed);
         let first_view = first.result().expect("virgin materialization succeeds");
         assert_eq!(
@@ -3985,10 +3963,7 @@ mod tests {
         let canonical_operation = first_view.operation().clone();
         let receipt_ref = first_view.receipt_ref().expect("materialized receipt");
 
-        let query = ArtifactStoreV1::query(
-            &mut fixture.authority,
-            fixture.request.operation_id(),
-        );
+        let query = ArtifactStoreV1::query(&mut fixture.authority, fixture.request.operation_id());
         assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
         assert_eq!(
             query.result().expect("query succeeds").operation(),
@@ -4008,14 +3983,14 @@ mod tests {
             MaterializationTerminalStateV1::Materialized,
         );
 
-        let replay = ArtifactStoreV1::materialize(
-            &mut fixture.authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let replay =
+            ArtifactStoreV1::materialize(&mut fixture.authority, &fixture.request, &fixture.pair);
         assert_eq!(replay.change(), ArtifactStoreChangeV1::Unchanged);
         assert_eq!(
-            replay.result().expect("same request replay succeeds").operation(),
+            replay
+                .result()
+                .expect("same request replay succeeds")
+                .operation(),
             &canonical_operation,
         );
     }
@@ -4030,11 +4005,8 @@ mod tests {
         lock.try_lock().expect("hold bootstrap exclusive lock");
         let before = tree_fingerprint(fixture.state_root());
 
-        let invocation = ArtifactStoreV1::materialize(
-            &mut fixture.authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let invocation =
+            ArtifactStoreV1::materialize(&mut fixture.authority, &fixture.request, &fixture.pair);
         assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unchanged);
         assert_eq!(
             invocation
@@ -4071,8 +4043,7 @@ mod tests {
             Err(rustix::io::Errno::EXIST),
         );
         let source_marker = fs::read(source.join("marker")).expect("source marker");
-        let destination_marker =
-            fs::read(destination.join("marker")).expect("destination marker");
+        let destination_marker = fs::read(destination.join("marker")).expect("destination marker");
         assert_eq!(source_marker.as_slice(), b"source");
         assert_eq!(destination_marker.as_slice(), b"destination");
 
@@ -4084,8 +4055,8 @@ mod tests {
             &child_path.join(MANIFEST_NAME),
             destination_bytes,
         ));
-        let pair = VerifiedArtifactPairV1::from_payload(b"noreplace pair ")
-            .expect("valid noreplace pair");
+        let pair =
+            VerifiedArtifactPairV1::from_payload(b"noreplace pair ").expect("valid noreplace pair");
         assert_eq!(
             publish_pair_file(
                 &child,
@@ -4113,8 +4084,7 @@ mod tests {
         ] {
             let mut fixture = TestStoreFixture::new(b"existing-child-fault ", operation_byte);
             let (store, _binding, mut tracker) = open_materializing_fixture(&mut fixture);
-            write_full_unindexed_pair(&store, &fixture.pair)
-                .expect("matching full unindexed pair");
+            write_full_unindexed_pair(&store, &fixture.pair).expect("matching full unindexed pair");
             let mut observer = FailingObserver {
                 target: point,
                 seen: Vec::new(),
@@ -4133,10 +4103,8 @@ mod tests {
             assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unknown);
             store.release().expect("release faulted test store");
 
-            let query = ArtifactStoreV1::query(
-                &mut fixture.authority,
-                fixture.request.operation_id(),
-            );
+            let query =
+                ArtifactStoreV1::query(&mut fixture.authority, fixture.request.operation_id());
             assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
             let view = query.result().expect("materializing query after fault");
             assert_eq!(view.state(), ArtifactStoreOperationStateV1::Materializing);
@@ -4157,13 +4125,9 @@ mod tests {
             seen: Vec::new(),
             fired: false,
         };
-        let publication = publish_or_recover_pair_observed(
-            &store,
-            &pair,
-            &mut tracker,
-            &mut observer,
-        )
-        .expect("late full pair is recovered in the same call");
+        let publication =
+            publish_or_recover_pair_observed(&store, &pair, &mut tracker, &mut observer)
+                .expect("late full pair is recovered in the same call");
         let PairPublication::Complete(verified) = publication else {
             panic!("late full pair must recover as complete");
         };
@@ -4172,11 +4136,13 @@ mod tests {
             observer.seen.first(),
             Some(&StoreFaultPoint::FreshPairAfterSecondFinalBeforeDurabilityProof),
         );
-        assert!(observer
-            .seen
-            .iter()
-            .skip(1)
-            .any(|point| *point == StoreFaultPoint::ExistingChildBeforeObjectsSync));
+        assert!(
+            observer
+                .seen
+                .iter()
+                .skip(1)
+                .any(|point| *point == StoreFaultPoint::ExistingChildBeforeObjectsSync)
+        );
         assert_eq!(
             observer
                 .seen
@@ -4214,14 +4180,20 @@ mod tests {
             operation.terminal().expect("materialized terminal").state(),
             MaterializationTerminalStateV1::Materialized,
         );
-        assert_eq!(store.snapshot.quarantine(), ArtifactQuarantineFactsV1::Absent);
+        assert_eq!(
+            store.snapshot.quarantine(),
+            ArtifactQuarantineFactsV1::Absent
+        );
         assert_eq!(tracker.change(), ArtifactStoreChangeV1::Changed);
         store.release().expect("release recovered test store");
 
         let query = ArtifactStoreV1::query(&mut fixture.authority, request.operation_id());
         assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
         assert_eq!(
-            query.result().expect("query recovered materialization").state(),
+            query
+                .result()
+                .expect("query recovered materialization")
+                .state(),
             ArtifactStoreOperationStateV1::Materialized,
         );
     }
