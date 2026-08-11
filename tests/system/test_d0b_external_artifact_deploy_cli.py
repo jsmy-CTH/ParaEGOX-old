@@ -189,7 +189,7 @@ def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins() 
     assert os.geteuid() != 0 and os.getegid() != 0
     source_binary = _require_exact_binary()
 
-    with tempfile.TemporaryDirectory(prefix="paraegox-d0b-", dir="/tmp") as raw:
+    with tempfile.TemporaryDirectory(prefix=".paraegox-d0b-", dir=Path.home()) as raw:
         root = Path(raw).resolve(strict=True)
         root.chmod(0o700)
         binary_directory = root / "bin"
