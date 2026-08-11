@@ -3155,7 +3155,7 @@ mod tests {
     }
 
     fn initial_snapshot() -> (ArtifactStoreSnapshotV1, VerifiedArtifactPairV1) {
-        let pair = VerifiedArtifactPairV1::from_payload(b"store-focused-test")
+        let pair = VerifiedArtifactPairV1::from_payload(b"store-focused-test ")
             .expect("valid fixture pair");
         let request =
             MaterializationRequestV1::new(operation(0x22), config(0x33), pair.object_ref());
@@ -3230,7 +3230,7 @@ mod tests {
     #[test]
     fn object_directory_name_is_fixed_lowercase_digest_name() {
         let pair =
-            VerifiedArtifactPairV1::from_payload(b"pair-name-test").expect("valid fixture pair");
+            VerifiedArtifactPairV1::from_payload(b"pair-name-test ").expect("valid fixture pair");
         let name = object_directory_name(pair.object_ref());
         assert_eq!(name.len(), 131);
         assert!(name.starts_with("o-"));
