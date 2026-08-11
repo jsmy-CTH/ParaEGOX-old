@@ -212,7 +212,7 @@ const REMOTE_AGENT_RETAINED_S0_CENSUS_DIGEST_DOMAIN_V2: &[u8] =
     b"paraegox.runtime.remote-agent-retained-s0-census.sha256.v2";
 const MODE_MASK: u32 = 0o7777;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONTROL_REQUEST_BYTES: usize = maximum_eight([
+const MAX_CONTROL_REQUEST_BYTES: usize = maximum([
     MAX_REFERENCE_RUNTIME_APPLY_REQUEST_BYTES,
     MAX_REFERENCE_BOOTSTRAP_REQUEST_BYTES,
     MAX_REFERENCE_QUERY_REQUEST_BYTES,
@@ -221,8 +221,9 @@ const MAX_CONTROL_REQUEST_BYTES: usize = maximum_eight([
     MAX_MANAGED_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
+    MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
 ]);
-const MAX_CONTROL_RESPONSE_BYTES: usize = maximum_eight([
+const MAX_CONTROL_RESPONSE_BYTES: usize = maximum([
     MAX_REFERENCE_APPLY_TERMINAL_RECEIPT_BYTES,
     MAX_REFERENCE_BOOTSTRAP_RESPONSE_BYTES,
     MAX_REFERENCE_QUERY_RESPONSE_BYTES,
@@ -807,7 +808,7 @@ impl fmt::Debug for RuntimeManagedFabricServiceDependenciesV1 {
     }
 }
 
-const fn maximum_eight(values: [usize; 8]) -> usize {
+const fn maximum<const N: usize>(values: [usize; N]) -> usize {
     let mut maximum = values[0];
     let mut index = 1;
     while index < values.len() {
