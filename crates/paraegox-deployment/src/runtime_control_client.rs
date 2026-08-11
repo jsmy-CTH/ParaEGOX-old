@@ -36,9 +36,11 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricApplyRequestV1, ManagedFabricApplyTerminalReceiptV1, ManagedFabricPlanError,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+    MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
-    ManagedModelAgentStackPlanError, ManagedModelAgentStackTerminalReceiptV1,
+    ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackPlanError,
+    ManagedModelAgentStackTerminalReceiptV1,
 };
 use paraegox_runtime_contracts::managed_serving_bootstrap::{
     MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES, MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES,
@@ -1982,6 +1984,118 @@ impl UnixRuntimeManagedModelAgentStackClient {
         RuntimeManagedModelAgentStackExchangeOutcomeV1 { action, response }
     }
 
+    pub(crate) async fn exchange_artifact(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        request_time_channel: ReferenceChannelBindingV1,
+    ) -> Result<Box<[u8]>, RuntimeManagedModelAgentStackExchangeError> {
+        let decoded = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+            request.canonical_wire(),
+        )
+        .map_err(RuntimeManagedModelAgentStackClientFailure::RequestContract)
+        .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        if decoded != *request
+            || request.canonical_wire().is_empty()
+            || request.canonical_wire().len()
+                > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES
+            || request.target() != self.endpoint.target
+            || request_time_channel.target() != request.target()
+            || request_time_channel.runtime_peer() != self.response_verifier.runtime_principal
+        {
+            return Err(RuntimeManagedModelAgentStackExchangeError::NotSent(
+                RuntimeManagedModelAgentStackClientFailure::RequestMismatch,
+            ));
+        }
+        let transport_frame =
+            length_prefix_artifact_managed_model_agent_stack(request.canonical_wire());
+        let deadline = Instant::now() + self.exchange_timeout;
+        let validated_endpoint = validate_endpoint_metadata(&self.endpoint)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        let mut stream = bounded_managed_model_agent_stack_io(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::Connect,
+            ManagedModelAgentStackDeliveryState::NotSent,
+            UnixStream::connect(self.endpoint.socket_path()),
+        )
+        .await?;
+        validated_endpoint
+            .revalidate(&self.endpoint)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        let runtime_credentials =
+            validate_peer_credentials(&stream, self.endpoint.server_credentials)
+                .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+                .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        let current_channel = validated_endpoint
+            .channel(&self.endpoint, runtime_credentials)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::Endpoint)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        if current_channel != request_time_channel {
+            return Err(RuntimeManagedModelAgentStackExchangeError::NotSent(
+                RuntimeManagedModelAgentStackClientFailure::CurrentChannelMismatch,
+            ));
+        }
+        bounded_managed_model_agent_stack_io(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::WriteRequest,
+            ManagedModelAgentStackDeliveryState::Uncertain,
+            stream.write_all(&transport_frame),
+        )
+        .await?;
+        let mut length_bytes = [0_u8; LENGTH_PREFIX_BYTES];
+        bounded_managed_model_agent_stack_read_exact(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::ReadResponseLength,
+            &mut stream,
+            &mut length_bytes,
+        )
+        .await?;
+        let response_length = u32::from_be_bytes(length_bytes) as usize;
+        if response_length == 0 {
+            return Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                RuntimeManagedModelAgentStackClientFailure::InvalidResponseLength,
+            ));
+        }
+        if response_length > MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES {
+            return Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                RuntimeManagedModelAgentStackClientFailure::ResponseBoundExceeded,
+            ));
+        }
+        let mut response_bytes = vec![0_u8; response_length];
+        bounded_managed_model_agent_stack_read_exact(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::ReadResponse,
+            &mut stream,
+            &mut response_bytes,
+        )
+        .await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = bounded_managed_model_agent_stack_io(
+            deadline,
+            RuntimeManagedModelAgentStackIoPhase::ReadTrailing,
+            ManagedModelAgentStackDeliveryState::Uncertain,
+            stream.read(&mut trailing),
+        )
+        .await?;
+        if trailing_bytes != 0 {
+            return Err(RuntimeManagedModelAgentStackExchangeError::Uncertain(
+                RuntimeManagedModelAgentStackClientFailure::TrailingBytes,
+            ));
+        }
+        let receipt = ManagedModelAgentStackTerminalReceiptV1::decode(&response_bytes)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::ResponseContract)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::Uncertain)?;
+        self.response_verifier
+            .verify(&receipt)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::Uncertain)?;
+        receipt
+            .validate_against_artifact_request(request, request_time_channel)
+            .map_err(RuntimeManagedModelAgentStackClientFailure::ResponseContract)
+            .map_err(RuntimeManagedModelAgentStackExchangeError::Uncertain)?;
+        Ok(receipt.canonical_wire().into())
+    }
+
     async fn exchange_request(
         &self,
         request: &ManagedModelAgentStackApplyRequestV1,
@@ -2095,6 +2209,16 @@ fn length_prefix_managed_model_agent_stack(payload: &[u8]) -> Box<[u8]> {
     debug_assert!(payload.len() <= MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES);
     let payload_length = u32::try_from(payload.len())
         .expect("canonical managed Model+Agent stack request bound is smaller than u32::MAX");
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame.into_boxed_slice()
+}
+
+fn length_prefix_artifact_managed_model_agent_stack(payload: &[u8]) -> Box<[u8]> {
+    debug_assert!(payload.len() <= MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES);
+    let payload_length = u32::try_from(payload.len())
+        .expect("canonical Artifact-bound Model+Agent request bound is smaller than u32::MAX");
     let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
     frame.extend_from_slice(&payload_length.to_be_bytes());
     frame.extend_from_slice(payload);
