@@ -853,6 +853,7 @@ impl ApplyAdmissionPolicy {
             ],
         )?;
         Ok(AuthenticatedManagedModelAgentStackApplyV1 {
+            request_envelope_digest: request.envelope_request_digest(),
             proof_envelope_digest,
             tenure_nonce_identity,
             request_nonce_identity,
@@ -987,6 +988,7 @@ impl ApplyAdmissionPolicy {
             ],
         )?;
         Ok(AuthenticatedManagedModelAgentStackApplyV1 {
+            request_envelope_digest: request.envelope_request_digest(),
             proof_envelope_digest,
             tenure_nonce_identity,
             request_nonce_identity,
@@ -994,16 +996,18 @@ impl ApplyAdmissionPolicy {
         })
     }
 
-    pub(crate) fn verify_artifact_managed_model_agent_stack_apply_request(
+    pub(crate) fn admit_authenticated_artifact_managed_model_agent_stack_apply_request(
         &self,
         request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        authenticated: AuthenticatedManagedModelAgentStackApplyV1,
         reading: ClockReading,
     ) -> Result<
         VerifiedArtifactManagedModelAgentStackApplyIngressV1,
         ManagedFabricApplyAdmissionError,
     > {
-        let authenticated =
-            self.authenticate_artifact_managed_model_agent_stack_apply_request(request)?;
+        if authenticated.request_envelope_digest != request.envelope_request_digest() {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
         let temporal = request.temporal();
         if temporal.target_clock_domain() != reading.domain() {
             return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
@@ -1711,6 +1715,7 @@ impl VerifiedManagedAgentStackApplyIngressV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedManagedModelAgentStackApplyV1 {
+    request_envelope_digest: Digest32,
     proof_envelope_digest: Digest32,
     tenure_nonce_identity: Digest32,
     request_nonce_identity: Digest32,
@@ -1769,6 +1774,7 @@ impl VerifiedArtifactManagedModelAgentStackApplyIngressV1 {
         );
         Self {
             authenticated: AuthenticatedManagedModelAgentStackApplyV1 {
+                request_envelope_digest: Digest32::from_bytes([0xaf; 32]),
                 proof_envelope_digest: Digest32::from_bytes([0xb0; 32]),
                 tenure_nonce_identity: Digest32::from_bytes([0xb1; 32]),
                 request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
@@ -1817,6 +1823,7 @@ impl VerifiedManagedModelAgentStackApplyIngressV1 {
         );
         Self {
             authenticated: AuthenticatedManagedModelAgentStackApplyV1 {
+                request_envelope_digest: Digest32::from_bytes([0xaf; 32]),
                 proof_envelope_digest: Digest32::from_bytes([0xb0; 32]),
                 tenure_nonce_identity: Digest32::from_bytes([0xb1; 32]),
                 request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
@@ -4687,9 +4694,17 @@ mod tests {
             generation,
             MonotonicInstant::from_ticks(100),
         );
+        let authenticated = admission
+            .policy
+            .authenticate_artifact_managed_model_agent_stack_apply_request(&request)
+            .expect("shared PXAR v12 must authenticate");
         let verified = admission
             .policy
-            .verify_artifact_managed_model_agent_stack_apply_request(&request, reading)
+            .admit_authenticated_artifact_managed_model_agent_stack_apply_request(
+                &request,
+                authenticated,
+                reading,
+            )
             .expect("shared PXAR v12 must authenticate and admit");
 
         assert_eq!(verified.clock_generation(), generation);
@@ -4697,17 +4712,27 @@ mod tests {
         assert_eq!(verified.deadline_nanos(), 6_000_183);
         assert_eq!(
             verified.authenticated().proof_envelope_digest(),
-            admission
-                .policy
-                .authenticate_artifact_managed_model_agent_stack_apply_request(&request)
-                .expect("shared PXAR v12 must authenticate")
-                .proof_envelope_digest(),
+            authenticated.proof_envelope_digest(),
         );
         assert_eq!(
             admission
                 .policy
-                .verify_artifact_managed_model_agent_stack_apply_request(
+                .admit_authenticated_artifact_managed_model_agent_stack_apply_request(
                     &request,
+                    AuthenticatedManagedModelAgentStackApplyV1 {
+                        request_envelope_digest: Digest32::from_bytes([0xff; 32]),
+                        ..authenticated
+                    },
+                    reading,
+                ),
+            Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation),
+        );
+        assert_eq!(
+            admission
+                .policy
+                .admit_authenticated_artifact_managed_model_agent_stack_apply_request(
+                    &request,
+                    authenticated,
                     ClockReading::new(
                         ClockDomainRef::from_bytes([0x0b; 16]),
                         generation,

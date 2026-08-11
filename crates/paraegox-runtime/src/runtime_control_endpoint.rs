@@ -3280,7 +3280,8 @@ impl ManagedFabricControlService {
         }
         let request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(frame)
             .map_err(|_| RuntimeControlRequestError::Rejected)?;
-        self.provisioning
+        let authenticated = self
+            .provisioning
             .admission_policy()
             .authenticate_artifact_managed_model_agent_stack_apply_request(&request)
             .map_err(|_| RuntimeControlRequestError::Rejected)?;
@@ -3318,7 +3319,11 @@ impl ManagedFabricControlService {
         let verified = self
             .provisioning
             .admission_policy()
-            .verify_artifact_managed_model_agent_stack_apply_request(&request, reading)
+            .admit_authenticated_artifact_managed_model_agent_stack_apply_request(
+                &request,
+                authenticated,
+                reading,
+            )
             .map_err(|_| RuntimeControlRequestError::Rejected)?;
         let cutover = ArtifactManagedModelAgentStackRuntimeCore::cutover(
             &mut self.core,
@@ -15789,7 +15794,7 @@ mod tests {
             .find(".clock_reading()")
             .expect("Artifact-bound admission clock disappeared");
         let fresh_admission = artifact_model
-            .find("verify_artifact_managed_model_agent_stack_apply_request")
+            .find("admit_authenticated_artifact_managed_model_agent_stack_apply_request")
             .expect("Artifact-bound fresh admission disappeared");
         let cutover = artifact_model
             .find("ArtifactManagedModelAgentStackRuntimeCore::cutover(")
