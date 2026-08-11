@@ -2537,6 +2537,16 @@ mod tests {
     }
 
     #[test]
+    fn export_artifact_f0_pxma_v1_predecessor_fixture() {
+        let wire = initial_exact_zero().canonical_wire().to_vec();
+        let hex = wire
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        panic!("ARTIFACT_F0_PXMA_V1_HEX={hex}");
+    }
+
+    #[test]
     fn checksum_tamper_and_truncation_fail_before_state_is_admitted() {
         let snapshot = initial_exact_zero();
         let mut corrupt = snapshot.canonical_wire().to_vec();

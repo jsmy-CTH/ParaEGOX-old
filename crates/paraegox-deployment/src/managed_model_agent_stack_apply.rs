@@ -4192,6 +4192,38 @@ mod tests {
     }
 
     #[test]
+    fn export_artifact_f0_pxmj_v1_predecessor_fixture() {
+        let controller = fabric_tests::controller_signer();
+        let provisioning = fabric_tests::provisioning();
+        let (mut journal, action) = uncertain_journal();
+        let receipt = signed_receipt(
+            action.request(),
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+            1,
+        );
+        journal
+            .consume_pxmt_with(
+                action,
+                receipt.canonical_wire(),
+                &controller,
+                &provisioning,
+                |_| Ok(()),
+            )
+            .expect("durable predecessor ActiveReady PXMT");
+        let wire = journal
+            .state()
+            .model_agent_stack_state()
+            .expect("predecessor PXMJ1")
+            .encode()
+            .expect("canonical predecessor PXMJ1");
+        let hex = wire
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        panic!("ARTIFACT_F0_PXMJ_V1_HEX={hex}");
+    }
+
+    #[test]
     fn every_legal_active_pxmt_is_durable_but_only_active_ready_opens_empty() {
         for (index, outcome) in [
             ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
