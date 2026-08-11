@@ -57,6 +57,45 @@ pub(crate) enum LocalChatSupervisorResultV1 {
     Contended,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactExternalSupervisorChildStateV1 {
+    Running,
+    Contended,
+    Exited(Option<i32>),
+}
+
+pub(crate) struct ArtifactExternalSupervisorChildV1 {
+    child: Child,
+    generation: Box<str>,
+}
+
+impl ArtifactExternalSupervisorChildV1 {
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+    ) -> Result<ArtifactExternalSupervisorChildStateV1, LocalProcessError> {
+        match self
+            .child
+            .try_wait()
+            .map_err(|_| LocalProcessError::LifecycleStartup)?
+        {
+            None => Ok(ArtifactExternalSupervisorChildStateV1::Running),
+            Some(status)
+                if status.code()
+                    == Some(i32::from(
+                        LOCAL_CHAT_SUPERVISOR_CONTENTION_EXIT_CODE_V1,
+                    )) =>
+            {
+                Ok(ArtifactExternalSupervisorChildStateV1::Contended)
+            }
+            Some(status) => Ok(ArtifactExternalSupervisorChildStateV1::Exited(status.code())),
+        }
+    }
+}
+
 enum PreparedLifecycleOwnerV1 {
     Chat(PreparedHeadlessChatV1),
     ArtifactExternal {
@@ -944,6 +983,37 @@ pub(crate) fn run_status(
 ) -> Result<LocalLifecycleObservationV1, LocalProcessError> {
     validate_execution_identity()?;
     observe(config)
+}
+
+pub(crate) fn spawn_artifact_external_supervisor(
+    config: &LocalManagedChatConfigV1,
+    request: DeveloperArtifactExternalControllerRequestV1,
+) -> Result<ArtifactExternalSupervisorChildV1, LocalProcessError> {
+    let executable = std::env::current_exe().map_err(|_| LocalProcessError::LifecycleStartup)?;
+    let generation = new_generation()?;
+    let child = Command::new(executable)
+        .arg(LOCAL_ARTIFACT_EXTERNAL_SUPERVISOR_MODE_V1)
+        .arg("--config")
+        .arg(config.source_path())
+        .arg("--artifact-object-ref")
+        .arg(request.object_ref().to_string())
+        .arg("--materialization-receipt-ref")
+        .arg(request.materialization_receipt_ref().to_string())
+        .arg("--operation-id")
+        .arg(lower_hex(request.operation_id().as_bytes()))
+        .arg(EXPECTED_CONFIG_COMMITMENT_OPTION)
+        .arg(lower_hex(&config.config_commitment()))
+        .arg(EXPECTED_GENERATION_OPTION)
+        .arg(&generation)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| LocalProcessError::LifecycleStartup)?;
+    Ok(ArtifactExternalSupervisorChildV1 {
+        child,
+        generation: generation.into(),
+    })
 }
 
 pub(crate) fn run_down(

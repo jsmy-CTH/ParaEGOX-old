@@ -12,7 +12,11 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use paraegox_artifact::{ArtifactObjectRefV1, MaterializationReceiptRefV1};
 #[cfg(unix)]
@@ -37,9 +41,17 @@ use crate::{
     },
     error::LocalProcessError,
 };
+#[cfg(unix)]
+use crate::lifecycle::{
+    self, ArtifactExternalSupervisorChildStateV1, LocalLifecycleStateV1,
+};
 
 const OUTPUT_SCHEMA_VERSION: u16 = 1;
 const PROFILE: &str = "developer-local-echo-prefix-v1";
+#[cfg(unix)]
+const EXTERNAL_DEPLOY_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(unix)]
+const EXTERNAL_DEPLOY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
 pub(crate) fn parse_supervisor_request(
@@ -151,9 +163,10 @@ impl ProjectionV1 {
         state: &'static str,
         terminal_outcome: Option<&'static str>,
         error: Option<LocalProcessError>,
+        changed: Option<bool>,
     ) -> Self {
         Self {
-            changed: Some(false),
+            changed,
             operation_id: Some(lower_hex(projection.operation_id().as_bytes())),
             state: Some(state),
             profile: Some(PROFILE),
@@ -182,8 +195,9 @@ impl ProjectionV1 {
 }
 
 /// Dispatches one already-recognized external deployment command. Query uses
-/// the read-only Controller facade; deploy still fails closed after complete
-/// preflight until the resident lifecycle owner can retain its exclusive gate.
+/// the read-only Controller facade; deploy starts exactly one hidden resident
+/// and returns only after its requested generation is correlated with the
+/// durable Controller outcome.
 pub(crate) fn dispatch_to(
     output: &mut impl Write,
     intent: ArtifactExternalDeploymentJsonIntentV1,
@@ -218,8 +232,42 @@ fn run_deploy_preflight(command: ArtifactExternalDeployCommandV1) -> ProjectionV
     if let Err(error) = artifact::ensure_deployment_execution_identity() {
         return ProjectionV1::error(Some(operation_id), error);
     }
-    if let Err(error) = config::parse_artifact_store_authority_config(command.config()) {
-        return ProjectionV1::error(Some(operation_id), error.into());
+    let authority_config = match config::parse_artifact_store_authority_config(command.config()) {
+        Ok(value) => value,
+        Err(error) => return ProjectionV1::error(Some(operation_id), error.into()),
+    };
+    let Some(controller_operation_id) =
+        ArtifactDeploymentOperationIdV1::try_from_bytes(*operation_id.as_bytes())
+    else {
+        return ProjectionV1::error(
+            Some(operation_id),
+            LocalProcessError::ArtifactExternalDeployOwner,
+        );
+    };
+    let mut authority = RevalidatingExternalControllerAuthority::new(&authority_config);
+    let controller_preflight =
+        DeveloperArtifactExternalControllerV1::query(&mut authority, controller_operation_id);
+    drop(authority);
+    if controller_preflight.result().is_err_and(|failure| {
+        matches!(
+            failure,
+            DeveloperArtifactExternalControllerFailureV1::UnsafePath
+                | DeveloperArtifactExternalControllerFailureV1::ConfigurationMismatch
+        )
+    }) {
+        return project_controller_query(operation_id, controller_preflight);
+    }
+    let managed_config = match config::parse_managed_chat_supervisor_config(
+        command.config().as_os_str().to_os_string(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return ProjectionV1::error(Some(operation_id), error.into()),
+    };
+    if authority_config.config_commitment().as_bytes() != &managed_config.config_commitment() {
+        return ProjectionV1::error(
+            Some(operation_id),
+            LocalProcessError::LifecycleConfiguration,
+        );
     }
     let object_ref = match ArtifactObjectRefV1::from_str(command.artifact_object_ref()) {
         Ok(value) => value,
@@ -262,10 +310,48 @@ fn run_deploy_preflight(command: ArtifactExternalDeployCommandV1) -> ProjectionV
         );
     }
     drop(bundle);
-    ProjectionV1::error(
-        Some(operation_id),
-        LocalProcessError::ArtifactExternalDeployOwner,
-    )
+    let request = match DeveloperArtifactExternalControllerRequestV1::try_new(
+        controller_operation_id,
+        authority_config.config_commitment(),
+        object_ref,
+        receipt_ref,
+    ) {
+        Some(value) => value,
+        None => {
+            return ProjectionV1::error(
+                Some(operation_id),
+                LocalProcessError::ArtifactExternalDeployArtifact,
+            );
+        }
+    };
+    match controller_preflight.into_result() {
+        Ok(projection) => {
+            if !projection_matches_request(&projection, &request) {
+                return ProjectionV1::error(
+                    Some(operation_id),
+                    LocalProcessError::ArtifactExternalDeployConflict,
+                );
+            }
+            return project_controller_state_with_changed(&projection, Some(false));
+        }
+        Err(
+            DeveloperArtifactExternalControllerFailureV1::NotFound
+            | DeveloperArtifactExternalControllerFailureV1::Contended
+            | DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(_),
+        ) => {}
+        Err(failure) => return project_controller_query_failure(operation_id, failure),
+    }
+    let child = match lifecycle::spawn_artifact_external_supervisor(&managed_config, request) {
+        Ok(value) => value,
+        Err(_) => {
+            return verified_request_uncertain_projection(
+                operation_id,
+                &request,
+                Some(false),
+            );
+        }
+    };
+    wait_for_artifact_external_owner(&managed_config, operation_id, request, child)
 }
 
 #[cfg(not(unix))]
@@ -362,6 +448,210 @@ fn lower_hex(bytes: &[u8]) -> String {
         write!(&mut text, "{byte:02x}").expect("writing into String cannot fail");
     }
     text
+}
+
+#[cfg(unix)]
+fn wait_for_artifact_external_owner(
+    config: &config::LocalManagedChatConfigV1,
+    operation_id: ArtifactExternalDeploymentOperationIdInputV1,
+    request: DeveloperArtifactExternalControllerRequestV1,
+    mut child: lifecycle::ArtifactExternalSupervisorChildV1,
+) -> ProjectionV1 {
+    let deadline = Instant::now() + EXTERNAL_DEPLOY_STARTUP_TIMEOUT;
+    let expected_generation = child.generation().to_owned();
+    let mut last_progress = None;
+    loop {
+        let child_state = match child.poll() {
+            Ok(value) => value,
+            Err(_) => {
+                return verified_request_uncertain_projection(operation_id, &request, None);
+            }
+        };
+        if child_state == ArtifactExternalSupervisorChildStateV1::Contended {
+            return verified_request_uncertain_projection(
+                operation_id,
+                &request,
+                Some(false),
+            );
+        }
+        let child_exit_code = match child_state {
+            ArtifactExternalSupervisorChildStateV1::Exited(code) => Some(code),
+            ArtifactExternalSupervisorChildStateV1::Running
+            | ArtifactExternalSupervisorChildStateV1::Contended => None,
+        };
+        let lifecycle_observation = lifecycle::run_status(config).ok();
+        if lifecycle_observation
+            .as_ref()
+            .and_then(|observation| observation.generation())
+            .is_some_and(|generation| generation != expected_generation)
+        {
+            return verified_request_uncertain_projection(
+                operation_id,
+                &request,
+                Some(false),
+            );
+        }
+        let generation_accepted = lifecycle_observation
+            .as_ref()
+            .and_then(|observation| observation.generation())
+            == Some(expected_generation.as_str());
+        let lifecycle_running = generation_accepted
+            && lifecycle_observation
+                .as_ref()
+                .is_some_and(|observation| observation.state() == LocalLifecycleStateV1::Running);
+
+        if generation_accepted || child_exit_code.is_some() {
+            let invocation = query_external_controller(config, request.operation_id());
+            match invocation.into_result() {
+                Ok(projection) => {
+                    if !projection_matches_request(&projection, &request) {
+                        return projection_error_with_changed(
+                            operation_id,
+                            LocalProcessError::ArtifactExternalDeployConflict,
+                            if generation_accepted { None } else { Some(false) },
+                        );
+                    }
+                    match projection.phase() {
+                        DeveloperArtifactExternalControllerPhaseV1::ActiveReady
+                            if lifecycle_running =>
+                        {
+                            return project_controller_state_with_changed(
+                                &projection,
+                                Some(true),
+                            );
+                        }
+                        DeveloperArtifactExternalControllerPhaseV1::Failed
+                        | DeveloperArtifactExternalControllerPhaseV1::Uncertain => {
+                            return project_controller_state_with_changed(
+                                &projection,
+                                Some(true),
+                            );
+                        }
+                        DeveloperArtifactExternalControllerPhaseV1::Admitted
+                        | DeveloperArtifactExternalControllerPhaseV1::Committed
+                        | DeveloperArtifactExternalControllerPhaseV1::Applying
+                        | DeveloperArtifactExternalControllerPhaseV1::ActiveReady => {
+                            last_progress = Some(projection);
+                        }
+                    }
+                }
+                Err(DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(
+                    Some(projection),
+                )) if projection_matches_request(&projection, &request) => {
+                    if child_exit_code.is_some() {
+                        return uncertain_controller_projection(&projection, None);
+                    }
+                }
+                Err(
+                    DeveloperArtifactExternalControllerFailureV1::NotFound
+                    | DeveloperArtifactExternalControllerFailureV1::Contended
+                    | DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(None),
+                ) => {}
+                Err(failure) => {
+                    let mut projection = project_controller_query_failure(operation_id, failure);
+                    if generation_accepted {
+                        projection.changed = None;
+                    }
+                    return projection;
+                }
+            }
+        }
+
+        if let Some(exit_code) = child_exit_code {
+            if exit_code == Some(2) && !generation_accepted && last_progress.is_none() {
+                return projection_error_with_changed(
+                    operation_id,
+                    LocalProcessError::ArtifactExternalDeployReplaceRequired,
+                    Some(false),
+                );
+            }
+            return last_progress.as_ref().map_or_else(
+                || {
+                    verified_request_uncertain_projection(
+                        operation_id,
+                        &request,
+                        if generation_accepted { None } else { Some(false) },
+                    )
+                },
+                |projection| uncertain_controller_projection(projection, Some(true)),
+            );
+        }
+        if Instant::now() >= deadline {
+            return last_progress.as_ref().map_or_else(
+                || verified_request_uncertain_projection(operation_id, &request, None),
+                |projection| uncertain_controller_projection(projection, None),
+            );
+        }
+        thread::sleep(EXTERNAL_DEPLOY_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn query_external_controller(
+    config: &config::LocalManagedChatConfigV1,
+    operation_id: ArtifactDeploymentOperationIdV1,
+) -> DeveloperArtifactExternalControllerInvocationV1 {
+    let mut authority =
+        RevalidatingExternalControllerAuthority::from_path(config.source_path().to_path_buf());
+    DeveloperArtifactExternalControllerV1::query(&mut authority, operation_id)
+}
+
+#[cfg(unix)]
+fn projection_matches_request(
+    projection: &DeveloperArtifactExternalControllerProjectionV1,
+    request: &DeveloperArtifactExternalControllerRequestV1,
+) -> bool {
+    projection.operation_id() == request.operation_id()
+        && projection.object_ref() == request.object_ref()
+        && projection.materialization_receipt_ref() == request.materialization_receipt_ref()
+}
+
+#[cfg(unix)]
+fn verified_request_uncertain_projection(
+    operation_id: ArtifactExternalDeploymentOperationIdInputV1,
+    request: &DeveloperArtifactExternalControllerRequestV1,
+    changed: Option<bool>,
+) -> ProjectionV1 {
+    ProjectionV1 {
+        changed,
+        operation_id: Some(operation_id_text(operation_id)),
+        state: Some("uncertain"),
+        profile: Some(PROFILE),
+        artifact_object_ref: Some(request.object_ref().to_string()),
+        materialization_receipt_ref: Some(request.materialization_receipt_ref().to_string()),
+        generation: None,
+        deployment_revision: None,
+        controller_snapshot_sequence: None,
+        deployment_receipt_ref: None,
+        runtime_apply_request_digest: None,
+        runtime_terminal_receipt_digest: None,
+        terminal_outcome: Some("uncertain"),
+        error: Some(LocalProcessError::ArtifactExternalDeployUncertain),
+    }
+}
+
+#[cfg(unix)]
+fn uncertain_controller_projection(
+    projection: &DeveloperArtifactExternalControllerProjectionV1,
+    changed: Option<bool>,
+) -> ProjectionV1 {
+    ProjectionV1::from_controller(
+        projection,
+        "uncertain",
+        Some("uncertain"),
+        Some(LocalProcessError::ArtifactExternalDeployUncertain),
+        changed,
+    )
+}
+
+fn projection_error_with_changed(
+    operation_id: ArtifactExternalDeploymentOperationIdInputV1,
+    error: LocalProcessError,
+    changed: Option<bool>,
+) -> ProjectionV1 {
+    let mut projection = ProjectionV1::error(Some(operation_id), error);
+    projection.changed = changed;
+    projection
 }
 
 #[cfg(unix)]
@@ -483,14 +773,15 @@ fn project_controller_query(
         );
     }
     match invocation.into_result() {
-        Ok(projection) => project_controller_state(&projection),
+        Ok(projection) => project_controller_state_with_changed(&projection, Some(false)),
         Err(failure) => project_controller_query_failure(operation_id, failure),
     }
 }
 
 #[cfg(unix)]
-fn project_controller_state(
+fn project_controller_state_with_changed(
     projection: &DeveloperArtifactExternalControllerProjectionV1,
+    changed: Option<bool>,
 ) -> ProjectionV1 {
     let (state, terminal_outcome, error) = match projection.phase() {
         DeveloperArtifactExternalControllerPhaseV1::Admitted => ("admitted", None, None),
@@ -510,7 +801,7 @@ fn project_controller_state(
             Some(LocalProcessError::ArtifactExternalDeployUncertain),
         ),
     };
-    ProjectionV1::from_controller(projection, state, terminal_outcome, error)
+    ProjectionV1::from_controller(projection, state, terminal_outcome, error, changed)
 }
 
 #[cfg(unix)]
@@ -548,6 +839,7 @@ fn project_controller_query_failure(
                 "uncertain",
                 Some("uncertain"),
                 Some(LocalProcessError::ArtifactExternalDeployUncertain),
+                Some(false),
             )
         }
         DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(None) => {
