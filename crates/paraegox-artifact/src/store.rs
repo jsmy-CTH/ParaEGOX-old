@@ -2943,6 +2943,7 @@ enum StoreFaultPoint {
     ExistingChildBeforeParentSync,
     ExistingChildBeforeParentReopen,
     ExistingChildBeforeFinalChildReopen,
+    FreshPairAfterSecondFinalBeforeDurabilityProof,
     PairMkdirFailureBeforeObjectsSync,
     PairMkdirFailureBeforeObjectsReopen,
 }
@@ -3233,6 +3234,10 @@ fn publish_or_recover_pair_observed(
             PAYLOAD_NEXT_NAME,
             PAYLOAD_NAME,
             pair.payload(),
+        )?;
+        recovery_fault_checkpoint(
+            observer,
+            StoreFaultPoint::FreshPairAfterSecondFinalBeforeDurabilityProof,
         )?;
         drop(reopened_child);
         let verified = sync_complete_child(
@@ -3636,21 +3641,303 @@ fn run_materialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions, Permissions};
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
 
     struct FailingObserver {
         target: StoreFaultPoint,
         seen: Vec<StoreFaultPoint>,
+        fired: bool,
     }
 
     impl StoreFaultObserver for FailingObserver {
         fn checkpoint(&mut self, point: StoreFaultPoint) -> Result<(), StoreError> {
             self.seen.push(point);
-            if point == self.target {
+            if point == self.target && !self.fired {
+                self.fired = true;
                 Err(StoreError::Io)
             } else {
                 Ok(())
             }
         }
+    }
+
+    struct TestTempDir {
+        canonical_base: PathBuf,
+        path: PathBuf,
+        identity: FileIdentity,
+    }
+
+    impl TestTempDir {
+        fn new() -> Self {
+            let canonical_base = std::env::temp_dir()
+                .canonicalize()
+                .expect("canonical test temporary base");
+            for _ in 0..16 {
+                let mut random = [0_u8; 16];
+                getrandom::fill(&mut random).expect("test temporary random suffix");
+                let mut name = String::from("paraegox-artifact-store-");
+                push_lower_hex(&mut name, &random);
+                let path = canonical_base.join(name);
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        fs::set_permissions(
+                            &path,
+                            Permissions::from_mode(DIRECTORY_MODE_BITS),
+                        )
+                        .expect("strict test temporary mode");
+                        let canonical_path = path.canonicalize().expect("canonical test directory");
+                        assert_eq!(canonical_path, path);
+                        let metadata = fs::symlink_metadata(&path).expect("test directory metadata");
+                        return Self {
+                            canonical_base,
+                            path,
+                            identity: FileIdentity::from_metadata(&metadata),
+                        };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("test temporary directory: {error}"),
+                }
+            }
+            panic!("could not allocate unique test temporary directory")
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let safe_name = self
+                .path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("paraegox-artifact-store-"));
+            if !safe_name
+                || self.path.parent() != Some(self.canonical_base.as_path())
+                || !self.path.starts_with(&self.canonical_base)
+            {
+                return;
+            }
+            let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+                return;
+            };
+            if !metadata.file_type().is_dir()
+                || FileIdentity::from_metadata(&metadata) != self.identity
+            {
+                return;
+            }
+            let Ok(canonical_path) = self.path.canonicalize() else {
+                return;
+            };
+            if canonical_path != self.path
+                || canonical_path.parent() != Some(self.canonical_base.as_path())
+            {
+                return;
+            }
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedAuthority {
+        binding: ArtifactStoreAuthorityBindingV1,
+    }
+
+    impl ArtifactStoreAuthorityV1 for FixedAuthority {
+        fn revalidate(
+            &mut self,
+        ) -> Result<ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1>
+        {
+            Ok(self.binding.clone())
+        }
+    }
+
+    struct TestStoreFixture {
+        _temp: TestTempDir,
+        authority: FixedAuthority,
+        request: MaterializationRequestV1,
+        pair: VerifiedArtifactPairV1,
+    }
+
+    impl TestStoreFixture {
+        fn new(payload: &[u8], operation_byte: u8) -> Self {
+            let temp = TestTempDir::new();
+            let pair = VerifiedArtifactPairV1::from_payload(payload).expect("valid test pair");
+            let binding = ArtifactStoreAuthorityBindingV1::try_new(
+                temp.path().join("state"),
+                config(0x33),
+            )
+            .expect("valid test store binding");
+            let request = MaterializationRequestV1::new(
+                operation(operation_byte),
+                binding.config_commitment(),
+                pair.object_ref(),
+            );
+            Self {
+                _temp: temp,
+                authority: FixedAuthority { binding },
+                request,
+                pair,
+            }
+        }
+
+        fn state_root(&self) -> &Path {
+            self.authority.binding.state_root()
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct TestTreeEntry {
+        relative: PathBuf,
+        mode: u32,
+        device: i128,
+        inode: i128,
+        length: u64,
+        bytes: Option<Vec<u8>>,
+    }
+
+    fn tree_fingerprint(root: &Path) -> Vec<TestTreeEntry> {
+        fn visit(root: &Path, current: &Path, output: &mut Vec<TestTreeEntry>) {
+            let metadata = fs::symlink_metadata(current).expect("test tree metadata");
+            output.push(TestTreeEntry {
+                relative: current
+                    .strip_prefix(root)
+                    .expect("test tree relative path")
+                    .to_path_buf(),
+                mode: metadata.mode(),
+                device: i128::from(metadata.dev()),
+                inode: i128::from(metadata.ino()),
+                length: metadata.len(),
+                bytes: metadata
+                    .file_type()
+                    .is_file()
+                    .then(|| fs::read(current).expect("test tree file bytes")),
+            });
+            if metadata.file_type().is_dir() {
+                let mut children = fs::read_dir(current)
+                    .expect("test tree directory")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("test tree entries");
+                children.sort_by_key(|entry| entry.file_name());
+                for child in children {
+                    visit(root, &child.path(), output);
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        visit(root, root, &mut output);
+        output
+    }
+
+    fn create_test_directory(path: &Path) {
+        fs::create_dir(path).expect("create test directory");
+        fs::set_permissions(path, Permissions::from_mode(DIRECTORY_MODE_BITS))
+            .expect("strict test directory mode");
+    }
+
+    fn create_test_regular(path: &Path, bytes: &[u8]) -> File {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create test regular file");
+        file.set_permissions(Permissions::from_mode(FILE_MODE_BITS))
+            .expect("strict test regular mode");
+        file.write_all(bytes).expect("write test regular file");
+        file.sync_all().expect("sync test regular file");
+        file
+    }
+
+    fn open_test_directory(path: &Path) -> DirectoryHandle {
+        let owned = open(
+            path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .expect("open test directory");
+        directory_from_owned(owned, geteuid().as_raw(), getegid().as_raw(), true)
+            .expect("strict test directory")
+    }
+
+    fn open_materializing_fixture(
+        fixture: &mut TestStoreFixture,
+    ) -> (
+        LockedStore,
+        ArtifactStoreAuthorityBindingV1,
+        ChangeTracker,
+    ) {
+        let binding = fixture.authority.binding.clone();
+        let request = fixture.request.clone();
+        let mut tracker = ChangeTracker::default();
+        let mut store = open_or_initialize_store(
+            &mut fixture.authority,
+            &binding,
+            &request,
+            &mut tracker,
+        )
+        .expect("initialize test store");
+        ensure_materializing(
+            &mut store,
+            &mut fixture.authority,
+            &binding,
+            request.operation_id(),
+            &mut tracker,
+        )
+        .expect("publish test materializing state");
+        let operation = store
+            .snapshot
+            .operation(request.operation_id())
+            .expect("test materializing operation");
+        assert!(operation.materializing().is_some());
+        assert!(operation.terminal().is_none());
+        assert!(store.snapshot.objects().is_empty());
+        (store, binding, tracker)
+    }
+
+    fn write_full_unindexed_pair(
+        store: &LockedStore,
+        pair: &VerifiedArtifactPairV1,
+    ) -> Result<(), StoreError> {
+        revalidate_public_store(store, false)?;
+        let child_name = object_directory_name(pair.object_ref());
+        mkdirat(&store.objects.file, child_name.as_str(), DIRECTORY_MODE)
+            .map_err(|_| StoreError::Io)?;
+        let child = open_directory_at(&store.objects, OsStr::new(&child_name))?;
+        exact_names(&child, &[])?;
+        publish_pair_file(
+            &child,
+            MANIFEST_NEXT_NAME,
+            MANIFEST_NAME,
+            pair.manifest_bytes(),
+        )?;
+        publish_pair_file(
+            &child,
+            PAYLOAD_NEXT_NAME,
+            PAYLOAD_NAME,
+            pair.payload(),
+        )?;
+        drop(child);
+        Ok(())
+    }
+
+    fn assert_prefix_query_not_found_and_unchanged(fixture: &mut TestStoreFixture) {
+        let state_root = fixture.state_root().to_path_buf();
+        let before = tree_fingerprint(&state_root);
+        let invocation = ArtifactStoreV1::query(
+            &mut fixture.authority,
+            fixture.request.operation_id(),
+        );
+        assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unchanged);
+        assert_eq!(
+            invocation.into_result().expect_err("prefix is not found"),
+            ArtifactStoreFailureV1::NotFound,
+        );
+        assert_eq!(tree_fingerprint(&state_root), before);
     }
 
     fn config(byte: u8) -> ArtifactConfigCommitmentV1 {
@@ -3679,6 +3966,279 @@ mod tests {
             ArtifactStoreSnapshotV1::initial(store(0x44), config(0x33), request, admission)
                 .expect("valid initial snapshot");
         (snapshot, pair)
+    }
+
+    #[test]
+    fn unix_virgin_materialize_query_read_and_replay_reacquire_lock() {
+        let mut fixture = TestStoreFixture::new(b"unix-store-e2e ", 0x51);
+        let first = ArtifactStoreV1::materialize(
+            &mut fixture.authority,
+            &fixture.request,
+            &fixture.pair,
+        );
+        assert_eq!(first.change(), ArtifactStoreChangeV1::Changed);
+        let first_view = first.result().expect("virgin materialization succeeds");
+        assert_eq!(
+            first_view.state(),
+            ArtifactStoreOperationStateV1::Materialized,
+        );
+        let canonical_operation = first_view.operation().clone();
+        let receipt_ref = first_view.receipt_ref().expect("materialized receipt");
+
+        let query = ArtifactStoreV1::query(
+            &mut fixture.authority,
+            fixture.request.operation_id(),
+        );
+        assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
+        assert_eq!(
+            query.result().expect("query succeeds").operation(),
+            &canonical_operation,
+        );
+
+        let bundle = ArtifactStoreV1::read_verified(
+            &mut fixture.authority,
+            fixture.pair.object_ref(),
+            receipt_ref,
+        )
+        .expect("verified read succeeds");
+        assert_eq!(bundle.request(), &fixture.request);
+        assert_eq!(bundle.pair(), Some(&fixture.pair));
+        assert_eq!(
+            bundle.terminal().state(),
+            MaterializationTerminalStateV1::Materialized,
+        );
+
+        let replay = ArtifactStoreV1::materialize(
+            &mut fixture.authority,
+            &fixture.request,
+            &fixture.pair,
+        );
+        assert_eq!(replay.change(), ArtifactStoreChangeV1::Unchanged);
+        assert_eq!(
+            replay.result().expect("same request replay succeeds").operation(),
+            &canonical_operation,
+        );
+    }
+
+    #[test]
+    fn unix_bootstrap_exclusive_contention_is_one_shot() {
+        let mut fixture = TestStoreFixture::new(b"unix-lock-contention ", 0x52);
+        create_test_directory(fixture.state_root());
+        let staging = fixture.state_root().join(STORE_STAGING_NAME);
+        create_test_directory(&staging);
+        let lock = create_test_regular(&staging.join(STORE_LOCK_NAME), &[]);
+        lock.try_lock().expect("hold bootstrap exclusive lock");
+        let before = tree_fingerprint(fixture.state_root());
+
+        let invocation = ArtifactStoreV1::materialize(
+            &mut fixture.authority,
+            &fixture.request,
+            &fixture.pair,
+        );
+        assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unchanged);
+        assert_eq!(
+            invocation
+                .into_result()
+                .expect_err("bootstrap lock is contended"),
+            ArtifactStoreFailureV1::Contended,
+        );
+        assert_eq!(tree_fingerprint(fixture.state_root()), before);
+        lock.unlock().expect("release bootstrap exclusive lock");
+        drop(lock);
+    }
+
+    #[test]
+    fn unix_noreplace_preserves_directory_and_pair_destinations() {
+        let temp = TestTempDir::new();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        create_test_directory(&source);
+        create_test_directory(&destination);
+        drop(create_test_regular(&source.join("marker"), b"source"));
+        drop(create_test_regular(
+            &destination.join("marker"),
+            b"destination",
+        ));
+        let parent = open_test_directory(temp.path());
+        assert_eq!(
+            renameat_with(
+                &parent.file,
+                "source",
+                &parent.file,
+                "destination",
+                RenameFlags::NOREPLACE,
+            ),
+            Err(rustix::io::Errno::EXIST),
+        );
+        let source_marker = fs::read(source.join("marker")).expect("source marker");
+        let destination_marker =
+            fs::read(destination.join("marker")).expect("destination marker");
+        assert_eq!(source_marker.as_slice(), b"source");
+        assert_eq!(destination_marker.as_slice(), b"destination");
+
+        let child_path = temp.path().join("pair");
+        create_test_directory(&child_path);
+        let child = open_test_directory(&child_path);
+        let destination_bytes = b"preserved destination";
+        drop(create_test_regular(
+            &child_path.join(MANIFEST_NAME),
+            destination_bytes,
+        ));
+        let pair = VerifiedArtifactPairV1::from_payload(b"noreplace pair ")
+            .expect("valid noreplace pair");
+        assert_eq!(
+            publish_pair_file(
+                &child,
+                MANIFEST_NEXT_NAME,
+                MANIFEST_NAME,
+                pair.manifest_bytes(),
+            ),
+            Err(StoreError::Io),
+        );
+        let preserved =
+            fs::read(child_path.join(MANIFEST_NAME)).expect("preserved pair destination");
+        let retained =
+            fs::read(child_path.join(MANIFEST_NEXT_NAME)).expect("retained pair candidate");
+        assert_eq!(preserved.as_slice(), destination_bytes);
+        assert_eq!(retained.as_slice(), pair.manifest_bytes());
+        drop(child);
+        drop(parent);
+    }
+
+    #[test]
+    fn unix_existing_child_sync_and_reopen_faults_are_owner_unknown() {
+        for (operation_byte, point) in [
+            (0x53, StoreFaultPoint::ExistingChildBeforeObjectsSync),
+            (0x54, StoreFaultPoint::ExistingChildBeforeObjectsReopen),
+        ] {
+            let mut fixture = TestStoreFixture::new(b"existing-child-fault ", operation_byte);
+            let (store, _binding, mut tracker) = open_materializing_fixture(&mut fixture);
+            write_full_unindexed_pair(&store, &fixture.pair)
+                .expect("matching full unindexed pair");
+            let mut observer = FailingObserver {
+                target: point,
+                seen: Vec::new(),
+                fired: false,
+            };
+            assert!(matches!(
+                publish_or_recover_pair_observed(
+                    &store,
+                    &fixture.pair,
+                    &mut tracker,
+                    &mut observer,
+                ),
+                Err(StoreError::Owner),
+            ));
+            assert!(observer.fired);
+            assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unknown);
+            store.release().expect("release faulted test store");
+
+            let query = ArtifactStoreV1::query(
+                &mut fixture.authority,
+                fixture.request.operation_id(),
+            );
+            assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
+            let view = query.result().expect("materializing query after fault");
+            assert_eq!(view.state(), ArtifactStoreOperationStateV1::Materializing);
+            assert!(view.operation().terminal().is_none());
+        }
+    }
+
+    #[test]
+    fn unix_fresh_late_full_pair_fault_recovers_to_materialized() {
+        let mut fixture = TestStoreFixture::new(b"fresh-late-full-pair ", 0x55);
+        let request = fixture.request.clone();
+        let pair = fixture.pair.clone();
+        let (mut store, binding, mut tracker) = open_materializing_fixture(&mut fixture);
+        let (object, object_successor) =
+            object_candidate(&store, request.operation_id(), &pair).expect("object successor");
+        let mut observer = FailingObserver {
+            target: StoreFaultPoint::FreshPairAfterSecondFinalBeforeDurabilityProof,
+            seen: Vec::new(),
+            fired: false,
+        };
+        let publication = publish_or_recover_pair_observed(
+            &store,
+            &pair,
+            &mut tracker,
+            &mut observer,
+        )
+        .expect("late full pair is recovered in the same call");
+        let PairPublication::Complete(verified) = publication else {
+            panic!("late full pair must recover as complete");
+        };
+        assert!(observer.fired);
+        assert_eq!(
+            observer.seen.first(),
+            Some(&StoreFaultPoint::FreshPairAfterSecondFinalBeforeDurabilityProof),
+        );
+        assert!(observer
+            .seen
+            .iter()
+            .skip(1)
+            .any(|point| *point == StoreFaultPoint::ExistingChildBeforeObjectsSync));
+        assert_eq!(
+            observer
+                .seen
+                .iter()
+                .filter(|point| {
+                    **point == StoreFaultPoint::FreshPairAfterSecondFinalBeforeDurabilityProof
+                })
+                .count(),
+            1,
+        );
+        assert_eq!(verified.as_ref(), &pair);
+
+        commit_successor(
+            &mut store,
+            &mut fixture.authority,
+            &binding,
+            object_successor,
+            &mut tracker,
+        )
+        .expect("commit recovered object successor");
+        let operation = commit_terminal_and_receipt(
+            &mut store,
+            &mut fixture.authority,
+            &binding,
+            TerminalCommitInput {
+                operation_id: request.operation_id(),
+                object: Some(&object),
+                state: MaterializationTerminalStateV1::Materialized,
+                quarantine: ArtifactQuarantineFactsV1::Absent,
+            },
+            &mut tracker,
+        )
+        .expect("commit recovered materialized terminal");
+        assert_eq!(
+            operation.terminal().expect("materialized terminal").state(),
+            MaterializationTerminalStateV1::Materialized,
+        );
+        assert_eq!(store.snapshot.quarantine(), ArtifactQuarantineFactsV1::Absent);
+        assert_eq!(tracker.change(), ArtifactStoreChangeV1::Changed);
+        store.release().expect("release recovered test store");
+
+        let query = ArtifactStoreV1::query(&mut fixture.authority, request.operation_id());
+        assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
+        assert_eq!(
+            query.result().expect("query recovered materialization").state(),
+            ArtifactStoreOperationStateV1::Materialized,
+        );
+    }
+
+    #[test]
+    fn unix_initial_non_authoritative_prefixes_are_not_found_and_unchanged() {
+        let mut fixture = TestStoreFixture::new(b"initial-prefix-query ", 0x56);
+        create_test_directory(fixture.state_root());
+        let staging = fixture.state_root().join(STORE_STAGING_NAME);
+        create_test_directory(&staging);
+        assert_prefix_query_not_found_and_unchanged(&mut fixture);
+
+        drop(create_test_regular(&staging.join(STORE_LOCK_NAME), &[]));
+        assert_prefix_query_not_found_and_unchanged(&mut fixture);
+
+        create_test_directory(&staging.join(OBJECTS_NAME));
+        assert_prefix_query_not_found_and_unchanged(&mut fixture);
     }
 
     #[test]
@@ -3728,12 +4288,14 @@ mod tests {
             StoreFaultPoint::ExistingChildBeforeParentSync,
             StoreFaultPoint::ExistingChildBeforeParentReopen,
             StoreFaultPoint::ExistingChildBeforeFinalChildReopen,
+            StoreFaultPoint::FreshPairAfterSecondFinalBeforeDurabilityProof,
             StoreFaultPoint::PairMkdirFailureBeforeObjectsSync,
             StoreFaultPoint::PairMkdirFailureBeforeObjectsReopen,
         ] {
             let mut observer = FailingObserver {
                 target: point,
                 seen: Vec::new(),
+                fired: false,
             };
             let mut tracker = ChangeTracker::default();
             tracker.ambiguous();
