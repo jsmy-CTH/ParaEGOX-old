@@ -13,7 +13,6 @@ use core::{fmt, time::Duration};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Instant;
 
 use crate::managed_agent_transport::{
     AGENT_CONVERSATION_PORT_PHYSICAL_BINDINGS, AgentConversationClient,
@@ -308,12 +307,15 @@ impl ManagedAgentAssembly {
     where
         P: AgentConversationModelProvider + 'static,
     {
-        let owner_state = Arc::new(AtomicU8::new(OWNER_STARTING));
-        let prepare_started = Instant::now();
+        // Opening the durable Agent journal establishes the semantic owner
+        // that the already-committed AgentStartIntent is about. It is owner
+        // bootstrap, not a physical lifecycle Prepare callback: charging its
+        // synchronous filesystem recovery to the one-millisecond Prepare
+        // budget made identical fresh owners depend on filesystem latency.
+        // The first physical effect remains the Fabric binding mutation below
+        // and is still bounded by the exact Start budget.
         let service = AgentService::open_durable(config.agent_service, &config.journal_path())?;
-        if prepare_started.elapsed() >= config.budget(ManagedServiceLifecycleStage::Prepare) {
-            return Err(ManagedAgentAssemblyError::PrepareDeadlineExceeded);
-        }
+        let owner_state = Arc::new(AtomicU8::new(OWNER_STARTING));
 
         let port_spec = config.port.clone();
         let start_budget = config.budget(ManagedServiceLifecycleStage::Start);
@@ -904,7 +906,6 @@ pub(crate) enum ManagedAgentAssemblyError {
     ProviderSelectionMismatch,
     ProviderResolutionFailed,
     InstalledPortUnavailable,
-    PrepareDeadlineExceeded,
     ReadinessDeadlineExceeded,
     PortMutationRejected(AgentPortMutationFailure),
     PortMutationUncertain(AgentPortMutationFailure),

@@ -3664,4 +3664,24 @@ mod tests {
             .expect("missing Model+Agent shutdown boundary");
         assert!(!shutdown.contains("require_remote_agent_access_s0_mutation_unfrozen_v2"));
     }
+
+    #[test]
+    fn agent_journal_bootstrap_precedes_the_bounded_physical_start() {
+        let source = include_str!("managed_agent_runtime.rs");
+        let start = source
+            .split_once("    async fn start_with_provider<P>(")
+            .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn shutdown("))
+            .map(|(start, _)| start)
+            .expect("missing Agent startup boundary");
+        let journal = start
+            .find("AgentService::open_durable")
+            .expect("missing durable Agent journal bootstrap");
+        let physical_start = start
+            .find(".mutate_live_fabric(")
+            .expect("missing bounded Agent Fabric mutation");
+        assert!(journal < physical_start);
+        assert!(!start.contains("PrepareDeadlineExceeded"));
+        assert!(start.contains("ManagedServiceLifecycleStage::Start"));
+        assert!(start.contains("ManagedServiceLifecycleStage::Readiness"));
+    }
 }
