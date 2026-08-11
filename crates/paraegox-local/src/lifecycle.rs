@@ -60,7 +60,7 @@ pub(crate) enum LocalChatSupervisorResultV1 {
 enum PreparedLifecycleOwnerV1 {
     Chat(PreparedHeadlessChatV1),
     ArtifactExternal {
-        prepared: PreparedArtifactExternalOwnerV1,
+        prepared: Box<PreparedArtifactExternalOwnerV1>,
         request: DeveloperArtifactExternalControllerRequestV1,
     },
 }
@@ -1223,7 +1223,10 @@ pub(crate) fn run_artifact_external_supervisor(
         .map_err(|_| LocalProcessError::LifecycleStartup)?;
     runtime.block_on(run_supervisor_async(
         config,
-        PreparedLifecycleOwnerV1::ArtifactExternal { prepared, request },
+        PreparedLifecycleOwnerV1::ArtifactExternal {
+            prepared: Box::new(prepared),
+            request,
+        },
         expected_generation,
     ))
 }
@@ -1467,7 +1470,7 @@ fn spawn_composition(
                     run_prepared_headless_chat(prepared, &mut control)
                 }
                 PreparedLifecycleOwnerV1::ArtifactExternal { prepared, .. } => {
-                    run_prepared_artifact_external_owner(prepared, generation, &mut control)
+                    run_prepared_artifact_external_owner(*prepared, generation, &mut control)
                 }
             };
             let _ = events.send(SupervisorEventV1::Exited(result));
