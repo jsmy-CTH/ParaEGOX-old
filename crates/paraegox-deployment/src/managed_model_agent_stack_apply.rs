@@ -3528,6 +3528,26 @@ mod tests {
         .expect("Model plan")
     }
 
+    fn artifact_model_plan(
+        selection: ManagedAgentProviderSelectionV1,
+    ) -> ManagedModelServicePlanV1 {
+        ManagedModelServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(
+                ManagedServiceId::from_bytes([0x89; 16]),
+                budgets([23, 29, 31, 37, 41]),
+            ),
+            8,
+            selection,
+            ManagedModelAdapterBindingV1::try_new(
+                *b"px-art-prefix-v1",
+                ManagedModelAdapterVersionV1::try_new(1).expect("Artifact adapter version"),
+                ManagedModelCapabilityIdV1::bounded_text_v1(),
+            )
+            .expect("Artifact adapter binding"),
+        )
+        .expect("Artifact Model plan")
+    }
+
     fn activation(
         selection: ManagedAgentProviderSelectionV1,
         state: &ManagedFabricControllerStateV1,
@@ -4120,7 +4140,17 @@ mod tests {
             .expect("verified Fabric context");
         let predecessor = state.desired().expect("Fabric desired");
         let predecessor_request = state.request().expect("Fabric request");
-        let requested = activation(provider(0x83), &state);
+        let selection = provider(0x83);
+        let requested = ManagedModelAgentStackActivationV1::try_new(
+            state
+                .desired()
+                .expect("active Fabric desired")
+                .execution()
+                .clone(),
+            agent_plan(selection),
+            artifact_model_plan(selection),
+        )
+        .expect("Artifact activation");
         let desired = ArtifactBoundManagedModelAgentStackDesiredPlanV1::try_activate(
             ArtifactBoundManagedModelAgentStackDesiredInputV1 {
                 context: &context,
