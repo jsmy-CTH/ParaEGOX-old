@@ -3449,7 +3449,7 @@ mod tests {
             ArtifactStoreSnapshotCandidateV1::decode_canonical(&trailing).and_then(|candidate| {
                 candidate.validate_filesystem(ArtifactFilesystemClaimV1::Stable)
             }),
-            Err(ArtifactContractError::InvalidLength)
+            Err(ArtifactContractError::InvalidHeader)
         );
         assert_eq!(
             ArtifactCapacityInputV1::new(
