@@ -1,10 +1,13 @@
-//! Pure canonical Artifact F0 contracts.
+//! Canonical Artifact F0 contracts and Unix store ownership.
 //!
 //! This crate owns the versioned bytes, typed references, strict snapshot
-//! reducer, and verified read bundles. It deliberately owns no filesystem,
-//! lock, process, deployment, or Runtime behavior.
+//! reducer, verified read bundles, and descriptor-relative Unix filesystem and
+//! advisory-lock behavior. It deliberately owns no process, deployment, or
+//! Runtime behavior.
 
 mod contract;
+#[cfg(unix)]
+mod store;
 
 pub use contract::{
     ARTIFACT_DEFENSE_CEILING_BYTES, ArtifactCapacityInputV1, ArtifactConfigCommitmentV1,
@@ -19,4 +22,12 @@ pub use contract::{
     PXAK_BYTES, PXAM_BYTES, PXAQ_BYTES, PXAV_BYTES, PXAW_BYTES, PXAX_BYTES, PXAY_HEADER_BYTES,
     PXAZ_HEADER_BYTES, PXMU_BYTES, PXOP_HEADER_BYTES, VerifiedArtifactPairV1,
     VerifiedMaterializationReadBundleV1,
+};
+
+#[cfg(unix)]
+pub use store::{
+    ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1,
+    ArtifactStoreAuthorityV1, ArtifactStoreChangeV1, ArtifactStoreFailureV1,
+    ArtifactStoreInvocationV1, ArtifactStoreOperationStateV1, ArtifactStoreOperationViewV1,
+    ArtifactStoreReadFailureV1, ArtifactStoreV1,
 };

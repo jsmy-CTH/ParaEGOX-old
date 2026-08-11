@@ -1,0 +1,2597 @@
+//! Descriptor-relative Unix owner for the Artifact F0 materialization store.
+//!
+//! Public values returned by this module are fully owned. No file descriptor,
+//! advisory-lock guard, directory cursor, or filesystem borrow crosses the
+//! facade boundary.
+
+use core::fmt;
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, Metadata, TryLockError};
+use std::io::{self, Read, Write};
+use std::num::NonZeroU64;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+
+use nix::dir::Dir;
+use nix::fcntl::{OFlag, open, openat, renameat};
+use nix::sys::stat::{Mode, fchmod, mkdirat};
+use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
+use rustix::fs::{RenameFlags, renameat_with};
+
+use crate::{
+    ArtifactCapacityInputV1, ArtifactConfigCommitmentV1, ArtifactFilesystemClaimV1,
+    ArtifactManifestV1, ArtifactObjectRecordV1, ArtifactObjectRefV1, ArtifactOperationIdV1,
+    ArtifactQuarantineFactsV1, ArtifactRecoveryStartV1, ArtifactSnapshotSuccessorV1,
+    ArtifactStoreInstanceV1, ArtifactStoreSnapshotCandidateV1, ArtifactStoreSnapshotV1,
+    MaterializationAdmissionV1, MaterializationOperationV1, MaterializationReceiptRefV1,
+    MaterializationReceiptV1, MaterializationRequestV1, MaterializationTerminalStateV1,
+    MaterializationTerminalV1, MaterializingRecordV1, VerifiedArtifactPairV1,
+    VerifiedMaterializationReadBundleV1,
+};
+
+const MAX_STATE_ROOT_UTF8_BYTES: usize = 3917;
+const STORE_ROOT_NAME: &str = "artifact-store-v1";
+const STORE_STAGING_NAME: &str = ".artifact-store-v1.initializing";
+const STORE_LOCK_NAME: &str = "artifact.lock";
+const STORE_SNAPSHOT_NAME: &str = "artifact.snapshot";
+const STORE_SNAPSHOT_NEXT_NAME: &str = ".artifact.snapshot.next";
+const OBJECTS_NAME: &str = "objects";
+const MANIFEST_NAME: &str = "manifest.pxam";
+const MANIFEST_NEXT_NAME: &str = ".manifest.pxam.next";
+const PAYLOAD_NAME: &str = "payload.bin";
+const PAYLOAD_NEXT_NAME: &str = ".payload.bin.next";
+const MAX_SNAPSHOT_BYTES: usize = 1_241_344;
+const MAX_OBJECT_DIRECTORIES: usize = 65;
+const DIRECTORY_MODE_BITS: u32 = 0o700;
+const FILE_MODE_BITS: u32 = 0o600;
+const MODE_MASK: u32 = 0o7777;
+const DIRECTORY_MODE: Mode = Mode::S_IRUSR
+    .union(Mode::S_IWUSR)
+    .union(Mode::S_IXUSR);
+const FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
+
+/// One revalidated, owned view of the current configuration authority.
+///
+/// This value deliberately carries no descriptor. Every store invocation pins
+/// and validates the path again, then asks the authority to revalidate it at
+/// each publication boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactStoreAuthorityBindingV1 {
+    state_root: PathBuf,
+    config_commitment: ArtifactConfigCommitmentV1,
+}
+
+impl ArtifactStoreAuthorityBindingV1 {
+    pub fn try_new(
+        state_root: PathBuf,
+        config_commitment: ArtifactConfigCommitmentV1,
+    ) -> Result<Self, ArtifactStoreAuthorityRecheckFailureV1> {
+        validate_state_root_path(&state_root)?;
+        Ok(Self {
+            state_root,
+            config_commitment,
+        })
+    }
+
+    #[must_use]
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    #[must_use]
+    pub const fn config_commitment(&self) -> ArtifactConfigCommitmentV1 {
+        self.config_commitment
+    }
+}
+
+/// Failure reported while re-reading the caller-owned configuration authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactStoreAuthorityRecheckFailureV1 {
+    UnsafePath,
+    Configuration,
+    Io,
+}
+
+impl fmt::Display for ArtifactStoreAuthorityRecheckFailureV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsafePath => "artifact store authority path is unsafe",
+            Self::Configuration => "artifact store configuration authority changed",
+            Self::Io => "artifact store configuration authority could not be read",
+        })
+    }
+}
+
+impl std::error::Error for ArtifactStoreAuthorityRecheckFailureV1 {}
+
+/// Caller-owned seam used to re-read the current state-root/config binding.
+pub trait ArtifactStoreAuthorityV1 {
+    fn revalidate(
+        &mut self,
+    ) -> Result<ArtifactStoreAuthorityBindingV1, ArtifactStoreAuthorityRecheckFailureV1>;
+}
+
+/// What this invocation can prove about canonical owner mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactStoreChangeV1 {
+    Unchanged,
+    Changed,
+    Unknown,
+}
+
+/// Public state derived only from one canonical materialization operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactStoreOperationStateV1 {
+    Admitted,
+    Materializing,
+    Materialized,
+    AlreadyMaterialized,
+    Failed,
+    Uncertain,
+}
+
+/// Fully owned public projection of one verified operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactStoreOperationViewV1 {
+    operation: MaterializationOperationV1,
+}
+
+impl ArtifactStoreOperationViewV1 {
+    fn new(operation: MaterializationOperationV1) -> Self {
+        Self { operation }
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> &MaterializationOperationV1 {
+        &self.operation
+    }
+
+    #[must_use]
+    pub fn state(&self) -> ArtifactStoreOperationStateV1 {
+        use crate::MaterializationTerminalStateV1;
+
+        match self.operation.terminal().map(|terminal| terminal.state()) {
+            Some(MaterializationTerminalStateV1::Materialized) => {
+                ArtifactStoreOperationStateV1::Materialized
+            }
+            Some(MaterializationTerminalStateV1::AlreadyMaterialized) => {
+                ArtifactStoreOperationStateV1::AlreadyMaterialized
+            }
+            Some(MaterializationTerminalStateV1::Failed) => {
+                ArtifactStoreOperationStateV1::Failed
+            }
+            Some(MaterializationTerminalStateV1::Uncertain) => {
+                ArtifactStoreOperationStateV1::Uncertain
+            }
+            None if self.operation.materializing().is_some() => {
+                ArtifactStoreOperationStateV1::Materializing
+            }
+            None => ArtifactStoreOperationStateV1::Admitted,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> ArtifactOperationIdV1 {
+        self.operation.operation_id()
+    }
+
+    #[must_use]
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.operation.request().object_ref()
+    }
+
+    #[must_use]
+    pub fn receipt_ref(&self) -> Option<MaterializationReceiptRefV1> {
+        self.operation
+            .receipt()
+            .map(MaterializationReceiptRefV1::from_receipt)
+    }
+}
+
+/// Stable store-level failure classes consumed by CLI/Controller adapters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArtifactStoreFailureV1 {
+    UnsafePath,
+    ConfigurationMismatch,
+    Conflict,
+    Capacity,
+    NotFound,
+    Contended,
+    PublicationUncertain {
+        operation: Option<MaterializationOperationV1>,
+    },
+    Owner,
+    Io,
+}
+
+impl ArtifactStoreFailureV1 {
+    #[must_use]
+    pub const fn operation(&self) -> Option<&MaterializationOperationV1> {
+        match self {
+            Self::PublicationUncertain { operation } => operation.as_ref(),
+            Self::UnsafePath
+            | Self::ConfigurationMismatch
+            | Self::Conflict
+            | Self::Capacity
+            | Self::NotFound
+            | Self::Contended
+            | Self::Owner
+            | Self::Io => None,
+        }
+    }
+}
+
+impl fmt::Display for ArtifactStoreFailureV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsafePath => "artifact store path is unsafe",
+            Self::ConfigurationMismatch => "artifact store configuration authority changed",
+            Self::Conflict => "artifact operation conflicts with its durable request",
+            Self::Capacity => "artifact store capacity is exhausted",
+            Self::NotFound => "artifact operation was not found",
+            Self::Contended => "artifact store lock is contended",
+            Self::PublicationUncertain { .. } => "artifact operation outcome is uncertain",
+            Self::Owner => "artifact store owner state failed strict validation",
+            Self::Io => "artifact operation could not complete",
+        })
+    }
+}
+
+impl std::error::Error for ArtifactStoreFailureV1 {}
+
+/// Fully owned result. `changed` remains independent of command success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactStoreInvocationV1 {
+    change: ArtifactStoreChangeV1,
+    result: Result<ArtifactStoreOperationViewV1, ArtifactStoreFailureV1>,
+}
+
+impl ArtifactStoreInvocationV1 {
+    fn success(change: ArtifactStoreChangeV1, operation: MaterializationOperationV1) -> Self {
+        Self {
+            change,
+            result: Ok(ArtifactStoreOperationViewV1::new(operation)),
+        }
+    }
+
+    fn failure(change: ArtifactStoreChangeV1, failure: ArtifactStoreFailureV1) -> Self {
+        Self {
+            change,
+            result: Err(failure),
+        }
+    }
+
+    #[must_use]
+    pub const fn change(&self) -> ArtifactStoreChangeV1 {
+        self.change
+    }
+
+    #[must_use]
+    pub fn result(
+        &self,
+    ) -> Result<&ArtifactStoreOperationViewV1, &ArtifactStoreFailureV1> {
+        self.result.as_ref()
+    }
+
+    pub fn into_result(
+        self,
+    ) -> Result<ArtifactStoreOperationViewV1, ArtifactStoreFailureV1> {
+        self.result
+    }
+}
+
+/// Exact read-port classification required by D0b admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactStoreReadFailureV1 {
+    ReferenceMismatch,
+    ConfigurationMismatch,
+    NotFound,
+    Contended,
+    Owner,
+    Io,
+}
+
+impl fmt::Display for ArtifactStoreReadFailureV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ReferenceMismatch => "artifact materialization reference does not match",
+            Self::ConfigurationMismatch => "artifact store configuration authority changed",
+            Self::NotFound => "artifact materialization was not found",
+            Self::Contended => "artifact store lock is contended",
+            Self::Owner => "artifact store owner state failed strict validation",
+            Self::Io => "artifact materialization could not be read",
+        })
+    }
+}
+
+impl std::error::Error for ArtifactStoreReadFailureV1 {}
+
+/// One-shot namespace facade. It never retains an owner handle between calls.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArtifactStoreV1;
+
+impl ArtifactStoreV1 {
+    pub fn materialize(
+        authority: &mut dyn ArtifactStoreAuthorityV1,
+        request: &MaterializationRequestV1,
+        pair: &VerifiedArtifactPairV1,
+    ) -> ArtifactStoreInvocationV1 {
+        run_materialize(authority, request, pair)
+    }
+
+    pub fn query(
+        authority: &mut dyn ArtifactStoreAuthorityV1,
+        operation_id: ArtifactOperationIdV1,
+    ) -> ArtifactStoreInvocationV1 {
+        run_query(authority, operation_id)
+    }
+
+    pub fn read_verified(
+        authority: &mut dyn ArtifactStoreAuthorityV1,
+        object_ref: ArtifactObjectRefV1,
+        receipt_ref: MaterializationReceiptRefV1,
+    ) -> Result<VerifiedMaterializationReadBundleV1, ArtifactStoreReadFailureV1> {
+        run_read_verified(authority, object_ref, receipt_ref)
+    }
+}
+
+fn validate_state_root_path(
+    path: &Path,
+) -> Result<(), ArtifactStoreAuthorityRecheckFailureV1> {
+    let text = path
+        .to_str()
+        .ok_or(ArtifactStoreAuthorityRecheckFailureV1::UnsafePath)?;
+    if text == "/"
+        || !text.starts_with('/')
+        || text.ends_with('/')
+        || text.contains("//")
+        || text.as_bytes().contains(&0)
+        || text.len() > MAX_STATE_ROOT_UTF8_BYTES
+    {
+        return Err(ArtifactStoreAuthorityRecheckFailureV1::UnsafePath);
+    }
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir)
+        || components.clone().any(|component| !matches!(component, Component::Normal(_)))
+        || components.next().is_none()
+    {
+        return Err(ArtifactStoreAuthorityRecheckFailureV1::UnsafePath);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StoreError {
+    UnsafePath,
+    ConfigurationMismatch,
+    ReferenceMismatch,
+    Conflict,
+    Capacity,
+    NotFound,
+    Contended,
+    PublicationUncertain(Option<MaterializationOperationV1>),
+    Owner,
+    Io,
+}
+
+impl StoreError {
+    fn into_public(self) -> ArtifactStoreFailureV1 {
+        match self {
+            Self::UnsafePath => ArtifactStoreFailureV1::UnsafePath,
+            Self::ConfigurationMismatch => ArtifactStoreFailureV1::ConfigurationMismatch,
+            Self::ReferenceMismatch | Self::Conflict => ArtifactStoreFailureV1::Conflict,
+            Self::Capacity => ArtifactStoreFailureV1::Capacity,
+            Self::NotFound => ArtifactStoreFailureV1::NotFound,
+            Self::Contended => ArtifactStoreFailureV1::Contended,
+            Self::PublicationUncertain(operation) => {
+                ArtifactStoreFailureV1::PublicationUncertain { operation }
+            }
+            Self::Owner => ArtifactStoreFailureV1::Owner,
+            Self::Io => ArtifactStoreFailureV1::Io,
+        }
+    }
+
+    fn into_read(self) -> ArtifactStoreReadFailureV1 {
+        match self {
+            Self::ReferenceMismatch | Self::Conflict | Self::Capacity => {
+                ArtifactStoreReadFailureV1::ReferenceMismatch
+            }
+            Self::ConfigurationMismatch => ArtifactStoreReadFailureV1::ConfigurationMismatch,
+            Self::NotFound => ArtifactStoreReadFailureV1::NotFound,
+            Self::Contended => ArtifactStoreReadFailureV1::Contended,
+            Self::UnsafePath | Self::Owner | Self::PublicationUncertain(_) => {
+                ArtifactStoreReadFailureV1::Owner
+            }
+            Self::Io => ArtifactStoreReadFailureV1::Io,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChangeTracker {
+    proved_owner_commit: bool,
+    ambiguous_effect: bool,
+}
+
+impl ChangeTracker {
+    const fn change(self) -> ArtifactStoreChangeV1 {
+        if self.ambiguous_effect {
+            ArtifactStoreChangeV1::Unknown
+        } else if self.proved_owner_commit {
+            ArtifactStoreChangeV1::Changed
+        } else {
+            ArtifactStoreChangeV1::Unchanged
+        }
+    }
+
+    fn committed(&mut self) {
+        self.proved_owner_commit = true;
+        self.ambiguous_effect = false;
+    }
+
+    fn ambiguous(&mut self) {
+        self.ambiguous_effect = true;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+struct DirectoryHandle {
+    file: File,
+    identity: FileIdentity,
+    owner_uid: u32,
+    owner_gid: u32,
+}
+
+struct StateRootHandle {
+    parent: DirectoryHandle,
+    leaf_name: OsString,
+    leaf: DirectoryHandle,
+}
+
+struct LockedStore {
+    state_root: StateRootHandle,
+    root: DirectoryHandle,
+    objects: DirectoryHandle,
+    lock: Option<File>,
+    lock_identity: FileIdentity,
+    snapshot_identity: FileIdentity,
+    snapshot_bytes: Box<[u8]>,
+    snapshot: ArtifactStoreSnapshotV1,
+}
+
+impl LockedStore {
+    fn release(mut self) -> Result<(), StoreError> {
+        let unlock_result = self
+            .lock
+            .as_ref()
+            .ok_or(StoreError::Owner)
+            .and_then(|lock| lock.unlock().map_err(|_| StoreError::Io));
+        self.lock.take();
+        drop(self);
+        unlock_result
+    }
+}
+
+impl Drop for LockedStore {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            let _ = lock.unlock();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+fn authority_binding(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+) -> Result<ArtifactStoreAuthorityBindingV1, StoreError> {
+    let binding = authority.revalidate().map_err(|failure| match failure {
+        ArtifactStoreAuthorityRecheckFailureV1::UnsafePath => StoreError::UnsafePath,
+        ArtifactStoreAuthorityRecheckFailureV1::Configuration => {
+            StoreError::ConfigurationMismatch
+        }
+        ArtifactStoreAuthorityRecheckFailureV1::Io => StoreError::Io,
+    })?;
+    validate_state_root_path(binding.state_root()).map_err(|_| StoreError::UnsafePath)?;
+    Ok(binding)
+}
+
+fn require_same_authority(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    expected: &ArtifactStoreAuthorityBindingV1,
+) -> Result<(), StoreError> {
+    let current = authority_binding(authority)?;
+    if current != *expected {
+        return Err(StoreError::ConfigurationMismatch);
+    }
+    Ok(())
+}
+
+fn validate_directory_metadata(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+    strict_mode: bool,
+) -> Result<(), StoreError> {
+    if !metadata.file_type().is_dir() {
+        return Err(StoreError::Owner);
+    }
+    if strict_mode
+        && (metadata.uid() != owner_uid
+            || metadata.gid() != owner_gid
+            || metadata.mode() & MODE_MASK != DIRECTORY_MODE_BITS)
+    {
+        return Err(StoreError::Owner);
+    }
+    if !strict_mode
+        && metadata.uid() != 0
+        && metadata.uid() != owner_uid
+    {
+        return Err(StoreError::UnsafePath);
+    }
+    if !strict_mode && metadata.mode() & 0o022 != 0 {
+        return Err(StoreError::UnsafePath);
+    }
+    Ok(())
+}
+
+fn validate_regular_metadata(
+    metadata: &Metadata,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<(), StoreError> {
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != owner_uid
+        || metadata.gid() != owner_gid
+        || metadata.mode() & MODE_MASK != FILE_MODE_BITS
+    {
+        return Err(StoreError::Owner);
+    }
+    Ok(())
+}
+
+fn directory_from_owned(
+    owned: OwnedFd,
+    owner_uid: u32,
+    owner_gid: u32,
+    strict_mode: bool,
+) -> Result<DirectoryHandle, StoreError> {
+    let file = File::from(owned);
+    let metadata = file.metadata().map_err(|_| StoreError::Io)?;
+    validate_directory_metadata(&metadata, owner_uid, owner_gid, strict_mode)?;
+    Ok(DirectoryHandle {
+        file,
+        identity: FileIdentity::from_metadata(&metadata),
+        owner_uid,
+        owner_gid,
+    })
+}
+
+fn open_directory_at(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+) -> Result<DirectoryHandle, StoreError> {
+    let owned = openat(
+        &parent.file,
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == nix::errno::Errno::ENOENT {
+            StoreError::NotFound
+        } else {
+            StoreError::Io
+        }
+    })?;
+    directory_from_owned(owned, parent.owner_uid, parent.owner_gid, true)
+}
+
+fn open_state_parent(
+    path: &Path,
+) -> Result<(DirectoryHandle, OsString), StoreError> {
+    validate_state_root_path(path).map_err(|_| StoreError::UnsafePath)?;
+    let owner_uid = geteuid().as_raw();
+    let owner_gid = getegid().as_raw();
+    let leaf_name = path
+        .file_name()
+        .ok_or(StoreError::UnsafePath)?
+        .to_os_string();
+    let parent_path = path.parent().ok_or(StoreError::UnsafePath)?;
+    let root = open(
+        Path::new("/"),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|_| StoreError::Io)?;
+    let mut current = directory_from_owned(root, owner_uid, owner_gid, false)?;
+    for component in parent_path.components().skip(1) {
+        let Component::Normal(name) = component else {
+            return Err(StoreError::UnsafePath);
+        };
+        let owned = openat(
+            &current.file,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            if error == nix::errno::Errno::ENOENT {
+                StoreError::NotFound
+            } else {
+                StoreError::Io
+            }
+        })?;
+        let next = directory_from_owned(owned, owner_uid, owner_gid, false)?;
+        drop(current);
+        current = next;
+    }
+    let metadata = current.file.metadata().map_err(|_| StoreError::Io)?;
+    validate_directory_metadata(&metadata, owner_uid, owner_gid, true)?;
+    Ok((current, leaf_name))
+}
+
+fn pin_existing_state_root(
+    binding: &ArtifactStoreAuthorityBindingV1,
+) -> Result<StateRootHandle, StoreError> {
+    let (parent, leaf_name) = open_state_parent(binding.state_root())?;
+    let leaf = open_directory_at(&parent, &leaf_name)?;
+    Ok(StateRootHandle {
+        parent,
+        leaf_name,
+        leaf,
+    })
+}
+
+fn revalidate_directory(handle: &DirectoryHandle) -> Result<(), StoreError> {
+    let metadata = handle.file.metadata().map_err(|_| StoreError::Io)?;
+    validate_directory_metadata(
+        &metadata,
+        handle.owner_uid,
+        handle.owner_gid,
+        true,
+    )?;
+    if FileIdentity::from_metadata(&metadata) != handle.identity {
+        return Err(StoreError::Owner);
+    }
+    Ok(())
+}
+
+fn reopen_named_directory(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+    expected: FileIdentity,
+) -> Result<DirectoryHandle, StoreError> {
+    revalidate_directory(parent)?;
+    let opened = open_directory_at(parent, name)?;
+    if opened.identity != expected {
+        return Err(StoreError::Owner);
+    }
+    Ok(opened)
+}
+
+fn scan_names(directory: &DirectoryHandle) -> Result<BTreeSet<OsString>, StoreError> {
+    revalidate_directory(directory)?;
+    let owned = openat(
+        &directory.file,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|_| StoreError::Io)?;
+    let mut stream = Dir::from_fd(owned).map_err(|_| StoreError::Io)?;
+    let mut names = BTreeSet::new();
+    for entry in stream.iter() {
+        let entry = entry.map_err(|_| StoreError::Io)?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        if bytes.contains(&0) {
+            return Err(StoreError::Owner);
+        }
+        if !names.insert(OsStr::from_bytes(bytes).to_os_string()) {
+            return Err(StoreError::Owner);
+        }
+    }
+    Ok(names)
+}
+
+fn exact_names(directory: &DirectoryHandle, expected: &[&str]) -> Result<(), StoreError> {
+    let actual = scan_names(directory)?;
+    let expected = expected
+        .iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(StoreError::Owner);
+    }
+    Ok(())
+}
+
+fn open_regular_at(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+    access: OFlag,
+) -> Result<(File, FileIdentity), StoreError> {
+    let owned = openat(
+        &parent.file,
+        name,
+        access | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == nix::errno::Errno::ENOENT {
+            StoreError::NotFound
+        } else {
+            StoreError::Io
+        }
+    })?;
+    let file = File::from(owned);
+    let metadata = file.metadata().map_err(|_| StoreError::Io)?;
+    validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
+    Ok((file, FileIdentity::from_metadata(&metadata)))
+}
+
+fn validate_named_regular(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+    expected_identity: FileIdentity,
+    expected_len: Option<u64>,
+) -> Result<(), StoreError> {
+    let (file, identity) = open_regular_at(parent, name, OFlag::O_RDONLY)?;
+    let metadata = file.metadata().map_err(|_| StoreError::Io)?;
+    if identity != expected_identity
+        || expected_len.is_some_and(|length| metadata.len() != length)
+    {
+        return Err(StoreError::Owner);
+    }
+    drop(file);
+    Ok(())
+}
+
+fn read_regular_bounded(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+    maximum: usize,
+    allow_empty: bool,
+) -> Result<(Box<[u8]>, FileIdentity), StoreError> {
+    let (mut file, identity) = open_regular_at(parent, name, OFlag::O_RDONLY)?;
+    let before = file.metadata().map_err(|_| StoreError::Io)?;
+    let length = usize::try_from(before.len()).map_err(|_| StoreError::Owner)?;
+    if length > maximum || (!allow_empty && length == 0) {
+        return Err(StoreError::Owner);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|_| StoreError::Io)?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes).map_err(|_| StoreError::Io)?;
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).map_err(|_| StoreError::Io)? != 0 {
+        return Err(StoreError::Owner);
+    }
+    let after = file.metadata().map_err(|_| StoreError::Io)?;
+    validate_regular_metadata(&after, parent.owner_uid, parent.owner_gid)?;
+    if FileIdentity::from_metadata(&after) != identity || after.len() != before.len() {
+        return Err(StoreError::Owner);
+    }
+    validate_named_regular(parent, name, identity, Some(before.len()))?;
+    Ok((bytes.into_boxed_slice(), identity))
+}
+
+fn acquire_lock(root: &DirectoryHandle, mode: LockMode) -> Result<(File, FileIdentity), StoreError> {
+    let (lock, identity) = open_regular_at(root, OsStr::new(STORE_LOCK_NAME), OFlag::O_RDWR)?;
+    if lock.metadata().map_err(|_| StoreError::Io)?.len() != 0 {
+        return Err(StoreError::Owner);
+    }
+    let result = match mode {
+        LockMode::Shared => lock.try_lock_shared(),
+        LockMode::Exclusive => lock.try_lock(),
+    };
+    result.map_err(|error| match error {
+        TryLockError::WouldBlock => StoreError::Contended,
+        TryLockError::Error(_) => StoreError::Io,
+    })?;
+    validate_named_regular(root, OsStr::new(STORE_LOCK_NAME), identity, Some(0))?;
+    Ok((lock, identity))
+}
+
+fn finish_locked(
+    store: LockedStore,
+    tracker: ChangeTracker,
+    result: Result<MaterializationOperationV1, StoreError>,
+) -> ArtifactStoreInvocationV1 {
+    let release = store.release();
+    match (result, release) {
+        (Ok(operation), Ok(())) => ArtifactStoreInvocationV1::success(tracker.change(), operation),
+        (Err(error), Ok(())) => {
+            ArtifactStoreInvocationV1::failure(tracker.change(), error.into_public())
+        }
+        (_, Err(error)) => ArtifactStoreInvocationV1::failure(
+            if tracker.change() == ArtifactStoreChangeV1::Unchanged {
+                ArtifactStoreChangeV1::Unknown
+            } else {
+                tracker.change()
+            },
+            error.into_public(),
+        ),
+    }
+}
+
+fn push_lower_hex(output: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+}
+
+fn object_directory_name(object_ref: ArtifactObjectRefV1) -> String {
+    let mut name = String::with_capacity(131);
+    name.push_str("o-");
+    push_lower_hex(&mut name, object_ref.payload_digest().as_bytes());
+    name.push('-');
+    push_lower_hex(&mut name, object_ref.manifest_digest().as_bytes());
+    name
+}
+
+fn strict_pair_from_directory(
+    directory: &DirectoryHandle,
+) -> Result<VerifiedArtifactPairV1, StoreError> {
+    exact_names(directory, &[MANIFEST_NAME, PAYLOAD_NAME])?;
+    let (manifest, _) = read_regular_bounded(
+        directory,
+        OsStr::new(MANIFEST_NAME),
+        206,
+        false,
+    )?;
+    let (payload, _) = read_regular_bounded(directory, OsStr::new(PAYLOAD_NAME), 64, false)?;
+    VerifiedArtifactPairV1::verify(&manifest, &payload).map_err(|_| StoreError::Owner)
+}
+
+fn strict_indexed_object(
+    objects: &DirectoryHandle,
+    record: &ArtifactObjectRecordV1,
+) -> Result<VerifiedArtifactPairV1, StoreError> {
+    let name = object_directory_name(record.object_ref());
+    let directory = open_directory_at(objects, OsStr::new(&name))?;
+    let pair = strict_pair_from_directory(&directory)?;
+    if pair.object_ref() != record.object_ref()
+        || pair.manifest().payload_len() != record.payload_len()
+    {
+        return Err(StoreError::Owner);
+    }
+    let reopened = reopen_named_directory(objects, OsStr::new(&name), directory.identity)?;
+    let reopened_pair = strict_pair_from_directory(&reopened)?;
+    if reopened_pair != pair {
+        return Err(StoreError::Owner);
+    }
+    drop(reopened);
+    drop(directory);
+    Ok(pair)
+}
+
+fn validate_partial_pair_entry(
+    directory: &DirectoryHandle,
+    expected_ref: ArtifactObjectRefV1,
+) -> Result<u64, StoreError> {
+    let names = scan_names(directory)?;
+    let allowed = [
+        MANIFEST_NEXT_NAME,
+        PAYLOAD_NEXT_NAME,
+        MANIFEST_NAME,
+        PAYLOAD_NAME,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<BTreeSet<_>>();
+    if !names.is_subset(&allowed) {
+        return Err(StoreError::Owner);
+    }
+
+    let mut regular_bytes = 0_u64;
+    let mut manifest_bytes: Option<Box<[u8]>> = None;
+    let mut payload_bytes: Option<Box<[u8]>> = None;
+    for name in names {
+        let is_manifest = name == OsStr::new(MANIFEST_NAME)
+            || name == OsStr::new(MANIFEST_NEXT_NAME);
+        let maximum = if is_manifest { 206 } else { 64 };
+        let (bytes, _) = read_regular_bounded(directory, &name, maximum, false)?;
+        regular_bytes = regular_bytes
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| StoreError::Owner)?)
+            .ok_or(StoreError::Owner)?;
+        if is_manifest {
+            let manifest = ArtifactManifestV1::decode(&bytes).map_err(|_| StoreError::Owner)?;
+            if ArtifactObjectRefV1::from_manifest(&manifest).map_err(|_| StoreError::Owner)?
+                != expected_ref
+            {
+                return Err(StoreError::Owner);
+            }
+            if manifest_bytes
+                .as_ref()
+                .is_some_and(|existing| existing.as_ref() != bytes.as_ref())
+            {
+                return Err(StoreError::Owner);
+            }
+            manifest_bytes = Some(bytes);
+        } else {
+            let pair = VerifiedArtifactPairV1::from_payload(&bytes).map_err(|_| StoreError::Owner)?;
+            if pair.object_ref() != expected_ref {
+                return Err(StoreError::Owner);
+            }
+            if payload_bytes
+                .as_ref()
+                .is_some_and(|existing| existing.as_ref() != bytes.as_ref())
+            {
+                return Err(StoreError::Owner);
+            }
+            payload_bytes = Some(bytes);
+        }
+    }
+    if let (Some(manifest), Some(payload)) = (&manifest_bytes, &payload_bytes)
+        && VerifiedArtifactPairV1::verify(manifest, payload)
+            .map_err(|_| StoreError::Owner)?
+            .object_ref()
+            != expected_ref
+    {
+        return Err(StoreError::Owner);
+    }
+    Ok(regular_bytes)
+}
+
+fn validate_candidate_filesystem(
+    objects: &DirectoryHandle,
+    candidate: ArtifactStoreSnapshotCandidateV1,
+) -> Result<ArtifactStoreSnapshotV1, StoreError> {
+    let claim = candidate.filesystem_claim().clone();
+    let actual = scan_names(objects)?;
+    if actual.len() > MAX_OBJECT_DIRECTORIES {
+        return Err(StoreError::Owner);
+    }
+    let mut indexed = BTreeSet::new();
+    for record in candidate.objects() {
+        let name = object_directory_name(record.object_ref());
+        if !indexed.insert(OsString::from(&name)) || !actual.contains(OsStr::new(&name)) {
+            return Err(StoreError::Owner);
+        }
+        strict_indexed_object(objects, record)?;
+    }
+    let extras = actual.difference(&indexed).cloned().collect::<Vec<_>>();
+    match &claim {
+        ArtifactFilesystemClaimV1::Stable => {
+            if !extras.is_empty() {
+                return Err(StoreError::Owner);
+            }
+        }
+        ArtifactFilesystemClaimV1::Materializing {
+            operation_id: _,
+            object_ref,
+        } => {
+            let has_matching_indexed = candidate
+                .objects()
+                .iter()
+                .any(|record| record.object_ref() == *object_ref);
+            if has_matching_indexed {
+                if !extras.is_empty() {
+                    return Err(StoreError::Owner);
+                }
+            } else if extras.len() > 1 {
+                return Err(StoreError::Owner);
+            } else if let Some(extra) = extras.first() {
+                let expected = object_directory_name(*object_ref);
+                if extra.as_os_str() != OsStr::new(&expected) {
+                    return Err(StoreError::Owner);
+                }
+                let child = open_directory_at(objects, extra)?;
+                validate_partial_pair_entry(&child, *object_ref)?;
+                drop(child);
+            }
+        }
+        ArtifactFilesystemClaimV1::Quarantined {
+            operation_id: _,
+            object_ref,
+            regular_file_bytes,
+        } => {
+            if candidate
+                .objects()
+                .iter()
+                .any(|record| record.object_ref() == *object_ref)
+                || extras.len() != 1
+            {
+                return Err(StoreError::Owner);
+            }
+            let expected = object_directory_name(*object_ref);
+            if extras[0].as_os_str() != OsStr::new(&expected) {
+                return Err(StoreError::Owner);
+            }
+            let child = open_directory_at(objects, &extras[0])?;
+            let actual_bytes = validate_partial_pair_entry(&child, *object_ref)?;
+            if actual_bytes != *regular_file_bytes {
+                return Err(StoreError::Owner);
+            }
+            drop(child);
+        }
+    }
+    candidate
+        .validate_filesystem(claim)
+        .map_err(|_| StoreError::Owner)
+}
+
+fn decode_snapshot(
+    root: &DirectoryHandle,
+    name: &str,
+) -> Result<(ArtifactStoreSnapshotCandidateV1, Box<[u8]>, FileIdentity), StoreError> {
+    let (bytes, identity) = read_regular_bounded(
+        root,
+        OsStr::new(name),
+        MAX_SNAPSHOT_BYTES,
+        false,
+    )?;
+    let candidate = ArtifactStoreSnapshotCandidateV1::decode_canonical(&bytes)
+        .map_err(|_| StoreError::Owner)?;
+    Ok((candidate, bytes, identity))
+}
+
+fn open_final_locked(
+    state_root: StateRootHandle,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    mode: LockMode,
+) -> Result<LockedStore, StoreError> {
+    let root = open_directory_at(&state_root.leaf, OsStr::new(STORE_ROOT_NAME))?;
+    let initial_names = scan_names(&root)?;
+    let stable = [STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let with_next = [
+        STORE_LOCK_NAME,
+        STORE_SNAPSHOT_NAME,
+        STORE_SNAPSHOT_NEXT_NAME,
+        OBJECTS_NAME,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<BTreeSet<_>>();
+    if initial_names != stable && initial_names != with_next {
+        return Err(StoreError::Owner);
+    }
+    let (lock, lock_identity) = acquire_lock(&root, mode)?;
+    let names = scan_names(&root)?;
+    if names != stable && names != with_next {
+        let _ = lock.unlock();
+        drop(lock);
+        return Err(StoreError::Owner);
+    }
+    let (candidate, snapshot_bytes, snapshot_identity) =
+        decode_snapshot(&root, STORE_SNAPSHOT_NAME)?;
+    if candidate.config_commitment() != binding.config_commitment() {
+        let _ = lock.unlock();
+        drop(lock);
+        return Err(StoreError::ConfigurationMismatch);
+    }
+    let objects = open_directory_at(&root, OsStr::new(OBJECTS_NAME))?;
+    let snapshot = validate_candidate_filesystem(&objects, candidate)?;
+    revalidate_directory(&root)?;
+    validate_named_regular(
+        &root,
+        OsStr::new(STORE_LOCK_NAME),
+        lock_identity,
+        Some(0),
+    )?;
+    validate_named_regular(
+        &root,
+        OsStr::new(STORE_SNAPSHOT_NAME),
+        snapshot_identity,
+        Some(u64::try_from(snapshot_bytes.len()).map_err(|_| StoreError::Owner)?),
+    )?;
+    Ok(LockedStore {
+        state_root,
+        root,
+        objects,
+        lock: Some(lock),
+        lock_identity,
+        snapshot_identity,
+        snapshot_bytes,
+        snapshot,
+    })
+}
+
+fn permitted_next(
+    active: &ArtifactStoreSnapshotV1,
+    next: &ArtifactStoreSnapshotV1,
+) -> Result<ArtifactOperationIdV1, StoreError> {
+    let successor = if next.operations().len() == active.operations().len() + 1
+        && next.objects().len() == active.objects().len()
+    {
+        let operation = next.operations().last().ok_or(StoreError::Owner)?;
+        ArtifactSnapshotSuccessorV1::Admission {
+            request: operation.request().clone(),
+            admission: operation.admission().clone(),
+        }
+    } else if next.operations().len() == active.operations().len()
+        && next.objects().len() == active.objects().len() + 1
+    {
+        let object = next.objects().last().cloned().ok_or(StoreError::Owner)?;
+        let operation_id = active
+            .operations()
+            .iter()
+            .find(|operation| {
+                operation.materializing().is_some()
+                    && operation.terminal().is_none()
+                    && operation.request().object_ref() == object.object_ref()
+            })
+            .map(MaterializationOperationV1::operation_id)
+            .ok_or(StoreError::Owner)?;
+        ArtifactSnapshotSuccessorV1::Object {
+            operation_id,
+            object,
+        }
+    } else if next.operations().len() == active.operations().len()
+        && next.objects().len() == active.objects().len()
+    {
+        let changed = active
+            .operations()
+            .iter()
+            .zip(next.operations())
+            .filter(|(before, after)| before != after)
+            .collect::<Vec<_>>();
+        if changed.len() != 1 {
+            return Err(StoreError::Owner);
+        }
+        let (before, after) = changed[0];
+        if before.operation_id() != after.operation_id()
+            || before.request() != after.request()
+            || before.admission() != after.admission()
+        {
+            return Err(StoreError::Owner);
+        }
+        if before.materializing().is_none()
+            && before.terminal().is_none()
+            && after.terminal().is_none()
+            && after.receipt().is_none()
+        {
+            ArtifactSnapshotSuccessorV1::Materializing {
+                materializing: after.materializing().cloned().ok_or(StoreError::Owner)?,
+            }
+        } else if before.terminal().is_none() && after.receipt().is_none() {
+            ArtifactSnapshotSuccessorV1::Terminal {
+                terminal: after.terminal().cloned().ok_or(StoreError::Owner)?,
+                quarantine: next.quarantine(),
+            }
+        } else if before.receipt().is_none() {
+            ArtifactSnapshotSuccessorV1::Receipt {
+                receipt: after.receipt().cloned().ok_or(StoreError::Owner)?,
+            }
+        } else {
+            return Err(StoreError::Owner);
+        }
+    } else {
+        return Err(StoreError::Owner);
+    };
+    let operation_id = match &successor {
+        ArtifactSnapshotSuccessorV1::Admission { request, .. } => request.operation_id(),
+        ArtifactSnapshotSuccessorV1::Materializing { materializing } => {
+            materializing.operation_id()
+        }
+        ArtifactSnapshotSuccessorV1::Object { operation_id, .. } => *operation_id,
+        ArtifactSnapshotSuccessorV1::Terminal { terminal, .. } => terminal.operation_id(),
+        ArtifactSnapshotSuccessorV1::Receipt { receipt } => receipt.operation_id(),
+    };
+    if active
+        .try_successor(successor)
+        .map_err(|_| StoreError::Owner)?
+        != *next
+    {
+        return Err(StoreError::Owner);
+    }
+    Ok(operation_id)
+}
+
+fn read_and_validate_next(
+    store: &LockedStore,
+    binding: &ArtifactStoreAuthorityBindingV1,
+) -> Result<Option<(ArtifactStoreSnapshotV1, ArtifactOperationIdV1)>, StoreError> {
+    let names = scan_names(&store.root)?;
+    if !names.contains(OsStr::new(STORE_SNAPSHOT_NEXT_NAME)) {
+        return Ok(None);
+    }
+    let (candidate, _, _) = decode_snapshot(&store.root, STORE_SNAPSHOT_NEXT_NAME)?;
+    if candidate.config_commitment() != binding.config_commitment() {
+        return Err(StoreError::ConfigurationMismatch);
+    }
+    let next = validate_candidate_filesystem(&store.objects, candidate)?;
+    let operation_id = permitted_next(&store.snapshot, &next)?;
+    Ok(Some((next, operation_id)))
+}
+
+fn root_selection(state_root: &DirectoryHandle) -> Result<(bool, bool), StoreError> {
+    let names = scan_names(state_root)?;
+    Ok((
+        names.contains(OsStr::new(STORE_ROOT_NAME)),
+        names.contains(OsStr::new(STORE_STAGING_NAME)),
+    ))
+}
+
+fn inspect_initial_staging(
+    state_root: &StateRootHandle,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    operation_id: ArtifactOperationIdV1,
+) -> Result<Option<MaterializationOperationV1>, StoreError> {
+    let staging = open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?;
+    let mut names = scan_names(&staging)?;
+    if names.is_empty() {
+        drop(staging);
+        return Ok(None);
+    }
+    if !names.contains(OsStr::new(STORE_LOCK_NAME)) {
+        return Err(StoreError::Owner);
+    }
+    let (lock, _) = acquire_lock(&staging, LockMode::Shared)?;
+    names = scan_names(&staging)?;
+    let lock_only = [STORE_LOCK_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let lock_objects = [STORE_LOCK_NAME, OBJECTS_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let complete = [STORE_LOCK_NAME, OBJECTS_NAME, STORE_SNAPSHOT_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let result = if names == lock_only {
+        Ok(None)
+    } else if names == lock_objects {
+        let objects = open_directory_at(&staging, OsStr::new(OBJECTS_NAME))?;
+        exact_names(&objects, &[])?;
+        drop(objects);
+        Ok(None)
+    } else if names == complete {
+        let objects = open_directory_at(&staging, OsStr::new(OBJECTS_NAME))?;
+        let (candidate, _, _) = decode_snapshot(&staging, STORE_SNAPSHOT_NAME)?;
+        if candidate.config_commitment() != binding.config_commitment() {
+            Err(StoreError::ConfigurationMismatch)
+        } else {
+            let snapshot = validate_candidate_filesystem(&objects, candidate)?;
+            Ok(snapshot.operation(operation_id).cloned())
+        }
+    } else {
+        Err(StoreError::Owner)
+    };
+    let unlock = lock.unlock().map_err(|_| StoreError::Io);
+    drop(lock);
+    drop(staging);
+    unlock?;
+    result
+}
+
+fn readonly_finish(
+    store: LockedStore,
+    result: Result<MaterializationOperationV1, StoreError>,
+) -> ArtifactStoreInvocationV1 {
+    let release = store.release();
+    match (result, release) {
+        (Ok(operation), Ok(())) => {
+            ArtifactStoreInvocationV1::success(ArtifactStoreChangeV1::Unchanged, operation)
+        }
+        (Err(error), Ok(())) => ArtifactStoreInvocationV1::failure(
+            ArtifactStoreChangeV1::Unchanged,
+            error.into_public(),
+        ),
+        (_, Err(error)) => ArtifactStoreInvocationV1::failure(
+            ArtifactStoreChangeV1::Unchanged,
+            error.into_public(),
+        ),
+    }
+}
+
+fn run_query(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    operation_id: ArtifactOperationIdV1,
+) -> ArtifactStoreInvocationV1 {
+    let binding = match authority_binding(authority) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return ArtifactStoreInvocationV1::failure(
+                ArtifactStoreChangeV1::Unchanged,
+                error.into_public(),
+            );
+        }
+    };
+    let state_root = match pin_existing_state_root(&binding) {
+        Ok(state_root) => state_root,
+        Err(error) => {
+            return ArtifactStoreInvocationV1::failure(
+                ArtifactStoreChangeV1::Unchanged,
+                error.into_public(),
+            );
+        }
+    };
+    let (has_final, has_staging) = match root_selection(&state_root.leaf) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return ArtifactStoreInvocationV1::failure(
+                ArtifactStoreChangeV1::Unchanged,
+                error.into_public(),
+            );
+        }
+    };
+    if has_final && has_staging {
+        return ArtifactStoreInvocationV1::failure(
+            ArtifactStoreChangeV1::Unchanged,
+            ArtifactStoreFailureV1::Owner,
+        );
+    }
+    if !has_final {
+        if has_staging {
+            return match inspect_initial_staging(&state_root, &binding, operation_id) {
+                Ok(Some(operation)) => ArtifactStoreInvocationV1::failure(
+                    ArtifactStoreChangeV1::Unchanged,
+                    ArtifactStoreFailureV1::PublicationUncertain {
+                        operation: Some(operation),
+                    },
+                ),
+                Ok(None) => ArtifactStoreInvocationV1::failure(
+                    ArtifactStoreChangeV1::Unchanged,
+                    ArtifactStoreFailureV1::NotFound,
+                ),
+                Err(error) => ArtifactStoreInvocationV1::failure(
+                    ArtifactStoreChangeV1::Unchanged,
+                    error.into_public(),
+                ),
+            };
+        }
+        return ArtifactStoreInvocationV1::failure(
+            ArtifactStoreChangeV1::Unchanged,
+            ArtifactStoreFailureV1::NotFound,
+        );
+    }
+    let store = match open_final_locked(state_root, &binding, LockMode::Shared) {
+        Ok(store) => store,
+        Err(error) => {
+            return ArtifactStoreInvocationV1::failure(
+                ArtifactStoreChangeV1::Unchanged,
+                error.into_public(),
+            );
+        }
+    };
+    let result = (|| {
+        require_same_authority(authority, &binding)?;
+        let active_operation = store.snapshot.operation(operation_id).cloned();
+        if let Some((_, next_operation_id)) = read_and_validate_next(&store, &binding)? {
+            if active_operation
+                .as_ref()
+                .is_some_and(|operation| operation.terminal().is_some())
+            {
+                return Ok(active_operation.expect("checked as present"));
+            }
+            if next_operation_id == operation_id {
+                return Err(StoreError::PublicationUncertain(active_operation));
+            }
+            return Err(StoreError::Owner);
+        }
+        active_operation.ok_or(StoreError::NotFound)
+    })();
+    readonly_finish(store, result)
+}
+
+fn run_read_verified(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    object_ref: ArtifactObjectRefV1,
+    receipt_ref: MaterializationReceiptRefV1,
+) -> Result<VerifiedMaterializationReadBundleV1, ArtifactStoreReadFailureV1> {
+    let binding = authority_binding(authority).map_err(StoreError::into_read)?;
+    let state_root = pin_existing_state_root(&binding).map_err(StoreError::into_read)?;
+    let (has_final, has_staging) = root_selection(&state_root.leaf).map_err(StoreError::into_read)?;
+    if has_staging || !has_final {
+        return Err(if has_staging {
+            ArtifactStoreReadFailureV1::Owner
+        } else {
+            ArtifactStoreReadFailureV1::NotFound
+        });
+    }
+    let store = open_final_locked(state_root, &binding, LockMode::Shared)
+        .map_err(StoreError::into_read)?;
+    let result = (|| {
+        require_same_authority(authority, &binding)?;
+        if read_and_validate_next(&store, &binding)?.is_some() {
+            return Err(StoreError::Owner);
+        }
+        let operation = store
+            .snapshot
+            .operation(receipt_ref.operation_id())
+            .ok_or(StoreError::ReferenceMismatch)?;
+        let pair = match operation.terminal().map(MaterializationTerminalV1::state) {
+            Some(MaterializationTerminalStateV1::Materialized)
+            | Some(MaterializationTerminalStateV1::AlreadyMaterialized) => {
+                let record = store
+                    .snapshot
+                    .objects()
+                    .iter()
+                    .find(|record| record.object_ref() == object_ref)
+                    .ok_or(StoreError::ReferenceMismatch)?;
+                Some(strict_indexed_object(&store.objects, record)?)
+            }
+            Some(MaterializationTerminalStateV1::Failed)
+            | Some(MaterializationTerminalStateV1::Uncertain) => None,
+            None => return Err(StoreError::ReferenceMismatch),
+        };
+        store
+            .snapshot
+            .verified_read_bundle(receipt_ref, object_ref, pair)
+            .map_err(|_| StoreError::ReferenceMismatch)
+    })();
+    let release = store.release();
+    match (result, release) {
+        (Ok(bundle), Ok(())) => Ok(bundle),
+        (Err(error), Ok(())) => Err(error.into_read()),
+        (_, Err(error)) => Err(error.into_read()),
+    }
+}
+
+fn pin_or_create_state_root(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    tracker: &mut ChangeTracker,
+) -> Result<StateRootHandle, StoreError> {
+    let (parent, leaf_name) = open_state_parent(binding.state_root())?;
+    match open_directory_at(&parent, &leaf_name) {
+        Ok(leaf) => Ok(StateRootHandle {
+            parent,
+            leaf_name,
+            leaf,
+        }),
+        Err(StoreError::NotFound) => {
+            revalidate_directory(&parent)?;
+            mkdirat(&parent.file, &leaf_name, DIRECTORY_MODE).map_err(|error| {
+                if error == nix::errno::Errno::EEXIST {
+                    StoreError::Owner
+                } else {
+                    StoreError::Io
+                }
+            })?;
+            let result = (|| {
+                parent.file.sync_all().map_err(|_| StoreError::Io)?;
+                let leaf = open_directory_at(&parent, &leaf_name)?;
+                exact_names(&leaf, &[])?;
+                let expected_parent = parent.identity;
+                let expected_leaf = leaf.identity;
+                drop(leaf);
+                drop(parent);
+                let (reopened_parent, reopened_leaf_name) =
+                    open_state_parent(binding.state_root())?;
+                if reopened_parent.identity != expected_parent || reopened_leaf_name != leaf_name {
+                    return Err(StoreError::Owner);
+                }
+                let reopened_leaf =
+                    reopen_named_directory(&reopened_parent, &leaf_name, expected_leaf)?;
+                exact_names(&reopened_leaf, &[])?;
+                require_same_authority(authority, binding)?;
+                Ok(StateRootHandle {
+                    parent: reopened_parent,
+                    leaf_name,
+                    leaf: reopened_leaf,
+                })
+            })();
+            if result.is_err() {
+                tracker.ambiguous();
+            }
+            result
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_regular(
+    parent: &DirectoryHandle,
+    name: &str,
+    access: OFlag,
+) -> Result<(File, FileIdentity), StoreError> {
+    let owned = openat(
+        &parent.file,
+        name,
+        access
+            | OFlag::O_CREAT
+            | OFlag::O_EXCL
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NOFOLLOW,
+        FILE_MODE,
+    )
+    .map_err(|error| {
+        if error == nix::errno::Errno::EEXIST {
+            StoreError::Owner
+        } else {
+            StoreError::Io
+        }
+    })?;
+    let file = File::from(owned);
+    fchmod(&file, FILE_MODE).map_err(|_| StoreError::Io)?;
+    let metadata = file.metadata().map_err(|_| StoreError::Io)?;
+    validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
+    if metadata.len() != 0 {
+        return Err(StoreError::Owner);
+    }
+    Ok((file, FileIdentity::from_metadata(&metadata)))
+}
+
+fn write_new_exact(
+    parent: &DirectoryHandle,
+    name: &str,
+    bytes: &[u8],
+) -> Result<FileIdentity, StoreError> {
+    let (mut file, identity) = create_regular(parent, name, OFlag::O_WRONLY)?;
+    file.write_all(bytes).map_err(|_| StoreError::Io)?;
+    file.sync_all().map_err(|_| StoreError::Io)?;
+    drop(file);
+    let (reopened, reopened_bytes_identity) =
+        read_regular_bounded(parent, OsStr::new(name), bytes.len(), bytes.is_empty())?;
+    if reopened_bytes_identity != identity || reopened.as_ref() != bytes {
+        return Err(StoreError::Owner);
+    }
+    Ok(identity)
+}
+
+fn create_and_lock_staging(
+    staging: &DirectoryHandle,
+) -> Result<(File, FileIdentity), StoreError> {
+    let (lock, identity) = create_regular(staging, STORE_LOCK_NAME, OFlag::O_RDWR)?;
+    lock.sync_all().map_err(|_| StoreError::Io)?;
+    staging.file.sync_all().map_err(|_| StoreError::Io)?;
+    lock.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => StoreError::Contended,
+        TryLockError::Error(_) => StoreError::Io,
+    })?;
+    validate_named_regular(staging, OsStr::new(STORE_LOCK_NAME), identity, Some(0))?;
+    Ok((lock, identity))
+}
+
+fn create_objects_directory(staging: &DirectoryHandle) -> Result<DirectoryHandle, StoreError> {
+    mkdirat(&staging.file, OBJECTS_NAME, DIRECTORY_MODE).map_err(|error| {
+        if error == nix::errno::Errno::EEXIST {
+            StoreError::Owner
+        } else {
+            StoreError::Io
+        }
+    })?;
+    let objects = open_directory_at(staging, OsStr::new(OBJECTS_NAME))?;
+    exact_names(&objects, &[])?;
+    objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    staging.file.sync_all().map_err(|_| StoreError::Io)?;
+    let reopened = reopen_named_directory(staging, OsStr::new(OBJECTS_NAME), objects.identity)?;
+    exact_names(&reopened, &[])?;
+    drop(objects);
+    Ok(reopened)
+}
+
+fn draw_store_instance() -> Result<ArtifactStoreInstanceV1, StoreError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|_| StoreError::Io)?;
+    ArtifactStoreInstanceV1::try_from_bytes(bytes).map_err(|_| StoreError::Io)
+}
+
+fn publish_initial_staging(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    mut state_root: StateRootHandle,
+    staging: DirectoryHandle,
+    objects_identity: FileIdentity,
+    lock: File,
+    lock_identity: FileIdentity,
+    snapshot: ArtifactStoreSnapshotV1,
+    snapshot_bytes: Box<[u8]>,
+    snapshot_identity: FileIdentity,
+    tracker: &mut ChangeTracker,
+) -> Result<LockedStore, StoreError> {
+    exact_names(
+        &staging,
+        &[STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME],
+    )?;
+    validate_named_regular(
+        &staging,
+        OsStr::new(STORE_LOCK_NAME),
+        lock_identity,
+        Some(0),
+    )?;
+    validate_named_regular(
+        &staging,
+        OsStr::new(STORE_SNAPSHOT_NAME),
+        snapshot_identity,
+        Some(u64::try_from(snapshot_bytes.len()).map_err(|_| StoreError::Owner)?),
+    )?;
+    let objects = reopen_named_directory(&staging, OsStr::new(OBJECTS_NAME), objects_identity)?;
+    exact_names(&objects, &[])?;
+    staging.file.sync_all().map_err(|_| StoreError::Io)?;
+    state_root.leaf.file.sync_all().map_err(|_| StoreError::Io)?;
+    let reopened_staging = reopen_named_directory(
+        &state_root.leaf,
+        OsStr::new(STORE_STAGING_NAME),
+        staging.identity,
+    )?;
+    drop(objects);
+    drop(staging);
+    require_same_authority(authority, binding)?;
+    revalidate_directory(&state_root.leaf)?;
+    let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+    if has_final || !has_staging {
+        return Err(StoreError::Owner);
+    }
+    renameat_with(
+        &state_root.leaf.file,
+        STORE_STAGING_NAME,
+        &state_root.leaf.file,
+        STORE_ROOT_NAME,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::EXIST {
+            StoreError::Owner
+        } else {
+            StoreError::Io
+        }
+    })?;
+    tracker.ambiguous();
+    drop(reopened_staging);
+    state_root
+        .leaf
+        .file
+        .sync_all()
+        .map_err(|_| StoreError::PublicationUncertain(None))?;
+    let reopened_leaf = reopen_named_directory(
+        &state_root.parent,
+        &state_root.leaf_name,
+        state_root.leaf.identity,
+    )
+    .map_err(|_| StoreError::Owner)?;
+    drop(state_root.leaf);
+    state_root.leaf = reopened_leaf;
+    require_same_authority(authority, binding).map_err(|error| match error {
+        StoreError::ConfigurationMismatch => StoreError::Owner,
+        other => other,
+    })?;
+    let root = reopen_named_directory(
+        &state_root.leaf,
+        OsStr::new(STORE_ROOT_NAME),
+        staging_identity_from_snapshot(&state_root.leaf, snapshot_identity)?,
+    )?;
+    exact_names(
+        &root,
+        &[STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME],
+    )?;
+    validate_named_regular(
+        &root,
+        OsStr::new(STORE_LOCK_NAME),
+        lock_identity,
+        Some(0),
+    )?;
+    validate_named_regular(
+        &root,
+        OsStr::new(STORE_SNAPSHOT_NAME),
+        snapshot_identity,
+        Some(u64::try_from(snapshot_bytes.len()).map_err(|_| StoreError::Owner)?),
+    )?;
+    let objects = open_directory_at(&root, OsStr::new(OBJECTS_NAME))?;
+    if objects.identity != objects_identity {
+        return Err(StoreError::Owner);
+    }
+    let candidate = ArtifactStoreSnapshotCandidateV1::decode_canonical(&snapshot_bytes)
+        .map_err(|_| StoreError::Owner)?;
+    let verified = validate_candidate_filesystem(&objects, candidate)?;
+    if verified != snapshot {
+        return Err(StoreError::Owner);
+    }
+    tracker.committed();
+    Ok(LockedStore {
+        state_root,
+        root,
+        objects,
+        lock: Some(lock),
+        lock_identity,
+        snapshot_identity,
+        snapshot_bytes,
+        snapshot,
+    })
+}
+
+fn staging_identity_from_snapshot(
+    state_root: &DirectoryHandle,
+    snapshot_identity: FileIdentity,
+) -> Result<FileIdentity, StoreError> {
+    let root = open_directory_at(state_root, OsStr::new(STORE_ROOT_NAME))?;
+    let (_, identity) = open_regular_at(
+        &root,
+        OsStr::new(STORE_SNAPSHOT_NAME),
+        OFlag::O_RDONLY,
+    )?;
+    if identity != snapshot_identity {
+        return Err(StoreError::Owner);
+    }
+    Ok(root.identity)
+}
+
+fn open_or_initialize_store(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    request: &MaterializationRequestV1,
+    tracker: &mut ChangeTracker,
+) -> Result<LockedStore, StoreError> {
+    let state_root = pin_or_create_state_root(authority, binding, tracker)?;
+    let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+    if has_final && has_staging {
+        return Err(StoreError::Owner);
+    }
+    if has_final {
+        return open_final_locked(state_root, binding, LockMode::Exclusive);
+    }
+
+    let staging = if has_staging {
+        open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?
+    } else {
+        revalidate_directory(&state_root.leaf)?;
+        mkdirat(&state_root.leaf.file, STORE_STAGING_NAME, DIRECTORY_MODE).map_err(|error| {
+            if error == nix::errno::Errno::EEXIST {
+                StoreError::Owner
+            } else {
+                StoreError::Io
+            }
+        })?;
+        state_root.leaf.file.sync_all().map_err(|_| StoreError::Io)?;
+        open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?
+    };
+    let names = scan_names(&staging)?;
+    let empty = BTreeSet::new();
+    let lock_only = [STORE_LOCK_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let lock_objects = [STORE_LOCK_NAME, OBJECTS_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let complete = [STORE_LOCK_NAME, OBJECTS_NAME, STORE_SNAPSHOT_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    if names != empty && names != lock_only && names != lock_objects && names != complete {
+        return Err(StoreError::Owner);
+    }
+
+    let (lock, lock_identity) = if names == empty {
+        create_and_lock_staging(&staging)?
+    } else {
+        acquire_lock(&staging, LockMode::Exclusive)?
+    };
+    let (final_after_lock, staging_after_lock) = root_selection(&state_root.leaf)?;
+    if final_after_lock || !staging_after_lock {
+        let _ = lock.unlock();
+        drop(lock);
+        return Err(StoreError::Owner);
+    }
+    let objects = if names == empty || names == lock_only {
+        create_objects_directory(&staging)?
+    } else {
+        let objects = open_directory_at(&staging, OsStr::new(OBJECTS_NAME))?;
+        exact_names(&objects, &[])?;
+        objects
+    };
+
+    if names == complete {
+        let (candidate, snapshot_bytes, snapshot_identity) =
+            decode_snapshot(&staging, STORE_SNAPSHOT_NAME)?;
+        if candidate.config_commitment() != binding.config_commitment() {
+            return Err(StoreError::ConfigurationMismatch);
+        }
+        let snapshot = validate_candidate_filesystem(&objects, candidate)?;
+        let operation = snapshot
+            .operations()
+            .first()
+            .ok_or(StoreError::Owner)?;
+        if operation.request() != request {
+            return Err(StoreError::Conflict);
+        }
+        let objects_identity = objects.identity;
+        drop(objects);
+        return publish_initial_staging(
+            authority,
+            binding,
+            state_root,
+            staging,
+            objects_identity,
+            lock,
+            lock_identity,
+            snapshot,
+            snapshot_bytes,
+            snapshot_identity,
+            tracker,
+        );
+    }
+
+    exact_names(&objects, &[])?;
+    objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    staging.file.sync_all().map_err(|_| StoreError::Io)?;
+    let reopened_objects =
+        reopen_named_directory(&staging, OsStr::new(OBJECTS_NAME), objects.identity)?;
+    drop(objects);
+    let instance = draw_store_instance()?;
+    let sequence = NonZeroU64::new(1).expect("one is nonzero");
+    let admission = MaterializationAdmissionV1::new(instance, sequence, request);
+    let snapshot = ArtifactStoreSnapshotV1::initial(
+        instance,
+        binding.config_commitment(),
+        request.clone(),
+        admission,
+    )
+    .map_err(|_| StoreError::Owner)?;
+    let snapshot_bytes = snapshot.encode_canonical().map_err(|_| StoreError::Capacity)?;
+    let snapshot_identity = write_new_exact(&staging, STORE_SNAPSHOT_NAME, &snapshot_bytes)?;
+    staging.file.sync_all().map_err(|_| StoreError::Io)?;
+    let objects_identity = reopened_objects.identity;
+    drop(reopened_objects);
+    publish_initial_staging(
+        authority,
+        binding,
+        state_root,
+        staging,
+        objects_identity,
+        lock,
+        lock_identity,
+        snapshot,
+        snapshot_bytes,
+        snapshot_identity,
+        tracker,
+    )
+}
+
+fn cleanup_owned_next(
+    root: &DirectoryHandle,
+    expected_identity: FileIdentity,
+) -> Result<(), StoreError> {
+    let (file, identity) = open_regular_at(
+        root,
+        OsStr::new(STORE_SNAPSHOT_NEXT_NAME),
+        OFlag::O_RDONLY,
+    )?;
+    if identity != expected_identity {
+        return Err(StoreError::Owner);
+    }
+    unlinkat(
+        &root.file,
+        STORE_SNAPSHOT_NEXT_NAME,
+        UnlinkatFlags::NoRemoveDir,
+    )
+    .map_err(|_| StoreError::Io)?;
+    if file.metadata().map_err(|_| StoreError::Io)?.nlink() != 0 {
+        return Err(StoreError::Owner);
+    }
+    drop(file);
+    root.file.sync_all().map_err(|_| StoreError::Io)
+}
+
+fn commit_successor(
+    store: &mut LockedStore,
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    next: ArtifactStoreSnapshotV1,
+    tracker: &mut ChangeTracker,
+) -> Result<(), StoreError> {
+    let operation_id = permitted_next(&store.snapshot, &next)?;
+    let operation = next.operation(operation_id).cloned();
+    if scan_names(&store.root)?.contains(OsStr::new(STORE_SNAPSHOT_NEXT_NAME)) {
+        return Err(StoreError::Owner);
+    }
+    let bytes = next.encode_canonical().map_err(|error| match error {
+        crate::ArtifactContractError::CapacityExceeded
+        | crate::ArtifactContractError::ArithmeticOverflow => StoreError::Capacity,
+        _ => StoreError::Owner,
+    })?;
+    let (mut file, next_identity) =
+        create_regular(&store.root, STORE_SNAPSHOT_NEXT_NAME, OFlag::O_WRONLY)?;
+    let prepared = (|| {
+        file.write_all(&bytes).map_err(|_| StoreError::Io)?;
+        file.sync_all().map_err(|_| StoreError::Io)?;
+        drop(file);
+        let (reopened, identity) = read_regular_bounded(
+            &store.root,
+            OsStr::new(STORE_SNAPSHOT_NEXT_NAME),
+            MAX_SNAPSHOT_BYTES,
+            false,
+        )?;
+        if identity != next_identity || reopened != bytes {
+            return Err(StoreError::Owner);
+        }
+        let candidate = ArtifactStoreSnapshotCandidateV1::decode_canonical(&reopened)
+            .map_err(|_| StoreError::Owner)?;
+        if validate_candidate_filesystem(&store.objects, candidate)? != next {
+            return Err(StoreError::Owner);
+        }
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        if cleanup_owned_next(&store.root, next_identity).is_err() {
+            tracker.ambiguous();
+            return Err(StoreError::Owner);
+        }
+        return Err(error);
+    }
+    revalidate_directory(&store.root)?;
+    validate_named_regular(
+        &store.root,
+        OsStr::new(STORE_LOCK_NAME),
+        store.lock_identity,
+        Some(0),
+    )?;
+    let (active_bytes, active_identity) = read_regular_bounded(
+        &store.root,
+        OsStr::new(STORE_SNAPSHOT_NAME),
+        MAX_SNAPSHOT_BYTES,
+        false,
+    )?;
+    if active_identity != store.snapshot_identity || active_bytes != store.snapshot_bytes {
+        if cleanup_owned_next(&store.root, next_identity).is_err() {
+            tracker.ambiguous();
+        }
+        return Err(StoreError::Owner);
+    }
+    require_same_authority(authority, binding)?;
+    if let Err(error) = renameat(
+        &store.root.file,
+        STORE_SNAPSHOT_NEXT_NAME,
+        &store.root.file,
+        STORE_SNAPSHOT_NAME,
+    ) {
+        if cleanup_owned_next(&store.root, next_identity).is_err() {
+            tracker.ambiguous();
+            return Err(StoreError::Owner);
+        }
+        let _ = error;
+        return Err(StoreError::Io);
+    }
+    tracker.ambiguous();
+    store
+        .root
+        .file
+        .sync_all()
+        .map_err(|_| StoreError::PublicationUncertain(operation.clone()))?;
+    let (candidate, active_bytes, active_identity) =
+        decode_snapshot(&store.root, STORE_SNAPSHOT_NAME)
+            .map_err(|_| StoreError::PublicationUncertain(operation.clone()))?;
+    let active = validate_candidate_filesystem(&store.objects, candidate)
+        .map_err(|_| StoreError::PublicationUncertain(operation.clone()))?;
+    if active != next {
+        return Err(StoreError::PublicationUncertain(operation));
+    }
+    validate_named_regular(
+        &store.root,
+        OsStr::new(STORE_LOCK_NAME),
+        store.lock_identity,
+        Some(0),
+    )
+    .map_err(|_| StoreError::Owner)?;
+    store.snapshot = active;
+    store.snapshot_bytes = active_bytes;
+    store.snapshot_identity = active_identity;
+    tracker.committed();
+    Ok(())
+}
+
+fn settle_existing_next(
+    store: &mut LockedStore,
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    request: &MaterializationRequestV1,
+    tracker: &mut ChangeTracker,
+) -> Result<(), StoreError> {
+    let Some((next, operation_id)) = read_and_validate_next(store, binding)? else {
+        return Ok(());
+    };
+    let operation = next.operation(operation_id).ok_or(StoreError::Owner)?;
+    if operation_id != request.operation_id() || operation.request() != request {
+        return Err(StoreError::Owner);
+    }
+    revalidate_directory(&store.root)?;
+    validate_named_regular(
+        &store.root,
+        OsStr::new(STORE_LOCK_NAME),
+        store.lock_identity,
+        Some(0),
+    )?;
+    validate_named_regular(
+        &store.root,
+        OsStr::new(STORE_SNAPSHOT_NAME),
+        store.snapshot_identity,
+        Some(u64::try_from(store.snapshot_bytes.len()).map_err(|_| StoreError::Owner)?),
+    )?;
+    require_same_authority(authority, binding)?;
+    renameat(
+        &store.root.file,
+        STORE_SNAPSHOT_NEXT_NAME,
+        &store.root.file,
+        STORE_SNAPSHOT_NAME,
+    )
+    .map_err(|_| StoreError::PublicationUncertain(Some(operation.clone())))?;
+    tracker.ambiguous();
+    store
+        .root
+        .file
+        .sync_all()
+        .map_err(|_| StoreError::PublicationUncertain(Some(operation.clone())))?;
+    let (candidate, bytes, identity) = decode_snapshot(&store.root, STORE_SNAPSHOT_NAME)
+        .map_err(|_| StoreError::PublicationUncertain(Some(operation.clone())))?;
+    let reopened = validate_candidate_filesystem(&store.objects, candidate)
+        .map_err(|_| StoreError::PublicationUncertain(Some(operation.clone())))?;
+    if reopened != next {
+        return Err(StoreError::PublicationUncertain(Some(operation.clone())));
+    }
+    store.snapshot = reopened;
+    store.snapshot_bytes = bytes;
+    store.snapshot_identity = identity;
+    tracker.committed();
+    Ok(())
+}
+
+enum PairPublication {
+    Complete(VerifiedArtifactPairV1),
+    Quarantined(u64),
+    NoEffectFailure,
+}
+
+fn sync_partial_child(
+    store: &LockedStore,
+    child_name: &str,
+    expected_ref: ArtifactObjectRefV1,
+) -> Result<u64, StoreError> {
+    let child = open_directory_at(&store.objects, OsStr::new(child_name))?;
+    let names = scan_names(&child)?;
+    for name in &names {
+        let (file, _) = open_regular_at(&child, name, OFlag::O_RDONLY)?;
+        file.sync_all().map_err(|_| StoreError::Io)?;
+        drop(file);
+    }
+    let bytes = validate_partial_pair_entry(&child, expected_ref)?;
+    child.file.sync_all().map_err(|_| StoreError::Io)?;
+    store.objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    let reopened_objects = reopen_named_directory(
+        &store.root,
+        OsStr::new(OBJECTS_NAME),
+        store.objects.identity,
+    )?;
+    let reopened_child = reopen_named_directory(
+        &reopened_objects,
+        OsStr::new(child_name),
+        child.identity,
+    )?;
+    if validate_partial_pair_entry(&reopened_child, expected_ref)? != bytes {
+        return Err(StoreError::Owner);
+    }
+    drop(reopened_child);
+    drop(reopened_objects);
+    drop(child);
+    Ok(bytes)
+}
+
+fn sync_complete_child(
+    store: &LockedStore,
+    child_name: &str,
+    expected_pair: &VerifiedArtifactPairV1,
+) -> Result<VerifiedArtifactPairV1, StoreError> {
+    let child = open_directory_at(&store.objects, OsStr::new(child_name))?;
+    let (manifest, _) = open_regular_at(&child, OsStr::new(MANIFEST_NAME), OFlag::O_RDONLY)?;
+    let (payload, _) = open_regular_at(&child, OsStr::new(PAYLOAD_NAME), OFlag::O_RDONLY)?;
+    manifest.sync_all().map_err(|_| StoreError::Io)?;
+    payload.sync_all().map_err(|_| StoreError::Io)?;
+    drop(payload);
+    drop(manifest);
+    child.file.sync_all().map_err(|_| StoreError::Io)?;
+    store.objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    let pair = strict_pair_from_directory(&child)?;
+    if &pair != expected_pair {
+        return Err(StoreError::Owner);
+    }
+    let reopened_objects = reopen_named_directory(
+        &store.root,
+        OsStr::new(OBJECTS_NAME),
+        store.objects.identity,
+    )?;
+    let reopened_child = reopen_named_directory(
+        &reopened_objects,
+        OsStr::new(child_name),
+        child.identity,
+    )?;
+    let reopened_pair = strict_pair_from_directory(&reopened_child)?;
+    if reopened_pair != pair {
+        return Err(StoreError::Owner);
+    }
+    drop(reopened_child);
+    drop(reopened_objects);
+    drop(child);
+    Ok(pair)
+}
+
+fn publish_pair_file(
+    child: &DirectoryHandle,
+    temporary_name: &str,
+    final_name: &str,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
+    let identity = write_new_exact(child, temporary_name, bytes)?;
+    validate_named_regular(
+        child,
+        OsStr::new(temporary_name),
+        identity,
+        Some(u64::try_from(bytes.len()).map_err(|_| StoreError::Owner)?),
+    )?;
+    renameat_with(
+        &child.file,
+        temporary_name,
+        &child.file,
+        final_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|_| StoreError::Io)?;
+    child.file.sync_all().map_err(|_| StoreError::Io)?;
+    let (reopened, reopened_identity) =
+        read_regular_bounded(child, OsStr::new(final_name), bytes.len(), false)?;
+    if reopened_identity != identity || reopened.as_ref() != bytes {
+        return Err(StoreError::Owner);
+    }
+    Ok(())
+}
+
+fn publish_or_recover_pair(
+    store: &LockedStore,
+    pair: &VerifiedArtifactPairV1,
+    tracker: &mut ChangeTracker,
+) -> Result<PairPublication, StoreError> {
+    let child_name = object_directory_name(pair.object_ref());
+    let names = scan_names(&store.objects)?;
+    if names.contains(OsStr::new(&child_name)) {
+        let child = open_directory_at(&store.objects, OsStr::new(&child_name))?;
+        let child_names = scan_names(&child)?;
+        drop(child);
+        let complete_names = [MANIFEST_NAME, PAYLOAD_NAME]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<BTreeSet<_>>();
+        if child_names == complete_names {
+            return sync_complete_child(store, &child_name, pair)
+                .map(PairPublication::Complete);
+        }
+        return sync_partial_child(store, &child_name, pair.object_ref())
+            .map(PairPublication::Quarantined);
+    }
+
+    if let Err(error) = mkdirat(&store.objects.file, child_name.as_str(), DIRECTORY_MODE) {
+        let after = scan_names(&store.objects)?;
+        if !after.contains(OsStr::new(&child_name)) {
+            let _ = error;
+            return Ok(PairPublication::NoEffectFailure);
+        }
+        return Err(StoreError::Owner);
+    }
+    tracker.ambiguous();
+    let publication = (|| {
+        let child = open_directory_at(&store.objects, OsStr::new(&child_name))?;
+        exact_names(&child, &[])?;
+        child.file.sync_all().map_err(|_| StoreError::Io)?;
+        store.objects.file.sync_all().map_err(|_| StoreError::Io)?;
+        let reopened_child =
+            reopen_named_directory(&store.objects, OsStr::new(&child_name), child.identity)?;
+        drop(child);
+        publish_pair_file(
+            &reopened_child,
+            MANIFEST_NEXT_NAME,
+            MANIFEST_NAME,
+            pair.manifest_bytes(),
+        )?;
+        publish_pair_file(
+            &reopened_child,
+            PAYLOAD_NEXT_NAME,
+            PAYLOAD_NAME,
+            pair.payload(),
+        )?;
+        drop(reopened_child);
+        sync_complete_child(store, &child_name, pair)
+    })();
+    match publication {
+        Ok(verified) => Ok(PairPublication::Complete(verified)),
+        Err(_) => match sync_partial_child(store, &child_name, pair.object_ref()) {
+            Ok(bytes) => Ok(PairPublication::Quarantined(bytes)),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn commit_receipt(
+    store: &mut LockedStore,
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    operation_id: ArtifactOperationIdV1,
+    tracker: &mut ChangeTracker,
+) -> Result<MaterializationOperationV1, StoreError> {
+    let operation = store
+        .snapshot
+        .operation(operation_id)
+        .cloned()
+        .ok_or(StoreError::Owner)?;
+    if operation.receipt().is_some() {
+        return Ok(operation);
+    }
+    let terminal = operation.terminal().ok_or(StoreError::Owner)?;
+    let receipt = MaterializationReceiptV1::new(terminal);
+    let next = store
+        .snapshot
+        .try_successor(ArtifactSnapshotSuccessorV1::Receipt { receipt })
+        .map_err(|_| StoreError::Owner)?;
+    commit_successor(store, authority, binding, next, tracker)?;
+    store
+        .snapshot
+        .operation(operation_id)
+        .cloned()
+        .ok_or(StoreError::Owner)
+}
+
+fn commit_terminal_and_receipt(
+    store: &mut LockedStore,
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    operation_id: ArtifactOperationIdV1,
+    object: Option<&ArtifactObjectRecordV1>,
+    state: MaterializationTerminalStateV1,
+    quarantine: ArtifactQuarantineFactsV1,
+    tracker: &mut ChangeTracker,
+) -> Result<MaterializationOperationV1, StoreError> {
+    let operation = store
+        .snapshot
+        .operation(operation_id)
+        .cloned()
+        .ok_or(StoreError::Owner)?;
+    if operation.terminal().is_none() {
+        let terminal = MaterializationTerminalV1::new(
+            operation.admission(),
+            operation.materializing(),
+            object,
+            state,
+        )
+        .map_err(|_| StoreError::Owner)?;
+        let next = store
+            .snapshot
+            .try_successor(ArtifactSnapshotSuccessorV1::Terminal {
+                terminal,
+                quarantine,
+            })
+            .map_err(|_| StoreError::Owner)?;
+        commit_successor(store, authority, binding, next, tracker)?;
+    }
+    commit_receipt(
+        store,
+        authority,
+        binding,
+        operation_id,
+        tracker,
+    )
+}
+
+fn admit_operation(
+    store: &mut LockedStore,
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    request: &MaterializationRequestV1,
+    tracker: &mut ChangeTracker,
+) -> Result<(), StoreError> {
+    if let Some(existing) = store.snapshot.operation(request.operation_id()) {
+        return if existing.request() == request {
+            Ok(())
+        } else {
+            Err(StoreError::Conflict)
+        };
+    }
+    if !matches!(store.snapshot.quarantine(), ArtifactQuarantineFactsV1::Absent) {
+        return Err(StoreError::Capacity);
+    }
+    let sequence = store
+        .snapshot
+        .operation_high_water()
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .ok_or(StoreError::Capacity)?;
+    let admission = MaterializationAdmissionV1::new(
+        store.snapshot.store_instance(),
+        sequence,
+        request,
+    );
+    let next = store
+        .snapshot
+        .try_successor(ArtifactSnapshotSuccessorV1::Admission {
+            request: request.clone(),
+            admission,
+        })
+        .map_err(|error| match error {
+            crate::ArtifactContractError::CapacityExceeded
+            | crate::ArtifactContractError::ArithmeticOverflow => StoreError::Capacity,
+            _ => StoreError::Owner,
+        })?;
+    commit_successor(store, authority, binding, next, tracker)
+}
+
+fn ensure_materializing(
+    store: &mut LockedStore,
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    operation_id: ArtifactOperationIdV1,
+    tracker: &mut ChangeTracker,
+) -> Result<(), StoreError> {
+    let operation = store
+        .snapshot
+        .operation(operation_id)
+        .cloned()
+        .ok_or(StoreError::Owner)?;
+    if operation.materializing().is_some() {
+        return Ok(());
+    }
+    if operation.terminal().is_some() {
+        return Err(StoreError::Owner);
+    }
+    let materializing = MaterializingRecordV1::new(operation.admission());
+    let next = store
+        .snapshot
+        .try_successor(ArtifactSnapshotSuccessorV1::Materializing { materializing })
+        .map_err(|_| StoreError::Owner)?;
+    commit_successor(store, authority, binding, next, tracker)
+}
+
+fn object_candidate(
+    store: &LockedStore,
+    operation_id: ArtifactOperationIdV1,
+    pair: &VerifiedArtifactPairV1,
+) -> Result<(ArtifactObjectRecordV1, ArtifactStoreSnapshotV1), StoreError> {
+    let sequence = store
+        .snapshot
+        .object_high_water()
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .ok_or(StoreError::Capacity)?;
+    let object = ArtifactObjectRecordV1::new(store.snapshot.store_instance(), sequence, pair);
+    let next = store
+        .snapshot
+        .try_successor(ArtifactSnapshotSuccessorV1::Object {
+            operation_id,
+            object: object.clone(),
+        })
+        .map_err(|error| match error {
+            crate::ArtifactContractError::CapacityExceeded
+            | crate::ArtifactContractError::ArithmeticOverflow => StoreError::Capacity,
+            _ => StoreError::Owner,
+        })?;
+    let frame_bytes = next.encode_canonical().map_err(|_| StoreError::Capacity)?;
+    let pair_bytes = u64::try_from(pair.manifest_bytes().len())
+        .ok()
+        .and_then(|manifest| {
+            u64::try_from(pair.payload().len())
+                .ok()
+                .and_then(|payload| manifest.checked_add(payload))
+        })
+        .ok_or(StoreError::Capacity)?;
+    ArtifactCapacityInputV1::new(
+        store
+            .snapshot
+            .accounted_rest_bytes()
+            .map_err(|_| StoreError::Owner)?,
+        u64::try_from(frame_bytes.len()).map_err(|_| StoreError::Capacity)?,
+        0,
+        pair_bytes,
+        next.objects().len(),
+        next.operations().len(),
+        next.quarantine().regular_file_bytes(),
+    )
+    .checked_total()
+    .map_err(|_| StoreError::Capacity)?;
+    Ok((object, next))
+}
+
+fn drive_materialization(
+    store: &mut LockedStore,
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    request: &MaterializationRequestV1,
+    pair: &VerifiedArtifactPairV1,
+    tracker: &mut ChangeTracker,
+) -> Result<MaterializationOperationV1, StoreError> {
+    settle_existing_next(store, authority, binding, request, tracker)?;
+    admit_operation(store, authority, binding, request, tracker)?;
+    let operation_id = request.operation_id();
+    let operation = store
+        .snapshot
+        .operation(operation_id)
+        .cloned()
+        .ok_or(StoreError::Owner)?;
+    if operation.request() != request {
+        return Err(StoreError::Conflict);
+    }
+    if operation.receipt().is_some() {
+        return Ok(operation);
+    }
+    if operation.terminal().is_some() {
+        return commit_receipt(
+            store,
+            authority,
+            binding,
+            operation_id,
+            tracker,
+        );
+    }
+    ensure_materializing(store, authority, binding, operation_id, tracker)?;
+    match store
+        .snapshot
+        .recovery_start(operation_id)
+        .map_err(|_| StoreError::Owner)?
+    {
+        ArtifactRecoveryStartV1::UnreferencedCurrent(object) => {
+            let verified = strict_indexed_object(&store.objects, &object)?;
+            if &verified != pair {
+                return Err(StoreError::Owner);
+            }
+            commit_terminal_and_receipt(
+                store,
+                authority,
+                binding,
+                operation_id,
+                Some(&object),
+                MaterializationTerminalStateV1::Materialized,
+                ArtifactQuarantineFactsV1::Absent,
+                tracker,
+            )
+        }
+        ArtifactRecoveryStartV1::EarlierReferenced(object) => {
+            let verified = strict_indexed_object(&store.objects, &object)?;
+            if &verified != pair {
+                return Err(StoreError::Owner);
+            }
+            commit_terminal_and_receipt(
+                store,
+                authority,
+                binding,
+                operation_id,
+                Some(&object),
+                MaterializationTerminalStateV1::AlreadyMaterialized,
+                ArtifactQuarantineFactsV1::Absent,
+                tracker,
+            )
+        }
+        ArtifactRecoveryStartV1::NoMatchingObject => {
+            let candidate = object_candidate(store, operation_id, pair);
+            let (object, object_successor) = match candidate {
+                Ok(candidate) => candidate,
+                Err(StoreError::Capacity) => {
+                    return commit_terminal_and_receipt(
+                        store,
+                        authority,
+                        binding,
+                        operation_id,
+                        None,
+                        MaterializationTerminalStateV1::Failed,
+                        ArtifactQuarantineFactsV1::Absent,
+                        tracker,
+                    );
+                }
+                Err(error) => return Err(error),
+            };
+            match publish_or_recover_pair(store, pair, tracker)? {
+                PairPublication::NoEffectFailure => commit_terminal_and_receipt(
+                    store,
+                    authority,
+                    binding,
+                    operation_id,
+                    None,
+                    MaterializationTerminalStateV1::Failed,
+                    ArtifactQuarantineFactsV1::Absent,
+                    tracker,
+                ),
+                PairPublication::Quarantined(regular_file_bytes) => {
+                    commit_terminal_and_receipt(
+                        store,
+                        authority,
+                        binding,
+                        operation_id,
+                        None,
+                        MaterializationTerminalStateV1::Uncertain,
+                        ArtifactQuarantineFactsV1::Present {
+                            operation_id,
+                            regular_file_bytes,
+                        },
+                        tracker,
+                    )
+                }
+                PairPublication::Complete(verified) => {
+                    if &verified != pair {
+                        return Err(StoreError::Owner);
+                    }
+                    commit_successor(
+                        store,
+                        authority,
+                        binding,
+                        object_successor,
+                        tracker,
+                    )?;
+                    commit_terminal_and_receipt(
+                        store,
+                        authority,
+                        binding,
+                        operation_id,
+                        Some(&object),
+                        MaterializationTerminalStateV1::Materialized,
+                        ArtifactQuarantineFactsV1::Absent,
+                        tracker,
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn run_materialize(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    request: &MaterializationRequestV1,
+    pair: &VerifiedArtifactPairV1,
+) -> ArtifactStoreInvocationV1 {
+    let mut tracker = ChangeTracker::default();
+    let binding = match authority_binding(authority) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return ArtifactStoreInvocationV1::failure(tracker.change(), error.into_public());
+        }
+    };
+    if request.config_commitment() != binding.config_commitment() {
+        return ArtifactStoreInvocationV1::failure(
+            tracker.change(),
+            ArtifactStoreFailureV1::ConfigurationMismatch,
+        );
+    }
+    if request.object_ref() != pair.object_ref() {
+        return ArtifactStoreInvocationV1::failure(
+            tracker.change(),
+            ArtifactStoreFailureV1::Conflict,
+        );
+    }
+    let mut store = match open_or_initialize_store(
+        authority,
+        &binding,
+        request,
+        &mut tracker,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            return ArtifactStoreInvocationV1::failure(tracker.change(), error.into_public());
+        }
+    };
+    let result = drive_materialization(
+        &mut store,
+        authority,
+        &binding,
+        request,
+        pair,
+        &mut tracker,
+    );
+    finish_locked(store, tracker, result)
+}
