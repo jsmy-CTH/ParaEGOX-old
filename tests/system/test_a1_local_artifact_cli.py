@@ -1210,6 +1210,20 @@ def _invoke_artifact(binary: Path, arguments: list[str]) -> tuple[int, bytes, di
     return completed.returncode, completed.stdout, envelope
 
 
+def _read_regular_noatime(path: Path) -> bytes:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NOATIME,
+    )
+    try:
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 4096):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def _filesystem_projection(root: Path) -> tuple[tuple[object, ...], ...]:
     projected: list[tuple[object, ...]] = []
     for path in sorted(root.rglob("*")):
@@ -1217,7 +1231,7 @@ def _filesystem_projection(root: Path) -> tuple[tuple[object, ...], ...]:
         relative = path.relative_to(root).as_posix()
         payload_digest = None
         if stat.S_ISREG(metadata.st_mode):
-            payload_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            payload_digest = hashlib.sha256(_read_regular_noatime(path)).hexdigest()
         projected.append(
             (
                 relative,
@@ -1228,6 +1242,7 @@ def _filesystem_projection(root: Path) -> tuple[tuple[object, ...], ...]:
                 metadata.st_ino,
                 metadata.st_nlink,
                 metadata.st_size,
+                metadata.st_atime_ns,
                 metadata.st_mtime_ns,
                 metadata.st_ctime_ns,
                 payload_digest,
@@ -1352,6 +1367,13 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
 
         manifest = output / "manifest.pxam"
         payload = output / "payload.bin"
+        for path in (manifest, payload):
+            metadata = path.lstat()
+            os.utime(
+                path,
+                ns=(1_000_000_000, metadata.st_mtime_ns),
+                follow_symlinks=False,
+            )
         before_inspect = _filesystem_projection(output_parent)
         returncode, raw, inspected = _invoke_artifact(
             binary,
