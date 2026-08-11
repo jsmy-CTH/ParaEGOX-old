@@ -5544,54 +5544,65 @@ mod tests {
 
     #[test]
     fn artifact_external_controller_owner_reducer_matches_primary_goldens() {
-        let (request, _, plan_content, execution, runtime_request) = artifact_runtime_prefix();
-        let admitted = ArtifactExternalControllerStateV2::admit(request, [0x46; 32])
-            .expect("owner admits PXMJ2-A");
-        assert_eq!(
-            admitted.encode().expect("A wire").as_ref(),
-            decode_fixture_hex(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_admitted.hex"
-            )))
-        );
+        let admitted_wire = decode_fixture_hex(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_admitted.hex"
+        )));
+        let committed_wire = decode_fixture_hex(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_committed.hex"
+        )));
+        let applying_wire = decode_fixture_hex(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_applying.hex"
+        )));
+        let active_wire = decode_fixture_hex(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_active_ready.hex"
+        )));
+        let admitted_fixture =
+            ArtifactExternalControllerStateV2::decode(&admitted_wire).expect("A fixture");
+        let committed_fixture =
+            ArtifactExternalControllerStateV2::decode(&committed_wire).expect("C fixture");
+        let applying_fixture =
+            ArtifactExternalControllerStateV2::decode(&applying_wire).expect("P fixture");
+        let active_fixture =
+            ArtifactExternalControllerStateV2::decode(&active_wire).expect("R fixture");
+
+        let admitted = ArtifactExternalControllerStateV2::admit(
+            admitted_fixture.request().clone(),
+            *admitted_fixture.admission().controller_store_instance(),
+        )
+        .expect("owner admits PXMJ2-A");
+        assert_eq!(admitted.encode().expect("A wire").as_ref(), admitted_wire);
 
         let committed = admitted
-            .commit(plan_content, execution, runtime_request.clone())
+            .commit(
+                committed_fixture
+                    .plan_content()
+                    .expect("C plan content")
+                    .clone(),
+                committed_fixture.execution().expect("C execution").clone(),
+                committed_fixture
+                    .runtime_request()
+                    .expect("C PXAR12")
+                    .clone(),
+            )
             .expect("owner commits PXMJ2-C");
-        assert_eq!(
-            committed.encode().expect("C wire").as_ref(),
-            decode_fixture_hex(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_committed.hex"
-            )))
-        );
+        assert_eq!(committed.encode().expect("C wire").as_ref(), committed_wire);
 
         let applying = committed
-            .begin_apply([0x54; 16])
+            .begin_apply(applying_fixture.records()[1].progress.lifecycle_generation)
             .expect("owner commits PXMJ2-P");
-        assert_eq!(
-            applying.encode().expect("P wire").as_ref(),
-            decode_fixture_hex(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_applying.hex"
-            )))
-        );
+        assert_eq!(applying.encode().expect("P wire").as_ref(), applying_wire);
 
-        let terminal = signed_artifact_receipt(
-            &runtime_request,
-            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
-        )
-        .expect("signed ActiveReady");
         let active = applying
-            .finish_apply(Some(terminal), None)
+            .finish_apply(
+                Some(active_fixture.runtime_terminal().expect("R PXMT").clone()),
+                None,
+            )
             .expect("owner commits PXMJ2-R");
-        assert_eq!(
-            active.encode().expect("R wire").as_ref(),
-            decode_fixture_hex(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_active_ready.hex"
-            )))
-        );
+        assert_eq!(active.encode().expect("R wire").as_ref(), active_wire);
         assert!(matches!(
             active.finish_apply(None, Some(ArtifactExternalControllerPhaseV2::Failed)),
             Err(ManagedModelAgentStackApplyControllerError::InvalidPhase)

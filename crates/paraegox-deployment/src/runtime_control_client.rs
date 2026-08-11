@@ -36,11 +36,11 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricApplyRequestV1, ManagedFabricApplyTerminalReceiptV1, ManagedFabricPlanError,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+    ArtifactBoundManagedModelAgentStackApplyRequestV1,
     MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
-    ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackPlanError,
-    ManagedModelAgentStackTerminalReceiptV1,
+    ManagedModelAgentStackPlanError, ManagedModelAgentStackTerminalReceiptV1,
 };
 use paraegox_runtime_contracts::managed_serving_bootstrap::{
     MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES, MAX_MANAGED_SERVING_BOOTSTRAP_RESPONSE_BYTES,
@@ -1989,11 +1989,10 @@ impl UnixRuntimeManagedModelAgentStackClient {
         request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
         request_time_channel: ReferenceChannelBindingV1,
     ) -> Result<Box<[u8]>, RuntimeManagedModelAgentStackExchangeError> {
-        let decoded = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
-            request.canonical_wire(),
-        )
-        .map_err(RuntimeManagedModelAgentStackClientFailure::RequestContract)
-        .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
+        let decoded =
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(request.canonical_wire())
+                .map_err(RuntimeManagedModelAgentStackClientFailure::RequestContract)
+                .map_err(RuntimeManagedModelAgentStackExchangeError::NotSent)?;
         if decoded != *request
             || request.canonical_wire().is_empty()
             || request.canonical_wire().len()
@@ -2216,7 +2215,9 @@ fn length_prefix_managed_model_agent_stack(payload: &[u8]) -> Box<[u8]> {
 }
 
 fn length_prefix_artifact_managed_model_agent_stack(payload: &[u8]) -> Box<[u8]> {
-    debug_assert!(payload.len() <= MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES);
+    debug_assert!(
+        payload.len() <= MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES
+    );
     let payload_length = u32::try_from(payload.len())
         .expect("canonical Artifact-bound Model+Agent request bound is smaller than u32::MAX");
     let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
