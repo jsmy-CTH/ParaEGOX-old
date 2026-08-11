@@ -278,6 +278,18 @@ fn decode_nibble(byte: u8) -> Result<u8, ArtifactContractError> {
     }
 }
 
+/// Profile-only classification for an untrusted PXAM candidate.
+///
+/// This preclassification deliberately ignores every non-profile field. An
+/// exact-size frame exposes both fixed profile fields, while any other length
+/// remains indeterminate and belongs to the ordinary compatibility decoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactManifestProfileClassificationV1 {
+    Match,
+    Mismatch,
+    Indeterminate,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactManifestV1 {
     payload_len: u64,
@@ -285,6 +297,21 @@ pub struct ArtifactManifestV1 {
 }
 
 impl ArtifactManifestV1 {
+    #[must_use]
+    pub fn classify_profile(bytes: &[u8]) -> ArtifactManifestProfileClassificationV1 {
+        if bytes.len() != PXAM_BYTES {
+            return ArtifactManifestProfileClassificationV1::Indeterminate;
+        }
+        let declared_profile_len = u16::from_be_bytes([bytes[12], bytes[13]]);
+        if declared_profile_len != PROFILE.len() as u16
+            || bytes.get(80..110) != Some(PROFILE.as_slice())
+        {
+            ArtifactManifestProfileClassificationV1::Mismatch
+        } else {
+            ArtifactManifestProfileClassificationV1::Match
+        }
+    }
+
     pub fn from_payload(payload: &[u8]) -> Result<Self, ArtifactContractError> {
         validate_payload_bytes(payload)?;
         let payload_digest = raw_sha256(PAYLOAD_DIGEST_DOMAIN, &[payload]);
@@ -2803,6 +2830,12 @@ mod tests {
         VerifiedArtifactPairV1::from_payload(PAYLOAD).expect("canonical pair")
     }
 
+    fn manifest_bytes() -> [u8; PXAM_BYTES] {
+        ArtifactManifestV1::from_payload(PAYLOAD)
+            .expect("canonical manifest")
+            .encode()
+    }
+
     fn request(operation_id: ArtifactOperationIdV1) -> MaterializationRequestV1 {
         MaterializationRequestV1::new(operation_id, config(), pair().object_ref())
     }
@@ -2880,6 +2913,58 @@ mod tests {
             })
             .expect("receipt successor");
         (receipt_snapshot, pair, terminal, receipt)
+    }
+
+    #[test]
+    fn manifest_profile_classification_matches_canonical_profile() {
+        assert_eq!(
+            ArtifactManifestV1::classify_profile(&manifest_bytes()),
+            ArtifactManifestProfileClassificationV1::Match,
+        );
+    }
+
+    #[test]
+    fn manifest_profile_classification_rejects_declared_length_mismatch() {
+        let mut bytes = manifest_bytes();
+        put_u16(&mut bytes, 12, PROFILE.len() as u16 + 1);
+        assert_eq!(
+            ArtifactManifestV1::classify_profile(&bytes),
+            ArtifactManifestProfileClassificationV1::Mismatch,
+        );
+    }
+
+    #[test]
+    fn manifest_profile_classification_rejects_literal_mismatch() {
+        let mut bytes = manifest_bytes();
+        bytes[80] ^= 1;
+        assert_eq!(
+            ArtifactManifestV1::classify_profile(&bytes),
+            ArtifactManifestProfileClassificationV1::Mismatch,
+        );
+    }
+
+    #[test]
+    fn manifest_profile_mismatch_precedes_other_manifest_corruption() {
+        let mut bytes = manifest_bytes();
+        bytes[0] ^= 1;
+        bytes[80] ^= 1;
+        assert_eq!(
+            ArtifactManifestV1::classify_profile(&bytes),
+            ArtifactManifestProfileClassificationV1::Mismatch,
+        );
+        assert_eq!(
+            ArtifactManifestV1::decode(&bytes),
+            Err(ArtifactContractError::InvalidMagic),
+        );
+    }
+
+    #[test]
+    fn short_manifest_profile_classification_is_indeterminate() {
+        let bytes = manifest_bytes();
+        assert_eq!(
+            ArtifactManifestV1::classify_profile(&bytes[..PXAM_BYTES - 1]),
+            ArtifactManifestProfileClassificationV1::Indeterminate,
+        );
     }
 
     #[test]

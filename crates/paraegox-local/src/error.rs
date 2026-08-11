@@ -5,6 +5,7 @@ pub(crate) enum LocalProcessError {
     Configuration(ConfigError),
     OfflineJsonOutput,
     ArtifactPath,
+    ArtifactProfile,
     ArtifactCompatibility,
     ArtifactConflict,
     ArtifactCapacity,
@@ -101,6 +102,7 @@ impl LocalProcessError {
             Self::Configuration(error) => error.code(),
             Self::OfflineJsonOutput => "PXLC-OFFLINE-JSON-OUTPUT",
             Self::ArtifactPath => "PXLC-ARTIFACT-PATH",
+            Self::ArtifactProfile => "PXLC-ARTIFACT-PROFILE",
             Self::ArtifactCompatibility => "PXLC-ARTIFACT-COMPATIBILITY",
             Self::ArtifactConflict => "PXLC-ARTIFACT-CONFLICT",
             Self::ArtifactCapacity => "PXLC-ARTIFACT-CAPACITY",
@@ -197,6 +199,7 @@ impl LocalProcessError {
             Self::Configuration(error) => error.message(),
             Self::OfflineJsonOutput => "offline machine-readable output failed",
             Self::ArtifactPath => "artifact path is invalid or unsafe",
+            Self::ArtifactProfile => "artifact profile is unsupported",
             Self::ArtifactCompatibility => "artifact bytes are invalid or incompatible",
             Self::ArtifactConflict => "artifact operation conflicts with its durable request",
             Self::ArtifactCapacity => "artifact store capacity is exhausted",
@@ -364,6 +367,7 @@ impl LocalProcessError {
         match self {
             Self::Configuration(_)
             | Self::ArtifactPath
+            | Self::ArtifactProfile
             | Self::ArtifactCompatibility
             | Self::ArtifactConflict
             | Self::ArtifactCapacity

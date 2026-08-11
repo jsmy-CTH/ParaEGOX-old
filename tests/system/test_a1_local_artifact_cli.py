@@ -1309,7 +1309,8 @@ def test_artifact_f0_a1_dispatch_and_authority_source_guards() -> None:
     assert "ArtifactStore" not in build_body
     assert "ArtifactStore" not in inspect_body
     assert "RevalidatingArtifactAuthority::new" in artifact_source
-    assert artifact_source.count("drop(authority);") == 2
+    assert "ArtifactStoreV1::query(&mut authority, operation_id)" in artifact_source
+    assert artifact_source.count("drop(authority);") >= 2
     assert artifact_source.count("Ok(project_invocation(operation_id, invocation))") == 2
 
 
@@ -1471,6 +1472,93 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
             "command": "artifact.materialization.query",
             "changed": False,
         }
+
+        mismatched_config = workspace / "paraegox-mismatched.toml"
+        config_text = config_path.read_text()
+        assert "tcp/127.0.0.1:7447" in config_text
+        mismatched_config.write_text(
+            config_text.replace("tcp/127.0.0.1:7447", "tcp/127.0.0.1:7448", 1)
+        )
+        os.chmod(mismatched_config, 0o600)
+        returncode, _, mismatch_before_pair = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "materialize",
+                "--config",
+                os.fspath(mismatched_config),
+                "--manifest",
+                os.fspath(workspace / "missing-manifest.pxam"),
+                "--payload",
+                os.fspath(workspace / "missing-payload.bin"),
+                "--operation-id",
+                "a4" * 16,
+                "--json",
+            ],
+        )
+        assert returncode == 2
+        assert mismatch_before_pair["changed"] is False
+        assert mismatch_before_pair["diagnostics"] == [
+            {
+                "code": "PXLC-LIFECYCLE-CONFIGURATION",
+                "message": "managed-local lifecycle configuration authority changed",
+            }
+        ]
+
+        profile_mismatch = workspace / "profile-mismatch.pxam"
+        profile_bytes = bytearray(manifest.read_bytes())
+        assert profile_bytes[80:110] == _PROFILE
+        profile_bytes[80] ^= 1
+        profile_mismatch.write_bytes(profile_bytes)
+        os.chmod(profile_mismatch, 0o600)
+        for arguments in (
+            [
+                "artifact",
+                "inspect",
+                "--manifest",
+                os.fspath(profile_mismatch),
+                "--payload",
+                os.fspath(payload),
+                "--json",
+            ],
+            [
+                "artifact",
+                "materialize",
+                "--config",
+                os.fspath(config_path),
+                "--manifest",
+                os.fspath(profile_mismatch),
+                "--payload",
+                os.fspath(payload),
+                "--operation-id",
+                "a5" * 16,
+                "--json",
+            ],
+        ):
+            returncode, _, profile_failure = _invoke_artifact(binary, arguments)
+            assert returncode == 2
+            assert profile_failure["changed"] is False
+            assert profile_failure["diagnostics"] == [
+                {
+                    "code": "PXLC-ARTIFACT-PROFILE",
+                    "message": "artifact profile is unsupported",
+                }
+            ]
+
+        returncode, _, path_before_profile = _invoke_artifact(
+            binary,
+            [
+                "artifact",
+                "inspect",
+                "--manifest",
+                os.fspath(profile_mismatch),
+                "--payload",
+                os.fspath(workspace / "missing-payload.bin"),
+                "--json",
+            ],
+        )
+        assert returncode == 2
+        assert path_before_profile["diagnostics"][0]["code"] == "PXLC-ARTIFACT-PATH"
 
         second = "a3" * 16
         returncode, _, already = _invoke_artifact(

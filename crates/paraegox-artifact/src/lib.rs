@@ -11,10 +11,11 @@ mod store;
 
 pub use contract::{
     ARTIFACT_DEFENSE_CEILING_BYTES, ArtifactCapacityInputV1, ArtifactConfigCommitmentV1,
-    ArtifactContractError, ArtifactFilesystemClaimV1, ArtifactManifestV1, ArtifactObjectRecordV1,
-    ArtifactObjectRefV1, ArtifactOperationIdV1, ArtifactQuarantineFactsV1, ArtifactRecoveryStartV1,
-    ArtifactSnapshotSuccessorV1, ArtifactStoreInstanceV1, ArtifactStoreSnapshotCandidateV1,
-    ArtifactStoreSnapshotV1, MAX_ARTIFACT_OBJECTS, MAX_ARTIFACT_OPERATIONS,
+    ArtifactContractError, ArtifactFilesystemClaimV1, ArtifactManifestProfileClassificationV1,
+    ArtifactManifestV1, ArtifactObjectRecordV1, ArtifactObjectRefV1, ArtifactOperationIdV1,
+    ArtifactQuarantineFactsV1, ArtifactRecoveryStartV1, ArtifactSnapshotSuccessorV1,
+    ArtifactStoreInstanceV1, ArtifactStoreSnapshotCandidateV1, ArtifactStoreSnapshotV1,
+    MAX_ARTIFACT_OBJECTS, MAX_ARTIFACT_OPERATIONS,
     MAX_ARTIFACT_PAYLOAD_BYTES, MAX_ARTIFACT_QUARANTINE_BYTES, MAX_ARTIFACT_SNAPSHOT_BYTES,
     MAX_PXAY_BODY_BYTES, MaterializationAdmissionV1, MaterializationOperationV1,
     MaterializationReceiptRefV1, MaterializationReceiptV1, MaterializationRequestV1,
