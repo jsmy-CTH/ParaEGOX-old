@@ -130,7 +130,16 @@ def _invoke_json(
         print(f"D0B-STDERR:{process.stderr.decode(errors='backslashreplace')}")
         _print_d0b_failure_state(environment)
         if arguments and arguments[0] == "deploy":
-            pytest.exit("captured first D0b deploy failure", returncode=1)
+            diagnostic_path = Path(environment["PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH"])
+            diagnostic = (
+                diagnostic_path.read_text(encoding="utf-8", errors="backslashreplace").strip()
+                if diagnostic_path.is_file()
+                else "<absent>"
+            )
+            pytest.exit(
+                f"captured first D0b deploy failure: {diagnostic}",
+                returncode=1,
+            )
     assert process.returncode == expected_returncode, (
         arguments,
         process.returncode,
