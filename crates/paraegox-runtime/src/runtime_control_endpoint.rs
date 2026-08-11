@@ -3276,35 +3276,57 @@ impl ManagedFabricControlService {
         frame: &[u8],
     ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
         if frame.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES {
+            record_d0b_runtime_diagnostic("request-bound", frame.len());
             return Err(RuntimeControlRequestError::Rejected);
         }
         let request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(frame)
-            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+            .map_err(|error| {
+                record_d0b_runtime_diagnostic("request-decode", error);
+                RuntimeControlRequestError::Rejected
+            })?;
         self.provisioning
             .admission_policy()
             .authenticate_artifact_managed_model_agent_stack_apply_request(&request)
-            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+            .map_err(|error| {
+                record_d0b_runtime_diagnostic("request-authenticate", error);
+                RuntimeControlRequestError::Rejected
+            })?;
         if let Some(model_stack) = self.artifact_model_stack.as_ref() {
             return match model_stack.authenticated_terminal_replay(&request, self.channel) {
                 Ok(Some(receipt)) => managed_model_agent_stack_terminal_response_wire(&receipt),
-                Ok(None) => Err(map_managed_model_agent_stack_error(
-                    ManagedModelAgentStackRuntimeError::OperationConflict,
-                )),
-                Err(error) => Err(map_managed_model_agent_stack_error(error)),
+                Ok(None) => {
+                    record_d0b_runtime_diagnostic("terminal-replay-missing", "operation-conflict");
+                    Err(map_managed_model_agent_stack_error(
+                        ManagedModelAgentStackRuntimeError::OperationConflict,
+                    ))
+                }
+                Err(error) => {
+                    record_d0b_runtime_diagnostic("terminal-replay", &error);
+                    Err(map_managed_model_agent_stack_error(error))
+                }
             };
         }
         self.core
             .require_remote_agent_access_s0_mutation_unfrozen_v2()
-            .map_err(map_managed_fabric_error)?;
+            .map_err(|error| {
+                record_d0b_runtime_diagnostic("mutation-freeze", &error);
+                map_managed_fabric_error(error)
+            })?;
         let reading = self
             .core
             .clock_reading()
-            .map_err(map_managed_fabric_error)?;
+            .map_err(|error| {
+                record_d0b_runtime_diagnostic("clock-reading", &error);
+                map_managed_fabric_error(error)
+            })?;
         let verified = self
             .provisioning
             .admission_policy()
             .verify_artifact_managed_model_agent_stack_apply_request(&request, reading)
-            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+            .map_err(|error| {
+                record_d0b_runtime_diagnostic("request-verify", error);
+                RuntimeControlRequestError::Rejected
+            })?;
         let runtime_host_epoch = self.core.runtime_host_epoch();
         let clock = self.core.stack_clock();
         let cutover = ArtifactManagedModelAgentStackRuntimeCore::cutover(
@@ -3324,7 +3346,10 @@ impl ManagedFabricControlService {
             self.channel,
         )
         .await
-        .map_err(map_managed_model_agent_stack_error)?;
+        .map_err(|error| {
+            record_d0b_runtime_diagnostic("cutover", &error);
+            map_managed_model_agent_stack_error(error)
+        })?;
         match cutover {
             ArtifactManagedModelAgentStackCutoverOutcome::NoEffect(receipt) => {
                 managed_model_agent_stack_terminal_response_wire(&receipt)
@@ -3333,7 +3358,10 @@ impl ManagedFabricControlService {
                 self.artifact_model_stack = Some(*model_stack);
                 match receipt {
                     Some(receipt) => managed_model_agent_stack_terminal_response_wire(&receipt),
-                    None => Err(RuntimeControlRequestError::Unavailable),
+                    None => {
+                        record_d0b_runtime_diagnostic("installed", "missing-terminal");
+                        Err(RuntimeControlRequestError::Unavailable)
+                    }
                 }
             }
         }
@@ -4053,6 +4081,13 @@ fn map_managed_model_agent_stack_error(
             error,
         ))
     }
+}
+
+fn record_d0b_runtime_diagnostic(stage: &str, detail: impl fmt::Debug) {
+    let Some(path) = std::env::var_os("PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH") else {
+        return;
+    };
+    let _ = fs::write(path, format!("{stage}:{detail:?}\n"));
 }
 
 fn map_distributed_agent_stack_error(
