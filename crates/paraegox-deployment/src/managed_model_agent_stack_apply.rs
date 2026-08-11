@@ -9,7 +9,10 @@ use core::num::NonZeroU64;
 use core::{fmt, str::FromStr};
 
 use ed25519_dalek::Signature;
-use paraegox_artifact::{ArtifactConfigCommitmentV1, ArtifactContractError, ArtifactObjectRefV1};
+use paraegox_artifact::{
+    ArtifactConfigCommitmentV1, ArtifactContractError, ArtifactObjectRefV1,
+    MaterializationReceiptRefV1,
+};
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_runtime_contracts::apply::ExpectedActive;
 use paraegox_runtime_contracts::managed_fabric_plan::{
@@ -20,7 +23,7 @@ use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
     ArtifactBoundManagedModelAgentStackTargetExecutionV1, ArtifactExecutionBindingV1,
     ManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackPlanError,
     ManagedModelAgentStackTargetModeV1, ManagedModelAgentStackTerminalOutcomeV1,
-    ManagedModelAgentStackTerminalReceiptV1,
+    ManagedModelAgentStackTerminalReceiptV1, artifact_execution_profile_commitment_v1,
 };
 use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
 use paraegox_runtime_contracts::provenance::{SourcePlanRevision, TargetSliceDigest};
@@ -494,6 +497,30 @@ impl ArtifactExternalDeploymentProgressV1 {
 
     const fn has_lifecycle_generation(self) -> bool {
         !all_zero_16(self.lifecycle_generation)
+    }
+
+    const fn deployment_revision(self) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.deployment_revision)
+    }
+
+    const fn committed_controller_snapshot_sequence(self) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.controller_snapshot_sequence)
+    }
+
+    fn runtime_apply_request_digest(self) -> Option<Digest32> {
+        optional_digest_from_bytes(self.runtime_apply_request_digest)
+    }
+
+    fn runtime_terminal_receipt_digest(self) -> Option<Digest32> {
+        optional_digest_from_bytes(self.runtime_terminal_receipt_digest)
+    }
+
+    const fn lifecycle_generation(self) -> Option<[u8; 16]> {
+        if all_zero_16(self.lifecycle_generation) {
+            None
+        } else {
+            Some(self.lifecycle_generation)
+        }
     }
 }
 
@@ -4954,6 +4981,470 @@ mod artifact_external_store {
     }
 }
 
+/// Revalidation failures exposed by the narrow DeveloperLocal external
+/// Controller authority callback. The callback returns values, never handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeveloperArtifactExternalControllerAuthorityRecheckFailureV1 {
+    UnsafePath,
+    Configuration,
+    Io,
+}
+
+/// Current immutable authority binding for the external Controller store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeveloperArtifactExternalControllerAuthorityBindingV1 {
+    state_root: std::path::PathBuf,
+    config_commitment: ArtifactConfigCommitmentV1,
+}
+
+impl DeveloperArtifactExternalControllerAuthorityBindingV1 {
+    pub fn try_new(
+        state_root: std::path::PathBuf,
+        config_commitment: ArtifactConfigCommitmentV1,
+    ) -> Result<Self, DeveloperArtifactExternalControllerAuthorityRecheckFailureV1> {
+        artifact_external_store::ArtifactExternalControllerAuthorityBindingV1::try_new(
+            state_root.clone(),
+            config_commitment,
+        )
+        .map_err(|_| DeveloperArtifactExternalControllerAuthorityRecheckFailureV1::UnsafePath)?;
+        Ok(Self {
+            state_root,
+            config_commitment,
+        })
+    }
+
+    #[must_use]
+    pub fn state_root(&self) -> &std::path::Path {
+        &self.state_root
+    }
+
+    #[must_use]
+    pub const fn config_commitment(&self) -> ArtifactConfigCommitmentV1 {
+        self.config_commitment
+    }
+}
+
+/// Revalidates the current config path before every Controller publication.
+pub trait DeveloperArtifactExternalControllerAuthorityV1 {
+    fn revalidate(
+        &mut self,
+    ) -> Result<
+        DeveloperArtifactExternalControllerAuthorityBindingV1,
+        DeveloperArtifactExternalControllerAuthorityRecheckFailureV1,
+    >;
+}
+
+/// Fully validated fixed-profile input to the external Controller admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeveloperArtifactExternalControllerRequestV1 {
+    operation_id: ArtifactDeploymentOperationIdV1,
+    config_commitment: ArtifactConfigCommitmentV1,
+    object_ref: ArtifactObjectRefV1,
+    materialization_receipt_ref: MaterializationReceiptRefV1,
+}
+
+impl DeveloperArtifactExternalControllerRequestV1 {
+    pub fn try_new(
+        operation_id: ArtifactDeploymentOperationIdV1,
+        config_commitment: ArtifactConfigCommitmentV1,
+        object_ref: ArtifactObjectRefV1,
+        materialization_receipt_ref: MaterializationReceiptRefV1,
+    ) -> Option<Self> {
+        let binding = ArtifactExecutionBindingV1::try_new(
+            object_ref,
+            materialization_receipt_ref,
+            artifact_execution_profile_commitment_v1(),
+        )
+        .ok()?;
+        ArtifactExternalDeploymentRequestV1::try_new(
+            operation_id,
+            config_commitment,
+            binding,
+        )
+        .ok()?;
+        Some(Self {
+            operation_id,
+            config_commitment,
+            object_ref,
+            materialization_receipt_ref,
+        })
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> ArtifactDeploymentOperationIdV1 {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn config_commitment(&self) -> ArtifactConfigCommitmentV1 {
+        self.config_commitment
+    }
+
+    #[must_use]
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
+
+    #[must_use]
+    pub const fn materialization_receipt_ref(&self) -> MaterializationReceiptRefV1 {
+        self.materialization_receipt_ref
+    }
+}
+
+/// Public semantic phase. No PXMJ wire value or mutable owner handle escapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeveloperArtifactExternalControllerPhaseV1 {
+    Admitted,
+    Committed,
+    Applying,
+    ActiveReady,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeveloperArtifactExternalControllerTerminalOutcomeV1 {
+    ActiveReady,
+    Failed,
+    Uncertain,
+}
+
+/// Owned point-in-time projection consumed by the local JSON boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeveloperArtifactExternalControllerProjectionV1 {
+    phase: DeveloperArtifactExternalControllerPhaseV1,
+    operation_id: ArtifactDeploymentOperationIdV1,
+    object_ref: ArtifactObjectRefV1,
+    materialization_receipt_ref: MaterializationReceiptRefV1,
+    lifecycle_generation: Option<[u8; 16]>,
+    deployment_revision: Option<NonZeroU64>,
+    committed_controller_snapshot_sequence: Option<NonZeroU64>,
+    deployment_receipt_ref: Option<Box<str>>,
+    runtime_apply_request_digest: Option<Digest32>,
+    runtime_terminal_receipt_digest: Option<Digest32>,
+    terminal_outcome: Option<DeveloperArtifactExternalControllerTerminalOutcomeV1>,
+}
+
+impl DeveloperArtifactExternalControllerProjectionV1 {
+    #[must_use]
+    pub const fn phase(&self) -> DeveloperArtifactExternalControllerPhaseV1 {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> ArtifactDeploymentOperationIdV1 {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn object_ref(&self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
+
+    #[must_use]
+    pub const fn materialization_receipt_ref(&self) -> MaterializationReceiptRefV1 {
+        self.materialization_receipt_ref
+    }
+
+    #[must_use]
+    pub const fn lifecycle_generation(&self) -> Option<[u8; 16]> {
+        self.lifecycle_generation
+    }
+
+    #[must_use]
+    pub const fn deployment_revision(&self) -> Option<NonZeroU64> {
+        self.deployment_revision
+    }
+
+    #[must_use]
+    pub const fn committed_controller_snapshot_sequence(&self) -> Option<NonZeroU64> {
+        self.committed_controller_snapshot_sequence
+    }
+
+    #[must_use]
+    pub fn deployment_receipt_ref(&self) -> Option<&str> {
+        self.deployment_receipt_ref.as_deref()
+    }
+
+    #[must_use]
+    pub const fn runtime_apply_request_digest(&self) -> Option<Digest32> {
+        self.runtime_apply_request_digest
+    }
+
+    #[must_use]
+    pub const fn runtime_terminal_receipt_digest(&self) -> Option<Digest32> {
+        self.runtime_terminal_receipt_digest
+    }
+
+    #[must_use]
+    pub const fn terminal_outcome(
+        &self,
+    ) -> Option<DeveloperArtifactExternalControllerTerminalOutcomeV1> {
+        self.terminal_outcome
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeveloperArtifactExternalControllerFailureV1 {
+    UnsafePath,
+    ConfigurationMismatch,
+    Conflict,
+    ReplaceRequired,
+    NotFound,
+    Contended,
+    PublicationUncertain(Option<Box<DeveloperArtifactExternalControllerProjectionV1>>),
+    Owner,
+    Io,
+}
+
+/// Fully owned result. `changed` is `None` only when owner mutation attribution
+/// is no longer provable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeveloperArtifactExternalControllerInvocationV1 {
+    changed: Option<bool>,
+    result: Result<
+        DeveloperArtifactExternalControllerProjectionV1,
+        DeveloperArtifactExternalControllerFailureV1,
+    >,
+}
+
+impl DeveloperArtifactExternalControllerInvocationV1 {
+    #[must_use]
+    pub const fn changed(&self) -> Option<bool> {
+        self.changed
+    }
+
+    #[must_use]
+    pub fn result(
+        &self,
+    ) -> Result<
+        &DeveloperArtifactExternalControllerProjectionV1,
+        &DeveloperArtifactExternalControllerFailureV1,
+    > {
+        self.result.as_ref()
+    }
+
+    pub fn into_result(
+        self,
+    ) -> Result<
+        DeveloperArtifactExternalControllerProjectionV1,
+        DeveloperArtifactExternalControllerFailureV1,
+    > {
+        self.result
+    }
+}
+
+struct DeveloperArtifactExternalControllerAuthorityAdapter<'a> {
+    authority: &'a mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+}
+
+impl artifact_external_store::ArtifactExternalControllerAuthorityV1
+    for DeveloperArtifactExternalControllerAuthorityAdapter<'_>
+{
+    fn revalidate(
+        &mut self,
+    ) -> Result<
+        artifact_external_store::ArtifactExternalControllerAuthorityBindingV1,
+        artifact_external_store::ArtifactExternalControllerAuthorityRecheckFailureV1,
+    > {
+        let binding = self.authority.revalidate().map_err(|failure| match failure {
+            DeveloperArtifactExternalControllerAuthorityRecheckFailureV1::UnsafePath => {
+                artifact_external_store::ArtifactExternalControllerAuthorityRecheckFailureV1::UnsafePath
+            }
+            DeveloperArtifactExternalControllerAuthorityRecheckFailureV1::Configuration => {
+                artifact_external_store::ArtifactExternalControllerAuthorityRecheckFailureV1::Configuration
+            }
+            DeveloperArtifactExternalControllerAuthorityRecheckFailureV1::Io => {
+                artifact_external_store::ArtifactExternalControllerAuthorityRecheckFailureV1::Io
+            }
+        })?;
+        artifact_external_store::ArtifactExternalControllerAuthorityBindingV1::try_new(
+            binding.state_root,
+            binding.config_commitment,
+        )
+        .map_err(|_| {
+            artifact_external_store::ArtifactExternalControllerAuthorityRecheckFailureV1::UnsafePath
+        })
+    }
+}
+
+/// Narrow one-shot facade over the owner-private PXMJ v2 store. The mutating
+/// admission entrypoint is called only while the Local lifecycle owner lock is
+/// already held; this facade does not create a second lifecycle authority.
+pub struct DeveloperArtifactExternalControllerV1;
+
+impl DeveloperArtifactExternalControllerV1 {
+    pub fn admit_under_lifecycle_owner(
+        authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+        request: &DeveloperArtifactExternalControllerRequestV1,
+    ) -> DeveloperArtifactExternalControllerInvocationV1 {
+        let Ok(request) = internal_external_request(request) else {
+            return DeveloperArtifactExternalControllerInvocationV1 {
+                changed: Some(false),
+                result: Err(DeveloperArtifactExternalControllerFailureV1::Owner),
+            };
+        };
+        let mut adapter = DeveloperArtifactExternalControllerAuthorityAdapter { authority };
+        project_external_invocation(
+            artifact_external_store::ArtifactExternalDeploymentControllerStoreV1::admit(
+                &mut adapter,
+                &request,
+            ),
+        )
+    }
+
+    pub fn query(
+        authority: &mut dyn DeveloperArtifactExternalControllerAuthorityV1,
+        operation_id: ArtifactDeploymentOperationIdV1,
+    ) -> DeveloperArtifactExternalControllerInvocationV1 {
+        let mut adapter = DeveloperArtifactExternalControllerAuthorityAdapter { authority };
+        project_external_invocation(
+            artifact_external_store::ArtifactExternalDeploymentControllerStoreV1::query(
+                &mut adapter,
+                operation_id,
+            ),
+        )
+    }
+}
+
+fn internal_external_request(
+    request: &DeveloperArtifactExternalControllerRequestV1,
+) -> Result<ArtifactExternalDeploymentRequestV1, ManagedModelAgentStackApplyControllerError> {
+    let binding = ArtifactExecutionBindingV1::try_new(
+        request.object_ref,
+        request.materialization_receipt_ref,
+        artifact_execution_profile_commitment_v1(),
+    )?;
+    ArtifactExternalDeploymentRequestV1::try_new(
+        request.operation_id,
+        request.config_commitment,
+        binding,
+    )
+}
+
+fn project_external_invocation(
+    invocation: artifact_external_store::ArtifactExternalControllerStoreInvocationV1,
+) -> DeveloperArtifactExternalControllerInvocationV1 {
+    let changed = match invocation.change() {
+        artifact_external_store::ArtifactExternalControllerStoreChangeV1::Unchanged => Some(false),
+        artifact_external_store::ArtifactExternalControllerStoreChangeV1::Changed => Some(true),
+        artifact_external_store::ArtifactExternalControllerStoreChangeV1::Unknown => None,
+    };
+    let result = match invocation.into_result() {
+        Ok(state) => project_external_state(&state),
+        Err(failure) => Err(project_external_failure(failure)),
+    };
+    DeveloperArtifactExternalControllerInvocationV1 { changed, result }
+}
+
+fn project_external_failure(
+    failure: artifact_external_store::ArtifactExternalControllerStoreFailureV1,
+) -> DeveloperArtifactExternalControllerFailureV1 {
+    match failure {
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::UnsafePath => {
+            DeveloperArtifactExternalControllerFailureV1::UnsafePath
+        }
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::ConfigurationMismatch => {
+            DeveloperArtifactExternalControllerFailureV1::ConfigurationMismatch
+        }
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::Conflict => {
+            DeveloperArtifactExternalControllerFailureV1::Conflict
+        }
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::ReplaceRequired => {
+            DeveloperArtifactExternalControllerFailureV1::ReplaceRequired
+        }
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::NotFound => {
+            DeveloperArtifactExternalControllerFailureV1::NotFound
+        }
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::Contended => {
+            DeveloperArtifactExternalControllerFailureV1::Contended
+        }
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::PublicationUncertain(
+            state,
+        ) => match state.map(|state| project_external_state(&state)).transpose() {
+            Ok(state) => DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(state),
+            Err(_) => DeveloperArtifactExternalControllerFailureV1::Owner,
+        },
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::Owner => {
+            DeveloperArtifactExternalControllerFailureV1::Owner
+        }
+        artifact_external_store::ArtifactExternalControllerStoreFailureV1::Io => {
+            DeveloperArtifactExternalControllerFailureV1::Io
+        }
+    }
+}
+
+fn project_external_state(
+    state: &ArtifactExternalControllerStateV2,
+) -> Result<
+    DeveloperArtifactExternalControllerProjectionV1,
+    DeveloperArtifactExternalControllerFailureV1,
+> {
+    let phase = match state.phase() {
+        ArtifactExternalControllerPhaseV2::Admitted => {
+            DeveloperArtifactExternalControllerPhaseV1::Admitted
+        }
+        ArtifactExternalControllerPhaseV2::Committed => {
+            DeveloperArtifactExternalControllerPhaseV1::Committed
+        }
+        ArtifactExternalControllerPhaseV2::Applying => {
+            DeveloperArtifactExternalControllerPhaseV1::Applying
+        }
+        ArtifactExternalControllerPhaseV2::ActiveReady => {
+            DeveloperArtifactExternalControllerPhaseV1::ActiveReady
+        }
+        ArtifactExternalControllerPhaseV2::Failed => {
+            DeveloperArtifactExternalControllerPhaseV1::Failed
+        }
+        ArtifactExternalControllerPhaseV2::Uncertain => {
+            DeveloperArtifactExternalControllerPhaseV1::Uncertain
+        }
+    };
+    let progress = state.records().last().map(|record| record.progress());
+    let deployment_receipt_ref = match state.receipt() {
+        Some(receipt) => Some(
+            DeploymentReceiptRefV1::from_receipt(state.request(), state.admission(), receipt)
+                .map_err(|_| DeveloperArtifactExternalControllerFailureV1::Owner)?
+                .encode()
+                .into_boxed_str(),
+        ),
+        None => None,
+    };
+    let terminal_outcome = match state.phase() {
+        ArtifactExternalControllerPhaseV2::ActiveReady => {
+            Some(DeveloperArtifactExternalControllerTerminalOutcomeV1::ActiveReady)
+        }
+        ArtifactExternalControllerPhaseV2::Failed => {
+            Some(DeveloperArtifactExternalControllerTerminalOutcomeV1::Failed)
+        }
+        ArtifactExternalControllerPhaseV2::Uncertain => {
+            Some(DeveloperArtifactExternalControllerTerminalOutcomeV1::Uncertain)
+        }
+        ArtifactExternalControllerPhaseV2::Admitted
+        | ArtifactExternalControllerPhaseV2::Committed
+        | ArtifactExternalControllerPhaseV2::Applying => None,
+    };
+    Ok(DeveloperArtifactExternalControllerProjectionV1 {
+        phase,
+        operation_id: state.request().operation_id(),
+        object_ref: state.request().binding().object_ref(),
+        materialization_receipt_ref: state.request().binding().materialization_receipt_ref(),
+        lifecycle_generation: progress.and_then(ArtifactExternalDeploymentProgressV1::lifecycle_generation),
+        deployment_revision: progress.and_then(ArtifactExternalDeploymentProgressV1::deployment_revision),
+        committed_controller_snapshot_sequence: progress.and_then(
+            ArtifactExternalDeploymentProgressV1::committed_controller_snapshot_sequence,
+        ),
+        deployment_receipt_ref,
+        runtime_apply_request_digest: progress.and_then(
+            ArtifactExternalDeploymentProgressV1::runtime_apply_request_digest,
+        ),
+        runtime_terminal_receipt_digest: progress.and_then(
+            ArtifactExternalDeploymentProgressV1::runtime_terminal_receipt_digest,
+        ),
+        terminal_outcome,
+    })
+}
+
 impl fmt::Display for ManagedModelAgentStackApplyControllerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -5093,6 +5584,24 @@ mod tests {
         ) -> Result<
             ArtifactExternalControllerAuthorityBindingV1,
             ArtifactExternalControllerAuthorityRecheckFailureV1,
+        > {
+            Ok(self.binding.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedDeveloperArtifactExternalAuthority {
+        binding: DeveloperArtifactExternalControllerAuthorityBindingV1,
+    }
+
+    impl DeveloperArtifactExternalControllerAuthorityV1
+        for FixedDeveloperArtifactExternalAuthority
+    {
+        fn revalidate(
+            &mut self,
+        ) -> Result<
+            DeveloperArtifactExternalControllerAuthorityBindingV1,
+            DeveloperArtifactExternalControllerAuthorityRecheckFailureV1,
         > {
             Ok(self.binding.clone())
         }
@@ -7615,6 +8124,89 @@ mod tests {
             final_query.result().expect("queried R").phase(),
             ArtifactExternalControllerPhaseV2::ActiveReady,
         );
+
+        let public_binding = DeveloperArtifactExternalControllerAuthorityBindingV1::try_new(
+            test_root.state_root(),
+            request.config_commitment(),
+        )
+        .expect("public authority binding");
+        let mut public_authority = FixedDeveloperArtifactExternalAuthority {
+            binding: public_binding,
+        };
+        let projected = DeveloperArtifactExternalControllerV1::query(
+            &mut public_authority,
+            request.operation_id(),
+        );
+        assert_eq!(projected.changed(), Some(false));
+        let projected = projected.result().expect("projected R");
+        assert_eq!(
+            projected.phase(),
+            DeveloperArtifactExternalControllerPhaseV1::ActiveReady,
+        );
+        assert_eq!(projected.object_ref(), request.binding().object_ref());
+        assert_eq!(
+            projected.materialization_receipt_ref(),
+            request.binding().materialization_receipt_ref(),
+        );
+        assert_eq!(projected.lifecycle_generation(), Some([0x54; 16]));
+        assert_eq!(
+            projected.deployment_revision().map(NonZeroU64::get),
+            Some(1),
+        );
+        assert_eq!(
+            projected
+                .committed_controller_snapshot_sequence()
+                .map(NonZeroU64::get),
+            Some(2),
+        );
+        assert!(projected.deployment_receipt_ref().is_some());
+        assert_eq!(
+            projected.terminal_outcome(),
+            Some(DeveloperArtifactExternalControllerTerminalOutcomeV1::ActiveReady),
+        );
+    }
+
+    #[test]
+    fn developer_external_controller_facade_admits_without_exposing_owner_state() {
+        let admitted_fixture =
+            ArtifactExternalControllerStateV2::decode(&decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_admitted.hex"
+            ))))
+            .expect("A fixture");
+        let internal = admitted_fixture.request();
+        let request = DeveloperArtifactExternalControllerRequestV1::try_new(
+            internal.operation_id(),
+            internal.config_commitment(),
+            internal.binding().object_ref(),
+            internal.binding().materialization_receipt_ref(),
+        )
+        .expect("public request");
+        let test_root = ArtifactExternalStoreTestRoot::new();
+        let binding = DeveloperArtifactExternalControllerAuthorityBindingV1::try_new(
+            test_root.state_root(),
+            request.config_commitment(),
+        )
+        .expect("public authority binding");
+        let mut authority = FixedDeveloperArtifactExternalAuthority { binding };
+
+        let admitted = DeveloperArtifactExternalControllerV1::admit_under_lifecycle_owner(
+            &mut authority,
+            &request,
+        );
+        assert_eq!(admitted.changed(), Some(true));
+        let projection = admitted.result().expect("projected A");
+        assert_eq!(
+            projection.phase(),
+            DeveloperArtifactExternalControllerPhaseV1::Admitted,
+        );
+        assert_eq!(projection.operation_id(), request.operation_id());
+        assert_eq!(projection.deployment_revision(), None);
+        assert_eq!(projection.committed_controller_snapshot_sequence(), None);
+        assert_eq!(projection.deployment_receipt_ref(), None);
+        assert_eq!(projection.runtime_apply_request_digest(), None);
+        assert_eq!(projection.runtime_terminal_receipt_digest(), None);
+        assert_eq!(projection.terminal_outcome(), None);
     }
 
     #[test]

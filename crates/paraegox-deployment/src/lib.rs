@@ -120,5 +120,12 @@ pub use developer_local_tenure_authority::{
     DeveloperLocalTenureAuthorityIdentityBytesV1, DeveloperLocalTenureAuthorityV1,
 };
 #[cfg(unix)]
-pub use managed_model_agent_stack_apply::ArtifactDeploymentOperationIdV1;
+pub use managed_model_agent_stack_apply::{
+    ArtifactDeploymentOperationIdV1, DeveloperArtifactExternalControllerAuthorityBindingV1,
+    DeveloperArtifactExternalControllerAuthorityRecheckFailureV1,
+    DeveloperArtifactExternalControllerAuthorityV1, DeveloperArtifactExternalControllerFailureV1,
+    DeveloperArtifactExternalControllerInvocationV1, DeveloperArtifactExternalControllerPhaseV1,
+    DeveloperArtifactExternalControllerProjectionV1, DeveloperArtifactExternalControllerRequestV1,
+    DeveloperArtifactExternalControllerTerminalOutcomeV1, DeveloperArtifactExternalControllerV1,
+};
 pub use tenure_authority_process::{TenureAuthorityProcessError, run_tenure_authority_process};
