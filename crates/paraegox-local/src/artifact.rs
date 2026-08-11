@@ -1590,14 +1590,13 @@ mod json_tests {
             arguments[index] = OsString::from_vec(vec![0xff]);
             let mut output = Vec::new();
             assert_eq!(
-                dispatch_to(
-                    &mut output,
-                    ArtifactJsonIntentV1::Materialize,
-                    &arguments,
-                ),
+                dispatch_to(&mut output, ArtifactJsonIntentV1::Materialize, &arguments,),
                 2
             );
-            assert_eq!(String::from_utf8(output).expect("UTF-8 JSON"), MATERIALIZE_ERROR);
+            assert_eq!(
+                String::from_utf8(output).expect("UTF-8 JSON"),
+                MATERIALIZE_ERROR
+            );
         }
 
         let mut query = [
