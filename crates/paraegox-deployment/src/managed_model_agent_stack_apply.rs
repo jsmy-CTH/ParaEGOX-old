@@ -3215,6 +3215,1626 @@ impl From<DigestBuildError> for ManagedModelAgentStackApplyControllerError {
     }
 }
 
+mod artifact_external_store {
+    use std::collections::BTreeSet;
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{File, Metadata, TryLockError};
+    use std::io::{Read, Write};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Component, Path, PathBuf};
+
+    use nix::dir::Dir;
+    use nix::fcntl::{OFlag, open, openat, renameat};
+    use nix::sys::stat::{Mode, fchmod, mkdirat};
+    use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    use super::{
+        ArtifactConfigCommitmentV1, ArtifactDeploymentOperationIdV1,
+        ArtifactExternalControllerPhaseV2, ArtifactExternalControllerStateV2,
+        ArtifactExternalDeploymentRequestV1, MAX_ARTIFACT_STATE_V2_BYTES,
+    };
+
+    const MAX_STATE_ROOT_UTF8_BYTES: usize = 3917;
+    const ROOT_NAME: &str = "artifact-external-controller-v1";
+    const STAGING_NAME: &str = ".artifact-external-controller-v1.initializing";
+    const LOCK_NAME: &str = "artifact-external.lock";
+    const SNAPSHOT_NAME: &str = "artifact-external.pxmj";
+    const NEXT_NAME: &str = ".artifact-external.pxmj.next";
+    const DIRECTORY_MODE_BITS: u32 = 0o700;
+    const FILE_MODE_BITS: u32 = 0o600;
+    const MODE_MASK: u32 = 0o7777;
+    const DIRECTORY_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR).union(Mode::S_IXUSR);
+    const FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ArtifactExternalControllerAuthorityBindingV1 {
+        state_root: PathBuf,
+        config_commitment: ArtifactConfigCommitmentV1,
+    }
+
+    impl ArtifactExternalControllerAuthorityBindingV1 {
+        pub(crate) fn try_new(
+            state_root: PathBuf,
+            config_commitment: ArtifactConfigCommitmentV1,
+        ) -> Result<Self, ArtifactExternalControllerStoreFailureV1> {
+            validate_state_root_path(&state_root)?;
+            Ok(Self {
+                state_root,
+                config_commitment,
+            })
+        }
+
+        pub(crate) fn state_root(&self) -> &Path {
+            &self.state_root
+        }
+
+        pub(crate) const fn config_commitment(&self) -> ArtifactConfigCommitmentV1 {
+            self.config_commitment
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ArtifactExternalControllerAuthorityRecheckFailureV1 {
+        UnsafePath,
+        Configuration,
+        Io,
+    }
+
+    pub(crate) trait ArtifactExternalControllerAuthorityV1 {
+        fn revalidate(
+            &mut self,
+        ) -> Result<
+            ArtifactExternalControllerAuthorityBindingV1,
+            ArtifactExternalControllerAuthorityRecheckFailureV1,
+        >;
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ArtifactExternalControllerStoreChangeV1 {
+        Unchanged,
+        Changed,
+        Unknown,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum ArtifactExternalControllerStoreFailureV1 {
+        UnsafePath,
+        ConfigurationMismatch,
+        Conflict,
+        ReplaceRequired,
+        NotFound,
+        Contended,
+        PublicationUncertain(Option<Box<ArtifactExternalControllerStateV2>>),
+        Owner,
+        Io,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ArtifactExternalControllerStoreInvocationV1 {
+        change: ArtifactExternalControllerStoreChangeV1,
+        result: Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1>,
+    }
+
+    impl ArtifactExternalControllerStoreInvocationV1 {
+        fn success(
+            change: ArtifactExternalControllerStoreChangeV1,
+            state: ArtifactExternalControllerStateV2,
+        ) -> Self {
+            Self {
+                change,
+                result: Ok(state),
+            }
+        }
+
+        fn failure(
+            change: ArtifactExternalControllerStoreChangeV1,
+            failure: ArtifactExternalControllerStoreFailureV1,
+        ) -> Self {
+            Self {
+                change,
+                result: Err(failure),
+            }
+        }
+
+        pub(crate) const fn change(&self) -> ArtifactExternalControllerStoreChangeV1 {
+            self.change
+        }
+
+        pub(crate) fn result(
+            &self,
+        ) -> Result<&ArtifactExternalControllerStateV2, &ArtifactExternalControllerStoreFailureV1>
+        {
+            self.result.as_ref()
+        }
+
+        pub(crate) fn into_result(
+            self,
+        ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1>
+        {
+            self.result
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FileIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    impl FileIdentity {
+        fn from_metadata(metadata: &Metadata) -> Self {
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+    }
+
+    struct DirectoryHandle {
+        file: File,
+        identity: FileIdentity,
+        owner_uid: u32,
+        owner_gid: u32,
+    }
+
+    struct StateRootHandle {
+        parent: DirectoryHandle,
+        leaf_name: OsString,
+        leaf: DirectoryHandle,
+    }
+
+    #[derive(Clone, Copy)]
+    enum LockMode {
+        Shared,
+        Exclusive,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ChangeTracker(ArtifactExternalControllerStoreChangeV1);
+
+    impl ChangeTracker {
+        const fn new() -> Self {
+            Self(ArtifactExternalControllerStoreChangeV1::Unchanged)
+        }
+
+        fn ambiguous(&mut self) {
+            self.0 = ArtifactExternalControllerStoreChangeV1::Unknown;
+        }
+
+        fn committed(&mut self) {
+            self.0 = ArtifactExternalControllerStoreChangeV1::Changed;
+        }
+
+        const fn change(self) -> ArtifactExternalControllerStoreChangeV1 {
+            self.0
+        }
+    }
+
+    pub(crate) struct ArtifactExternalDeploymentControllerLockedV1 {
+        state_root: StateRootHandle,
+        root: DirectoryHandle,
+        lock: Option<File>,
+        lock_identity: FileIdentity,
+        snapshot_identity: FileIdentity,
+        snapshot_bytes: Box<[u8]>,
+        state: ArtifactExternalControllerStateV2,
+    }
+
+    impl ArtifactExternalDeploymentControllerLockedV1 {
+        pub(crate) const fn state(&self) -> &ArtifactExternalControllerStateV2 {
+            &self.state
+        }
+
+        pub(crate) fn commit_successor(
+            &mut self,
+            authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+            binding: &ArtifactExternalControllerAuthorityBindingV1,
+            next: ArtifactExternalControllerStateV2,
+        ) -> ArtifactExternalControllerStoreInvocationV1 {
+            let mut tracker = ChangeTracker::new();
+            let result = commit_successor(self, authority, binding, next, &mut tracker);
+            match result {
+                Ok(state) => {
+                    ArtifactExternalControllerStoreInvocationV1::success(tracker.change(), state)
+                }
+                Err(failure) => {
+                    ArtifactExternalControllerStoreInvocationV1::failure(tracker.change(), failure)
+                }
+            }
+        }
+
+        pub(crate) fn release(mut self) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+            let lock = self
+                .lock
+                .take()
+                .ok_or(ArtifactExternalControllerStoreFailureV1::Owner)?;
+            drop(self);
+            lock.unlock()
+                .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)
+        }
+    }
+
+    impl Drop for ArtifactExternalDeploymentControllerLockedV1 {
+        fn drop(&mut self) {
+            if let Some(lock) = self.lock.take() {
+                let _ = lock.unlock();
+            }
+        }
+    }
+
+    pub(crate) struct ArtifactExternalDeploymentControllerStoreV1;
+
+    impl ArtifactExternalDeploymentControllerStoreV1 {
+        pub(crate) fn admit(
+            authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+            request: &ArtifactExternalDeploymentRequestV1,
+        ) -> ArtifactExternalControllerStoreInvocationV1 {
+            let mut tracker = ChangeTracker::new();
+            let result = run_admit(authority, request, &mut tracker);
+            match result {
+                Ok(state) => {
+                    ArtifactExternalControllerStoreInvocationV1::success(tracker.change(), state)
+                }
+                Err(failure) => {
+                    ArtifactExternalControllerStoreInvocationV1::failure(tracker.change(), failure)
+                }
+            }
+        }
+
+        pub(crate) fn query(
+            authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+            operation_id: ArtifactDeploymentOperationIdV1,
+        ) -> ArtifactExternalControllerStoreInvocationV1 {
+            match run_query(authority, operation_id) {
+                Ok(state) => ArtifactExternalControllerStoreInvocationV1::success(
+                    ArtifactExternalControllerStoreChangeV1::Unchanged,
+                    state,
+                ),
+                Err(failure) => ArtifactExternalControllerStoreInvocationV1::failure(
+                    ArtifactExternalControllerStoreChangeV1::Unchanged,
+                    failure,
+                ),
+            }
+        }
+
+        pub(crate) fn open_exclusive(
+            authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+            operation_id: ArtifactDeploymentOperationIdV1,
+        ) -> Result<
+            (
+                ArtifactExternalControllerAuthorityBindingV1,
+                ArtifactExternalDeploymentControllerLockedV1,
+            ),
+            ArtifactExternalControllerStoreFailureV1,
+        > {
+            let binding = authority_binding(authority)?;
+            let state_root = pin_state_root(&binding)?;
+            revalidate_current_authority(authority, &binding, &state_root)?;
+            let store = open_final_locked(state_root, &binding, LockMode::Exclusive)?;
+            if store.state.request().operation_id() != operation_id {
+                return release_locked(
+                    store,
+                    Err(ArtifactExternalControllerStoreFailureV1::NotFound),
+                );
+            }
+            Ok((binding, store))
+        }
+    }
+
+    fn validate_state_root_path(
+        path: &Path,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let bytes = path.as_os_str().as_bytes();
+        if !path.is_absolute()
+            || path == Path::new("/")
+            || bytes.len() > MAX_STATE_ROOT_UTF8_BYTES
+            || bytes.contains(&0)
+            || path.to_str().is_none()
+            || bytes.ends_with(b"/")
+            || bytes.windows(2).any(|window| window == b"//")
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::UnsafePath);
+        }
+        for segment in bytes.split(|byte| *byte == b'/').skip(1) {
+            if segment.is_empty() || segment == b"." || segment == b".." {
+                return Err(ArtifactExternalControllerStoreFailureV1::UnsafePath);
+            }
+        }
+        Ok(())
+    }
+
+    fn authority_binding(
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+    ) -> Result<
+        ArtifactExternalControllerAuthorityBindingV1,
+        ArtifactExternalControllerStoreFailureV1,
+    > {
+        let binding = authority.revalidate().map_err(|failure| match failure {
+            ArtifactExternalControllerAuthorityRecheckFailureV1::UnsafePath => {
+                ArtifactExternalControllerStoreFailureV1::UnsafePath
+            }
+            ArtifactExternalControllerAuthorityRecheckFailureV1::Configuration => {
+                ArtifactExternalControllerStoreFailureV1::ConfigurationMismatch
+            }
+            ArtifactExternalControllerAuthorityRecheckFailureV1::Io => {
+                ArtifactExternalControllerStoreFailureV1::Io
+            }
+        })?;
+        validate_state_root_path(binding.state_root())?;
+        Ok(binding)
+    }
+
+    fn require_same_authority(
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        expected: &ArtifactExternalControllerAuthorityBindingV1,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let current = authority_binding(authority)?;
+        if current != *expected {
+            return Err(ArtifactExternalControllerStoreFailureV1::ConfigurationMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_directory_metadata(
+        metadata: &Metadata,
+        uid: u32,
+        gid: u32,
+        strict: bool,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        if !metadata.file_type().is_dir() {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        if strict
+            && (metadata.uid() != uid
+                || metadata.gid() != gid
+                || metadata.mode() & MODE_MASK != DIRECTORY_MODE_BITS)
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        if !strict && metadata.uid() != 0 && metadata.uid() != uid {
+            return Err(ArtifactExternalControllerStoreFailureV1::UnsafePath);
+        }
+        if !strict && metadata.mode() & 0o022 != 0 {
+            return Err(ArtifactExternalControllerStoreFailureV1::UnsafePath);
+        }
+        Ok(())
+    }
+
+    fn validate_regular_metadata(
+        metadata: &Metadata,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        if !metadata.file_type().is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != uid
+            || metadata.gid() != gid
+            || metadata.mode() & MODE_MASK != FILE_MODE_BITS
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn directory_from_owned(
+        owned: OwnedFd,
+        uid: u32,
+        gid: u32,
+        strict: bool,
+    ) -> Result<DirectoryHandle, ArtifactExternalControllerStoreFailureV1> {
+        let file = File::from(owned);
+        let metadata = file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        validate_directory_metadata(&metadata, uid, gid, strict)?;
+        Ok(DirectoryHandle {
+            file,
+            identity: FileIdentity::from_metadata(&metadata),
+            owner_uid: uid,
+            owner_gid: gid,
+        })
+    }
+
+    fn open_state_parent(
+        path: &Path,
+    ) -> Result<(DirectoryHandle, OsString), ArtifactExternalControllerStoreFailureV1> {
+        validate_state_root_path(path)?;
+        let uid = geteuid().as_raw();
+        let gid = getegid().as_raw();
+        let leaf_name = path
+            .file_name()
+            .ok_or(ArtifactExternalControllerStoreFailureV1::UnsafePath)?
+            .to_os_string();
+        let parent_path = path
+            .parent()
+            .ok_or(ArtifactExternalControllerStoreFailureV1::UnsafePath)?;
+        let root = open(
+            Path::new("/"),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        let mut current = directory_from_owned(root, uid, gid, false)?;
+        for component in parent_path.components().skip(1) {
+            let Component::Normal(name) = component else {
+                return Err(ArtifactExternalControllerStoreFailureV1::UnsafePath);
+            };
+            let owned = openat(
+                &current.file,
+                name,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| match error {
+                nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => {
+                    ArtifactExternalControllerStoreFailureV1::UnsafePath
+                }
+                nix::errno::Errno::ENOENT => ArtifactExternalControllerStoreFailureV1::NotFound,
+                _ => ArtifactExternalControllerStoreFailureV1::Io,
+            })?;
+            let next = directory_from_owned(owned, uid, gid, false)?;
+            drop(current);
+            current = next;
+        }
+        let metadata = current
+            .file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        validate_directory_metadata(&metadata, uid, gid, true)
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::UnsafePath)?;
+        Ok((current, leaf_name))
+    }
+
+    fn open_directory_at(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> Result<DirectoryHandle, ArtifactExternalControllerStoreFailureV1> {
+        let owned = openat(
+            &parent.file,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| match error {
+            nix::errno::Errno::ENOENT | nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => {
+                ArtifactExternalControllerStoreFailureV1::Owner
+            }
+            _ => ArtifactExternalControllerStoreFailureV1::Io,
+        })?;
+        directory_from_owned(owned, parent.owner_uid, parent.owner_gid, true)
+    }
+
+    fn open_state_leaf(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+    ) -> Result<DirectoryHandle, ArtifactExternalControllerStoreFailureV1> {
+        let owned = openat(
+            &parent.file,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| match error {
+            nix::errno::Errno::ENOENT => ArtifactExternalControllerStoreFailureV1::NotFound,
+            nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => {
+                ArtifactExternalControllerStoreFailureV1::UnsafePath
+            }
+            _ => ArtifactExternalControllerStoreFailureV1::Io,
+        })?;
+        directory_from_owned(owned, parent.owner_uid, parent.owner_gid, true).map_err(|failure| {
+            match failure {
+                ArtifactExternalControllerStoreFailureV1::Owner => {
+                    ArtifactExternalControllerStoreFailureV1::UnsafePath
+                }
+                other => other,
+            }
+        })
+    }
+
+    fn pin_state_root(
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+    ) -> Result<StateRootHandle, ArtifactExternalControllerStoreFailureV1> {
+        let (parent, leaf_name) = open_state_parent(binding.state_root())?;
+        let leaf = open_state_leaf(&parent, &leaf_name)?;
+        Ok(StateRootHandle {
+            parent,
+            leaf_name,
+            leaf,
+        })
+    }
+
+    fn revalidate_directory(
+        directory: &DirectoryHandle,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let metadata = directory
+            .file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        validate_directory_metadata(&metadata, directory.owner_uid, directory.owner_gid, true)?;
+        if FileIdentity::from_metadata(&metadata) != directory.identity {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn reopen_named_directory(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: FileIdentity,
+    ) -> Result<DirectoryHandle, ArtifactExternalControllerStoreFailureV1> {
+        revalidate_directory(parent)?;
+        let directory = open_directory_at(parent, name)?;
+        if directory.identity != expected {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(directory)
+    }
+
+    fn revalidate_current_authority(
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+        state_root: &StateRootHandle,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        require_same_authority(authority, binding)?;
+        let (parent, leaf_name) = open_state_parent(binding.state_root())?;
+        if parent.identity != state_root.parent.identity || leaf_name != state_root.leaf_name {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let leaf = open_state_leaf(&parent, &leaf_name).map_err(|failure| match failure {
+            ArtifactExternalControllerStoreFailureV1::UnsafePath
+            | ArtifactExternalControllerStoreFailureV1::NotFound => {
+                ArtifactExternalControllerStoreFailureV1::Owner
+            }
+            other => other,
+        })?;
+        if leaf.identity != state_root.leaf.identity {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn scan_names(
+        directory: &DirectoryHandle,
+    ) -> Result<BTreeSet<OsString>, ArtifactExternalControllerStoreFailureV1> {
+        revalidate_directory(directory)?;
+        let owned = openat(
+            &directory.file,
+            ".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        let mut stream =
+            Dir::from_fd(owned).map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        let mut names = BTreeSet::new();
+        for entry in stream.iter() {
+            let entry = entry.map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            if bytes.contains(&0) || !names.insert(OsStr::from_bytes(bytes).to_os_string()) {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+        }
+        Ok(names)
+    }
+
+    fn exact_names(
+        directory: &DirectoryHandle,
+        expected: &[&str],
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let actual = scan_names(directory)?;
+        let expected = expected.iter().map(OsString::from).collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn root_selection(
+        state_root: &DirectoryHandle,
+    ) -> Result<(bool, bool), ArtifactExternalControllerStoreFailureV1> {
+        let names = scan_names(state_root)?;
+        Ok((
+            names.contains(OsStr::new(ROOT_NAME)),
+            names.contains(OsStr::new(STAGING_NAME)),
+        ))
+    }
+
+    fn open_regular_at(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        access: OFlag,
+    ) -> Result<(File, FileIdentity), ArtifactExternalControllerStoreFailureV1> {
+        let owned = openat(
+            &parent.file,
+            name,
+            access | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| match error {
+            nix::errno::Errno::ENOENT | nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => {
+                ArtifactExternalControllerStoreFailureV1::Owner
+            }
+            _ => ArtifactExternalControllerStoreFailureV1::Io,
+        })?;
+        let file = File::from(owned);
+        let metadata = file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
+        Ok((file, FileIdentity::from_metadata(&metadata)))
+    }
+
+    fn validate_named_regular(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: FileIdentity,
+        expected_len: u64,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let (file, identity) = open_regular_at(parent, name, OFlag::O_RDONLY)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        if identity != expected || metadata.len() != expected_len {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn read_regular(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        maximum: usize,
+        allow_empty: bool,
+    ) -> Result<(Box<[u8]>, FileIdentity), ArtifactExternalControllerStoreFailureV1> {
+        let (mut file, identity) = open_regular_at(parent, name, OFlag::O_RDONLY)?;
+        let before = file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        let length = usize::try_from(before.len())
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
+        if length > maximum || (!allow_empty && length == 0) {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let mut bytes = vec![0_u8; length];
+        file.read_exact(&mut bytes)
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        let mut trailing = [0_u8; 1];
+        if file
+            .read(&mut trailing)
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?
+            != 0
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let after = file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        validate_regular_metadata(&after, parent.owner_uid, parent.owner_gid)?;
+        if FileIdentity::from_metadata(&after) != identity || after.len() != before.len() {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        validate_named_regular(parent, name, identity, before.len())?;
+        Ok((bytes.into_boxed_slice(), identity))
+    }
+
+    fn create_regular(
+        parent: &DirectoryHandle,
+        name: &str,
+        access: OFlag,
+    ) -> Result<(File, FileIdentity), ArtifactExternalControllerStoreFailureV1> {
+        let owned = openat(
+            &parent.file,
+            name,
+            access | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            FILE_MODE,
+        )
+        .map_err(|error| match error {
+            nix::errno::Errno::EEXIST => ArtifactExternalControllerStoreFailureV1::Conflict,
+            _ => ArtifactExternalControllerStoreFailureV1::Io,
+        })?;
+        let file = File::from(owned);
+        fchmod(&file, FILE_MODE).map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
+        if metadata.len() != 0 {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok((file, FileIdentity::from_metadata(&metadata)))
+    }
+
+    fn write_new_exact(
+        parent: &DirectoryHandle,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<FileIdentity, ArtifactExternalControllerStoreFailureV1> {
+        let (mut file, identity) = create_regular(parent, name, OFlag::O_WRONLY)?;
+        file.write_all(bytes)
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        file.sync_all()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        drop(file);
+        let (reopened, reopened_identity) =
+            read_regular(parent, OsStr::new(name), bytes.len(), bytes.is_empty())?;
+        if reopened_identity != identity || reopened.as_ref() != bytes {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(identity)
+    }
+
+    fn acquire_lock(
+        root: &DirectoryHandle,
+        mode: LockMode,
+    ) -> Result<(File, FileIdentity), ArtifactExternalControllerStoreFailureV1> {
+        let (lock, identity) = open_regular_at(root, OsStr::new(LOCK_NAME), OFlag::O_RDWR)?;
+        if lock
+            .metadata()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?
+            .len()
+            != 0
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let result = match mode {
+            LockMode::Shared => lock.try_lock_shared(),
+            LockMode::Exclusive => lock.try_lock(),
+        };
+        result.map_err(|error| match error {
+            TryLockError::WouldBlock => ArtifactExternalControllerStoreFailureV1::Contended,
+            TryLockError::Error(_) => ArtifactExternalControllerStoreFailureV1::Io,
+        })?;
+        if let Err(failure) = validate_named_regular(root, OsStr::new(LOCK_NAME), identity, 0) {
+            return release_file(lock, Err(failure));
+        }
+        Ok((lock, identity))
+    }
+
+    fn release_file<T>(
+        lock: File,
+        primary: Result<T, ArtifactExternalControllerStoreFailureV1>,
+    ) -> Result<T, ArtifactExternalControllerStoreFailureV1> {
+        let release = lock
+            .unlock()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io);
+        drop(lock);
+        match primary {
+            Err(failure) => Err(failure),
+            Ok(value) => release.map(|()| value),
+        }
+    }
+
+    fn release_locked<T>(
+        mut store: ArtifactExternalDeploymentControllerLockedV1,
+        primary: Result<T, ArtifactExternalControllerStoreFailureV1>,
+    ) -> Result<T, ArtifactExternalControllerStoreFailureV1> {
+        let lock = store
+            .lock
+            .take()
+            .ok_or(ArtifactExternalControllerStoreFailureV1::Owner)?;
+        drop(store);
+        release_file(lock, primary)
+    }
+
+    fn read_state(
+        root: &DirectoryHandle,
+        name: &str,
+    ) -> Result<
+        (ArtifactExternalControllerStateV2, Box<[u8]>, FileIdentity),
+        ArtifactExternalControllerStoreFailureV1,
+    > {
+        let (bytes, identity) =
+            read_regular(root, OsStr::new(name), MAX_ARTIFACT_STATE_V2_BYTES, false)?;
+        let state = ArtifactExternalControllerStateV2::decode(&bytes)
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
+        let canonical = state
+            .encode()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
+        if canonical != bytes {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok((state, bytes, identity))
+    }
+
+    fn validate_config(
+        state: &ArtifactExternalControllerStateV2,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        if state.request().config_commitment() != binding.config_commitment() {
+            return Err(ArtifactExternalControllerStoreFailureV1::ConfigurationMismatch);
+        }
+        Ok(())
+    }
+
+    fn permitted_successor(
+        current: &ArtifactExternalControllerStateV2,
+        next: &ArtifactExternalControllerStateV2,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let expected_sequence = current
+            .controller_snapshot_sequence()
+            .get()
+            .checked_add(1)
+            .ok_or(ArtifactExternalControllerStoreFailureV1::Owner)?;
+        if next.controller_snapshot_sequence().get() != expected_sequence
+            || next.request() != current.request()
+            || next.admission() != current.admission()
+            || !next.records().starts_with(current.records())
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let allowed = match current.phase() {
+            ArtifactExternalControllerPhaseV2::Admitted => matches!(
+                next.phase(),
+                ArtifactExternalControllerPhaseV2::Committed
+                    | ArtifactExternalControllerPhaseV2::Failed
+                    | ArtifactExternalControllerPhaseV2::Uncertain
+            ),
+            ArtifactExternalControllerPhaseV2::Committed => matches!(
+                next.phase(),
+                ArtifactExternalControllerPhaseV2::Applying
+                    | ArtifactExternalControllerPhaseV2::Failed
+                    | ArtifactExternalControllerPhaseV2::Uncertain
+            ),
+            ArtifactExternalControllerPhaseV2::Applying => matches!(
+                next.phase(),
+                ArtifactExternalControllerPhaseV2::ActiveReady
+                    | ArtifactExternalControllerPhaseV2::Failed
+                    | ArtifactExternalControllerPhaseV2::Uncertain
+            ),
+            ArtifactExternalControllerPhaseV2::ActiveReady
+            | ArtifactExternalControllerPhaseV2::Failed
+            | ArtifactExternalControllerPhaseV2::Uncertain => false,
+        };
+        if !allowed {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn open_final_locked(
+        state_root: StateRootHandle,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+        mode: LockMode,
+    ) -> Result<
+        ArtifactExternalDeploymentControllerLockedV1,
+        ArtifactExternalControllerStoreFailureV1,
+    > {
+        let root = open_directory_at(&state_root.leaf, OsStr::new(ROOT_NAME))?;
+        let (lock, lock_identity) = acquire_lock(&root, mode)?;
+        let result = (|| {
+            let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+            if !has_final || has_staging {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            let public_root =
+                reopen_named_directory(&state_root.leaf, OsStr::new(ROOT_NAME), root.identity)?;
+            let names = scan_names(&public_root)?;
+            let stable = [OsString::from(LOCK_NAME), OsString::from(SNAPSHOT_NAME)]
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let with_next = [
+                OsString::from(LOCK_NAME),
+                OsString::from(SNAPSHOT_NAME),
+                OsString::from(NEXT_NAME),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            if names != stable && names != with_next {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            validate_named_regular(&public_root, OsStr::new(LOCK_NAME), lock_identity, 0)?;
+            let (state, bytes, snapshot_identity) = read_state(&public_root, SNAPSHOT_NAME)?;
+            validate_config(&state, binding)?;
+            Ok((state, bytes, snapshot_identity))
+        })();
+        let (state, snapshot_bytes, snapshot_identity) = match result {
+            Ok(value) => value,
+            Err(failure) => return release_file(lock, Err(failure)),
+        };
+        Ok(ArtifactExternalDeploymentControllerLockedV1 {
+            state_root,
+            root,
+            lock: Some(lock),
+            lock_identity,
+            snapshot_identity,
+            snapshot_bytes,
+            state,
+        })
+    }
+
+    fn read_validated_next(
+        store: &ArtifactExternalDeploymentControllerLockedV1,
+    ) -> Result<
+        Option<(ArtifactExternalControllerStateV2, Box<[u8]>, FileIdentity)>,
+        ArtifactExternalControllerStoreFailureV1,
+    > {
+        let names = scan_names(&store.root)?;
+        let stable = [OsString::from(LOCK_NAME), OsString::from(SNAPSHOT_NAME)]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if names == stable {
+            return Ok(None);
+        }
+        let with_next = [
+            OsString::from(LOCK_NAME),
+            OsString::from(SNAPSHOT_NAME),
+            OsString::from(NEXT_NAME),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if names != with_next {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let (next, bytes, identity) = read_state(&store.root, NEXT_NAME)?;
+        permitted_successor(&store.state, &next)?;
+        Ok(Some((next, bytes, identity)))
+    }
+
+    fn validate_public_store(
+        store: &ArtifactExternalDeploymentControllerLockedV1,
+        allow_next: bool,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let (has_final, has_staging) = root_selection(&store.state_root.leaf)?;
+        if !has_final || has_staging {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let root = reopen_named_directory(
+            &store.state_root.leaf,
+            OsStr::new(ROOT_NAME),
+            store.root.identity,
+        )?;
+        let names = scan_names(&root)?;
+        let stable = [OsString::from(LOCK_NAME), OsString::from(SNAPSHOT_NAME)]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let with_next = [
+            OsString::from(LOCK_NAME),
+            OsString::from(SNAPSHOT_NAME),
+            OsString::from(NEXT_NAME),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if names != stable && (!allow_next || names != with_next) {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        validate_named_regular(&root, OsStr::new(LOCK_NAME), store.lock_identity, 0)?;
+        let (state, bytes, identity) = read_state(&root, SNAPSHOT_NAME)?;
+        if identity != store.snapshot_identity
+            || bytes != store.snapshot_bytes
+            || state != store.state
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn query_locked(
+        store: ArtifactExternalDeploymentControllerLockedV1,
+        operation_id: ArtifactDeploymentOperationIdV1,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        let result = (|| {
+            validate_public_store(&store, true)?;
+            if let Some((next, _, _)) = read_validated_next(&store)? {
+                if next.request().operation_id() == operation_id {
+                    return Err(
+                        ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(
+                            Box::new(next),
+                        )),
+                    );
+                }
+            }
+            if store.state.request().operation_id() != operation_id {
+                return Err(ArtifactExternalControllerStoreFailureV1::NotFound);
+            }
+            Ok(store.state.clone())
+        })();
+        release_locked(store, result)
+    }
+
+    fn clone_state_root(
+        state_root: &StateRootHandle,
+    ) -> Result<StateRootHandle, ArtifactExternalControllerStoreFailureV1> {
+        let parent = reopen_named_directory(
+            &state_root.parent,
+            OsStr::new("."),
+            state_root.parent.identity,
+        )?;
+        let leaf =
+            reopen_named_directory(&parent, &state_root.leaf_name, state_root.leaf.identity)?;
+        Ok(StateRootHandle {
+            parent,
+            leaf_name: state_root.leaf_name.clone(),
+            leaf,
+        })
+    }
+
+    fn inspect_staging(
+        state_root: &StateRootHandle,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+        operation_id: ArtifactDeploymentOperationIdV1,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        let staging = match open_directory_at(&state_root.leaf, OsStr::new(STAGING_NAME)) {
+            Ok(staging) => staging,
+            Err(failure) => {
+                let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+                if has_final && !has_staging {
+                    let store = open_final_locked(
+                        clone_state_root(state_root)?,
+                        binding,
+                        LockMode::Shared,
+                    )?;
+                    return query_locked(store, operation_id);
+                }
+                return Err(failure);
+            }
+        };
+        let (lock, lock_identity) = acquire_lock(&staging, LockMode::Shared)?;
+        let result = (|| {
+            let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+            if has_final || !has_staging {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            let staging = reopen_named_directory(
+                &state_root.leaf,
+                OsStr::new(STAGING_NAME),
+                staging.identity,
+            )?;
+            exact_names(&staging, &[LOCK_NAME, SNAPSHOT_NAME])?;
+            validate_named_regular(&staging, OsStr::new(LOCK_NAME), lock_identity, 0)?;
+            let (state, _, _) = read_state(&staging, SNAPSHOT_NAME)?;
+            validate_config(&state, binding)?;
+            if state.phase() != ArtifactExternalControllerPhaseV2::Admitted
+                || state.controller_snapshot_sequence().get() != 1
+            {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            if state.request().operation_id() != operation_id {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            Err(
+                ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(Box::new(
+                    state,
+                ))),
+            )
+        })();
+        release_file(lock, result)
+    }
+
+    fn run_query(
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        operation_id: ArtifactDeploymentOperationIdV1,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        let binding = authority_binding(authority)?;
+        let state_root = match pin_state_root(&binding) {
+            Ok(state_root) => state_root,
+            Err(ArtifactExternalControllerStoreFailureV1::NotFound) => {
+                return Err(ArtifactExternalControllerStoreFailureV1::NotFound);
+            }
+            Err(failure) => return Err(failure),
+        };
+        revalidate_current_authority(authority, &binding, &state_root)?;
+        match root_selection(&state_root.leaf)? {
+            (false, false) => Err(ArtifactExternalControllerStoreFailureV1::NotFound),
+            (true, false) => {
+                let store = open_final_locked(state_root, &binding, LockMode::Shared)?;
+                query_locked(store, operation_id)
+            }
+            (false, true) => inspect_staging(&state_root, &binding, operation_id),
+            (true, true) => Err(ArtifactExternalControllerStoreFailureV1::Owner),
+        }
+    }
+
+    fn draw_store_instance() -> Result<[u8; 32], ArtifactExternalControllerStoreFailureV1> {
+        let mut instance = [0_u8; 32];
+        getrandom::fill(&mut instance).map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        if instance.iter().all(|byte| *byte == 0) {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(instance)
+    }
+
+    fn create_directory(
+        parent: &DirectoryHandle,
+        name: &str,
+    ) -> Result<DirectoryHandle, ArtifactExternalControllerStoreFailureV1> {
+        mkdirat(&parent.file, name, DIRECTORY_MODE).map_err(|error| match error {
+            nix::errno::Errno::EEXIST => ArtifactExternalControllerStoreFailureV1::Conflict,
+            _ => ArtifactExternalControllerStoreFailureV1::Io,
+        })?;
+        let directory = open_directory_at(parent, OsStr::new(name))?;
+        revalidate_directory(&directory)?;
+        Ok(directory)
+    }
+
+    fn seal_staging_prefix(
+        state_root: &StateRootHandle,
+        staging: &DirectoryHandle,
+        lock: &File,
+        lock_identity: FileIdentity,
+    ) -> Result<DirectoryHandle, ArtifactExternalControllerStoreFailureV1> {
+        lock.sync_all()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        staging
+            .file
+            .sync_all()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        state_root
+            .leaf
+            .file
+            .sync_all()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        let reopened =
+            reopen_named_directory(&state_root.leaf, OsStr::new(STAGING_NAME), staging.identity)?;
+        exact_names(&reopened, &[LOCK_NAME])?;
+        validate_named_regular(&reopened, OsStr::new(LOCK_NAME), lock_identity, 0)?;
+        Ok(reopened)
+    }
+
+    fn create_and_lock_staging(
+        state_root: &StateRootHandle,
+    ) -> Result<(DirectoryHandle, File, FileIdentity), ArtifactExternalControllerStoreFailureV1>
+    {
+        let staging = create_directory(&state_root.leaf, STAGING_NAME)?;
+        let (lock, lock_identity) = create_regular(&staging, LOCK_NAME, OFlag::O_RDWR)?;
+        if let Err(failure) = lock.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => ArtifactExternalControllerStoreFailureV1::Contended,
+            TryLockError::Error(_) => ArtifactExternalControllerStoreFailureV1::Io,
+        }) {
+            return release_file(lock, Err(failure));
+        }
+        let reopened = match seal_staging_prefix(state_root, &staging, &lock, lock_identity) {
+            Ok(reopened) => reopened,
+            Err(failure) => return release_file(lock, Err(failure)),
+        };
+        drop(staging);
+        Ok((reopened, lock, lock_identity))
+    }
+
+    fn open_complete_staging(
+        state_root: &StateRootHandle,
+    ) -> Result<
+        (
+            DirectoryHandle,
+            File,
+            FileIdentity,
+            ArtifactExternalControllerStateV2,
+            Box<[u8]>,
+            FileIdentity,
+        ),
+        ArtifactExternalControllerStoreFailureV1,
+    > {
+        let staging = open_directory_at(&state_root.leaf, OsStr::new(STAGING_NAME))?;
+        let (lock, lock_identity) = acquire_lock(&staging, LockMode::Exclusive)?;
+        let result = (|| {
+            let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+            if has_final || !has_staging {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            let staging = reopen_named_directory(
+                &state_root.leaf,
+                OsStr::new(STAGING_NAME),
+                staging.identity,
+            )?;
+            exact_names(&staging, &[LOCK_NAME, SNAPSHOT_NAME])?;
+            validate_named_regular(&staging, OsStr::new(LOCK_NAME), lock_identity, 0)?;
+            let (state, bytes, identity) = read_state(&staging, SNAPSHOT_NAME)?;
+            if state.phase() != ArtifactExternalControllerPhaseV2::Admitted
+                || state.controller_snapshot_sequence().get() != 1
+            {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            Ok((staging, state, bytes, identity))
+        })();
+        match result {
+            Ok((staging, state, bytes, identity)) => {
+                Ok((staging, lock, lock_identity, state, bytes, identity))
+            }
+            Err(failure) => release_file(lock, Err(failure)),
+        }
+    }
+
+    struct InitialPublication {
+        state_root: StateRootHandle,
+        staging: DirectoryHandle,
+        lock: File,
+        lock_identity: FileIdentity,
+        state: ArtifactExternalControllerStateV2,
+        bytes: Box<[u8]>,
+        snapshot_identity: FileIdentity,
+    }
+
+    fn publish_initial(
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+        publication: InitialPublication,
+        tracker: &mut ChangeTracker,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        let InitialPublication {
+            state_root,
+            staging,
+            lock,
+            lock_identity,
+            state,
+            bytes,
+            snapshot_identity,
+        } = publication;
+        let staging_identity = staging.identity;
+        let result = (|| {
+            exact_names(&staging, &[LOCK_NAME, SNAPSHOT_NAME])?;
+            validate_named_regular(&staging, OsStr::new(LOCK_NAME), lock_identity, 0)?;
+            let expected_len = u64::try_from(bytes.len())
+                .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
+            validate_named_regular(
+                &staging,
+                OsStr::new(SNAPSHOT_NAME),
+                snapshot_identity,
+                expected_len,
+            )?;
+            staging
+                .file
+                .sync_all()
+                .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+            state_root
+                .leaf
+                .file
+                .sync_all()
+                .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+            let reopened_staging = reopen_named_directory(
+                &state_root.leaf,
+                OsStr::new(STAGING_NAME),
+                staging_identity,
+            )?;
+            exact_names(&reopened_staging, &[LOCK_NAME, SNAPSHOT_NAME])?;
+            validate_named_regular(&reopened_staging, OsStr::new(LOCK_NAME), lock_identity, 0)?;
+            validate_named_regular(
+                &reopened_staging,
+                OsStr::new(SNAPSHOT_NAME),
+                snapshot_identity,
+                expected_len,
+            )?;
+            revalidate_current_authority(authority, binding, &state_root)?;
+            if root_selection(&state_root.leaf)? != (false, true) {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            tracker.ambiguous();
+            renameat_with(
+                &state_root.leaf.file,
+                STAGING_NAME,
+                &state_root.leaf.file,
+                ROOT_NAME,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| {
+                ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(Box::new(
+                    state.clone(),
+                )))
+            })?;
+            drop(reopened_staging);
+            state_root.leaf.file.sync_all().map_err(|_| {
+                ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(Box::new(
+                    state.clone(),
+                )))
+            })?;
+            revalidate_current_authority(authority, binding, &state_root)
+                .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
+            if root_selection(&state_root.leaf)? != (true, false) {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            let root =
+                reopen_named_directory(&state_root.leaf, OsStr::new(ROOT_NAME), staging_identity)?;
+            exact_names(&root, &[LOCK_NAME, SNAPSHOT_NAME])?;
+            validate_named_regular(&root, OsStr::new(LOCK_NAME), lock_identity, 0)?;
+            let (reopened, reopened_bytes, reopened_identity) = read_state(&root, SNAPSHOT_NAME)?;
+            if reopened != state
+                || reopened_bytes != bytes
+                || reopened_identity != snapshot_identity
+            {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            tracker.committed();
+            Ok(state)
+        })();
+        release_file(lock, result)
+    }
+
+    fn run_admit(
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        request: &ArtifactExternalDeploymentRequestV1,
+        tracker: &mut ChangeTracker,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        let binding = authority_binding(authority)?;
+        if request.config_commitment() != binding.config_commitment() {
+            return Err(ArtifactExternalControllerStoreFailureV1::ConfigurationMismatch);
+        }
+        let state_root = pin_state_root(&binding)?;
+        revalidate_current_authority(authority, &binding, &state_root)?;
+        match root_selection(&state_root.leaf)? {
+            (true, true) => return Err(ArtifactExternalControllerStoreFailureV1::Owner),
+            (true, false) => {
+                let store = open_final_locked(state_root, &binding, LockMode::Exclusive)?;
+                let result = if store.state.request().operation_id() != request.operation_id() {
+                    Err(ArtifactExternalControllerStoreFailureV1::ReplaceRequired)
+                } else if store.state.request() != request {
+                    Err(ArtifactExternalControllerStoreFailureV1::Conflict)
+                } else {
+                    Ok(store.state.clone())
+                };
+                return release_locked(store, result);
+            }
+            (false, true) => {
+                let (staging, lock, lock_identity, state, bytes, snapshot_identity) =
+                    open_complete_staging(&state_root)?;
+                if let Err(failure) = validate_config(&state, &binding) {
+                    return release_file(lock, Err(failure));
+                }
+                if state.request().operation_id() != request.operation_id() {
+                    return release_file(lock, Err(ArtifactExternalControllerStoreFailureV1::Owner));
+                }
+                if state.request() != request {
+                    return release_file(lock, Err(ArtifactExternalControllerStoreFailureV1::Conflict));
+                }
+                return publish_initial(
+                    authority,
+                    &binding,
+                    InitialPublication {
+                        state_root,
+                        staging,
+                        lock,
+                        lock_identity,
+                        state,
+                        bytes,
+                        snapshot_identity,
+                    },
+                    tracker,
+                );
+            }
+            (false, false) => {}
+        }
+
+        tracker.ambiguous();
+        let (staging, lock, lock_identity) = create_and_lock_staging(&state_root)?;
+        tracker.0 = ArtifactExternalControllerStoreChangeV1::Unchanged;
+        if let Err(failure) = revalidate_current_authority(authority, &binding, &state_root) {
+            tracker.ambiguous();
+            return release_file(lock, Err(failure));
+        }
+        if root_selection(&state_root.leaf)? != (false, true) {
+            return release_file(lock, Err(ArtifactExternalControllerStoreFailureV1::Owner));
+        }
+        let instance = match draw_store_instance() {
+            Ok(instance) => instance,
+            Err(failure) => return release_file(lock, Err(failure)),
+        };
+        let state = match ArtifactExternalControllerStateV2::admit(request.clone(), instance) {
+            Ok(state) => state,
+            Err(_) => {
+                return release_file(
+                    lock,
+                    Err(ArtifactExternalControllerStoreFailureV1::Owner),
+                );
+            }
+        };
+        let bytes = match state.encode() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return release_file(
+                    lock,
+                    Err(ArtifactExternalControllerStoreFailureV1::Owner),
+                );
+            }
+        };
+        tracker.ambiguous();
+        let snapshot_identity = match write_new_exact(&staging, SNAPSHOT_NAME, &bytes) {
+            Ok(identity) => identity,
+            Err(failure) => return release_file(lock, Err(failure)),
+        };
+        publish_initial(
+            authority,
+            &binding,
+            InitialPublication {
+                state_root,
+                staging,
+                lock,
+                lock_identity,
+                state,
+                bytes,
+                snapshot_identity,
+            },
+            tracker,
+        )
+    }
+
+    enum SnapshotRenameState {
+        Old,
+        New,
+        ObservationUnavailable,
+        OwnerInvalid,
+    }
+
+    fn classify_snapshot_rename(
+        store: &ArtifactExternalDeploymentControllerLockedV1,
+        next: &ArtifactExternalControllerStateV2,
+        next_bytes: &[u8],
+        next_identity: FileIdentity,
+    ) -> SnapshotRenameState {
+        let names = match scan_names(&store.root) {
+            Ok(names) => names,
+            Err(ArtifactExternalControllerStoreFailureV1::Io) => {
+                return SnapshotRenameState::ObservationUnavailable;
+            }
+            Err(_) => return SnapshotRenameState::OwnerInvalid,
+        };
+        let stable = [OsString::from(LOCK_NAME), OsString::from(SNAPSHOT_NAME)]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let with_next = [
+            OsString::from(LOCK_NAME),
+            OsString::from(SNAPSHOT_NAME),
+            OsString::from(NEXT_NAME),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if names == with_next {
+            match (
+                read_state(&store.root, SNAPSHOT_NAME),
+                read_state(&store.root, NEXT_NAME),
+            ) {
+                (
+                    Ok((active, active_bytes, active_identity)),
+                    Ok((candidate, candidate_bytes, candidate_identity)),
+                ) if active == store.state
+                    && active_bytes == store.snapshot_bytes
+                    && active_identity == store.snapshot_identity
+                    && candidate == *next
+                    && candidate_bytes.as_ref() == next_bytes
+                    && candidate_identity == next_identity =>
+                {
+                    SnapshotRenameState::Old
+                }
+                (Err(ArtifactExternalControllerStoreFailureV1::Io), _)
+                | (_, Err(ArtifactExternalControllerStoreFailureV1::Io)) => {
+                    SnapshotRenameState::ObservationUnavailable
+                }
+                _ => SnapshotRenameState::OwnerInvalid,
+            }
+        } else if names == stable {
+            match read_state(&store.root, SNAPSHOT_NAME) {
+                Ok((active, active_bytes, active_identity))
+                    if active == *next
+                        && active_bytes.as_ref() == next_bytes
+                        && active_identity == next_identity =>
+                {
+                    SnapshotRenameState::New
+                }
+                Err(ArtifactExternalControllerStoreFailureV1::Io) => {
+                    SnapshotRenameState::ObservationUnavailable
+                }
+                _ => SnapshotRenameState::OwnerInvalid,
+            }
+        } else {
+            SnapshotRenameState::OwnerInvalid
+        }
+    }
+
+    fn cleanup_next(
+        root: &DirectoryHandle,
+        identity: FileIdentity,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let (_, current) = open_regular_at(root, OsStr::new(NEXT_NAME), OFlag::O_RDONLY)?;
+        if current != identity {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        unlinkat(&root.file, NEXT_NAME, UnlinkatFlags::NoRemoveDir)
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        root.file
+            .sync_all()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Io)?;
+        if scan_names(root)?.contains(OsStr::new(NEXT_NAME)) {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
+    fn settle_successor(
+        store: &mut ArtifactExternalDeploymentControllerLockedV1,
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+        next: ArtifactExternalControllerStateV2,
+        next_bytes: Box<[u8]>,
+        next_identity: FileIdentity,
+        tracker: &mut ChangeTracker,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        revalidate_current_authority(authority, binding, &store.state_root)?;
+        validate_public_store(store, true)?;
+        tracker.ambiguous();
+        if renameat(&store.root.file, NEXT_NAME, &store.root.file, SNAPSHOT_NAME).is_err() {
+            match classify_snapshot_rename(store, &next, &next_bytes, next_identity) {
+                SnapshotRenameState::Old => {
+                    cleanup_next(&store.root, next_identity)?;
+                    tracker.0 = ArtifactExternalControllerStoreChangeV1::Unchanged;
+                    return Err(ArtifactExternalControllerStoreFailureV1::Io);
+                }
+                SnapshotRenameState::New => {}
+                SnapshotRenameState::ObservationUnavailable => {
+                    return Err(
+                        ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(
+                            Box::new(next),
+                        )),
+                    );
+                }
+                SnapshotRenameState::OwnerInvalid => {
+                    return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+                }
+            }
+        }
+        store.root.file.sync_all().map_err(|_| {
+            ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(Box::new(
+                next.clone(),
+            )))
+        })?;
+        revalidate_current_authority(authority, binding, &store.state_root)
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
+        if root_selection(&store.state_root.leaf)? != (true, false) {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        let root = reopen_named_directory(
+            &store.state_root.leaf,
+            OsStr::new(ROOT_NAME),
+            store.root.identity,
+        )?;
+        exact_names(&root, &[LOCK_NAME, SNAPSHOT_NAME])?;
+        validate_named_regular(&root, OsStr::new(LOCK_NAME), store.lock_identity, 0)?;
+        let (reopened, reopened_bytes, reopened_identity) = read_state(&root, SNAPSHOT_NAME)?;
+        if reopened != next || reopened_bytes != next_bytes || reopened_identity != next_identity {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        store.snapshot_identity = reopened_identity;
+        store.snapshot_bytes = reopened_bytes;
+        store.state = reopened.clone();
+        tracker.committed();
+        Ok(reopened)
+    }
+
+    fn commit_successor(
+        store: &mut ArtifactExternalDeploymentControllerLockedV1,
+        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
+        binding: &ArtifactExternalControllerAuthorityBindingV1,
+        next: ArtifactExternalControllerStateV2,
+        tracker: &mut ChangeTracker,
+    ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        validate_config(&next, binding)?;
+        permitted_successor(&store.state, &next)?;
+        validate_public_store(store, true)?;
+        if let Some((existing, bytes, identity)) = read_validated_next(store)? {
+            if existing != next {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            return settle_successor(store, authority, binding, next, bytes, identity, tracker);
+        }
+        revalidate_current_authority(authority, binding, &store.state_root)?;
+        let bytes = next
+            .encode()
+            .map_err(|_| ArtifactExternalControllerStoreFailureV1::Owner)?;
+        tracker.ambiguous();
+        let identity = write_new_exact(&store.root, NEXT_NAME, &bytes)?;
+        settle_successor(store, authority, binding, next, bytes, identity, tracker)
+    }
+}
+
+pub(crate) use artifact_external_store::{
+    ArtifactExternalControllerAuthorityBindingV1,
+    ArtifactExternalControllerAuthorityRecheckFailureV1, ArtifactExternalControllerAuthorityV1,
+    ArtifactExternalControllerStoreChangeV1, ArtifactExternalControllerStoreFailureV1,
+    ArtifactExternalControllerStoreInvocationV1, ArtifactExternalDeploymentControllerLockedV1,
+    ArtifactExternalDeploymentControllerStoreV1,
+};
+
 impl fmt::Display for ManagedModelAgentStackApplyControllerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

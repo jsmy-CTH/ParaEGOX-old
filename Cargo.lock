@@ -1638,12 +1638,14 @@ name = "paraegox-deployment"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "nix",
  "paraegox-artifact",
  "paraegox-fabric",
  "paraegox-kernel",
  "paraegox-node",
  "paraegox-runtime-contracts",
+ "rustix",
  "sha2",
  "tokio",
  "zeroize",
