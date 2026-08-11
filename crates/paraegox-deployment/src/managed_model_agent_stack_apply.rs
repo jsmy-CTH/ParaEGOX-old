@@ -4725,8 +4725,8 @@ mod tests {
         .expect("agent-intent Quarantined PXDO");
         let expected_pxmt = agent_quarantined.canonical_wire().to_vec();
         let expected_pxdo = agent_quarantined_receipt.canonical_wire().to_vec();
-        let agent_quarantined_controller = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let agent_quarantined_controller =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Failed,
                 controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
                 request: request.clone(),
@@ -4741,9 +4741,8 @@ mod tests {
                     agent_quarantined_record,
                 ],
                 receipt: Some(agent_quarantined_receipt),
-            },
-        )
-        .expect("agent-intent Quarantined PXMJ2-F");
+            })
+            .expect("agent-intent Quarantined PXMJ2-F");
         let agent_quarantined_wire = agent_quarantined_controller
             .encode()
             .expect("agent-intent Quarantined PXMJ2 wire");
@@ -4787,7 +4786,9 @@ mod tests {
             expected_pxdo.as_slice(),
         );
         assert_eq!(
-            reopened_agent_quarantined.encode().expect("canonical re-encode"),
+            reopened_agent_quarantined
+                .encode()
+                .expect("canonical re-encode"),
             agent_quarantined_wire,
         );
 
