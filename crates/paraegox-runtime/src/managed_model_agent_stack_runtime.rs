@@ -17,20 +17,23 @@ use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::time::ClockReading;
 use paraegox_runtime_contracts::apply::ExpectedActive;
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
-    ManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackPlanError,
-    ManagedModelAgentStackProjectionV1, ManagedModelAgentStackTargetExecutionV1,
-    ManagedModelAgentStackTargetModeV1, ManagedModelAgentStackTerminalAuthClaimV1,
-    ManagedModelAgentStackTerminalEvidenceFieldsV1, ManagedModelAgentStackTerminalEvidenceV1,
-    ManagedModelAgentStackTerminalFactsV1, ManagedModelAgentStackTerminalHeadV1,
-    ManagedModelAgentStackTerminalLifecycleEffectV1, ManagedModelAgentStackTerminalOutcomeV1,
-    ManagedModelAgentStackTerminalReceiptDraftV1, ManagedModelAgentStackTerminalReceiptV1,
-    ManagedModelAgentStackTerminalStateV1,
+    ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackApplyRequestV1,
+    ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
+    ManagedModelAgentStackTargetExecutionV1, ManagedModelAgentStackTargetModeV1,
+    ManagedModelAgentStackTerminalAuthClaimV1, ManagedModelAgentStackTerminalEvidenceFieldsV1,
+    ManagedModelAgentStackTerminalEvidenceV1, ManagedModelAgentStackTerminalFactsV1,
+    ManagedModelAgentStackTerminalHeadV1, ManagedModelAgentStackTerminalLifecycleEffectV1,
+    ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptDraftV1,
+    ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackTerminalStateV1,
 };
 use paraegox_runtime_contracts::managed_service::{ManagedServiceGeneration, ManagedServiceId};
 use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
-use crate::admission::VerifiedManagedModelAgentStackApplyIngressV1;
+use crate::admission::{
+    VerifiedArtifactManagedModelAgentStackApplyIngressV1,
+    VerifiedManagedModelAgentStackApplyIngressV1,
+};
 use crate::managed_agent_runtime::{
     ManagedAgentAssembly, ManagedAgentAssemblyError, RuntimeAgentConversationHandle,
 };
@@ -40,6 +43,10 @@ use crate::managed_fabric_runtime::{
     ManagedFabricStackCutoverObservation,
 };
 use crate::managed_model_agent_stack_state::{
+    ArtifactManagedModelAgentStackDurableActiveV2,
+    ArtifactManagedModelAgentStackDurablePendingV2,
+    ArtifactManagedModelAgentStackPendingKindV2, ArtifactManagedModelAgentStackSnapshotTransitionV2,
+    ArtifactManagedModelAgentStackSnapshotV2, ArtifactManagedModelAgentStackTerminalRecordV2,
     ManagedModelAgentStackDurableActive, ManagedModelAgentStackDurablePending,
     ManagedModelAgentStackDurablePhase, ManagedModelAgentStackPendingKind,
     ManagedModelAgentStackReplayRecord, ManagedModelAgentStackRevisionHighWater,
@@ -92,6 +99,22 @@ pub(crate) struct ManagedModelAgentStackRuntimeCore {
     recovery_completed: bool,
 }
 
+pub(crate) struct ArtifactManagedModelAgentStackRuntimeCore {
+    snapshot: ArtifactManagedModelAgentStackSnapshotV2,
+    projection: ManagedModelAgentStackProjectionV1,
+    state_directory: PathBuf,
+    runtime_host_epoch: u64,
+    clock: RuntimeClock,
+    response_key_ref: ApplyAuthKeyRef,
+    response_signer: SigningKey,
+    handle_broker: RuntimeAgentHandleBroker,
+    model_backend_resolver: Arc<dyn RuntimeModelBackendResolverV1>,
+    cancellation: CancellationSource,
+    model: Option<ManagedModelAssembly>,
+    agent: Option<ManagedAgentAssembly>,
+    handle: Option<RuntimeAgentConversationHandle>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedModelAgentStackApplyOutcome {
     Committed(ManagedModelAgentStackTerminalReceiptV1),
@@ -103,6 +126,14 @@ pub(crate) enum ManagedModelAgentStackCutoverOutcome {
     Installed(
         Box<ManagedModelAgentStackRuntimeCore>,
         ManagedModelAgentStackApplyOutcome,
+    ),
+}
+
+pub(crate) enum ArtifactManagedModelAgentStackCutoverOutcome {
+    NoEffect(ManagedModelAgentStackTerminalReceiptV1),
+    Installed(
+        Box<ArtifactManagedModelAgentStackRuntimeCore>,
+        Option<ManagedModelAgentStackTerminalReceiptV1>,
     ),
 }
 
@@ -164,6 +195,570 @@ struct UncertainTerminalInput<'a> {
     fabric_generation: Option<ManagedServiceGeneration>,
     model_generation: Option<ManagedServiceGeneration>,
     agent_generation: Option<ManagedServiceGeneration>,
+}
+
+const _: fn() = artifact_runtime_compile_time_anchor;
+
+fn artifact_runtime_compile_time_anchor() {
+    let _ = ArtifactManagedModelAgentStackRuntimeCore::cutover;
+    let _ = ArtifactManagedModelAgentStackRuntimeCore::authenticated_terminal_replay;
+    let _ = ArtifactManagedModelAgentStackRuntimeCore::retains_live_resources;
+    let _ = artifact_cutover_outcome_contract_anchor;
+}
+
+fn artifact_cutover_outcome_contract_anchor(
+    outcome: &ArtifactManagedModelAgentStackCutoverOutcome,
+) {
+    match outcome {
+        ArtifactManagedModelAgentStackCutoverOutcome::NoEffect(receipt) => {
+            let _ = receipt;
+        }
+        ArtifactManagedModelAgentStackCutoverOutcome::Installed(core, receipt) => {
+            let _ = (core, receipt);
+        }
+    }
+}
+
+impl ArtifactManagedModelAgentStackRuntimeCore {
+    fn from_snapshot(
+        snapshot: ArtifactManagedModelAgentStackSnapshotV2,
+        config: ManagedModelAgentStackOwnerConfig,
+    ) -> Self {
+        Self {
+            snapshot,
+            projection: config.projection,
+            state_directory: config.state_directory,
+            runtime_host_epoch: config.runtime_host_epoch,
+            clock: config.clock,
+            response_key_ref: config.response_key_ref,
+            response_signer: config.response_signer,
+            handle_broker: config.handle_broker,
+            model_backend_resolver: config.model_backend_resolver,
+            cancellation: CancellationSource::root(),
+            model: None,
+            agent: None,
+            handle: None,
+        }
+    }
+
+    fn retains_live_resources(&self) -> bool {
+        self.model.is_some() || self.agent.is_some() || self.handle.is_some()
+    }
+
+    pub(crate) async fn cutover(
+        fabric: &mut ManagedFabricRuntimeCore,
+        config: ManagedModelAgentStackOwnerConfig,
+        request: ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        verified: VerifiedArtifactManagedModelAgentStackApplyIngressV1,
+        response_channel: ReferenceChannelBindingV1,
+    ) -> Result<ArtifactManagedModelAgentStackCutoverOutcome, ManagedModelAgentStackRuntimeError>
+    {
+        validate_artifact_cutover_request(fabric, &config, &request, response_channel)?;
+        fabric.require_remote_agent_access_s0_mutation_unfrozen_v2()?;
+        let predecessor = fabric.stack_cutover_observation().await?;
+        match observe_artifact_deadline(config.clock, verified) {
+            Ok(()) => {}
+            Err(ManagedModelAgentStackRuntimeError::DeadlineExpired) => {
+                return Ok(ArtifactManagedModelAgentStackCutoverOutcome::NoEffect(
+                    build_artifact_pre_cutover_no_effect_terminal(
+                        &config,
+                        &request,
+                        response_channel,
+                        predecessor.generation,
+                        20,
+                    )?,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        if validate_artifact_cutover_cas_and_fabric(&request, &predecessor).is_err() {
+            return Ok(ArtifactManagedModelAgentStackCutoverOutcome::NoEffect(
+                build_artifact_pre_cutover_no_effect_terminal(
+                    &config,
+                    &request,
+                    response_channel,
+                    predecessor.generation,
+                    21,
+                )?,
+            ));
+        }
+
+        let projection_digest = stack_projection_digest(&config.projection)?;
+        let initial = ArtifactManagedModelAgentStackSnapshotV2::try_initial_at_sequence(
+            fabric.store_instance_id(),
+            fabric.owner_target_fingerprint(),
+            projection_digest,
+            1,
+            config.runtime_host_epoch,
+            artifact_initial_exact_zero_transition(predecessor.generation),
+            &config.projection,
+        )?;
+        fabric.initialize_managed_model_agent_stack(projection_digest, initial.canonical_wire())?;
+        let mut core = Self::from_snapshot(initial, config);
+
+        let model_generation = next_generation(core.snapshot.model_generation_high_water)?;
+        let model_intent = artifact_model_intent_transition(
+            core.snapshot.transition(),
+            &request,
+            verified,
+            response_channel,
+            predecessor.generation,
+            model_generation,
+        )?;
+        core.commit_transition(fabric, model_intent)?;
+
+        let model_dependency = match core
+            .start_model(request.target_execution().clone(), model_generation)
+            .await
+        {
+            Ok(dependency) => dependency,
+            Err(error) => {
+                let terminal = match model_start_cleanup_exact_zero(&error) {
+                    Some(true) => Some(core.commit_model_terminal(
+                        fabric,
+                        &request,
+                        response_channel,
+                        predecessor.generation,
+                        model_generation,
+                        true,
+                    )?),
+                    Some(false) => Some(core.commit_model_terminal(
+                        fabric,
+                        &request,
+                        response_channel,
+                        predecessor.generation,
+                        model_generation,
+                        false,
+                    )?),
+                    None => None,
+                };
+                return Ok(ArtifactManagedModelAgentStackCutoverOutcome::Installed(
+                    Box::new(core),
+                    terminal,
+                ));
+            }
+        };
+
+        let agent_generation = next_generation(core.snapshot.agent_generation_high_water)?;
+        core.commit_agent_start_intent(fabric, agent_generation)?;
+        if core
+            .start_agent(
+                predecessor.control,
+                request.target_execution().embedded(),
+                model_generation,
+                model_dependency,
+            )
+            .await
+            .is_err()
+        {
+            let model_exact = core.shutdown_model().await;
+            let terminal = if model_exact {
+                Some(core.commit_agent_quarantined(
+                    fabric,
+                    &request,
+                    response_channel,
+                    predecessor.generation,
+                    model_generation,
+                    agent_generation,
+                )?)
+            } else {
+                None
+            };
+            return Ok(ArtifactManagedModelAgentStackCutoverOutcome::Installed(
+                Box::new(core),
+                terminal,
+            ));
+        }
+
+        let receipt = core.commit_active_ready(
+            fabric,
+            &request,
+            response_channel,
+            predecessor.generation,
+            model_generation,
+            agent_generation,
+        )?;
+        core.publish_handle(&receipt)?;
+        Ok(ArtifactManagedModelAgentStackCutoverOutcome::Installed(
+            Box::new(core),
+            Some(receipt),
+        ))
+    }
+
+    pub(crate) fn authenticated_terminal_replay(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        response_channel: ReferenceChannelBindingV1,
+    ) -> Result<Option<ManagedModelAgentStackTerminalReceiptV1>, ManagedModelAgentStackRuntimeError>
+    {
+        let source_scope = request.provenance().source_scope();
+        let operation_id = request.operation_id();
+        let Some(record) = self.snapshot.terminals.iter().find(|record| {
+            record.source_scope == source_scope && record.operation_id == operation_id
+        }) else {
+            return Ok(None);
+        };
+        if record.request != *request || record.request_digest != request.envelope_request_digest() {
+            return Err(ManagedModelAgentStackRuntimeError::OperationConflict);
+        }
+        record
+            .receipt
+            .validate_against_artifact_request(request, response_channel)
+            .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)?;
+        verify_runtime_terminal_signature(
+            &record.receipt,
+            self.response_key_ref,
+            &self.response_signer,
+        )?;
+        Ok(Some(record.receipt.clone()))
+    }
+
+    async fn start_model(
+        &mut self,
+        execution: paraegox_runtime_contracts::managed_model_agent_stack_plan::ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        generation: ManagedServiceGeneration,
+    ) -> Result<ManagedModelDependencyHandle, ManagedModelAgentStackRuntimeError> {
+        let agent_service_id = active_agent_service_id(execution.embedded())?;
+        let (assembly, dependency) = ManagedModelAssembly::start_artifact(
+            execution,
+            generation,
+            agent_service_id,
+            Arc::clone(&self.model_backend_resolver),
+            self.clock,
+            &self.cancellation,
+        )
+        .await?;
+        self.model = Some(assembly);
+        Ok(dependency)
+    }
+
+    async fn start_agent(
+        &mut self,
+        fabric: ManagedFabricControlHandle,
+        execution: &ManagedModelAgentStackTargetExecutionV1,
+        model_generation: ManagedServiceGeneration,
+        model_dependency: ManagedModelDependencyHandle,
+    ) -> Result<(), ManagedModelAgentStackRuntimeError> {
+        let model_service_id = execution
+            .model()
+            .ok_or(ManagedModelAgentStackRuntimeError::InvalidDurableState)?
+            .service()
+            .service_id();
+        let (agent, handle) = ManagedAgentAssembly::start_with_model_dependency(
+            fabric,
+            execution.managed_agent_stack(),
+            self.state_directory.clone(),
+            model_service_id,
+            model_generation,
+            model_dependency,
+        )
+        .await?;
+        self.agent = Some(agent);
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    async fn shutdown_model(&mut self) -> bool {
+        let exact_zero = {
+            let Some(model) = self.model.as_mut() else {
+                return true;
+            };
+            model.shutdown().await.exact_zero()
+        };
+        if exact_zero {
+            self.model = None;
+        }
+        exact_zero
+    }
+
+    fn commit_agent_start_intent(
+        &mut self,
+        fabric: &mut ManagedFabricRuntimeCore,
+        agent_generation: ManagedServiceGeneration,
+    ) -> Result<(), ManagedModelAgentStackRuntimeError> {
+        let transition = artifact_agent_start_intent_transition(
+            self.snapshot.transition(),
+            agent_generation,
+        )?;
+        self.commit_transition(fabric, transition)
+    }
+
+    fn commit_model_terminal(
+        &mut self,
+        fabric: &mut ManagedFabricRuntimeCore,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        response_channel: ReferenceChannelBindingV1,
+        fabric_generation: ManagedServiceGeneration,
+        model_generation: ManagedServiceGeneration,
+        cleanup_exact_zero: bool,
+    ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+        let (selection, quarantine_reason) = if cleanup_exact_zero {
+            let reason = quarantine_reason_digest_for_request(
+                30,
+                request.envelope_request_digest(),
+                Some(true),
+            )?;
+            (
+                TerminalSelection {
+                    outcome: ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+                    lifecycle_effect: ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                    head: ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                    fabric_generation: Some(fabric_generation),
+                    model_generation: Some(model_generation),
+                    agent_generation: None,
+                    physical_binding_census: 0,
+                    census_complete: true,
+                    fabric_ready: true,
+                    model_ready: false,
+                    agent_ready: false,
+                    fabric_to_agent_dependency_ready: false,
+                    model_to_agent_dependency_ready: false,
+                    exact_zero: false,
+                    quarantined: true,
+                    raw_code: 30,
+                    raw_context: Some(reason),
+                },
+                Some(reason),
+            )
+        } else {
+            (
+                TerminalSelection {
+                    outcome: ManagedModelAgentStackTerminalOutcomeV1::Uncertain,
+                    lifecycle_effect: ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                    head: ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                    fabric_generation: Some(fabric_generation),
+                    model_generation: Some(model_generation),
+                    agent_generation: None,
+                    physical_binding_census: 0,
+                    census_complete: false,
+                    fabric_ready: false,
+                    model_ready: false,
+                    agent_ready: false,
+                    fabric_to_agent_dependency_ready: false,
+                    model_to_agent_dependency_ready: false,
+                    exact_zero: false,
+                    quarantined: false,
+                    raw_code: 32,
+                    raw_context: None,
+                },
+                None,
+            )
+        };
+        let receipt = self.build_terminal(request, response_channel, selection)?;
+        let mut transition = self.snapshot.transition();
+        transition.phase = if cleanup_exact_zero {
+            ManagedModelAgentStackDurablePhase::Quarantined
+        } else {
+            ManagedModelAgentStackDurablePhase::Uncertain
+        };
+        transition.physical_binding_census = selection.physical_binding_census;
+        transition.census_complete = selection.census_complete;
+        transition.fabric_ready = selection.fabric_ready;
+        transition.model_ready = selection.model_ready;
+        transition.agent_ready = selection.agent_ready;
+        transition.fabric_to_agent_dependency_ready =
+            selection.fabric_to_agent_dependency_ready;
+        transition.model_to_agent_dependency_ready =
+            selection.model_to_agent_dependency_ready;
+        transition.quarantine_reason = quarantine_reason;
+        insert_artifact_terminal(&mut transition.terminals, request, receipt.clone())?;
+        self.commit_transition(fabric, transition)?;
+        Ok(receipt)
+    }
+
+    fn commit_agent_quarantined(
+        &mut self,
+        fabric: &mut ManagedFabricRuntimeCore,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        response_channel: ReferenceChannelBindingV1,
+        fabric_generation: ManagedServiceGeneration,
+        model_generation: ManagedServiceGeneration,
+        agent_generation: ManagedServiceGeneration,
+    ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+        let reason = quarantine_reason_digest_for_request(
+            31,
+            request.envelope_request_digest(),
+            Some(true),
+        )?;
+        let selection = TerminalSelection {
+            outcome: ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+            lifecycle_effect: ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+            head: ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+            fabric_generation: Some(fabric_generation),
+            model_generation: Some(model_generation),
+            agent_generation: Some(agent_generation),
+            physical_binding_census: 0,
+            census_complete: false,
+            fabric_ready: true,
+            model_ready: false,
+            agent_ready: false,
+            fabric_to_agent_dependency_ready: false,
+            model_to_agent_dependency_ready: false,
+            exact_zero: false,
+            quarantined: true,
+            raw_code: 31,
+            raw_context: Some(reason),
+        };
+        let receipt = self.build_terminal(request, response_channel, selection)?;
+        let mut transition = self.snapshot.transition();
+        transition.phase = ManagedModelAgentStackDurablePhase::Quarantined;
+        transition.physical_binding_census = 0;
+        transition.census_complete = false;
+        transition.fabric_ready = true;
+        transition.model_ready = false;
+        transition.agent_ready = false;
+        transition.fabric_to_agent_dependency_ready = false;
+        transition.model_to_agent_dependency_ready = false;
+        transition.quarantine_reason = Some(reason);
+        insert_artifact_terminal(&mut transition.terminals, request, receipt.clone())?;
+        self.commit_transition(fabric, transition)?;
+        Ok(receipt)
+    }
+
+    fn commit_active_ready(
+        &mut self,
+        fabric: &mut ManagedFabricRuntimeCore,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        response_channel: ReferenceChannelBindingV1,
+        fabric_generation: ManagedServiceGeneration,
+        model_generation: ManagedServiceGeneration,
+        agent_generation: ManagedServiceGeneration,
+    ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+        let selection = TerminalSelection {
+            outcome: ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+            lifecycle_effect: ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+            head: ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+            fabric_generation: Some(fabric_generation),
+            model_generation: Some(model_generation),
+            agent_generation: Some(agent_generation),
+            physical_binding_census: 2,
+            census_complete: true,
+            fabric_ready: true,
+            model_ready: true,
+            agent_ready: true,
+            fabric_to_agent_dependency_ready: true,
+            model_to_agent_dependency_ready: true,
+            exact_zero: false,
+            quarantined: false,
+            raw_code: 1,
+            raw_context: None,
+        };
+        let receipt = self.build_terminal(request, response_channel, selection)?;
+        let mut transition = self.snapshot.transition();
+        transition.phase = ManagedModelAgentStackDurablePhase::ActiveReady;
+        transition.active = Some(ArtifactManagedModelAgentStackDurableActiveV2 {
+            fabric_generation,
+            model_generation,
+            agent_generation,
+            response_channel,
+            request: request.clone(),
+        });
+        transition.pending = None;
+        transition.physical_binding_census = 2;
+        transition.census_complete = true;
+        transition.fabric_ready = true;
+        transition.model_ready = true;
+        transition.agent_ready = true;
+        transition.fabric_to_agent_dependency_ready = true;
+        transition.model_to_agent_dependency_ready = true;
+        transition.quarantine_reason = None;
+        insert_artifact_terminal(&mut transition.terminals, request, receipt.clone())?;
+        self.commit_transition(fabric, transition)?;
+        Ok(receipt)
+    }
+
+    fn build_terminal(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        response_channel: ReferenceChannelBindingV1,
+        selection: TerminalSelection,
+    ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+        let reading = self.clock.reading()?;
+        let completion_sequence = self
+            .snapshot
+            .sequence()
+            .checked_add(1)
+            .ok_or(ManagedModelAgentStackRuntimeError::SequenceOverflow)?;
+        let state = ManagedModelAgentStackTerminalStateV1::try_new(
+            selection.outcome,
+            selection.lifecycle_effect,
+            selection.head,
+            selection.fabric_generation,
+            selection.model_generation,
+            selection.agent_generation,
+        )?;
+        let evidence = ManagedModelAgentStackTerminalEvidenceV1::try_new(
+            ManagedModelAgentStackTerminalEvidenceFieldsV1 {
+                physical_binding_census: selection.physical_binding_census,
+                census_complete: selection.census_complete,
+                fabric_ready: selection.fabric_ready,
+                model_ready: selection.model_ready,
+                agent_ready: selection.agent_ready,
+                fabric_to_agent_dependency_ready: selection.fabric_to_agent_dependency_ready,
+                model_to_agent_dependency_ready: selection.model_to_agent_dependency_ready,
+                exact_zero: selection.exact_zero,
+                quarantined: selection.quarantined,
+                resource_census_digest: resource_census_digest(selection)?,
+                raw_outcome_digest: raw_outcome_digest_for_request(
+                    selection,
+                    request.envelope_request_digest(),
+                )?,
+                completion_runtime_host_epoch: self.runtime_host_epoch,
+                completion_snapshot_sequence: completion_sequence,
+                selection_clock_generation: reading.generation(),
+                selection_observed_at_nanos: reading.now().value(),
+            },
+        )?;
+        let facts = ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(
+            request, state, evidence,
+        )?;
+        let algorithm = ApplyAuthAlgorithm::try_new(1)
+            .map_err(|_| ManagedModelAgentStackRuntimeError::SignerConfiguration)?;
+        let auth_claim = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
+            response_channel,
+            self.response_key_ref,
+            algorithm,
+            1,
+        )?;
+        let draft = ManagedModelAgentStackTerminalReceiptDraftV1::try_new_artifact_bound(
+            request,
+            facts,
+            response_channel,
+            auth_claim,
+        )?;
+        let signature = self
+            .response_signer
+            .sign(draft.signing_transcript()?.as_bytes());
+        Ok(draft.finalize(&signature.to_bytes())?)
+    }
+
+    fn publish_handle(
+        &self,
+        receipt: &ManagedModelAgentStackTerminalReceiptV1,
+    ) -> Result<(), ManagedModelAgentStackRuntimeError> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or(ManagedModelAgentStackRuntimeError::InvalidDurableState)?;
+        self.handle_broker
+            .publish_model_agent(handle.clone(), receipt)
+            .map_err(|_| ManagedModelAgentStackRuntimeError::HandleBrokerUnavailable)
+    }
+
+    fn commit_transition(
+        &mut self,
+        fabric: &mut ManagedFabricRuntimeCore,
+        transition: ArtifactManagedModelAgentStackSnapshotTransitionV2,
+    ) -> Result<(), ManagedModelAgentStackRuntimeError> {
+        let next = self.snapshot.try_successor_at_epoch(
+            self.runtime_host_epoch,
+            transition,
+            &self.projection,
+        )?;
+        fabric.commit_managed_model_agent_stack(next.canonical_wire())?;
+        self.snapshot = next;
+        Ok(())
+    }
 }
 
 impl ManagedModelAgentStackRuntimeCore {
@@ -1525,6 +2120,350 @@ impl ManagedModelAgentStackRuntimeCore {
     }
 }
 
+fn artifact_initial_exact_zero_transition(
+    fabric_generation: ManagedServiceGeneration,
+) -> ArtifactManagedModelAgentStackSnapshotTransitionV2 {
+    ArtifactManagedModelAgentStackSnapshotTransitionV2 {
+        fabric_generation_high_water: fabric_generation.value(),
+        model_generation_high_water: 0,
+        agent_generation_high_water: 0,
+        phase: ManagedModelAgentStackDurablePhase::ExactZero,
+        writer_fence: None,
+        revision_high_water: None,
+        active: None,
+        pending: None,
+        tenure_nonces: Vec::new(),
+        request_nonces: Vec::new(),
+        temporal_lineages: Vec::new(),
+        terminals: Vec::new(),
+        physical_binding_census: 0,
+        census_complete: true,
+        fabric_ready: false,
+        model_ready: false,
+        agent_ready: false,
+        fabric_to_agent_dependency_ready: false,
+        model_to_agent_dependency_ready: false,
+        quarantine_reason: None,
+    }
+}
+
+fn artifact_model_intent_transition(
+    mut transition: ArtifactManagedModelAgentStackSnapshotTransitionV2,
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    verified: VerifiedArtifactManagedModelAgentStackApplyIngressV1,
+    response_channel: ReferenceChannelBindingV1,
+    fabric_generation: ManagedServiceGeneration,
+    model_generation: ManagedServiceGeneration,
+) -> Result<ArtifactManagedModelAgentStackSnapshotTransitionV2, ManagedModelAgentStackRuntimeError>
+{
+    let proof_digest = verified.authenticated().proof_envelope_digest();
+    transition.fabric_generation_high_water = transition
+        .fabric_generation_high_water
+        .max(fabric_generation.value());
+    transition.model_generation_high_water = model_generation.value();
+    transition.phase = ManagedModelAgentStackDurablePhase::ModelStartIntent;
+    transition.writer_fence = Some(artifact_writer_fence(request, proof_digest));
+    transition.revision_high_water = Some(artifact_revision_high_water(request));
+    transition.active = None;
+    transition.pending = Some(ArtifactManagedModelAgentStackDurablePendingV2 {
+        kind: ArtifactManagedModelAgentStackPendingKindV2::ActivateArtifactV12,
+        fabric_generation: Some(fabric_generation),
+        model_generation: Some(model_generation),
+        agent_generation: None,
+        admitted_clock_generation: verified.clock_generation(),
+        admitted_at_nanos: verified.admitted_at_nanos(),
+        deadline_nanos: verified.deadline_nanos(),
+        response_channel,
+        request: request.clone(),
+    });
+    transition.physical_binding_census = 0;
+    transition.census_complete = true;
+    transition.fabric_ready = true;
+    transition.model_ready = false;
+    transition.agent_ready = false;
+    transition.fabric_to_agent_dependency_ready = true;
+    transition.model_to_agent_dependency_ready = false;
+    transition.quarantine_reason = None;
+    insert_verified_artifact_replays(
+        &mut transition,
+        verified,
+        request.envelope_request_digest(),
+    )?;
+    Ok(transition)
+}
+
+fn artifact_agent_start_intent_transition(
+    mut transition: ArtifactManagedModelAgentStackSnapshotTransitionV2,
+    agent_generation: ManagedServiceGeneration,
+) -> Result<ArtifactManagedModelAgentStackSnapshotTransitionV2, ManagedModelAgentStackRuntimeError>
+{
+    let pending = transition
+        .pending
+        .as_mut()
+        .ok_or(ManagedModelAgentStackRuntimeError::InvalidDurableState)?;
+    if pending.kind != ArtifactManagedModelAgentStackPendingKindV2::ActivateArtifactV12
+        || pending.agent_generation.is_some()
+    {
+        return Err(ManagedModelAgentStackRuntimeError::InvalidDurableState);
+    }
+    pending.agent_generation = Some(agent_generation);
+    transition.agent_generation_high_water = agent_generation.value();
+    transition.phase = ManagedModelAgentStackDurablePhase::AgentStartIntent;
+    transition.model_ready = true;
+    transition.model_to_agent_dependency_ready = true;
+    Ok(transition)
+}
+
+fn artifact_writer_fence(
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    proof_envelope_digest: Digest32,
+) -> ManagedModelAgentStackWriterFence {
+    let writer = request.control_commitment().control().writer_context();
+    let claim = writer.proof().claim();
+    ManagedModelAgentStackWriterFence {
+        source_scope: claim.source_scope(),
+        writer: claim.writer(),
+        principal: request.authentication().claim().principal(),
+        epoch: claim.epoch().value(),
+        proof_envelope_digest,
+    }
+}
+
+fn artifact_revision_high_water(
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+) -> ManagedModelAgentStackRevisionHighWater {
+    let provenance = request.provenance();
+    ManagedModelAgentStackRevisionHighWater {
+        source_scope: provenance.source_scope(),
+        revision: provenance.source_revision().value(),
+        source_plan_digest: provenance.source_plan_digest(),
+    }
+}
+
+fn insert_verified_artifact_replays(
+    transition: &mut ArtifactManagedModelAgentStackSnapshotTransitionV2,
+    verified: VerifiedArtifactManagedModelAgentStackApplyIngressV1,
+    request_digest: Digest32,
+) -> Result<(), ManagedModelAgentStackRuntimeError> {
+    insert_replay(
+        &mut transition.tenure_nonces,
+        ManagedModelAgentStackReplayRecord {
+            identity: verified.authenticated().tenure_nonce_identity(),
+            value_digest: verified.authenticated().proof_envelope_digest(),
+        },
+    )?;
+    insert_replay(
+        &mut transition.request_nonces,
+        ManagedModelAgentStackReplayRecord {
+            identity: verified.authenticated().request_nonce_identity(),
+            value_digest: request_digest,
+        },
+    )?;
+    insert_replay(
+        &mut transition.temporal_lineages,
+        ManagedModelAgentStackReplayRecord {
+            identity: verified.authenticated().temporal_lineage_identity(),
+            value_digest: request_digest,
+        },
+    )
+}
+
+fn insert_artifact_terminal(
+    records: &mut Vec<ArtifactManagedModelAgentStackTerminalRecordV2>,
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    receipt: ManagedModelAgentStackTerminalReceiptV1,
+) -> Result<(), ManagedModelAgentStackRuntimeError> {
+    let key = (
+        *request.provenance().source_scope().as_bytes(),
+        *request.operation_id().as_bytes(),
+    );
+    match records.binary_search_by_key(&key, |record| {
+        (
+            *record.source_scope.as_bytes(),
+            *record.operation_id.as_bytes(),
+        )
+    }) {
+        Ok(index)
+            if records[index].request == *request
+                && records[index].request_digest == request.envelope_request_digest()
+                && records[index].receipt == receipt =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(ManagedModelAgentStackRuntimeError::OperationConflict),
+        Err(index) if records.len() < MAX_STACK_REPLAY_RECORDS => {
+            records.insert(
+                index,
+                ArtifactManagedModelAgentStackTerminalRecordV2 {
+                    source_scope: request.provenance().source_scope(),
+                    operation_id: request.operation_id(),
+                    request_digest: request.envelope_request_digest(),
+                    request: request.clone(),
+                    receipt,
+                },
+            );
+            Ok(())
+        }
+        Err(_) => Err(ManagedModelAgentStackRuntimeError::ReplayCapacityReached),
+    }
+}
+
+fn verify_runtime_terminal_signature(
+    receipt: &ManagedModelAgentStackTerminalReceiptV1,
+    response_key_ref: ApplyAuthKeyRef,
+    response_signer: &SigningKey,
+) -> Result<(), ManagedModelAgentStackRuntimeError> {
+    let signature_bytes = receipt.authentication_signature();
+    if receipt.authentication_key() != response_key_ref
+        || receipt.authentication_algorithm().value() != 1
+        || receipt.authentication_algorithm_version() != 1
+        || signature_bytes.len() != 64
+    {
+        return Err(ManagedModelAgentStackRuntimeError::TerminalCorrelation);
+    }
+    let signature = Signature::from_slice(signature_bytes)
+        .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)?;
+    let transcript = receipt
+        .signing_transcript()
+        .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)?;
+    response_signer
+        .verifying_key()
+        .verify_strict(transcript.as_bytes(), &signature)
+        .map_err(|_| ManagedModelAgentStackRuntimeError::TerminalCorrelation)
+}
+
+fn build_artifact_pre_cutover_no_effect_terminal(
+    config: &ManagedModelAgentStackOwnerConfig,
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    response_channel: ReferenceChannelBindingV1,
+    fabric_generation: ManagedServiceGeneration,
+    raw_code: u16,
+) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+    let reading = config.clock.reading()?;
+    let selection = TerminalSelection {
+        outcome: ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected,
+        lifecycle_effect: ManagedModelAgentStackTerminalLifecycleEffectV1::ProvenNotStarted,
+        head: ManagedModelAgentStackTerminalHeadV1::PreservedNone,
+        fabric_generation: Some(fabric_generation),
+        model_generation: None,
+        agent_generation: None,
+        physical_binding_census: 0,
+        census_complete: true,
+        fabric_ready: true,
+        model_ready: false,
+        agent_ready: false,
+        fabric_to_agent_dependency_ready: false,
+        model_to_agent_dependency_ready: false,
+        exact_zero: false,
+        quarantined: false,
+        raw_code,
+        raw_context: None,
+    };
+    let state = ManagedModelAgentStackTerminalStateV1::try_new(
+        selection.outcome,
+        selection.lifecycle_effect,
+        selection.head,
+        selection.fabric_generation,
+        selection.model_generation,
+        selection.agent_generation,
+    )?;
+    let evidence = ManagedModelAgentStackTerminalEvidenceV1::try_new(
+        ManagedModelAgentStackTerminalEvidenceFieldsV1 {
+            physical_binding_census: selection.physical_binding_census,
+            census_complete: selection.census_complete,
+            fabric_ready: selection.fabric_ready,
+            model_ready: selection.model_ready,
+            agent_ready: selection.agent_ready,
+            fabric_to_agent_dependency_ready: selection.fabric_to_agent_dependency_ready,
+            model_to_agent_dependency_ready: selection.model_to_agent_dependency_ready,
+            exact_zero: selection.exact_zero,
+            quarantined: selection.quarantined,
+            resource_census_digest: resource_census_digest(selection)?,
+            raw_outcome_digest: raw_outcome_digest_for_request(
+                selection,
+                request.envelope_request_digest(),
+            )?,
+            completion_runtime_host_epoch: config.runtime_host_epoch,
+            completion_snapshot_sequence: 1,
+            selection_clock_generation: reading.generation(),
+            selection_observed_at_nanos: reading.now().value(),
+        },
+    )?;
+    let facts = ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(
+        request, state, evidence,
+    )?;
+    let algorithm = ApplyAuthAlgorithm::try_new(1)
+        .map_err(|_| ManagedModelAgentStackRuntimeError::SignerConfiguration)?;
+    let auth_claim = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
+        response_channel,
+        config.response_key_ref,
+        algorithm,
+        1,
+    )?;
+    let draft = ManagedModelAgentStackTerminalReceiptDraftV1::try_new_artifact_bound(
+        request,
+        facts,
+        response_channel,
+        auth_claim,
+    )?;
+    let signature = config
+        .response_signer
+        .sign(draft.signing_transcript()?.as_bytes());
+    Ok(draft.finalize(&signature.to_bytes())?)
+}
+
+fn validate_artifact_cutover_request(
+    fabric: &ManagedFabricRuntimeCore,
+    config: &ManagedModelAgentStackOwnerConfig,
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    response_channel: ReferenceChannelBindingV1,
+) -> Result<(), ManagedModelAgentStackRuntimeError> {
+    if fabric
+        .managed_model_agent_stack_projection_digest()
+        .is_some()
+        || request.target_execution().projection() != &config.projection
+        || request.target() != config.projection.target()
+        || request.expected_runtime_store_instance_id() != fabric.store_instance_id()
+        || response_channel.target() != request.target()
+        || !config.state_directory.is_absolute()
+    {
+        return Err(ManagedModelAgentStackRuntimeError::RequestRejected);
+    }
+    active_agent_service_id(request.target_execution().embedded())?;
+    Ok(())
+}
+
+fn validate_artifact_cutover_cas_and_fabric(
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    predecessor: &ManagedFabricStackCutoverObservation,
+) -> Result<(), ManagedModelAgentStackRuntimeError> {
+    if request
+        .target_execution()
+        .embedded()
+        .managed_agent_stack()
+        .fabric()
+        != &predecessor.execution
+        || request.control_commitment().control().expected_active()
+            != ExpectedActive::Exact(predecessor.target_slice_digest)
+    {
+        return Err(ManagedModelAgentStackRuntimeError::FabricChangeRequiresEmpty);
+    }
+    Ok(())
+}
+
+fn observe_artifact_deadline(
+    clock: RuntimeClock,
+    verified: VerifiedArtifactManagedModelAgentStackApplyIngressV1,
+) -> Result<(), ManagedModelAgentStackRuntimeError> {
+    let reading = clock.reading()?;
+    if reading.generation() != verified.clock_generation()
+        || reading.now().value() >= verified.deadline_nanos()
+    {
+        return Err(ManagedModelAgentStackRuntimeError::DeadlineExpired);
+    }
+    Ok(())
+}
+
 fn build_pre_cutover_no_effect_terminal(
     config: &ManagedModelAgentStackOwnerConfig,
     request: &ManagedModelAgentStackApplyRequestV1,
@@ -1939,19 +2878,38 @@ fn raw_outcome_digest(
     selection: TerminalSelection,
     request: &ManagedModelAgentStackApplyRequestV1,
 ) -> Result<Digest32, DigestBuildError> {
+    raw_outcome_digest_for_request(selection, request.envelope_request_digest())
+}
+
+fn raw_outcome_digest_for_request(
+    selection: TerminalSelection,
+    request_digest: Digest32,
+) -> Result<Digest32, DigestBuildError> {
     let mut builder = Digest32Builder::try_new(STACK_RAW_OUTCOME_DIGEST_DOMAIN)?;
     builder.field_u16(selection.raw_code)?;
     builder.field_u16(u16::from(selection.raw_context.is_some()))?;
     if let Some(context) = selection.raw_context {
         builder.field_digest(&context)?;
     }
-    builder.field_digest(&request.envelope_request_digest())?;
+    builder.field_digest(&request_digest)?;
     Ok(builder.finish())
 }
 
 fn quarantine_reason_digest(
     code: u16,
     request: &ManagedModelAgentStackApplyRequestV1,
+    model_cleanup_exact_zero: Option<bool>,
+) -> Result<Digest32, DigestBuildError> {
+    quarantine_reason_digest_for_request(
+        code,
+        request.envelope_request_digest(),
+        model_cleanup_exact_zero,
+    )
+}
+
+fn quarantine_reason_digest_for_request(
+    code: u16,
+    request_digest: Digest32,
     model_cleanup_exact_zero: Option<bool>,
 ) -> Result<Digest32, DigestBuildError> {
     let mut builder = Digest32Builder::try_new(STACK_QUARANTINE_DIGEST_DOMAIN)?;
@@ -1961,7 +2919,7 @@ fn quarantine_reason_digest(
         Some(false) => 1,
         Some(true) => 2,
     })?;
-    builder.field_digest(&request.envelope_request_digest())?;
+    builder.field_digest(&request_digest)?;
     Ok(builder.finish())
 }
 
@@ -2096,6 +3054,23 @@ impl From<RuntimeClockError> for ManagedModelAgentStackRuntimeError {
 mod tests {
     use super::*;
 
+    fn decode_fixture_hex(input: &str) -> Vec<u8> {
+        fn nibble(value: u8) -> u8 {
+            match value {
+                b'0'..=b'9' => value - b'0',
+                b'a'..=b'f' => value - b'a' + 10,
+                _ => panic!("fixture must use lower-case hex"),
+            }
+        }
+
+        let value = input.trim_end_matches('\n').as_bytes();
+        assert_eq!(value.len() % 2, 0);
+        value
+            .chunks_exact(2)
+            .map(|chunk| (nibble(chunk[0]) << 4) | nibble(chunk[1]))
+            .collect()
+    }
+
     fn generation(value: u64) -> ManagedServiceGeneration {
         ManagedServiceGeneration::try_new(value).expect("test generation must be nonzero")
     }
@@ -2142,6 +3117,95 @@ mod tests {
     }
 
     #[test]
+    fn artifact_owner_constructs_exact_zero_model_and_agent_intents_without_v1_fallback() {
+        let request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+            &decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
+            )),
+        )
+        .expect("shared PXAR12 fixture");
+        let projection = request.target_execution().projection().clone();
+        let projection_digest = stack_projection_digest(&projection).expect("projection digest");
+        let fabric_generation = generation(7);
+        let model_generation = generation(8);
+        let agent_generation = generation(9);
+        let channel = ReferenceChannelBindingV1::try_new(
+            request.target(),
+            paraegox_kernel::identity::PrincipalRef::from_bytes([0x71; 16]),
+            Digest32::from_bytes([0x72; 32]),
+            Digest32::from_bytes([0x73; 32]),
+        )
+        .expect("fixture channel");
+        let initial = ArtifactManagedModelAgentStackSnapshotV2::try_initial_at_sequence(
+            request.expected_runtime_store_instance_id(),
+            Digest32::from_bytes([0x55; 32]),
+            projection_digest,
+            1,
+            9,
+            artifact_initial_exact_zero_transition(fabric_generation),
+            &projection,
+        )
+        .expect("initial Artifact exact-zero snapshot");
+        assert_eq!(initial.phase, ManagedModelAgentStackDurablePhase::ExactZero);
+
+        let verified = VerifiedArtifactManagedModelAgentStackApplyIngressV1::for_test(
+            100,
+            6_000_183,
+            paraegox_kernel::time::ClockGeneration::try_new(3)
+                .expect("fixture clock generation"),
+            0xd3,
+        );
+        let model_intent = initial
+            .try_successor_at_epoch(
+                9,
+                artifact_model_intent_transition(
+                    initial.transition(),
+                    &request,
+                    verified,
+                    channel,
+                    fabric_generation,
+                    model_generation,
+                )
+                .expect("model-intent transition"),
+                &projection,
+            )
+            .expect("model-intent successor");
+        assert_eq!(model_intent.sequence(), 2);
+        assert_eq!(model_intent.phase, ManagedModelAgentStackDurablePhase::ModelStartIntent);
+        assert_eq!(model_intent.tenure_nonces.len(), 1);
+        assert_eq!(model_intent.request_nonces.len(), 1);
+        assert_eq!(model_intent.temporal_lineages.len(), 1);
+        let pending = model_intent.pending.as_ref().expect("retained pending request");
+        assert_eq!(pending.request, request);
+        assert_eq!(pending.admitted_at_nanos, 100);
+        assert_eq!(pending.deadline_nanos, 6_000_183);
+        assert_eq!(pending.fabric_generation, Some(fabric_generation));
+        assert_eq!(pending.model_generation, Some(model_generation));
+        assert_eq!(pending.agent_generation, None);
+
+        let agent_intent = model_intent
+            .try_successor_at_epoch(
+                9,
+                artifact_agent_start_intent_transition(
+                    model_intent.transition(),
+                    agent_generation,
+                )
+                .expect("agent-intent transition"),
+                &projection,
+            )
+            .expect("agent-intent successor");
+        assert_eq!(agent_intent.sequence(), 3);
+        assert_eq!(agent_intent.phase, ManagedModelAgentStackDurablePhase::AgentStartIntent);
+        assert_eq!(
+            agent_intent
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.agent_generation),
+            Some(agent_generation),
+        );
+    }
+
+    #[test]
     fn retained_terminal_and_s0_freeze_guards_precede_model_stack_mutation() {
         let source = include_str!("managed_model_agent_stack_runtime.rs");
         let lookup = source
@@ -2166,7 +3230,8 @@ mod tests {
         }
 
         let cutover = source
-            .split_once("    pub(crate) async fn cutover(")
+            .split_once("impl ManagedModelAgentStackRuntimeCore {")
+            .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn cutover("))
             .and_then(|(_, tail)| tail.split_once("    pub(crate) async fn recover("))
             .map(|(cutover, _)| cutover)
             .expect("missing Model+Agent cutover boundary");
