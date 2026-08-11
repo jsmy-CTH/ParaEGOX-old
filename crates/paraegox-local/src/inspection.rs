@@ -19,7 +19,8 @@ use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstatat};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, linkat, unlinkat};
 use paraegox_deployment::{
-    DeveloperFixtureModelAgentStackOutcomeV1, DeveloperProvisionedModelAgentStackOutcomeV1,
+    DeveloperArtifactExternalModelAgentStackOutcomeV1, DeveloperFixtureModelAgentStackOutcomeV1,
+    DeveloperProvisionedModelAgentStackOutcomeV1,
 };
 use paraegox_inspection::adapter::{
     InspectionSourceAdapterV1, LocalInspectionProjectionInputBuilderV1,
@@ -89,6 +90,7 @@ pub(crate) struct DeveloperLocalInspectionSourcesV2 {
 
 #[derive(Clone)]
 pub(crate) enum DeveloperLocalDeploymentOutcomeV1 {
+    ArtifactExternal(DeveloperArtifactExternalModelAgentStackOutcomeV1),
     Fixture(DeveloperFixtureModelAgentStackOutcomeV1),
     Provisioned(DeveloperProvisionedModelAgentStackOutcomeV1),
 }
@@ -96,6 +98,7 @@ pub(crate) enum DeveloperLocalDeploymentOutcomeV1 {
 impl DeveloperLocalDeploymentOutcomeV1 {
     pub(crate) fn agent_terminal_receipt(&self) -> &[u8] {
         match self {
+            Self::ArtifactExternal(outcome) => outcome.model_agent_terminal_receipt(),
             Self::Fixture(outcome) => outcome.model_agent_terminal_receipt(),
             Self::Provisioned(outcome) => outcome.model_agent_terminal_receipt(),
         }
@@ -301,6 +304,24 @@ fn build_projection(
         deployment_snapshot_sequence,
         deployment_request_digest,
     ) = match &sources.deployment {
+        DeveloperLocalDeploymentOutcomeV1::ArtifactExternal(outcome) => {
+            let projection = outcome.projection();
+            (
+                outcome.authority_tenure_epoch(),
+                outcome.authority_proof_digest(),
+                projection
+                    .deployment_revision()
+                    .ok_or(DeveloperLocalInspectionErrorV1::InvalidOwnerFacts)?
+                    .get(),
+                projection
+                    .committed_controller_snapshot_sequence()
+                    .ok_or(DeveloperLocalInspectionErrorV1::InvalidOwnerFacts)?
+                    .get(),
+                projection
+                    .runtime_apply_request_digest()
+                    .ok_or(DeveloperLocalInspectionErrorV1::InvalidOwnerFacts)?,
+            )
+        }
         DeveloperLocalDeploymentOutcomeV1::Fixture(outcome) => (
             outcome.authority_tenure_epoch(),
             outcome.authority_proof_digest(),
@@ -560,13 +581,26 @@ fn build_projection(
 fn verify_agent_terminal(
     sources: &DeveloperLocalInspectionSourcesV2,
 ) -> Result<ManagedModelAgentStackTerminalReceiptV1, DeveloperLocalInspectionErrorV1> {
-    let (wire, expected_digest) = match &sources.deployment {
+    let (wire, expected_request_digest, expected_digest) = match &sources.deployment {
+        DeveloperLocalDeploymentOutcomeV1::ArtifactExternal(outcome) => (
+            outcome.model_agent_terminal_receipt(),
+            outcome
+                .projection()
+                .runtime_apply_request_digest()
+                .ok_or(DeveloperLocalInspectionErrorV1::InvalidOwnerFacts)?,
+            outcome
+                .projection()
+                .runtime_terminal_receipt_digest()
+                .ok_or(DeveloperLocalInspectionErrorV1::InvalidOwnerFacts)?,
+        ),
         DeveloperLocalDeploymentOutcomeV1::Fixture(outcome) => (
             outcome.model_agent_terminal_receipt(),
+            outcome.model_agent_request_digest(),
             outcome.model_agent_receipt_digest(),
         ),
         DeveloperLocalDeploymentOutcomeV1::Provisioned(outcome) => (
             outcome.model_agent_terminal_receipt(),
+            outcome.model_agent_request_digest(),
             outcome.model_agent_receipt_digest(),
         ),
     };
@@ -581,6 +615,7 @@ fn verify_agent_terminal(
         || receipt.authentication_algorithm().value() != ED25519_ALGORITHM
         || receipt.authentication_algorithm_version() != ED25519_ALGORITHM_VERSION
         || receipt.authentication_signature().len() != ED25519_SIGNATURE_BYTES
+        || facts.request_digest() != expected_request_digest
         || receipt.receipt_digest() != expected_digest
         || state.outcome() != ManagedModelAgentStackTerminalOutcomeV1::ActiveReady
         || state.head() != ManagedModelAgentStackTerminalHeadV1::CommittedIncoming

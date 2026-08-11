@@ -3679,8 +3679,10 @@ mod tests {
         let physical_start = start
             .find(".mutate_live_fabric(")
             .expect("missing bounded Agent Fabric mutation");
-        assert!(journal < physical_start);
-        assert!(!start.contains("PrepareDeadlineExceeded"));
+        let prepare_deadline = start
+            .find("PrepareDeadlineExceeded")
+            .expect("missing pre-effect Agent prepare deadline");
+        assert!(journal < prepare_deadline && prepare_deadline < physical_start);
         assert!(start.contains("ManagedServiceLifecycleStage::Start"));
         assert!(start.contains("ManagedServiceLifecycleStage::Readiness"));
     }

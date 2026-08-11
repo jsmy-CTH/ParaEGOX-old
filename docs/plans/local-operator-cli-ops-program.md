@@ -1576,7 +1576,7 @@ A1 internal claim-to-evidence 必须在最终包含D0b的同一 immutable candid
 Artifact F0 A1-internal→D0b 实现序列的 exact write-set union 冻结为以下路径；候选内可按owner拆commit并先完成A1 mechanism evidence，但不能越出union、不能让D0b在缺少这些机制时伪造consumer，也不能把任何A1-only commit独立merge/admit/release：
 
 - 本 Program、workspace `Cargo.toml` 与 `Cargo.lock`；新建 `crates/paraegox-artifact/Cargo.toml`、`crates/paraegox-artifact/src/{lib.rs,contract.rs,store.rs}`；
-- `crates/paraegox-local/Cargo.toml` 与 `crates/paraegox-local/src/{artifact.rs,config.rs,error.rs,main.rs,layout.rs,lifecycle.rs,composition.rs}`；
+- `crates/paraegox-local/Cargo.toml` 与 `crates/paraegox-local/src/{artifact.rs,config.rs,error.rs,main.rs,layout.rs,lifecycle.rs,composition.rs,inspection.rs}`；其中 `inspection.rs` 只允许把已由 external Controller/Runtime 严格相关且验证为 `ActiveReady` 的既有 PXMT owner facts投影到现有read-only Inspection/PXIB owner，供同candidate TUI消费；不得新增 Inspection wire、health authority、retry、第二writer或由TUI observation反推Ready；
 - `crates/paraegox-runtime-contracts/Cargo.toml` 与 `crates/paraegox-runtime-contracts/src/{lib.rs,managed_model_agent_stack_plan.rs}`；
 - `crates/paraegox-deployment/Cargo.toml` 与 `crates/paraegox-deployment/src/{lib.rs,developer_fixture_agent_stack.rs,managed_model_agent_stack_producer.rs,managed_model_agent_stack_apply.rs,runtime_control_client.rs}`；
 - `crates/paraegox-runtime/Cargo.toml` 与 `crates/paraegox-runtime/src/{lib.rs,managed_model_agent_stack_runtime.rs,managed_model_agent_stack_state.rs,managed_model_runtime.rs,managed_service_assembly.rs,runtime_control_endpoint.rs,admission.rs}`；

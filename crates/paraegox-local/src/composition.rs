@@ -23,6 +23,7 @@ use paraegox_agent_contracts::{AgentConversationDeckRunId, AgentConversationSess
 use paraegox_agent_service::AgentConversationModelServiceProviderV1;
 use paraegox_deployment::{
     DeveloperArtifactExternalControllerRequestV1, DeveloperArtifactExternalModelAgentStackInputV1,
+    DeveloperArtifactExternalModelAgentStackOutcomeV1,
     DeveloperDeploymentAgentBootstrapStartFieldsV1, DeveloperDeploymentAgentBootstrapStartInputV1,
     DeveloperDeploymentAgentBootstrapStartOutcomeV1, DeveloperDeploymentEnrollmentFactsFieldsV1,
     DeveloperDeploymentEnrollmentFactsV1, DeveloperDeploymentOwnerV1,
@@ -490,6 +491,7 @@ pub(crate) fn run_prepared_artifact_external_owner(
         .projection()
         .runtime_terminal_receipt_digest()
         .ok_or(LocalProcessError::DeploymentActivation)?;
+    let inspection_sources = stack.artifact_external_inspection_sources(outcome.clone());
     let receipt_activation = LocalReceiptActivationInputV1::try_new(
         outcome
             .model_agent_terminal_receipt()
@@ -521,7 +523,11 @@ pub(crate) fn run_prepared_artifact_external_owner(
             config: bounds,
             ipc_socket_path: layout.agent_ipc_socket_path().to_path_buf(),
             ipc_bootstrap_path: layout.agent_ipc_bootstrap_path().to_path_buf(),
-            inspection: None,
+            inspection: Some(ConversationInspectionInput {
+                sources: inspection_sources,
+                ipc_socket_path: layout.inspection_ipc_socket_path().to_path_buf(),
+                ipc_bootstrap_path: layout.inspection_ipc_bootstrap_path().to_path_buf(),
+            }),
             receipt: Some(ConversationReceiptInput {
                 activation: receipt_activation,
                 ipc_socket_path: layout.receipt_ipc_socket_path().to_path_buf(),
@@ -1594,6 +1600,18 @@ fn run_prepared(
             DeveloperLocalDeploymentOutcomeV1::Provisioned(outcome) => (
                 outcome.model_agent_request_digest().into_bytes(),
                 outcome.model_agent_receipt_digest().into_bytes(),
+            ),
+            DeveloperLocalDeploymentOutcomeV1::ArtifactExternal(outcome) => (
+                outcome
+                    .projection()
+                    .runtime_apply_request_digest()
+                    .ok_or(LocalProcessError::DeploymentActivation)?
+                    .into_bytes(),
+                outcome
+                    .projection()
+                    .runtime_terminal_receipt_digest()
+                    .ok_or(LocalProcessError::DeploymentActivation)?
+                    .into_bytes(),
             ),
         };
         Some(LocalReceiptActivationInputV1::try_new(
@@ -3211,6 +3229,26 @@ impl RunningStack<'_> {
             node_status: self.owners().node().status().clone(),
             node_status_observed_at: self.owners().node().status_observed_at(),
             deployment,
+        }
+    }
+
+    fn artifact_external_inspection_sources(
+        &self,
+        deployment: DeveloperArtifactExternalModelAgentStackOutcomeV1,
+    ) -> DeveloperLocalInspectionSourcesV2 {
+        let runtime_ready = self.runtime().ready();
+        DeveloperLocalInspectionSourcesV2 {
+            authority_subject: self.identities.authority_ref(),
+            deployment_subject: self.identities.controller_principal(),
+            runtime_subject: runtime_ready.target(),
+            runtime_store_instance_id: runtime_ready.runtime_store_instance_id(),
+            runtime_response_key_ref: runtime_ready.runtime_response_key_ref(),
+            runtime_response_public_key: runtime_ready.runtime_response_public_key(),
+            fabric_subject: self.identities.fabric_service_id(),
+            agent_subject: self.identities.agent_service_id(),
+            node_status: self.owners().node().status().clone(),
+            node_status_observed_at: self.owners().node().status_observed_at(),
+            deployment: DeveloperLocalDeploymentOutcomeV1::ArtifactExternal(deployment),
         }
     }
 
