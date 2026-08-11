@@ -48,6 +48,7 @@ jobs:
       CARGO_TERM_COLOR: always
       PARAEGOX_M0_INIT_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
       PARAEGOX_A1_ARTIFACT_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
+      PARAEGOX_D0B_EXTERNAL_ARTIFACT_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
       PARAEGOX_M2_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
       PARAEGOX_D0A_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
       PARAEGOX_M3_INSPECTION_CLI_BINARY: ${{ github.workspace }}/target/debug/paraegox
@@ -67,8 +68,10 @@ jobs:
         run: cargo build --locked -p paraegox-local --bin paraegox
       - name: Rebuild locked development environment
         run: uv sync --locked
-      - name: Internal Artifact F0/A1 candidate evidence (non-admission)
-        run: uv run --frozen pytest tests/system/test_a1_local_artifact_cli.py
+      - name: Joint Artifact F0/A1 and D0b candidate evidence (non-admission)
+        run: |
+          uv run --frozen pytest tests/system/test_a1_local_artifact_cli.py
+          uv run --frozen pytest tests/system/test_d0b_external_artifact_deploy_cli.py
       - name: Lint
         run: uv run --frozen ruff check .
       - name: Governance fitness checks
