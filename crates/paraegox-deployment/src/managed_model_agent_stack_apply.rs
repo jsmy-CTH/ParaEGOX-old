@@ -4460,6 +4460,54 @@ mod artifact_external_store {
         snapshot_identity: FileIdentity,
     }
 
+    enum InitialRenameState {
+        Old,
+        New,
+        ObservationUnavailable,
+        OwnerInvalid,
+    }
+
+    struct InitialPublicationFacts<'a> {
+        root_identity: FileIdentity,
+        lock_identity: FileIdentity,
+        state: &'a ArtifactExternalControllerStateV2,
+        bytes: &'a [u8],
+        snapshot_identity: FileIdentity,
+    }
+
+    fn classify_initial_rename(
+        state_root: &StateRootHandle,
+        facts: InitialPublicationFacts<'_>,
+    ) -> InitialRenameState {
+        let observed = (|| {
+            let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+            let (name, state) = match (has_final, has_staging) {
+                (false, true) => (STAGING_NAME, InitialRenameState::Old),
+                (true, false) => (ROOT_NAME, InitialRenameState::New),
+                _ => return Err(ArtifactExternalControllerStoreFailureV1::Owner),
+            };
+            let root =
+                reopen_named_directory(&state_root.leaf, OsStr::new(name), facts.root_identity)?;
+            exact_names(&root, &[LOCK_NAME, SNAPSHOT_NAME])?;
+            validate_named_regular(&root, OsStr::new(LOCK_NAME), facts.lock_identity, 0)?;
+            let (snapshot, bytes, identity) = read_state(&root, SNAPSHOT_NAME)?;
+            if snapshot != *facts.state
+                || bytes.as_ref() != facts.bytes
+                || identity != facts.snapshot_identity
+            {
+                return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+            }
+            Ok(state)
+        })();
+        match observed {
+            Ok(state) => state,
+            Err(ArtifactExternalControllerStoreFailureV1::Io) => {
+                InitialRenameState::ObservationUnavailable
+            }
+            Err(_) => InitialRenameState::OwnerInvalid,
+        }
+    }
+
     fn publish_initial(
         authority: &mut dyn ArtifactExternalControllerAuthorityV1,
         binding: &ArtifactExternalControllerAuthorityBindingV1,
@@ -4514,18 +4562,38 @@ mod artifact_external_store {
                 return Err(ArtifactExternalControllerStoreFailureV1::Owner);
             }
             tracker.ambiguous();
-            renameat_with(
+            if renameat_with(
                 &state_root.leaf.file,
                 STAGING_NAME,
                 &state_root.leaf.file,
                 ROOT_NAME,
                 RenameFlags::NOREPLACE,
             )
-            .map_err(|_| {
-                ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(Box::new(
-                    state.clone(),
-                )))
-            })?;
+            .is_err()
+            {
+                match classify_initial_rename(
+                    &state_root,
+                    InitialPublicationFacts {
+                        root_identity: staging_identity,
+                        lock_identity,
+                        state: &state,
+                        bytes: &bytes,
+                        snapshot_identity,
+                    },
+                ) {
+                    InitialRenameState::New => {}
+                    InitialRenameState::Old | InitialRenameState::ObservationUnavailable => {
+                        return Err(
+                            ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(
+                                Box::new(state.clone()),
+                            )),
+                        );
+                    }
+                    InitialRenameState::OwnerInvalid => {
+                        return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+                    }
+                }
+            }
             drop(reopened_staging);
             state_root.leaf.file.sync_all().map_err(|_| {
                 ArtifactExternalControllerStoreFailureV1::PublicationUncertain(Some(Box::new(
@@ -4866,6 +4934,9 @@ impl std::error::Error for ManagedModelAgentStackApplyControllerError {}
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
 
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
     use paraegox_artifact::{
@@ -4897,6 +4968,12 @@ mod tests {
     };
     use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
+    use super::artifact_external_store::{
+        ArtifactExternalControllerAuthorityBindingV1,
+        ArtifactExternalControllerAuthorityRecheckFailureV1, ArtifactExternalControllerAuthorityV1,
+        ArtifactExternalControllerStoreChangeV1, ArtifactExternalControllerStoreFailureV1,
+        ArtifactExternalDeploymentControllerStoreV1,
+    };
     use super::*;
     use crate::managed_fabric_apply::{
         ManagedFabricApplyJournalV1, ManagedFabricControllerStateV1, tests as fabric_tests,
@@ -4908,6 +4985,83 @@ mod tests {
     };
 
     const RUNTIME_KEY: ApplyAuthKeyRef = ApplyAuthKeyRef::from_bytes([0x38; 16]);
+
+    struct ArtifactExternalStoreTestRoot {
+        base: PathBuf,
+        parent: PathBuf,
+        device: u64,
+        inode: u64,
+    }
+
+    impl ArtifactExternalStoreTestRoot {
+        fn new() -> Self {
+            let base = std::env::current_dir()
+                .expect("current test directory")
+                .canonicalize()
+                .expect("canonical test directory");
+            let mut random = [0_u8; 16];
+            getrandom::fill(&mut random).expect("test directory entropy");
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let parent = base.join(format!(".paraegox-external-store-test-{suffix}"));
+            fs::create_dir(&parent).expect("create strict test parent");
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+                .expect("set strict test parent mode");
+            let metadata = fs::symlink_metadata(&parent).expect("test parent metadata");
+            let state_root = parent.join("state");
+            fs::create_dir(&state_root).expect("create test state root");
+            fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+                .expect("set test state-root mode");
+            Self {
+                base,
+                parent,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        fn state_root(&self) -> PathBuf {
+            self.parent.join("state")
+        }
+    }
+
+    impl Drop for ArtifactExternalStoreTestRoot {
+        fn drop(&mut self) {
+            let exact_child = self.parent.parent() == Some(self.base.as_path())
+                && self
+                    .parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".paraegox-external-store-test-"));
+            let same_directory = fs::symlink_metadata(&self.parent).is_ok_and(|metadata| {
+                metadata.file_type().is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.dev() == self.device
+                    && metadata.ino() == self.inode
+            });
+            if exact_child && same_directory {
+                fs::remove_dir_all(&self.parent).expect("remove exact test directory");
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedArtifactExternalAuthority {
+        binding: ArtifactExternalControllerAuthorityBindingV1,
+    }
+
+    impl ArtifactExternalControllerAuthorityV1 for FixedArtifactExternalAuthority {
+        fn revalidate(
+            &mut self,
+        ) -> Result<
+            ArtifactExternalControllerAuthorityBindingV1,
+            ArtifactExternalControllerAuthorityRecheckFailureV1,
+        > {
+            Ok(self.binding.clone())
+        }
+    }
 
     fn artifact_external_request() -> ArtifactExternalDeploymentRequestV1 {
         let pair =
@@ -7244,6 +7398,163 @@ mod tests {
             active.finish_apply(None, Some(ArtifactExternalControllerPhaseV2::Failed)),
             Err(ManagedModelAgentStackApplyControllerError::InvalidPhase)
         ));
+    }
+
+    #[test]
+    fn artifact_external_controller_store_publishes_replays_and_advances_exact_chain() {
+        let admitted_fixture =
+            ArtifactExternalControllerStateV2::decode(&decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_admitted.hex"
+            ))))
+            .expect("A fixture");
+        let committed_fixture =
+            ArtifactExternalControllerStateV2::decode(&decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_committed.hex"
+            ))))
+            .expect("C fixture");
+        let applying_fixture =
+            ArtifactExternalControllerStateV2::decode(&decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_applying.hex"
+            ))))
+            .expect("P fixture");
+        let active_fixture =
+            ArtifactExternalControllerStateV2::decode(&decode_fixture_hex(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/wire/artifact_f0_pxmj_v2_active_ready.hex"
+            ))))
+            .expect("R fixture");
+        let request = admitted_fixture.request().clone();
+        let test_root = ArtifactExternalStoreTestRoot::new();
+        let binding = ArtifactExternalControllerAuthorityBindingV1::try_new(
+            test_root.state_root(),
+            request.config_commitment(),
+        )
+        .expect("test authority binding");
+        let mut authority = FixedArtifactExternalAuthority {
+            binding: binding.clone(),
+        };
+
+        let admitted = ArtifactExternalDeploymentControllerStoreV1::admit(&mut authority, &request);
+        assert_eq!(
+            admitted.change(),
+            ArtifactExternalControllerStoreChangeV1::Changed,
+        );
+        assert_eq!(
+            admitted.result().expect("published A").phase(),
+            ArtifactExternalControllerPhaseV2::Admitted,
+        );
+
+        let queried = ArtifactExternalDeploymentControllerStoreV1::query(
+            &mut authority,
+            request.operation_id(),
+        );
+        assert_eq!(
+            queried.change(),
+            ArtifactExternalControllerStoreChangeV1::Unchanged,
+        );
+        assert_eq!(
+            queried.result().expect("queried A").phase(),
+            ArtifactExternalControllerPhaseV2::Admitted,
+        );
+
+        let replayed = ArtifactExternalDeploymentControllerStoreV1::admit(&mut authority, &request);
+        assert_eq!(
+            replayed.change(),
+            ArtifactExternalControllerStoreChangeV1::Unchanged,
+        );
+        assert_eq!(
+            replayed.result().expect("replayed A").phase(),
+            ArtifactExternalControllerPhaseV2::Admitted,
+        );
+
+        let (locked_binding, mut locked) =
+            ArtifactExternalDeploymentControllerStoreV1::open_exclusive(
+                &mut authority,
+                request.operation_id(),
+            )
+            .expect("exclusive controller store");
+        let contended = ArtifactExternalDeploymentControllerStoreV1::query(
+            &mut authority,
+            request.operation_id(),
+        );
+        assert_eq!(
+            contended.change(),
+            ArtifactExternalControllerStoreChangeV1::Unchanged,
+        );
+        assert_eq!(
+            contended.into_result(),
+            Err(ArtifactExternalControllerStoreFailureV1::Contended),
+        );
+
+        let committed = locked
+            .state()
+            .clone()
+            .commit(
+                committed_fixture
+                    .plan_content()
+                    .expect("C plan content")
+                    .clone(),
+                committed_fixture.execution().expect("C execution").clone(),
+                committed_fixture
+                    .runtime_request()
+                    .expect("C runtime request")
+                    .clone(),
+            )
+            .expect("C successor");
+        let committed_result = locked.commit_successor(&mut authority, &locked_binding, committed);
+        assert_eq!(
+            committed_result.change(),
+            ArtifactExternalControllerStoreChangeV1::Changed,
+        );
+        let committed = committed_result.into_result().expect("durable C");
+
+        let applying = committed
+            .begin_apply(applying_fixture.records()[1].progress.lifecycle_generation)
+            .expect("P successor");
+        let applying_result = locked.commit_successor(&mut authority, &locked_binding, applying);
+        assert_eq!(
+            applying_result.change(),
+            ArtifactExternalControllerStoreChangeV1::Changed,
+        );
+        let applying = applying_result.into_result().expect("durable P");
+
+        let active = applying
+            .finish_apply(
+                Some(
+                    active_fixture
+                        .runtime_terminal()
+                        .expect("R terminal")
+                        .clone(),
+                ),
+                None,
+            )
+            .expect("R successor");
+        let active_result = locked.commit_successor(&mut authority, &locked_binding, active);
+        assert_eq!(
+            active_result.change(),
+            ArtifactExternalControllerStoreChangeV1::Changed,
+        );
+        assert_eq!(
+            active_result.into_result().expect("durable R").phase(),
+            ArtifactExternalControllerPhaseV2::ActiveReady,
+        );
+        locked.release().expect("release top lock");
+
+        let final_query = ArtifactExternalDeploymentControllerStoreV1::query(
+            &mut authority,
+            request.operation_id(),
+        );
+        assert_eq!(
+            final_query.change(),
+            ArtifactExternalControllerStoreChangeV1::Unchanged,
+        );
+        assert_eq!(
+            final_query.result().expect("queried R").phase(),
+            ArtifactExternalControllerPhaseV2::ActiveReady,
+        );
     }
 
     #[test]
