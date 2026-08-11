@@ -93,8 +93,7 @@ pub use deployment_process::{
 };
 #[cfg(unix)]
 pub use developer_fixture_agent_stack::{
-    DeveloperArtifactExternalModelAgentStackError,
-    DeveloperArtifactExternalModelAgentStackInputV1,
+    DeveloperArtifactExternalModelAgentStackError, DeveloperArtifactExternalModelAgentStackInputV1,
     DeveloperArtifactExternalModelAgentStackOutcomeV1,
     DeveloperFixtureAgentStackDeactivationOutcomeV1, DeveloperFixtureAgentStackError,
     DeveloperFixtureAgentStackInputV1, DeveloperFixtureAgentStackOutcomeV1,
@@ -112,8 +111,8 @@ pub use developer_fixture_agent_stack::{
     complete_developer_fixture_distributed_agent_stack_v1,
     deactivate_developer_fixture_agent_stack_v1, deactivate_developer_fixture_model_agent_stack_v1,
     deactivate_developer_provisioned_model_agent_stack_v1,
-    prepare_developer_fixture_distributed_agent_stack_v1, run_developer_fixture_agent_stack_v1,
-    run_developer_artifact_external_model_agent_stack_v1,
+    prepare_developer_fixture_distributed_agent_stack_v1,
+    run_developer_artifact_external_model_agent_stack_v1, run_developer_fixture_agent_stack_v1,
     run_developer_fixture_model_agent_stack_v1, run_developer_provisioned_agent_stack_v1,
     run_developer_provisioned_model_agent_stack_v1,
 };

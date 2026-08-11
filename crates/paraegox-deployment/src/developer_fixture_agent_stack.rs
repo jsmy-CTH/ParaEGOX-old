@@ -131,7 +131,8 @@ use crate::runtime_control_client::{
     RuntimeManagedModelAgentStackResponseVerifier, RuntimeManagedServingResponseVerifier,
     RuntimeQueryResponseVerifier, RuntimeUnixCredentials, UnixRuntimeControlEndpoint,
     UnixRuntimeManagedAgentStackClient, UnixRuntimeManagedFabricClient,
-    UnixRuntimeManagedModelAgentStackClient, UnixRuntimeManagedServingClient, UnixRuntimeQueryClient,
+    UnixRuntimeManagedModelAgentStackClient, UnixRuntimeManagedServingClient,
+    UnixRuntimeQueryClient,
 };
 use crate::tenure_client::{
     AcquireTenureRequestToSign, AuthorityProofVerifier, AuthoritySocketAcl,
@@ -1475,9 +1476,7 @@ pub enum DeveloperArtifactExternalModelAgentStackError {
     ModelAgentApply,
 }
 
-impl From<DeveloperFixtureAgentStackError>
-    for DeveloperArtifactExternalModelAgentStackError
-{
+impl From<DeveloperFixtureAgentStackError> for DeveloperArtifactExternalModelAgentStackError {
     fn from(value: DeveloperFixtureAgentStackError) -> Self {
         Self::Base(value)
     }
@@ -1713,10 +1712,8 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
     let internal_request = internal_external_request(&request)
         .map_err(|_| DeveloperArtifactExternalModelAgentStackError::InvalidInput)?;
 
-    let mut controller = DeveloperArtifactExternalControllerResidentV1::open(
-        authority,
-        request.operation_id(),
-    )?;
+    let mut controller =
+        DeveloperArtifactExternalControllerResidentV1::open(authority, request.operation_id())?;
     if controller.state().phase() != ArtifactExternalControllerPhaseV2::Admitted
         || controller.state().request() != &internal_request
     {
@@ -1755,16 +1752,20 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
                 DeveloperFixtureAgentStackError::Cutover,
             )
         })?;
-    let predecessor = successor.state().desired().ok_or(
-        DeveloperArtifactExternalModelAgentStackError::Base(
-            DeveloperFixtureAgentStackError::Cutover,
-        ),
-    )?;
-    let predecessor_request = successor.state().request().ok_or(
-        DeveloperArtifactExternalModelAgentStackError::Base(
-            DeveloperFixtureAgentStackError::Cutover,
-        ),
-    )?;
+    let predecessor =
+        successor
+            .state()
+            .desired()
+            .ok_or(DeveloperArtifactExternalModelAgentStackError::Base(
+                DeveloperFixtureAgentStackError::Cutover,
+            ))?;
+    let predecessor_request =
+        successor
+            .state()
+            .request()
+            .ok_or(DeveloperArtifactExternalModelAgentStackError::Base(
+                DeveloperFixtureAgentStackError::Cutover,
+            ))?;
     let activation = ManagedModelAgentStackActivationV1::try_new(
         predecessor.execution().clone(),
         developer_artifact_agent_plan(&context)?,
@@ -1819,10 +1820,8 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
         ));
     }
 
-    let mut controller = DeveloperArtifactExternalControllerResidentV1::open(
-        authority,
-        request.operation_id(),
-    )?;
+    let mut controller =
+        DeveloperArtifactExternalControllerResidentV1::open(authority, request.operation_id())?;
     let successor = reopen_artifact_successor(&context)?;
     let reopened_context = successor
         .state()
@@ -1861,10 +1860,8 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
         EXCHANGE_TIMEOUT,
     )
     .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
-    let response = runtime.block_on(client.exchange_artifact(
-        &runtime_request,
-        fabric_context.channel(),
-    ));
+    let response =
+        runtime.block_on(client.exchange_artifact(&runtime_request, fabric_context.channel()));
     let (runtime_terminal, missing_terminal_phase) = match response {
         Ok(wire) => (
             Some(
@@ -1881,10 +1878,8 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
         }
     };
 
-    let mut controller = DeveloperArtifactExternalControllerResidentV1::open(
-        authority,
-        request.operation_id(),
-    )?;
+    let mut controller =
+        DeveloperArtifactExternalControllerResidentV1::open(authority, request.operation_id())?;
     let successor = reopen_artifact_successor(&context)?;
     let reopened_context = successor
         .state()
@@ -1901,11 +1896,8 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
             .validate_against_artifact_request(&runtime_request, reopened_context.channel())
             .map_err(|_| DeveloperArtifactExternalModelAgentStackError::ModelAgentApply)?;
     }
-    let terminal = controller.finish_apply(
-        authority,
-        runtime_terminal.clone(),
-        missing_terminal_phase,
-    );
+    let terminal =
+        controller.finish_apply(authority, runtime_terminal.clone(), missing_terminal_phase);
     let authority_proof = successor
         .state()
         .legacy_snapshot()

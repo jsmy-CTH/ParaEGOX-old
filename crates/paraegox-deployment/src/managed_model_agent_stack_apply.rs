@@ -5557,9 +5557,7 @@ impl DeveloperArtifactExternalControllerResidentV1 {
             .map_err(project_external_failure)
     }
 
-    pub(crate) fn release(
-        self,
-    ) -> Result<(), DeveloperArtifactExternalControllerFailureV1> {
+    pub(crate) fn release(self) -> Result<(), DeveloperArtifactExternalControllerFailureV1> {
         self.store.release().map_err(project_external_failure)
     }
 }
@@ -5581,8 +5579,10 @@ pub(crate) fn internal_external_request(
 
 pub(crate) fn internal_external_projection(
     state: &ArtifactExternalControllerStateV2,
-) -> Result<DeveloperArtifactExternalControllerProjectionV1, DeveloperArtifactExternalControllerFailureV1>
-{
+) -> Result<
+    DeveloperArtifactExternalControllerProjectionV1,
+    DeveloperArtifactExternalControllerFailureV1,
+> {
     project_external_state(state)
 }
 
