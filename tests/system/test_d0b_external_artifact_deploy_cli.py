@@ -226,7 +226,7 @@ def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins() 
                 environment,
             )
             object_ref = built["artifact_object_ref"]
-            assert isinstance(object_ref, str) and object_ref.startswith("pxak1:")
+            assert isinstance(object_ref, str) and object_ref.startswith("sha256:")
             materialized = _invoke_json(
                 binary,
                 [

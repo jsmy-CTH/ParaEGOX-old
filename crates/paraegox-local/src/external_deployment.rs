@@ -850,7 +850,6 @@ fn minimal_uncertain_projection(
         LocalProcessError::ArtifactExternalDeployUncertain,
     );
     projection.state = Some("uncertain");
-    projection.terminal_outcome = Some("uncertain");
     projection
 }
 
@@ -1016,7 +1015,7 @@ mod tests {
                 "\"controller_snapshot_sequence\":null,\"deployment_receipt_ref\":null,",
                 "\"runtime_apply_request_digest\":null,",
                 "\"runtime_terminal_receipt_digest\":null,",
-                "\"terminal_outcome\":\"uncertain\",",
+                "\"terminal_outcome\":null,",
                 "\"current_health_checked\":false,\"diagnostics\":[{",
                 "\"code\":\"PXLC-DEPLOY-UNCERTAIN\",",
                 "\"message\":\"deployment operation outcome is uncertain\"}]}\n",
