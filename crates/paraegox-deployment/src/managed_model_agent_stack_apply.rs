@@ -5375,13 +5375,7 @@ mod tests {
 
     #[test]
     fn artifact_external_controller_state_v2_matches_all_shared_successor_goldens() {
-        for (
-            wire,
-            phase,
-            snapshot_sequence,
-            record_count,
-            expected_terminal_outcome,
-        ) in [
+        for (wire, phase, snapshot_sequence, record_count, expected_terminal_outcome) in [
             (
                 decode_fixture_hex(include_str!(
                     "../../../tests/fixtures/wire/artifact_f0_pxmj_v2_committed.hex"
@@ -5481,12 +5475,18 @@ mod tests {
                     "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
                 )),
             );
-            let last = state.records().last().expect("shared terminal/progress record");
+            let last = state
+                .records()
+                .last()
+                .expect("shared terminal/progress record");
             assert_eq!(last.progress().deployment_revision, 1);
             assert_eq!(last.progress().controller_snapshot_sequence, 2);
             assert_eq!(
                 last.progress().runtime_apply_request_digest,
-                if record_count == 1 || snapshot_sequence == 3 && phase != ArtifactExternalControllerPhaseV2::Applying {
+                if record_count == 1
+                    || snapshot_sequence == 3
+                        && phase != ArtifactExternalControllerPhaseV2::Applying
+                {
                     [0; 32]
                 } else {
                     *runtime_request.envelope_request_digest().as_bytes()
@@ -5509,7 +5509,14 @@ mod tests {
                     assert_eq!(last.progress().runtime_terminal_receipt_digest, [0; 32]);
                 }
             }
-            assert_eq!(state.receipt().is_some(), !matches!(phase, ArtifactExternalControllerPhaseV2::Committed | ArtifactExternalControllerPhaseV2::Applying));
+            assert_eq!(
+                state.receipt().is_some(),
+                !matches!(
+                    phase,
+                    ArtifactExternalControllerPhaseV2::Committed
+                        | ArtifactExternalControllerPhaseV2::Applying
+                )
+            );
             assert_eq!(
                 state.encode().expect("canonical PXMJ2 re-encode").as_ref(),
                 wire.as_slice(),
