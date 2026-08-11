@@ -17,8 +17,10 @@ sha2.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+getrandom.workspace = true
 nix.workspace = true
 paraegox-fabric.workspace = true
+rustix.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 
 [lints]
