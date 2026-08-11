@@ -3670,13 +3670,14 @@ mod tests {
 
     impl TestTempDir {
         fn new() -> Self {
-            let canonical_base = std::env::temp_dir()
+            let canonical_base = std::env::current_dir()
+                .expect("test workspace directory")
                 .canonicalize()
                 .expect("canonical test temporary base");
             for _ in 0..16 {
                 let mut random = [0_u8; 16];
                 getrandom::fill(&mut random).expect("test temporary random suffix");
-                let mut name = String::from("paraegox-artifact-store-");
+                let mut name = String::from(".paraegox-artifact-store-");
                 push_lower_hex(&mut name, &random);
                 let path = canonical_base.join(name);
                 match fs::create_dir(&path) {
@@ -3711,7 +3712,7 @@ mod tests {
                 .path
                 .file_name()
                 .and_then(OsStr::to_str)
-                .is_some_and(|name| name.starts_with("paraegox-artifact-store-"));
+                .is_some_and(|name| name.starts_with(".paraegox-artifact-store-"));
             if !safe_name
                 || self.path.parent() != Some(self.canonical_base.as_path())
                 || !self.path.starts_with(&self.canonical_base)
