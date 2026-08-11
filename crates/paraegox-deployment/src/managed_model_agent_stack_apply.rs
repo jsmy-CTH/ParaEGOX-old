@@ -3419,6 +3419,15 @@ mod artifact_external_store {
         identity: FileIdentity,
     }
 
+    struct SettleSuccessorInput<'a> {
+        authority: &'a mut dyn ArtifactExternalControllerAuthorityV1,
+        binding: &'a ArtifactExternalControllerAuthorityBindingV1,
+        next: ArtifactExternalControllerStateV2,
+        next_bytes: Box<[u8]>,
+        next_identity: FileIdentity,
+        owned_next: bool,
+    }
+
     struct CompleteStaging {
         staging: DirectoryHandle,
         lock: File,
@@ -4828,14 +4837,17 @@ mod artifact_external_store {
 
     fn settle_successor(
         store: &mut ArtifactExternalDeploymentControllerLockedV1,
-        authority: &mut dyn ArtifactExternalControllerAuthorityV1,
-        binding: &ArtifactExternalControllerAuthorityBindingV1,
-        next: ArtifactExternalControllerStateV2,
-        next_bytes: Box<[u8]>,
-        next_identity: FileIdentity,
-        owned_next: bool,
+        input: SettleSuccessorInput<'_>,
         tracker: &mut ChangeTracker,
     ) -> Result<ArtifactExternalControllerStateV2, ArtifactExternalControllerStoreFailureV1> {
+        let SettleSuccessorInput {
+            authority,
+            binding,
+            next,
+            next_bytes,
+            next_identity,
+            owned_next,
+        } = input;
         revalidate_current_authority(authority, binding, &store.state_root)?;
         validate_public_store(store, true)?;
         tracker.ambiguous();
@@ -4910,12 +4922,14 @@ mod artifact_external_store {
             }
             return settle_successor(
                 store,
-                authority,
-                binding,
-                next,
-                existing.bytes,
-                existing.identity,
-                false,
+                SettleSuccessorInput {
+                    authority,
+                    binding,
+                    next,
+                    next_bytes: existing.bytes,
+                    next_identity: existing.identity,
+                    owned_next: false,
+                },
                 tracker,
             );
         }
@@ -4926,7 +4940,16 @@ mod artifact_external_store {
         tracker.ambiguous();
         let identity = write_new_exact(&store.root, NEXT_NAME, &bytes)?;
         settle_successor(
-            store, authority, binding, next, bytes, identity, true, tracker,
+            store,
+            SettleSuccessorInput {
+                authority,
+                binding,
+                next,
+                next_bytes: bytes,
+                next_identity: identity,
+                owned_next: true,
+            },
+            tracker,
         )
     }
 }
