@@ -113,6 +113,15 @@ mod remote_agent_one_echo;
     expect(dead_code, reason = "Awaiting T2-D APFS durable store admission")
 )] // GOV-WAIVER-0001
 mod remote_agent_outbox;
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Bounded closeout enabler; production owner absent; next batch must consume or remove"
+    )
+)] // GOV-WAIVER-0001
+mod remote_agent_s1_runtime;
 #[expect(dead_code, reason = "Awaiting admitted internal consumer")] // GOV-WAIVER-0001
 mod request;
 #[cfg(unix)]
@@ -198,7 +207,8 @@ pub use distributed_fabric_runtime::{
 pub use managed_agent_runtime::{RuntimeAgentConversationError, RuntimeAgentConversationHandle};
 #[cfg(unix)]
 pub use managed_model_runtime::{
-    RuntimeModelBackendResolveError, RuntimeModelBackendResolverV1, RuntimeResolvedModelBackendV1,
+    RuntimeModelBackendResolveError, RuntimeModelBackendResolverV1,
+    RuntimeResolvedArtifactModelBackendV1, RuntimeResolvedModelBackendV1,
 };
 #[cfg(unix)]
 pub use runtime_agent_developer_local_ipc::{

@@ -15,12 +15,14 @@ use paraegox_agent_service::{
     AgentConversationModelOutcomeV1, AgentConversationModelProvider,
     AgentConversationModelServiceProviderV1,
 };
+use paraegox_artifact::VerifiedMaterializationReadBundleV1;
 use paraegox_kernel::time::MonotonicDeadline;
 use paraegox_model::{
     ModelBackendIdentityV1, ModelBackendV1, ModelServiceConfigV1, ModelServiceV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
-    ManagedModelCapabilityIdV1, ManagedModelServicePlanV1,
+    ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelCapabilityIdV1,
+    ManagedModelServicePlanV1,
 };
 use paraegox_runtime_contracts::managed_service::{
     ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleStage,
@@ -96,6 +98,74 @@ impl fmt::Debug for RuntimeResolvedModelBackendV1 {
     }
 }
 
+/// Resolver-owned readback plus backend for one exact Artifact-bound Slice.
+///
+/// Runtime still compares the returned execution and complete materialization
+/// chain with committed desired state before the backend can own capacity.
+/// Debug never traverses either the read bundle or backend.
+pub struct RuntimeResolvedArtifactModelBackendV1 {
+    execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    materialization: VerifiedMaterializationReadBundleV1,
+    backend: Arc<dyn ModelBackendV1>,
+}
+
+impl RuntimeResolvedArtifactModelBackendV1 {
+    #[must_use]
+    pub fn new<B>(
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        materialization: VerifiedMaterializationReadBundleV1,
+        backend: B,
+    ) -> Self
+    where
+        B: ModelBackendV1,
+    {
+        Self {
+            execution,
+            materialization,
+            backend: Arc::new(backend),
+        }
+    }
+
+    #[must_use]
+    pub fn from_shared(
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        materialization: VerifiedMaterializationReadBundleV1,
+        backend: Arc<dyn ModelBackendV1>,
+    ) -> Self {
+        Self {
+            execution,
+            materialization,
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub const fn execution(&self) -> &ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+        &self.execution
+    }
+
+    #[must_use]
+    pub const fn materialization(&self) -> &VerifiedMaterializationReadBundleV1 {
+        &self.materialization
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> &Arc<dyn ModelBackendV1> {
+        &self.backend
+    }
+}
+
+impl fmt::Debug for RuntimeResolvedArtifactModelBackendV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeResolvedArtifactModelBackendV1")
+            .field("execution", &self.execution)
+            .field("materialization", &"<verified-read-bundle>")
+            .field("backend", &"<redacted-backend>")
+            .finish()
+    }
+}
+
 /// Repeatable process-composition seam for one exact managed Model plan.
 ///
 /// A resolver may own Secret material, but it must return the complete plan it
@@ -105,6 +175,16 @@ pub trait RuntimeModelBackendResolverV1: Send + Sync + 'static {
         &self,
         plan: &ManagedModelServicePlanV1,
     ) -> Result<RuntimeResolvedModelBackendV1, RuntimeModelBackendResolveError>;
+
+    /// Resolves the exact external Artifact path. Existing resolvers fail
+    /// closed by default and therefore cannot reinterpret an Artifact Slice
+    /// as the compiled-in `resolve` path.
+    fn resolve_artifact(
+        &self,
+        _execution: &ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    ) -> Result<RuntimeResolvedArtifactModelBackendV1, RuntimeModelBackendResolveError> {
+        Err(RuntimeModelBackendResolveError::ResolutionFailed)
+    }
 }
 
 #[derive(Debug)]
