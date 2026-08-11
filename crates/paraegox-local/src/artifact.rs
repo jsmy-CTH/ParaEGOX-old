@@ -65,9 +65,7 @@ const fn map_artifact_path_errno(error: nix::errno::Errno) -> LocalProcessError 
 }
 
 #[cfg(unix)]
-const fn map_artifact_presence_errno(
-    error: nix::errno::Errno,
-) -> Result<bool, LocalProcessError> {
+const fn map_artifact_presence_errno(error: nix::errno::Errno) -> Result<bool, LocalProcessError> {
     if matches!(error, nix::errno::Errno::ENOENT) {
         Ok(false)
     } else {
@@ -77,18 +75,19 @@ const fn map_artifact_presence_errno(
 
 #[cfg(unix)]
 fn map_artifact_metadata_error(error: std::io::Error) -> LocalProcessError {
-    error.raw_os_error().map_or(LocalProcessError::ArtifactIo, |raw| {
-        map_artifact_path_errno(nix::errno::Errno::from_raw(raw))
-    })
+    error
+        .raw_os_error()
+        .map_or(LocalProcessError::ArtifactIo, |raw| {
+            map_artifact_path_errno(nix::errno::Errno::from_raw(raw))
+        })
 }
 
 #[cfg(unix)]
 fn artifact_regular_read_flags(
     inspect_noatime: bool,
 ) -> Result<nix::fcntl::OFlag, LocalProcessError> {
-    let flags = nix::fcntl::OFlag::O_RDONLY
-        | nix::fcntl::OFlag::O_CLOEXEC
-        | nix::fcntl::OFlag::O_NOFOLLOW;
+    let flags =
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NOFOLLOW;
     if !inspect_noatime {
         return Ok(flags);
     }
@@ -160,7 +159,10 @@ const fn classify_build_mkdir_failure(
                 ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain)
             }
         }
-    } else if matches!(map_artifact_path_errno(error), LocalProcessError::ArtifactPath) {
+    } else if matches!(
+        map_artifact_path_errno(error),
+        LocalProcessError::ArtifactPath
+    ) {
         ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath)
     } else {
         ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain)
@@ -669,9 +671,7 @@ mod unix {
             .file_name()
             .ok_or_else(|| ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath))?;
         let staging_name = build_staging_name(output_text);
-        if staging_name.len() != STAGING_NAME_BYTES
-            || OsStr::new(&staging_name) == output_leaf
-        {
+        if staging_name.len() != STAGING_NAME_BYTES || OsStr::new(&staging_name) == output_leaf {
             return Err(ArtifactFailureV1::new(
                 Some(false),
                 LocalProcessError::ArtifactPath,
@@ -694,8 +694,7 @@ mod unix {
                 output_text,
                 output_leaf,
                 &staging_name,
-            )
-            {
+            ) {
                 if error == LocalProcessError::ArtifactIo {
                     output_io_failed = true;
                 } else {
@@ -778,7 +777,9 @@ mod unix {
             return Err(failure);
         }
         let pair = pair.expect("successful build preflight has verified pair");
-        let mut pinned = pinned.take().expect("successful build preflight has output parent");
+        let mut pinned = pinned
+            .take()
+            .expect("successful build preflight has output parent");
         let final_exists = final_exists.expect("successful build preflight has final observation");
         let expected_manifest = pair.manifest_bytes();
 
@@ -808,11 +809,7 @@ mod unix {
             )?;
             return Ok(pair_projection(false, &pair));
         }
-        if let Err(error) = mkdirat(
-            &pinned.parent.file,
-            staging_name.as_str(),
-            directory_mode(),
-        ) {
+        if let Err(error) = mkdirat(&pinned.parent.file, staging_name.as_str(), directory_mode()) {
             let evidence = if error == nix::errno::Errno::EEXIST {
                 match named_directory_exists(&pinned.parent, OsStr::new(&staging_name)) {
                     Ok(true) => BuildMkdirEvidenceV1::KnownStage,
@@ -1300,8 +1297,8 @@ mod unix {
         inspect_noatime: bool,
     ) -> Result<(Box<[u8]>, FileIdentity, File), LocalProcessError> {
         let flags = artifact_regular_read_flags(inspect_noatime)?;
-        let owned = openat(&parent.file, name, flags, Mode::empty())
-            .map_err(map_artifact_path_errno)?;
+        let owned =
+            openat(&parent.file, name, flags, Mode::empty()).map_err(map_artifact_path_errno)?;
         let mut file = File::from(owned);
         let metadata = file.metadata().map_err(map_artifact_metadata_error)?;
         validate_regular_metadata(&metadata, strict_mode, None)?;
@@ -1832,8 +1829,14 @@ mod json_tests {
             Some(false),
             LocalProcessError::ArtifactUncertain,
         ));
-        assert_eq!(classify_build_pre_effect_failure(true, false, true, false), path);
-        assert_eq!(classify_build_pre_effect_failure(true, true, false, false), path);
+        assert_eq!(
+            classify_build_pre_effect_failure(true, false, true, false),
+            path
+        );
+        assert_eq!(
+            classify_build_pre_effect_failure(true, true, false, false),
+            path
+        );
         assert_eq!(
             classify_build_pre_effect_failure(false, false, true, false),
             uncertain
@@ -1862,10 +1865,7 @@ mod json_tests {
             ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath)
         );
         assert_eq!(
-            classify_build_mkdir_failure(
-                nix::errno::Errno::EEXIST,
-                BuildMkdirEvidenceV1::Unknown,
-            ),
+            classify_build_mkdir_failure(nix::errno::Errno::EEXIST, BuildMkdirEvidenceV1::Unknown,),
             ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain)
         );
         assert_eq!(
@@ -1876,10 +1876,7 @@ mod json_tests {
             ArtifactFailureV1::new(Some(false), LocalProcessError::ArtifactPath)
         );
         assert_eq!(
-            classify_build_mkdir_failure(
-                nix::errno::Errno::EIO,
-                BuildMkdirEvidenceV1::NotChecked,
-            ),
+            classify_build_mkdir_failure(nix::errno::Errno::EIO, BuildMkdirEvidenceV1::NotChecked,),
             ArtifactFailureV1::new(None, LocalProcessError::ArtifactUncertain)
         );
         assert_eq!(
