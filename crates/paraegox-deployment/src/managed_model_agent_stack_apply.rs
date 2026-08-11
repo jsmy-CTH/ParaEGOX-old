@@ -4185,63 +4185,169 @@ mod tests {
         )
     }
 
-    fn signed_artifact_active_receipt(
+    fn signed_artifact_receipt(
         request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
-    ) -> ManagedModelAgentStackTerminalReceiptV1 {
+        outcome: ManagedModelAgentStackTerminalOutcomeV1,
+    ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackPlanError> {
         let generation =
             |value| Some(ManagedServiceGeneration::try_new(value).expect("service generation"));
+        let (
+            lifecycle_effect,
+            head,
+            fabric_generation,
+            model_generation,
+            agent_generation,
+            physical_binding_census,
+            census_complete,
+            fabric_ready,
+            model_ready,
+            agent_ready,
+            fabric_dependency,
+            model_dependency,
+            exact_zero,
+            quarantined,
+            completion_snapshot_sequence,
+            selection_observed_at_nanos,
+            digest_marker,
+        ) = match outcome {
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                generation(7),
+                generation(8),
+                generation(9),
+                2,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                12,
+                13,
+                0xa1,
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                None,
+                None,
+                None,
+                0,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                16,
+                25,
+                0xa3,
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::ProvenNotStarted,
+                ManagedModelAgentStackTerminalHeadV1::PreservedNone,
+                generation(7),
+                None,
+                None,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                1,
+                21,
+                0xa5,
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::Uncertain => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                generation(7),
+                generation(8),
+                None,
+                0,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                11,
+                22,
+                0xa7,
+            ),
+            ManagedModelAgentStackTerminalOutcomeV1::Quarantined => (
+                ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+                ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+                generation(7),
+                generation(8),
+                None,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                11,
+                23,
+                0xa9,
+            ),
+        };
         let state = ManagedModelAgentStackTerminalStateV1::try_new(
-            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
-            ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
-            ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
-            generation(7),
-            generation(8),
-            generation(9),
-        )
-        .expect("ActiveReady terminal state");
+            outcome,
+            lifecycle_effect,
+            head,
+            fabric_generation,
+            model_generation,
+            agent_generation,
+        )?;
         let evidence = ManagedModelAgentStackTerminalEvidenceV1::try_new(
             ManagedModelAgentStackTerminalEvidenceFieldsV1 {
-                physical_binding_census: 2,
-                census_complete: true,
-                fabric_ready: true,
-                model_ready: true,
-                agent_ready: true,
-                fabric_to_agent_dependency_ready: true,
-                model_to_agent_dependency_ready: true,
-                exact_zero: false,
-                quarantined: false,
-                resource_census_digest: Digest32::from_bytes([0xa1; 32]),
-                raw_outcome_digest: Digest32::from_bytes([0xa2; 32]),
-                completion_runtime_host_epoch: 12,
-                completion_snapshot_sequence: 13,
+                physical_binding_census,
+                census_complete,
+                fabric_ready,
+                model_ready,
+                agent_ready,
+                fabric_to_agent_dependency_ready: fabric_dependency,
+                model_to_agent_dependency_ready: model_dependency,
+                exact_zero,
+                quarantined,
+                resource_census_digest: Digest32::from_bytes([digest_marker; 32]),
+                raw_outcome_digest: Digest32::from_bytes([digest_marker.wrapping_add(1); 32]),
+                completion_runtime_host_epoch: 9,
+                completion_snapshot_sequence,
                 selection_clock_generation: request.temporal().target_clock_generation(),
-                selection_observed_at_nanos: 14,
+                selection_observed_at_nanos,
             },
-        )
-        .expect("ActiveReady evidence");
+        )?;
         let facts =
-            ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(request, state, evidence)
-                .expect("Artifact PXMT facts");
+            ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(request, state, evidence)?;
         let channel = fabric_tests::channel();
         let auth = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
             channel,
             RUNTIME_KEY,
             ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
             1,
-        )
-        .expect("PXMT auth");
+        )?;
         let draft = ManagedModelAgentStackTerminalReceiptDraftV1::try_new_artifact_bound(
             request, facts, channel, auth,
-        )
-        .expect("PXMT draft");
+        )?;
         let runtime: SigningKey = fabric_tests::runtime_signer();
-        let signature = runtime.sign(
-            draft
-                .signing_transcript()
-                .expect("PXMT transcript")
-                .as_bytes(),
-        );
-        draft.finalize(&signature.to_bytes()).expect("signed PXMT")
+        let signature = runtime.sign(draft.signing_transcript()?.as_bytes());
+        draft.finalize(&signature.to_bytes())
     }
 
     fn rewrite_artifact_state_checksum(frame: &mut [u8]) {
@@ -4353,7 +4459,11 @@ mod tests {
             applying,
         );
 
-        let runtime_terminal = signed_artifact_active_receipt(&runtime_request);
+        let runtime_terminal = signed_artifact_receipt(
+            &runtime_request,
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+        )
+        .expect("ActiveReady Artifact PXMT");
         let active_progress = ArtifactExternalDeploymentProgressV1::try_new(
             NonZeroU64::new(1),
             NonZeroU64::new(2),
@@ -4406,6 +4516,144 @@ mod tests {
             active,
         );
 
+        for (outcome, controller_phase, record_state) in [
+            (
+                ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected,
+                ArtifactExternalControllerPhaseV2::Failed,
+                ArtifactExternalDeploymentRecordStateV1::Failed,
+            ),
+            (
+                ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+                ArtifactExternalControllerPhaseV2::Failed,
+                ArtifactExternalDeploymentRecordStateV1::Failed,
+            ),
+            (
+                ManagedModelAgentStackTerminalOutcomeV1::Uncertain,
+                ArtifactExternalControllerPhaseV2::Uncertain,
+                ArtifactExternalDeploymentRecordStateV1::Uncertain,
+            ),
+        ] {
+            let terminal = signed_artifact_receipt(&runtime_request, outcome)
+                .expect("legal Artifact activation PXMT");
+            let terminal_progress = ArtifactExternalDeploymentProgressV1::try_new(
+                NonZeroU64::new(1),
+                NonZeroU64::new(2),
+                Some(desired_head),
+                Some(runtime_request.envelope_request_digest()),
+                Some(terminal.receipt_digest()),
+                Some([0x54; 16]),
+            )
+            .expect("post-P terminal progress");
+            let terminal_record = ArtifactExternalDeploymentRecordV1::try_new(
+                record_state,
+                NonZeroU64::new(3).expect("record sequence"),
+                &request,
+                &admission,
+                terminal_progress,
+                Some(&applying_record),
+            )
+            .expect("terminal PXDM");
+            let terminal_receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+                NonZeroU64::new(1).expect("receipt sequence"),
+                &request,
+                &admission,
+                &terminal_record,
+            )
+            .expect("terminal PXDO");
+            let controller = ArtifactExternalControllerStateV2::try_new(
+                ArtifactExternalControllerStateInputV2 {
+                    phase: controller_phase,
+                    controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
+                    request: request.clone(),
+                    admission: admission.clone(),
+                    plan_content: Some(plan_content.clone()),
+                    execution: Some(execution.clone()),
+                    runtime_request: Some(runtime_request.clone()),
+                    runtime_terminal: Some(terminal.clone()),
+                    records: vec![
+                        committed_record.clone(),
+                        applying_record.clone(),
+                        terminal_record,
+                    ],
+                    receipt: Some(terminal_receipt),
+                },
+            )
+            .expect("PXMJ2 post-P terminal");
+            let wire = controller.encode().expect("PXMJ2 terminal wire");
+            let reopened = ArtifactExternalControllerStateV2::decode(&wire)
+                .expect("reopen post-P terminal");
+            assert_eq!(reopened, controller);
+            assert_eq!(reopened.phase(), controller_phase);
+            assert_eq!(
+                reopened
+                    .runtime_terminal()
+                    .expect("archived exact PXMT")
+                    .canonical_wire(),
+                terminal.canonical_wire(),
+            );
+            assert_eq!(
+                reopened.records().last().expect("terminal record").progress()
+                    .runtime_terminal_receipt_digest,
+                *terminal.receipt_digest().as_bytes(),
+            );
+
+            let (wrong_phase, wrong_record_state) =
+                if controller_phase == ArtifactExternalControllerPhaseV2::Failed {
+                    (
+                        ArtifactExternalControllerPhaseV2::Uncertain,
+                        ArtifactExternalDeploymentRecordStateV1::Uncertain,
+                    )
+                } else {
+                    (
+                        ArtifactExternalControllerPhaseV2::Failed,
+                        ArtifactExternalDeploymentRecordStateV1::Failed,
+                    )
+                };
+            let wrong_record = ArtifactExternalDeploymentRecordV1::try_new(
+                wrong_record_state,
+                NonZeroU64::new(3).expect("record sequence"),
+                &request,
+                &admission,
+                terminal_progress,
+                Some(&applying_record),
+            )
+            .expect("shape-valid wrong-phase PXDM");
+            let wrong_receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+                NonZeroU64::new(1).expect("receipt sequence"),
+                &request,
+                &admission,
+                &wrong_record,
+            )
+            .expect("shape-valid wrong-phase PXDO");
+            assert!(
+                ArtifactExternalControllerStateV2::try_new(
+                    ArtifactExternalControllerStateInputV2 {
+                        phase: wrong_phase,
+                        controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
+                        request: request.clone(),
+                        admission: admission.clone(),
+                        plan_content: Some(plan_content.clone()),
+                        execution: Some(execution.clone()),
+                        runtime_request: Some(runtime_request.clone()),
+                        runtime_terminal: Some(terminal),
+                        records: vec![
+                            committed_record.clone(),
+                            applying_record.clone(),
+                            wrong_record,
+                        ],
+                        receipt: Some(wrong_receipt),
+                    },
+                )
+                .is_err()
+            );
+        }
+
+        assert!(signed_artifact_receipt(
+            &runtime_request,
+            ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero,
+        )
+        .is_err());
+
         let failed_progress = ArtifactExternalDeploymentProgressV1::try_new(
             None,
             None,
@@ -4450,6 +4698,105 @@ mod tests {
                 .expect("reopen F"),
             failed,
         );
+
+        let pre_commit_uncertain_record = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Uncertain,
+            NonZeroU64::new(1).expect("record sequence"),
+            &request,
+            &admission,
+            failed_progress,
+            None,
+        )
+        .expect("PXDM-U pre-C");
+        let pre_commit_uncertain_receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+            NonZeroU64::new(1).expect("receipt sequence"),
+            &request,
+            &admission,
+            &pre_commit_uncertain_record,
+        )
+        .expect("PXDO-U pre-C");
+        let pre_commit_uncertain = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Uncertain,
+                controller_snapshot_sequence: NonZeroU64::new(2).expect("sequence"),
+                request: request.clone(),
+                admission: admission.clone(),
+                plan_content: None,
+                execution: None,
+                runtime_request: None,
+                runtime_terminal: None,
+                records: vec![pre_commit_uncertain_record],
+                receipt: Some(pre_commit_uncertain_receipt),
+            },
+        )
+        .expect("PXMJ2-U pre-C");
+        assert_eq!(
+            ArtifactExternalControllerStateV2::decode(
+                &pre_commit_uncertain
+                    .encode()
+                    .expect("PXMJ2-U pre-C wire"),
+            )
+            .expect("reopen U pre-C"),
+            pre_commit_uncertain,
+        );
+
+        for (controller_phase, record_state) in [
+            (
+                ArtifactExternalControllerPhaseV2::Failed,
+                ArtifactExternalDeploymentRecordStateV1::Failed,
+            ),
+            (
+                ArtifactExternalControllerPhaseV2::Uncertain,
+                ArtifactExternalDeploymentRecordStateV1::Uncertain,
+            ),
+        ] {
+            let post_commit_progress = ArtifactExternalDeploymentProgressV1::try_new(
+                NonZeroU64::new(1),
+                NonZeroU64::new(2),
+                Some(desired_head),
+                None,
+                None,
+                Some([0x56; 16]),
+            )
+            .expect("post-C terminal progress");
+            let post_commit_record = ArtifactExternalDeploymentRecordV1::try_new(
+                record_state,
+                NonZeroU64::new(2).expect("record sequence"),
+                &request,
+                &admission,
+                post_commit_progress,
+                Some(&committed_record),
+            )
+            .expect("PXDM post-C terminal");
+            let post_commit_receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+                NonZeroU64::new(1).expect("receipt sequence"),
+                &request,
+                &admission,
+                &post_commit_record,
+            )
+            .expect("PXDO post-C terminal");
+            let post_commit = ArtifactExternalControllerStateV2::try_new(
+                ArtifactExternalControllerStateInputV2 {
+                    phase: controller_phase,
+                    controller_snapshot_sequence: NonZeroU64::new(3).expect("sequence"),
+                    request: request.clone(),
+                    admission: admission.clone(),
+                    plan_content: Some(plan_content.clone()),
+                    execution: Some(execution.clone()),
+                    runtime_request: Some(runtime_request.clone()),
+                    runtime_terminal: None,
+                    records: vec![committed_record.clone(), post_commit_record],
+                    receipt: Some(post_commit_receipt),
+                },
+            )
+            .expect("PXMJ2 post-C terminal");
+            let post_commit_wire = post_commit.encode().expect("PXMJ2 post-C wire");
+            assert_eq!(
+                ArtifactExternalControllerStateV2::decode(&post_commit_wire)
+                    .expect("reopen post-C terminal"),
+                post_commit,
+            );
+        }
 
         let uncertain_record = ArtifactExternalDeploymentRecordV1::try_new(
             ArtifactExternalDeploymentRecordStateV1::Uncertain,
