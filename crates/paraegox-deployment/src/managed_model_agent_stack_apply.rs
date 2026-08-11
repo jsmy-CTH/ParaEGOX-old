@@ -4401,6 +4401,24 @@ mod tests {
         frame[checksum_offset..].copy_from_slice(checksum.as_bytes());
     }
 
+    fn rewrite_external_record_digest(frame: &mut [u8], record_offset: usize) {
+        let digest_offset = record_offset + 464;
+        let digest = raw_sha256(
+            EXTERNAL_RECORD_DIGEST_DOMAIN,
+            &frame[record_offset..digest_offset],
+        );
+        frame[digest_offset..digest_offset + 32].copy_from_slice(digest.as_bytes());
+    }
+
+    fn rewrite_external_receipt_digest(frame: &mut [u8], receipt_offset: usize) {
+        let digest_offset = receipt_offset + 400;
+        let digest = raw_sha256(
+            EXTERNAL_RECEIPT_DIGEST_DOMAIN,
+            &frame[receipt_offset..digest_offset],
+        );
+        frame[digest_offset..digest_offset + 32].copy_from_slice(digest.as_bytes());
+    }
+
     #[test]
     fn artifact_external_controller_state_v2_reopens_every_durable_prefix() {
         let (request, admission, plan_content, execution, runtime_request) =
@@ -4459,11 +4477,19 @@ mod tests {
                 receipt: None,
             })
             .expect("PXMJ2-C");
+        let committed_wire = committed.encode().expect("PXMJ2-C wire");
         assert_eq!(
-            ArtifactExternalControllerStateV2::decode(&committed.encode().expect("PXMJ2-C wire"))
-                .expect("reopen C"),
+            ArtifactExternalControllerStateV2::decode(&committed_wire).expect("reopen C"),
             committed,
         );
+        let mut committed_pin_drift = committed_wire.to_vec();
+        let committed_record_offset =
+            committed_pin_drift.len() - ARTIFACT_STATE_V2_CHECKSUM_BYTES - EXTERNAL_RECORD_BYTES;
+        committed_pin_drift[committed_record_offset + 248..committed_record_offset + 256]
+            .copy_from_slice(&3_u64.to_be_bytes());
+        rewrite_external_record_digest(&mut committed_pin_drift, committed_record_offset);
+        rewrite_artifact_state_checksum(&mut committed_pin_drift);
+        assert!(ArtifactExternalControllerStateV2::decode(&committed_pin_drift).is_err());
 
         let applying_progress = ArtifactExternalDeploymentProgressV1::try_new(
             NonZeroU64::new(1),
@@ -4559,6 +4585,10 @@ mod tests {
             ArtifactExternalControllerStateV2::decode(&active_wire).expect("reopen R"),
             active,
         );
+        let mut active_header_drift = active_wire.to_vec();
+        active_header_drift[16..24].copy_from_slice(&3_u64.to_be_bytes());
+        rewrite_artifact_state_checksum(&mut active_header_drift);
+        assert!(ArtifactExternalControllerStateV2::decode(&active_header_drift).is_err());
 
         for (outcome, controller_phase, record_state) in [
             (
@@ -4839,11 +4869,29 @@ mod tests {
                 receipt: Some(failed_receipt),
             })
             .expect("PXMJ2-F pre-C");
+        let failed_wire = failed.encode().expect("PXMJ2-F wire");
         assert_eq!(
-            ArtifactExternalControllerStateV2::decode(&failed.encode().expect("PXMJ2-F wire"))
-                .expect("reopen F"),
+            ArtifactExternalControllerStateV2::decode(&failed_wire).expect("reopen F"),
             failed,
         );
+        let mut failed_pin_drift = failed_wire.to_vec();
+        let failed_receipt_offset =
+            failed_pin_drift.len() - ARTIFACT_STATE_V2_CHECKSUM_BYTES - EXTERNAL_RECEIPT_BYTES;
+        let failed_record_offset = failed_receipt_offset - EXTERNAL_RECORD_BYTES;
+        failed_pin_drift[failed_record_offset + 248..failed_record_offset + 256]
+            .copy_from_slice(&2_u64.to_be_bytes());
+        rewrite_external_record_digest(&mut failed_pin_drift, failed_record_offset);
+        let failed_record_digest: [u8; 32] = failed_pin_drift
+            [failed_record_offset + 464..failed_record_offset + 496]
+            .try_into()
+            .expect("PXDM digest");
+        failed_pin_drift[failed_receipt_offset + 104..failed_receipt_offset + 136]
+            .copy_from_slice(&failed_record_digest);
+        failed_pin_drift[failed_receipt_offset + 248..failed_receipt_offset + 256]
+            .copy_from_slice(&2_u64.to_be_bytes());
+        rewrite_external_receipt_digest(&mut failed_pin_drift, failed_receipt_offset);
+        rewrite_artifact_state_checksum(&mut failed_pin_drift);
+        assert!(ArtifactExternalControllerStateV2::decode(&failed_pin_drift).is_err());
 
         let pre_commit_uncertain_record = ArtifactExternalDeploymentRecordV1::try_new(
             ArtifactExternalDeploymentRecordStateV1::Uncertain,
@@ -4939,6 +4987,14 @@ mod tests {
                     .expect("reopen post-C terminal"),
                 post_commit,
             );
+            let mut receipt_pin_drift = post_commit_wire.to_vec();
+            let receipt_offset =
+                receipt_pin_drift.len() - ARTIFACT_STATE_V2_CHECKSUM_BYTES - EXTERNAL_RECEIPT_BYTES;
+            receipt_pin_drift[receipt_offset + 248..receipt_offset + 256]
+                .copy_from_slice(&3_u64.to_be_bytes());
+            rewrite_external_receipt_digest(&mut receipt_pin_drift, receipt_offset);
+            rewrite_artifact_state_checksum(&mut receipt_pin_drift);
+            assert!(ArtifactExternalControllerStateV2::decode(&receipt_pin_drift).is_err());
         }
 
         let uncertain_record = ArtifactExternalDeploymentRecordV1::try_new(
