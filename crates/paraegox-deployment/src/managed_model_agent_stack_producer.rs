@@ -963,3 +963,244 @@ impl fmt::Display for ManagedModelAgentStackProducerError {
 }
 
 impl std::error::Error for ManagedModelAgentStackProducerError {}
+
+#[cfg(test)]
+mod tests {
+    use paraegox_artifact::{MaterializationReceiptRefV1, VerifiedArtifactPairV1};
+    use paraegox_kernel::digest::Digest32;
+    use paraegox_kernel::time::BoundedDuration;
+    use paraegox_runtime_contracts::assignment::BindingId;
+    use paraegox_runtime_contracts::managed_agent_stack_plan::{
+        ManagedAgentIngressLimitsV1, ManagedAgentPortPlanV1, ManagedAgentProviderRefV1,
+        ManagedAgentProviderSelectionV1, ManagedAgentSemanticLimitsV1, ManagedAgentServicePlanV1,
+    };
+    use paraegox_runtime_contracts::managed_fabric_plan::{
+        ManagedFabricListenEndpointV1, ManagedFabricTargetExecutionV1,
+    };
+    use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+        ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelAdapterBindingV1,
+        ManagedModelAdapterVersionV1, ManagedModelAgentStackApplyRequestV1,
+        ManagedModelAgentStackTargetExecutionV1, ManagedModelCapabilityIdV1,
+        ManagedModelServicePlanV1, artifact_execution_profile_commitment_v1,
+    };
+    use paraegox_runtime_contracts::managed_service::{
+        ManagedServiceId, ManagedServiceLifecycleBudgetsV1, ManagedServiceSpecV1,
+    };
+    use paraegox_runtime_contracts::provenance::{SourcePlanRevision, TargetSliceDigest};
+
+    use super::{
+        ArtifactBoundManagedModelAgentStackDesiredInputV1,
+        ArtifactBoundManagedModelAgentStackDesiredPlanV1,
+        ArtifactBoundManagedModelAgentStackPlanContentV2, ArtifactExecutionBindingV1,
+        FreshManagedModelAgentStackApplyV1, ManagedModelAgentStackActivationV1,
+        produce_artifact_bound_managed_model_agent_stack_request_v1,
+        validate_artifact_bound_managed_model_agent_stack_request_v1,
+    };
+    use crate::managed_fabric_apply::tests::{
+        controller_signer, ready_snapshot, remote_provisioning_and_ingress, service,
+    };
+    use crate::managed_fabric_producer::VerifiedManagedFabricProducerContextV1;
+
+    fn lifecycle_budgets(values: [u64; 5]) -> ManagedServiceLifecycleBudgetsV1 {
+        ManagedServiceLifecycleBudgetsV1::try_new(
+            BoundedDuration::from_nanos(values[0]),
+            BoundedDuration::from_nanos(values[1]),
+            BoundedDuration::from_nanos(values[2]),
+            BoundedDuration::from_nanos(values[3]),
+            BoundedDuration::from_nanos(values[4]),
+        )
+        .expect("lifecycle budgets")
+    }
+
+    fn provider(marker: u8) -> ManagedAgentProviderSelectionV1 {
+        ManagedAgentProviderSelectionV1::try_deterministic_fixture(
+            ManagedAgentProviderRefV1::try_from_bytes([marker; 16]).expect("provider ref"),
+            Digest32::from_bytes([marker.wrapping_add(1); 32]),
+        )
+        .expect("provider selection")
+    }
+
+    fn agent_plan() -> ManagedAgentServicePlanV1 {
+        let ingress = ManagedAgentIngressLimitsV1::try_new(
+            64,
+            512 * 1024,
+            128 * 1024,
+            128 * 1024,
+            5_000_000_000,
+        )
+        .expect("Agent ingress");
+        let port = ManagedAgentPortPlanV1::try_new(
+            BindingId::from_bytes([0x81; 16]),
+            BindingId::from_bytes([0x82; 16]),
+            "paraegox/agent/v1/submit",
+            "paraegox/agent/v1/control",
+            ingress,
+        )
+        .expect("Agent port");
+        ManagedAgentServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(
+                ManagedServiceId::from_bytes([0x88; 16]),
+                lifecycle_budgets([7, 11, 13, 17, 19]),
+            ),
+            ManagedAgentSemanticLimitsV1::try_new(16, 64, 64, 64).expect("Agent limits"),
+            port,
+            provider(0x83),
+        )
+        .expect("Agent plan")
+    }
+
+    fn model_plan() -> ManagedModelServicePlanV1 {
+        ManagedModelServicePlanV1::try_new(
+            ManagedServiceSpecV1::new(
+                ManagedServiceId::from_bytes([0x89; 16]),
+                lifecycle_budgets([23, 29, 31, 37, 41]),
+            ),
+            8,
+            provider(0x83),
+            ManagedModelAdapterBindingV1::try_new(
+                *b"px-art-prefix-v1",
+                ManagedModelAdapterVersionV1::try_new(1).expect("adapter version"),
+                ManagedModelCapabilityIdV1::bounded_text_v1(),
+            )
+            .expect("Artifact Model adapter"),
+        )
+        .expect("Model plan")
+    }
+
+    fn artifact_binding() -> ArtifactExecutionBindingV1 {
+        let pair =
+            VerifiedArtifactPairV1::from_payload(b"literal-prefix-v1 ").expect("Artifact pair");
+        let receipt = format!(
+            "pxamr1:{}:7:{}:{}",
+            "a1".repeat(32),
+            "a2".repeat(16),
+            "a3".repeat(32),
+        )
+        .parse::<MaterializationReceiptRefV1>()
+        .expect("materialization Receipt ref");
+        ArtifactExecutionBindingV1::try_new(
+            pair.object_ref(),
+            receipt,
+            artifact_execution_profile_commitment_v1(),
+        )
+        .expect("Artifact execution binding")
+    }
+
+    #[test]
+    fn artifact_bound_plan_content_and_request_are_exact_successors() {
+        let snapshot = ready_snapshot();
+        let controller = controller_signer();
+        let (remote, ingress) = remote_provisioning_and_ingress();
+        let context = VerifiedManagedFabricProducerContextV1::try_from_remote_describe(
+            snapshot.state(),
+            &controller,
+            &remote,
+            &ingress,
+        )
+        .expect("verified Fabric context");
+        let predecessor = ManagedFabricTargetExecutionV1::try_one_managed_fabric_service(
+            context.projection().clone(),
+            service(),
+            ManagedFabricListenEndpointV1::try_new("tcp/127.0.0.1:7447").expect("Fabric endpoint"),
+        )
+        .expect("Fabric predecessor");
+        let predecessor_slice = TargetSliceDigest::new(Digest32::from_bytes([0xb1; 32]));
+        let activation = ManagedModelAgentStackActivationV1::try_new(
+            predecessor.clone(),
+            agent_plan(),
+            model_plan(),
+        )
+        .expect("Artifact activation");
+        let binding = artifact_binding();
+        let desired = ArtifactBoundManagedModelAgentStackDesiredPlanV1::try_activate(
+            ArtifactBoundManagedModelAgentStackDesiredInputV1 {
+                context: &context,
+                cutover_marker_digest: Digest32::from_bytes([0xb2; 32]),
+                predecessor_revision: SourcePlanRevision::new(context.legacy_revision()),
+                predecessor_execution: &predecessor,
+                predecessor_slice_digest: predecessor_slice,
+                deployment_request_digest: Digest32::from_bytes([0xb3; 32]),
+                deployment_admission_digest: Digest32::from_bytes([0xb4; 32]),
+                binding,
+                activation: &activation,
+            },
+        )
+        .expect("Artifact desired");
+        let request = produce_artifact_bound_managed_model_agent_stack_request_v1(
+            &context,
+            &desired,
+            FreshManagedModelAgentStackApplyV1::try_new([0xc1; 16], [0xc2; 16], [0xc3; 32])
+                .expect("fresh Runtime identities"),
+            &controller,
+        )
+        .expect("PXAR12");
+
+        assert_eq!(desired.plan_content().binding(), binding);
+        assert_eq!(desired.plan_content().execution(), desired.execution());
+        assert_eq!(request.target_execution(), desired.execution());
+        assert_eq!(request.provenance(), desired.provenance());
+        validate_artifact_bound_managed_model_agent_stack_request_v1(&context, &desired, &request)
+            .expect("validated PXAR12");
+        assert_eq!(
+            ArtifactBoundManagedModelAgentStackPlanContentV2::decode(
+                context.target(),
+                desired.plan_content().canonical_bytes(),
+            ),
+            Ok(desired.plan_content().clone()),
+        );
+        assert_eq!(
+            ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(
+                desired.execution().canonical_wire(),
+            ),
+            Ok(desired.execution().clone()),
+        );
+        assert_eq!(
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(request.canonical_wire(),),
+            Ok(request.clone()),
+        );
+        assert!(
+            ManagedModelAgentStackTargetExecutionV1::decode(desired.execution().canonical_wire())
+                .is_err()
+        );
+        assert!(
+            ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(
+                desired.execution().embedded().canonical_wire(),
+            )
+            .is_err()
+        );
+        assert!(ManagedModelAgentStackApplyRequestV1::decode(request.canonical_wire()).is_err());
+        assert!(
+            crate::planner::PlanContent::try_from_persisted(
+                context.target(),
+                desired.plan_content().canonical_bytes(),
+            )
+            .is_err()
+        );
+
+        let mut reserved = desired.plan_content().canonical_bytes().to_vec();
+        reserved[35] = 1;
+        assert!(
+            ArtifactBoundManagedModelAgentStackPlanContentV2::decode(context.target(), &reserved)
+                .is_err()
+        );
+        let swapped = ArtifactBoundManagedModelAgentStackDesiredPlanV1::try_activate(
+            ArtifactBoundManagedModelAgentStackDesiredInputV1 {
+                context: &context,
+                cutover_marker_digest: Digest32::from_bytes([0xb2; 32]),
+                predecessor_revision: SourcePlanRevision::new(context.legacy_revision()),
+                predecessor_execution: &predecessor,
+                predecessor_slice_digest: predecessor_slice,
+                deployment_request_digest: Digest32::from_bytes([0xb4; 32]),
+                deployment_admission_digest: Digest32::from_bytes([0xb3; 32]),
+                binding,
+                activation: &activation,
+            },
+        )
+        .expect("swapped commitment desired");
+        assert_ne!(
+            desired.provenance().source_plan_digest(),
+            swapped.provenance().source_plan_digest(),
+        );
+    }
+}
