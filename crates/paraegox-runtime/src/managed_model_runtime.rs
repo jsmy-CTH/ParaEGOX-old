@@ -109,36 +109,17 @@ impl fmt::Debug for RuntimeResolvedModelBackendV1 {
 pub struct RuntimeResolvedArtifactModelBackendV1 {
     execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
     materialization: VerifiedMaterializationReadBundleV1,
-    backend: Arc<dyn ModelBackendV1>,
 }
 
 impl RuntimeResolvedArtifactModelBackendV1 {
     #[must_use]
-    pub fn new<B>(
+    pub const fn new(
         execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
         materialization: VerifiedMaterializationReadBundleV1,
-        backend: B,
-    ) -> Self
-    where
-        B: ModelBackendV1,
-    {
-        Self {
-            execution,
-            materialization,
-            backend: Arc::new(backend),
-        }
-    }
-
-    #[must_use]
-    pub fn from_shared(
-        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
-        materialization: VerifiedMaterializationReadBundleV1,
-        backend: Arc<dyn ModelBackendV1>,
     ) -> Self {
         Self {
             execution,
             materialization,
-            backend,
         }
     }
 
@@ -151,11 +132,6 @@ impl RuntimeResolvedArtifactModelBackendV1 {
     pub const fn materialization(&self) -> &VerifiedMaterializationReadBundleV1 {
         &self.materialization
     }
-
-    #[must_use]
-    pub fn backend(&self) -> &Arc<dyn ModelBackendV1> {
-        &self.backend
-    }
 }
 
 impl fmt::Debug for RuntimeResolvedArtifactModelBackendV1 {
@@ -164,7 +140,6 @@ impl fmt::Debug for RuntimeResolvedArtifactModelBackendV1 {
             .debug_struct("RuntimeResolvedArtifactModelBackendV1")
             .field("execution", &self.execution)
             .field("materialization", &"<verified-read-bundle>")
-            .field("backend", &"<redacted-backend>")
             .finish()
     }
 }
@@ -314,6 +289,29 @@ struct RuntimeManagedModelService {
     slot: Arc<ManagedModelSlot>,
 }
 
+struct RuntimeArtifactPrefixBackendV1 {
+    identity: ModelBackendIdentityV1,
+    prefix: Box<str>,
+}
+
+impl ModelBackendV1 for RuntimeArtifactPrefixBackendV1 {
+    fn identity(&self) -> ModelBackendIdentityV1 {
+        self.identity
+    }
+
+    fn invoke(
+        &self,
+        request: paraegox_model::ModelInvocationRequestV1,
+        _cancellation: paraegox_model::ModelCancellationViewV1,
+    ) -> paraegox_model::ModelBackendFuture {
+        let mut output = String::with_capacity(self.prefix.len() + request.prompt().len());
+        output.push_str(&self.prefix);
+        output.push_str(request.prompt());
+        let output = output.into_boxed_str();
+        Box::pin(async move { paraegox_model::ModelInvocationOutcomeV1::Success(output) })
+    }
+}
+
 impl RuntimeManagedModelService {
     fn context_matches(&self, context: &ManagedServiceContext) -> bool {
         context.service_id() == self.plan.service().service_id()
@@ -369,13 +367,21 @@ impl RuntimeManagedModelService {
                 != MaterializationReceiptRefV1::from_receipt(materialization.receipt())
             || VerifiedArtifactPairV1::verify(pair.manifest_bytes(), pair.payload()).as_ref()
                 != Ok(pair)
-            || !Self::backend_identity_matches(&self.plan, resolved.backend().identity())
         {
             return Err(RuntimeModelBackendResolveError::ResolutionFailed);
         }
+        let prefix = core::str::from_utf8(pair.payload())
+            .map_err(|_| RuntimeModelBackendResolveError::ResolutionFailed)?
+            .to_owned()
+            .into_boxed_str();
+        let identity = ModelBackendIdentityV1::try_new(
+            *self.plan.provider().provider_ref().as_bytes(),
+            self.plan.provider().config_digest(),
+        )
+        .map_err(|_| RuntimeModelBackendResolveError::ResolutionFailed)?;
         Ok(RuntimeResolvedModelBackendV1::from_shared(
             self.plan,
-            Arc::clone(resolved.backend()),
+            Arc::new(RuntimeArtifactPrefixBackendV1 { identity, prefix }),
         ))
     }
 }
@@ -779,11 +785,16 @@ impl Drop for ManagedModelAssembly {
 mod tests {
     use super::*;
 
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
     use paraegox_agent_contracts::{
         AgentConversationDeckRunId, AgentConversationRequestId, AgentConversationSessionId,
         AgentConversationTurnId,
     };
     use paraegox_agent_service::{AgentService, AgentServiceConfigV1};
+    use paraegox_artifact::{
+        ArtifactFilesystemClaimV1, ArtifactOperationIdV1, ArtifactStoreSnapshotCandidateV1,
+    };
     use paraegox_kernel::digest::Digest32;
     use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
     use paraegox_model::{
@@ -869,6 +880,86 @@ mod tests {
                 Arc::clone(&self.backend),
             ))
         }
+    }
+
+    struct ArtifactResolver {
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        materialization: VerifiedMaterializationReadBundleV1,
+        compiled_calls: Arc<AtomicUsize>,
+        artifact_calls: Arc<AtomicUsize>,
+    }
+
+    impl RuntimeModelBackendResolverV1 for ArtifactResolver {
+        fn resolve(
+            &self,
+            _plan: &ManagedModelServicePlanV1,
+        ) -> Result<RuntimeResolvedModelBackendV1, RuntimeModelBackendResolveError> {
+            self.compiled_calls.fetch_add(1, Ordering::SeqCst);
+            Err(RuntimeModelBackendResolveError::ResolutionFailed)
+        }
+
+        fn resolve_artifact(
+            &self,
+            _execution: &ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        ) -> Result<RuntimeResolvedArtifactModelBackendV1, RuntimeModelBackendResolveError> {
+            self.artifact_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeResolvedArtifactModelBackendV1::new(
+                self.execution.clone(),
+                self.materialization.clone(),
+            ))
+        }
+    }
+
+    fn decode_fixture_hex(input: &str) -> Vec<u8> {
+        let value = input.trim_end_matches('\n');
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| {
+                u8::from_str_radix(std::str::from_utf8(chunk).expect("fixture UTF-8"), 16)
+                    .expect("fixture lower hex")
+            })
+            .collect()
+    }
+
+    fn artifact_execution() -> ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+        ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(&decode_fixture_hex(
+            include_str!("../../../tests/fixtures/wire/artifact_f0_pxte_v11.hex"),
+        ))
+        .expect("shared PXTE v11 fixture")
+    }
+
+    fn artifact_materialization(
+        snapshot_fixture: &str,
+        operation_seed: u8,
+    ) -> VerifiedMaterializationReadBundleV1 {
+        let candidate = ArtifactStoreSnapshotCandidateV1::decode_canonical(&decode_fixture_hex(
+            snapshot_fixture,
+        ))
+        .expect("shared PXAZ fixture");
+        let snapshot = candidate
+            .validate_filesystem(ArtifactFilesystemClaimV1::Stable)
+            .expect("stable shared PXAZ fixture");
+        let pair = VerifiedArtifactPairV1::verify(
+            &decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxam_v1.hex"
+            )),
+            b"artifact-f0-prefix: ",
+        )
+        .expect("shared Artifact pair");
+        let operation_id = ArtifactOperationIdV1::try_from_bytes([operation_seed; 16])
+            .expect("fixture operation identity");
+        let receipt = snapshot
+            .operation(operation_id)
+            .and_then(|operation| operation.receipt())
+            .expect("shared operation receipt");
+        snapshot
+            .verified_read_bundle(
+                MaterializationReceiptRefV1::from_receipt(receipt),
+                pair.object_ref(),
+                Some(pair),
+            )
+            .expect("shared verified materialization")
     }
 
     fn generation(value: u64) -> ManagedServiceGeneration {
@@ -1021,6 +1112,82 @@ mod tests {
         let Err(ManagedModelAssemblyError::StartupFailed { stage, cleanup, .. }) = result else {
             panic!("backend identity drift must fail managed Model startup");
         };
+        assert_eq!(stage, ManagedServiceLifecycleStage::Prepare);
+        assert!(cleanup.exact_zero());
+    }
+
+    #[tokio::test]
+    async fn artifact_resolver_is_the_only_path_and_runtime_owns_exact_prefix_backend() {
+        let execution = artifact_execution();
+        let materialization = artifact_materialization(
+            include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxaz_materialized_receipt_v1.hex"
+            ),
+            0xa2,
+        );
+        let compiled_calls = Arc::new(AtomicUsize::new(0));
+        let artifact_calls = Arc::new(AtomicUsize::new(0));
+        let resolver: Arc<dyn RuntimeModelBackendResolverV1> = Arc::new(ArtifactResolver {
+            execution: execution.clone(),
+            materialization,
+            compiled_calls: Arc::clone(&compiled_calls),
+            artifact_calls: Arc::clone(&artifact_calls),
+        });
+        let parent = CancellationSource::root();
+        let (mut assembly, mut handle) = ManagedModelAssembly::start_artifact(
+            execution,
+            generation(13),
+            ManagedServiceId::from_bytes([0x36; 16]),
+            resolver,
+            clock(),
+            &parent,
+        )
+        .await
+        .expect("matching Artifact execution must become Ready");
+        let (request, cancellation) = agent_call(0x81, "hello");
+
+        assert_eq!(compiled_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(artifact_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            handle.complete(request, cancellation).await,
+            AgentConversationModelOutcomeV1::Success("artifact-f0-prefix: hello".into())
+        );
+        assert!(assembly.shutdown().await.exact_zero());
+    }
+
+    #[tokio::test]
+    async fn artifact_receipt_binding_drift_fails_before_capacity_is_installed() {
+        let execution = artifact_execution();
+        let materialization = artifact_materialization(
+            include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxaz_already_materialized_receipt_v1.hex"
+            ),
+            0xa3,
+        );
+        let compiled_calls = Arc::new(AtomicUsize::new(0));
+        let artifact_calls = Arc::new(AtomicUsize::new(0));
+        let resolver: Arc<dyn RuntimeModelBackendResolverV1> = Arc::new(ArtifactResolver {
+            execution: execution.clone(),
+            materialization,
+            compiled_calls: Arc::clone(&compiled_calls),
+            artifact_calls: Arc::clone(&artifact_calls),
+        });
+        let parent = CancellationSource::root();
+        let result = ManagedModelAssembly::start_artifact(
+            execution,
+            generation(14),
+            ManagedServiceId::from_bytes([0x37; 16]),
+            resolver,
+            clock(),
+            &parent,
+        )
+        .await;
+
+        let Err(ManagedModelAssemblyError::StartupFailed { stage, cleanup, .. }) = result else {
+            panic!("Artifact Receipt binding drift must fail managed Model startup");
+        };
+        assert_eq!(compiled_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(artifact_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stage, ManagedServiceLifecycleStage::Prepare);
         assert!(cleanup.exact_zero());
     }
