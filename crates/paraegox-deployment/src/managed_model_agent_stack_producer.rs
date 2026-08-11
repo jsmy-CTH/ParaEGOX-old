@@ -18,6 +18,11 @@ use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricTargetExecutionV1, ManagedFabricTargetModeV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+    ARTIFACT_EXECUTION_BINDING_V1_BYTES,
+    ArtifactBoundManagedModelAgentStackApplyRequestDraftV1,
+    ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ArtifactBoundManagedModelAgentStackTargetExecutionV1, ArtifactExecutionBindingV1,
+    MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES,
     ManagedModelAgentStackApplyRequestDraftV1, ManagedModelAgentStackApplyRequestV1,
     ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
     ManagedModelAgentStackTargetExecutionV1, ManagedModelAgentStackTargetModeV1,
@@ -41,6 +46,18 @@ const ED25519_ALGORITHM_VERSION: u16 = 1;
 const ED25519_SIGNATURE_BYTES: usize = 64;
 const STACK_DESIRED_DIGEST_DOMAIN: &[u8] =
     b"paraegox.deployment.managed-model-agent-stack-desired.sha256.v1";
+const ARTIFACT_PLAN_CONTENT_MAGIC: &[u8; 32] = b"ParaEGOX\0deployment-plan-content";
+const ARTIFACT_PLAN_CONTENT_DIGEST_DOMAIN: &[u8] = b"paraegox.deployment.plan-content.sha256.v2";
+const ARTIFACT_STACK_DESIRED_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.deployment.artifact-bound-managed-model-agent-stack-desired.sha256.v1";
+const ARTIFACT_PLAN_CONTENT_PREFIX_BYTES: usize = 252;
+
+/// Exact Artifact-bound PlanContent successor version.
+pub(crate) const ARTIFACT_PLAN_CONTENT_VERSION: u16 = 2;
+/// Exact Artifact-bound managed Model/Agent shape discriminator.
+pub(crate) const ARTIFACT_PLAN_CONTENT_SHAPE: u8 = 3;
+/// Maximum canonical Artifact-bound PlanContent bytes.
+pub(crate) const MAX_ARTIFACT_PLAN_CONTENT_BYTES: usize = 2_758;
 
 /// Explicit requested sibling stack assembled over active PXAR v6 authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +125,277 @@ impl FreshManagedModelAgentStackApplyV1 {
             temporal_constraint_id,
             authentication_nonce,
         })
+    }
+}
+
+/// Digest of exact Artifact-bound PlanContent v2 bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactPlanContentDigestV2(Digest32);
+
+impl ArtifactPlanContentDigestV2 {
+    #[must_use]
+    pub(crate) const fn value(self) -> Digest32 {
+        self.0
+    }
+}
+
+/// Owner-private PlanContent v2 carrying one exact binding and PXTE v11.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactBoundManagedModelAgentStackPlanContentV2 {
+    target: paraegox_kernel::identity::RuntimeHostId,
+    binding: ArtifactExecutionBindingV1,
+    execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    canonical_bytes: Box<[u8]>,
+    digest: ArtifactPlanContentDigestV2,
+}
+
+impl ArtifactBoundManagedModelAgentStackPlanContentV2 {
+    pub(crate) fn try_new(
+        target: paraegox_kernel::identity::RuntimeHostId,
+        binding: ArtifactExecutionBindingV1,
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    ) -> Result<Self, ManagedModelAgentStackProducerError> {
+        if execution.projection().target() != target || execution.binding() != binding {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        let execution_length = u32::try_from(execution.canonical_wire().len())
+            .map_err(|_| ManagedModelAgentStackProducerError::InvalidDesiredPlan)?;
+        let frame_length = ARTIFACT_PLAN_CONTENT_PREFIX_BYTES
+            .checked_add(execution.canonical_wire().len())
+            .ok_or(ManagedModelAgentStackProducerError::InvalidDesiredPlan)?;
+        if frame_length > MAX_ARTIFACT_PLAN_CONTENT_BYTES {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        let frame_length = u32::try_from(frame_length)
+            .map_err(|_| ManagedModelAgentStackProducerError::InvalidDesiredPlan)?;
+        let mut canonical_bytes = Vec::with_capacity(frame_length as usize);
+        canonical_bytes.extend_from_slice(ARTIFACT_PLAN_CONTENT_MAGIC);
+        canonical_bytes.extend_from_slice(&ARTIFACT_PLAN_CONTENT_VERSION.to_be_bytes());
+        canonical_bytes.push(ARTIFACT_PLAN_CONTENT_SHAPE);
+        canonical_bytes.push(0);
+        canonical_bytes.extend_from_slice(&frame_length.to_be_bytes());
+        canonical_bytes.extend_from_slice(target.as_bytes());
+        canonical_bytes.extend_from_slice(binding.canonical_wire());
+        canonical_bytes.extend_from_slice(&execution_length.to_be_bytes());
+        canonical_bytes.extend_from_slice(execution.canonical_wire());
+        let mut digest = Digest32Builder::try_new(ARTIFACT_PLAN_CONTENT_DIGEST_DOMAIN)?;
+        digest.field_bytes(&canonical_bytes)?;
+        Ok(Self {
+            target,
+            binding,
+            execution,
+            canonical_bytes: canonical_bytes.into_boxed_slice(),
+            digest: ArtifactPlanContentDigestV2(digest.finish()),
+        })
+    }
+
+    pub(crate) fn decode(
+        expected_target: paraegox_kernel::identity::RuntimeHostId,
+        frame: &[u8],
+    ) -> Result<Self, ManagedModelAgentStackProducerError> {
+        if frame.len() > MAX_ARTIFACT_PLAN_CONTENT_BYTES {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        if frame.len() < ARTIFACT_PLAN_CONTENT_PREFIX_BYTES
+            || frame.get(..32) != Some(ARTIFACT_PLAN_CONTENT_MAGIC.as_slice())
+            || read_u16(&frame[32..34]) != ARTIFACT_PLAN_CONTENT_VERSION
+            || frame[34] != ARTIFACT_PLAN_CONTENT_SHAPE
+            || frame[35] != 0
+            || read_u32(&frame[36..40]) as usize != frame.len()
+        {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        let target = paraegox_kernel::identity::RuntimeHostId::from_bytes(
+            frame[40..56]
+                .try_into()
+                .map_err(|_| ManagedModelAgentStackProducerError::InvalidDesiredPlan)?,
+        );
+        if target != expected_target {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        let binding = ArtifactExecutionBindingV1::decode(
+            &frame[56..56 + ARTIFACT_EXECUTION_BINDING_V1_BYTES],
+        )?;
+        let execution_length = read_u32(&frame[248..252]) as usize;
+        if execution_length == 0
+            || execution_length
+                > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES
+            || ARTIFACT_PLAN_CONTENT_PREFIX_BYTES.checked_add(execution_length) != Some(frame.len())
+        {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        let execution = ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(
+            &frame[ARTIFACT_PLAN_CONTENT_PREFIX_BYTES..],
+        )?;
+        let decoded = Self::try_new(target, binding, execution)?;
+        if decoded.canonical_bytes() != frame {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        Ok(decoded)
+    }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> paraegox_kernel::identity::RuntimeHostId {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) const fn binding(&self) -> ArtifactExecutionBindingV1 {
+        self.binding
+    }
+
+    #[must_use]
+    pub(crate) const fn execution(&self) -> &ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+        &self.execution
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    #[must_use]
+    pub(crate) const fn digest(&self) -> ArtifactPlanContentDigestV2 {
+        self.digest
+    }
+}
+
+/// Exact Artifact-bound desired state committed by the external Controller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactBoundManagedModelAgentStackDesiredPlanV1 {
+    cutover_marker_digest: Digest32,
+    predecessor_slice_digest: TargetSliceDigest,
+    deployment_request_digest: Digest32,
+    deployment_admission_digest: Digest32,
+    revision: SourcePlanRevision,
+    provenance: PlanProvenance,
+    plan_content: ArtifactBoundManagedModelAgentStackPlanContentV2,
+    execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+}
+
+/// All immutable authorities needed to derive one Artifact-bound desired state.
+pub(crate) struct ArtifactBoundManagedModelAgentStackDesiredInputV1<'a> {
+    pub(crate) context: &'a VerifiedManagedFabricProducerContextV1,
+    pub(crate) cutover_marker_digest: Digest32,
+    pub(crate) predecessor_revision: SourcePlanRevision,
+    pub(crate) predecessor_execution: &'a ManagedFabricTargetExecutionV1,
+    pub(crate) predecessor_slice_digest: TargetSliceDigest,
+    pub(crate) deployment_request_digest: Digest32,
+    pub(crate) deployment_admission_digest: Digest32,
+    pub(crate) binding: ArtifactExecutionBindingV1,
+    pub(crate) activation: &'a ManagedModelAgentStackActivationV1,
+}
+
+impl ArtifactBoundManagedModelAgentStackDesiredPlanV1 {
+    pub(crate) fn try_activate(
+        input: ArtifactBoundManagedModelAgentStackDesiredInputV1<'_>,
+    ) -> Result<Self, ManagedModelAgentStackProducerError> {
+        let ArtifactBoundManagedModelAgentStackDesiredInputV1 {
+            context,
+            cutover_marker_digest,
+            predecessor_revision,
+            predecessor_execution,
+            predecessor_slice_digest,
+            deployment_request_digest,
+            deployment_admission_digest,
+            binding,
+            activation,
+        } = input;
+        if digest_is_zero(deployment_request_digest)
+            || digest_is_zero(deployment_admission_digest)
+        {
+            return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
+        }
+        let embedded = ManagedModelAgentStackDesiredPlanV1::try_activate(
+            context,
+            cutover_marker_digest,
+            predecessor_revision,
+            predecessor_execution,
+            predecessor_slice_digest,
+            activation,
+        )?;
+        let revision = embedded.revision();
+        let execution = ArtifactBoundManagedModelAgentStackTargetExecutionV1::try_new(
+            embedded.execution().projection().clone(),
+            binding,
+            embedded.execution().clone(),
+        )?;
+        let plan_content = ArtifactBoundManagedModelAgentStackPlanContentV2::try_new(
+            context.target(),
+            binding,
+            execution.clone(),
+        )?;
+        let mut digest = Digest32Builder::try_new(ARTIFACT_STACK_DESIRED_DIGEST_DOMAIN)?;
+        digest.field_digest(&cutover_marker_digest)?;
+        digest.field_bytes(context.target().as_bytes())?;
+        digest.field_bytes(context.source_scope().as_bytes())?;
+        digest.field_bytes(context.source_plan().as_bytes())?;
+        digest.field_u64(revision.value())?;
+        digest.field_bytes(predecessor_slice_digest.value().as_bytes())?;
+        digest.field_digest(&deployment_request_digest)?;
+        digest.field_digest(&deployment_admission_digest)?;
+        digest.field_digest(&plan_content.digest().value())?;
+        digest.field_bytes(execution.canonical_wire())?;
+        let provenance = PlanProvenance::new(
+            context.source_scope(),
+            context.source_plan(),
+            revision,
+            SourcePlanDigest::new(digest.finish()),
+        );
+        Ok(Self {
+            cutover_marker_digest,
+            predecessor_slice_digest,
+            deployment_request_digest,
+            deployment_admission_digest,
+            revision,
+            provenance,
+            plan_content,
+            execution,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn cutover_marker_digest(&self) -> Digest32 {
+        self.cutover_marker_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn predecessor_slice_digest(&self) -> TargetSliceDigest {
+        self.predecessor_slice_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn deployment_request_digest(&self) -> Digest32 {
+        self.deployment_request_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn deployment_admission_digest(&self) -> Digest32 {
+        self.deployment_admission_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn revision(&self) -> SourcePlanRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub(crate) const fn provenance(&self) -> PlanProvenance {
+        self.provenance
+    }
+
+    #[must_use]
+    pub(crate) const fn plan_content(
+        &self,
+    ) -> &ArtifactBoundManagedModelAgentStackPlanContentV2 {
+        &self.plan_content
+    }
+
+    #[must_use]
+    pub(crate) const fn execution(
+        &self,
+    ) -> &ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+        &self.execution
     }
 }
 
@@ -299,6 +587,101 @@ pub(crate) fn produce_managed_model_agent_stack_empty_request_v1(
     produce_request_with_budget(context, desired, fresh, controller_signer, budget)
 }
 
+pub(crate) fn produce_artifact_bound_managed_model_agent_stack_request_v1(
+    context: &VerifiedManagedFabricProducerContextV1,
+    desired: &ArtifactBoundManagedModelAgentStackDesiredPlanV1,
+    fresh: FreshManagedModelAgentStackApplyV1,
+    controller_signer: &SigningKey,
+) -> Result<ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackProducerError>
+{
+    let budget = active_execution_lifecycle_budget(desired.execution().embedded())?;
+    if controller_signer.verifying_key().to_bytes() != context.controller_verifying_key()
+        || desired.execution().projection().managed_agent_stack_projection()
+            .managed_fabric_projection()
+            != context.projection()
+        || desired.provenance().source_scope() != context.source_scope()
+        || desired.provenance().source_plan() != context.source_plan()
+        || desired.plan_content().execution() != desired.execution()
+        || desired.plan_content().binding() != desired.execution().binding()
+    {
+        return Err(ManagedModelAgentStackProducerError::ControllerOrDesiredMismatch);
+    }
+    let control = RuntimeApplyControl::new(
+        context.writer_context().clone(),
+        ExpectedActive::Exact(desired.predecessor_slice_digest()),
+        ApplyOperationId::from_bytes(fresh.operation_id),
+    );
+    let temporal = ApplyTemporalConstraint::try_new(
+        TemporalConstraintId::from_bytes(fresh.temporal_constraint_id),
+        context.clock_domain(),
+        context.clock_generation(),
+        budget,
+        budget,
+    )?;
+    let claim = ApplyRequestAuthClaim::try_new(
+        context.controller_principal(),
+        context.request_key(),
+        ApplyAuthAlgorithm::try_new(ED25519_ALGORITHM)?,
+        ED25519_ALGORITHM_VERSION,
+        &fresh.authentication_nonce,
+    )?;
+    let draft = ArtifactBoundManagedModelAgentStackApplyRequestDraftV1::try_new(
+        desired.execution().clone(),
+        desired.provenance(),
+        control,
+        temporal,
+        context.runtime_store_instance_id(),
+        claim,
+    )?;
+    let signature = controller_signer.sign(draft.signing_transcript()?.as_bytes());
+    let request = draft.finalize(&signature.to_bytes())?;
+    validate_artifact_bound_managed_model_agent_stack_request_v1(
+        context, desired, &request,
+    )?;
+    Ok(request)
+}
+
+pub(crate) fn validate_artifact_bound_managed_model_agent_stack_request_v1(
+    context: &VerifiedManagedFabricProducerContextV1,
+    desired: &ArtifactBoundManagedModelAgentStackDesiredPlanV1,
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+) -> Result<(), ManagedModelAgentStackProducerError> {
+    let lifecycle_budget = active_execution_lifecycle_budget(desired.execution().embedded())?;
+    let control = request.control_commitment().control();
+    let temporal = request.temporal();
+    let authentication = request.authentication();
+    let claim = authentication.claim();
+    if request.target() != context.target()
+        || request.target_execution() != desired.execution()
+        || request.provenance() != desired.provenance()
+        || request.expected_runtime_store_instance_id() != context.runtime_store_instance_id()
+        || control.expected_active() != ExpectedActive::Exact(desired.predecessor_slice_digest())
+        || control.writer_context() != context.writer_context()
+        || temporal.target_clock_domain() != context.clock_domain()
+        || temporal.target_clock_generation() != context.clock_generation()
+        || temporal.original_budget() != lifecycle_budget
+        || temporal.remaining_budget() != lifecycle_budget
+        || claim.principal() != context.controller_principal()
+        || claim.key() != context.request_key()
+        || claim.algorithm().value() != ED25519_ALGORITHM
+        || claim.algorithm_version() != ED25519_ALGORITHM_VERSION
+        || authentication.signature().len() != ED25519_SIGNATURE_BYTES
+    {
+        return Err(ManagedModelAgentStackProducerError::RequestMismatch);
+    }
+    let signature: [u8; ED25519_SIGNATURE_BYTES] = authentication
+        .signature()
+        .try_into()
+        .map_err(|_| ManagedModelAgentStackProducerError::RequestMismatch)?;
+    VerifyingKey::from_bytes(&context.controller_verifying_key())
+        .map_err(|_| ManagedModelAgentStackProducerError::RequestMismatch)?
+        .verify_strict(
+            request.signing_transcript()?.as_bytes(),
+            &Signature::from_bytes(&signature),
+        )
+        .map_err(|_| ManagedModelAgentStackProducerError::RequestMismatch)
+}
+
 fn produce_request_with_budget(
     context: &VerifiedManagedFabricProducerContextV1,
     desired: &ManagedModelAgentStackDesiredPlanV1,
@@ -432,16 +815,20 @@ fn validate_request_with_budget(
 fn active_stack_lifecycle_budget(
     desired: &ManagedModelAgentStackDesiredPlanV1,
 ) -> Result<BoundedDuration, ManagedModelAgentStackProducerError> {
-    if desired.execution().mode() != ManagedModelAgentStackTargetModeV1::FabricModelAndAgent {
+    active_execution_lifecycle_budget(desired.execution())
+}
+
+fn active_execution_lifecycle_budget(
+    execution: &ManagedModelAgentStackTargetExecutionV1,
+) -> Result<BoundedDuration, ManagedModelAgentStackProducerError> {
+    if execution.mode() != ManagedModelAgentStackTargetModeV1::FabricModelAndAgent {
         return Err(ManagedModelAgentStackProducerError::InvalidDesiredPlan);
     }
-    let agent = desired
-        .execution()
+    let agent = execution
         .managed_agent_stack()
         .agent()
         .ok_or(ManagedModelAgentStackProducerError::InvalidDesiredPlan)?;
-    let model = desired
-        .execution()
+    let model = execution
         .model()
         .ok_or(ManagedModelAgentStackProducerError::InvalidDesiredPlan)?;
     let mut total = 0_u64;
@@ -504,6 +891,14 @@ fn bytes_are_zero(bytes: &[u8]) -> bool {
 
 fn digest_is_zero(value: Digest32) -> bool {
     bytes_are_zero(value.as_bytes())
+}
+
+fn read_u16(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes(bytes.try_into().unwrap_or([0; 2]))
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes.try_into().unwrap_or([0; 4]))
 }
 
 #[derive(Debug)]
