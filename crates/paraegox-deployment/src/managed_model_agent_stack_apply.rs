@@ -5607,7 +5607,6 @@ mod tests {
     use std::path::PathBuf;
 
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
-    use fs2::FileExt as _;
     use paraegox_artifact::{
         ArtifactObjectRefV1, MaterializationReceiptRefV1, VerifiedArtifactPairV1,
     };

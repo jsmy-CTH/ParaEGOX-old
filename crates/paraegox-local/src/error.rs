@@ -34,6 +34,11 @@ pub(crate) enum LocalProcessError {
     LocalDeployJsonOutput,
     ArtifactExternalDeployArtifact,
     ArtifactExternalDeployMaterializationReceipt,
+    ArtifactExternalDeployConflict,
+    ArtifactExternalDeployReplaceRequired,
+    ArtifactExternalDeployNotFound,
+    ArtifactExternalDeployFailed,
+    ArtifactExternalDeployUncertain,
     ArtifactExternalDeployOwner,
     ArtifactExternalDeployJsonOutput,
     LocalInspectionNotRunning,
@@ -137,6 +142,11 @@ impl LocalProcessError {
             Self::ArtifactExternalDeployMaterializationReceipt => {
                 "PXLC-DEPLOY-MATERIALIZATION-RECEIPT"
             }
+            Self::ArtifactExternalDeployConflict => "PXLC-DEPLOY-CONFLICT",
+            Self::ArtifactExternalDeployReplaceRequired => "PXLC-DEPLOY-REPLACE-REQUIRED",
+            Self::ArtifactExternalDeployNotFound => "PXLC-DEPLOY-NOT-FOUND",
+            Self::ArtifactExternalDeployFailed => "PXLC-DEPLOY-FAILED",
+            Self::ArtifactExternalDeployUncertain => "PXLC-DEPLOY-UNCERTAIN",
             Self::ArtifactExternalDeployOwner => "PXLC-DEPLOY-OWNER",
             Self::ArtifactExternalDeployJsonOutput => "PXLC-DEPLOY-EXTERNAL-JSON-OUTPUT",
             Self::LocalInspectionNotRunning => "PXLC-INSPECTION-NOT-RUNNING",
@@ -255,6 +265,17 @@ impl LocalProcessError {
             }
             Self::ArtifactExternalDeployMaterializationReceipt => {
                 "materialization receipt is invalid or not ready"
+            }
+            Self::ArtifactExternalDeployConflict => {
+                "deployment operation conflicts with its durable request"
+            }
+            Self::ArtifactExternalDeployReplaceRequired => {
+                "existing deployment state requires explicit replacement"
+            }
+            Self::ArtifactExternalDeployNotFound => "deployment operation was not found",
+            Self::ArtifactExternalDeployFailed => "deployment operation failed",
+            Self::ArtifactExternalDeployUncertain => {
+                "deployment operation outcome is uncertain"
             }
             Self::ArtifactExternalDeployOwner => {
                 "deployment owner could not complete the operation"
@@ -395,6 +416,8 @@ impl LocalProcessError {
             | Self::ArtifactCapacity
             | Self::ArtifactExternalDeployArtifact
             | Self::ArtifactExternalDeployMaterializationReceipt
+            | Self::ArtifactExternalDeployConflict
+            | Self::ArtifactExternalDeployReplaceRequired
             | Self::InitUnsafeExecutionIdentity
             | Self::InitWorkspaceConflict
             | Self::LifecycleConfiguration => 2,
