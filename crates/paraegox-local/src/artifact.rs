@@ -402,6 +402,16 @@ fn dispatch_unix(
     intent: ArtifactJsonIntentV1,
     command: ArtifactCommandV1,
 ) -> u8 {
+    #[cfg(not(target_os = "linux"))]
+    if matches!(intent, ArtifactJsonIntentV1::Inspect) {
+        return write_preparse_error(
+            output,
+            intent,
+            command_operation_id(&command),
+            LocalProcessError::Configuration(config::ConfigError::UnsupportedPlatform),
+        );
+    }
+
     if let Err(error) = ensure_execution_identity() {
         return write_preparse_error(output, intent, command_operation_id(&command), error);
     }
@@ -1892,7 +1902,26 @@ mod json_tests {
 
     #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
-    fn inspect_read_flags_fail_closed_without_noatime() {
+    fn inspect_is_platform_rejected_before_identity_without_noatime() {
+        let arguments = [
+            "artifact",
+            "inspect",
+            "--manifest",
+            "/tmp/manifest.pxam",
+            "--payload",
+            "/tmp/payload.bin",
+            "--json",
+        ]
+        .map(OsString::from);
+        let mut output = Vec::new();
+        assert_eq!(
+            dispatch_to(&mut output, ArtifactJsonIntentV1::Inspect, &arguments),
+            2
+        );
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8 JSON"),
+            "{\"schema_version\":1,\"command\":\"artifact.inspect\",\"ok\":false,\"changed\":false,\"profile\":null,\"artifact_object_ref\":null,\"payload_length\":null,\"runtime_kind\":null,\"adapter_abi\":null,\"target_profile\":null,\"diagnostics\":[{\"code\":\"PXLC-PLATFORM-UNSUPPORTED\",\"message\":\"DeveloperLocal modes require the Unix DeveloperLocal platform\"}]}\n"
+        );
         assert_eq!(
             artifact_regular_read_flags(true),
             Err(LocalProcessError::ArtifactIo)

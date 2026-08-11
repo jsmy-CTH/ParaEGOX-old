@@ -1939,7 +1939,7 @@ impl DistributedFabricTargetOptionSlotsV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigError {
     NonUtf8Argument,
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), all(unix, not(target_os = "linux"))))]
     UnsupportedPlatform,
     MissingMode,
     UnknownMode,
@@ -2026,7 +2026,7 @@ impl ConfigError {
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::NonUtf8Argument => "PXLC-ARG-NON-UTF8",
-            #[cfg(not(unix))]
+            #[cfg(any(not(unix), all(unix, not(target_os = "linux"))))]
             Self::UnsupportedPlatform => "PXLC-PLATFORM-UNSUPPORTED",
             Self::MissingMode => "PXLC-MODE-MISSING",
             Self::UnknownMode => "PXLC-MODE-UNKNOWN",
@@ -2113,7 +2113,7 @@ impl ConfigError {
     pub(crate) const fn message(self) -> &'static str {
         match self {
             Self::NonUtf8Argument => "arguments must be valid UTF-8",
-            #[cfg(not(unix))]
+            #[cfg(any(not(unix), all(unix, not(target_os = "linux"))))]
             Self::UnsupportedPlatform => {
                 "DeveloperLocal modes require the Unix DeveloperLocal platform"
             }
