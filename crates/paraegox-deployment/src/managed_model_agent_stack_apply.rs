@@ -80,17 +80,15 @@ const ARTIFACT_DESIRED_DIGEST_DOMAIN: &[u8] =
 pub struct ArtifactDeploymentOperationIdV1([u8; 16]);
 
 impl ArtifactDeploymentOperationIdV1 {
-    pub const fn try_from_bytes(
-        bytes: [u8; 16],
-    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+    pub const fn try_from_bytes(bytes: [u8; 16]) -> Option<Self> {
         let mut index = 0;
         while index < bytes.len() {
             if bytes[index] != 0 {
-                return Ok(Self(bytes));
+                return Some(Self(bytes));
             }
             index += 1;
         }
-        Err(ManagedModelAgentStackApplyControllerError::InvalidState)
+        None
     }
 
     #[must_use]
@@ -152,7 +150,8 @@ impl ArtifactExternalDeploymentRequestV1 {
             frame[16..32]
                 .try_into()
                 .map_err(|_| ManagedModelAgentStackApplyControllerError::InvalidState)?,
-        )?;
+        )
+        .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?;
         let config_commitment = ArtifactConfigCommitmentV1::try_from_bytes(
             frame[32..64]
                 .try_into()
@@ -858,7 +857,8 @@ impl FromStr for DeploymentReceiptRefV1 {
                 parts
                     .next()
                     .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
-            )?)?;
+            )?)
+            .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?;
         let deployment_receipt_digest = Digest32::from_bytes(decode_lower_hex_exact::<32>(
             parts
                 .next()
@@ -3457,7 +3457,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(ArtifactDeploymentOperationIdV1::try_from_bytes([0; 16]).is_err());
+        assert!(ArtifactDeploymentOperationIdV1::try_from_bytes([0; 16]).is_none());
         assert!(
             ArtifactExternalDeploymentAdmissionV1::try_new(
                 [0; 32],
