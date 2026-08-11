@@ -26,6 +26,12 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _FIXTURE_ROOT = _REPOSITORY_ROOT / "tests" / "fixtures" / "wire"
 _LEDGER_PATH = _FIXTURE_ROOT / "artifact_f0_semantic_ledger_v1.json"
 _CLI_ENVELOPES_PATH = _FIXTURE_ROOT / "artifact_f0_a1_cli_envelopes_v1.jsonl"
+_DEPLOYMENT_QUERY_NOT_FOUND_PATH = (
+    _FIXTURE_ROOT / "artifact_f0_deployment_query_not_found_v1.json"
+)
+_DEPLOYMENT_QUERY_CONTENDED_PATH = (
+    _FIXTURE_ROOT / "artifact_f0_deployment_query_d0a_resident_contended_v1.json"
+)
 _BINARY_ENVIRONMENT = "PARAEGOX_A1_ARTIFACT_CLI_BINARY"
 
 _ZERO32 = bytes(32)
@@ -1283,6 +1289,32 @@ def test_artifact_f0_a1_cli_envelope_fixture_is_canonical() -> None:
         "materialization_receipt_ref",
         "diagnostics",
     ]
+    for path in (_DEPLOYMENT_QUERY_NOT_FOUND_PATH, _DEPLOYMENT_QUERY_CONTENDED_PATH):
+        raw = path.read_bytes()
+        value = json.loads(raw)
+        assert raw == _compact_json(value)
+        assert value["operation_id"] == "d1" * 16
+        assert list(value) == [
+            "schema_version",
+            "command",
+            "mode",
+            "ok",
+            "changed",
+            "operation_id",
+            "state",
+            "profile",
+            "artifact_object_ref",
+            "materialization_receipt_ref",
+            "generation",
+            "deployment_revision",
+            "controller_snapshot_sequence",
+            "deployment_receipt_ref",
+            "runtime_apply_request_digest",
+            "runtime_terminal_receipt_digest",
+            "terminal_outcome",
+            "current_health_checked",
+            "diagnostics",
+        ]
 
 
 def test_artifact_f0_a1_dispatch_and_authority_source_guards() -> None:
@@ -1411,34 +1443,7 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
             ],
         )
         assert returncode == 1
-        assert raw == _compact_json(
-            {
-                "schema_version": 1,
-                "command": "deployment.operation.query",
-                "mode": "local",
-                "ok": False,
-                "changed": False,
-                "operation_id": deployment_operation,
-                "state": None,
-                "profile": None,
-                "artifact_object_ref": None,
-                "materialization_receipt_ref": None,
-                "generation": None,
-                "deployment_revision": None,
-                "controller_snapshot_sequence": None,
-                "deployment_receipt_ref": None,
-                "runtime_apply_request_digest": None,
-                "runtime_terminal_receipt_digest": None,
-                "terminal_outcome": None,
-                "current_health_checked": False,
-                "diagnostics": [
-                    {
-                        "code": "PXLC-DEPLOY-NOT-FOUND",
-                        "message": "deployment operation was not found",
-                    }
-                ],
-            }
-        )
+        assert raw == _DEPLOYMENT_QUERY_NOT_FOUND_PATH.read_bytes()
         assert deployment_not_found["operation_id"] == deployment_operation
         assert not state_root.exists(), "deployment query must not create a missing state root"
 
@@ -1671,34 +1676,7 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
                 ],
             )
             assert returncode == 1
-            assert raw == _compact_json(
-                {
-                    "schema_version": 1,
-                    "command": "deployment.operation.query",
-                    "mode": "local",
-                    "ok": False,
-                    "changed": False,
-                    "operation_id": deployment_operation,
-                    "state": "uncertain",
-                    "profile": None,
-                    "artifact_object_ref": None,
-                    "materialization_receipt_ref": None,
-                    "generation": None,
-                    "deployment_revision": None,
-                    "controller_snapshot_sequence": None,
-                    "deployment_receipt_ref": None,
-                    "runtime_apply_request_digest": None,
-                    "runtime_terminal_receipt_digest": None,
-                    "terminal_outcome": "uncertain",
-                    "current_health_checked": False,
-                    "diagnostics": [
-                        {
-                            "code": "PXLC-DEPLOY-UNCERTAIN",
-                            "message": "deployment operation outcome is uncertain",
-                        }
-                    ],
-                }
-            )
+            assert raw == _DEPLOYMENT_QUERY_CONTENDED_PATH.read_bytes()
             assert contended["state"] == "uncertain"
         finally:
             os.close(lifecycle_lock)
