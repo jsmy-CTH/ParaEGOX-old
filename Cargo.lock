@@ -1766,7 +1766,9 @@ dependencies = [
 name = "paraegox-runtime-contracts"
 version = "0.1.0"
 dependencies = [
+ "paraegox-artifact",
  "paraegox-kernel",
+ "sha2",
 ]
 
 [[package]]

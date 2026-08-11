@@ -7,9 +7,11 @@
 
 use core::{fmt, num::NonZeroU32};
 
+use paraegox_artifact::{ArtifactObjectRefV1, MaterializationReceiptRefV1};
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::{BoundedDuration, ClockGeneration};
+use sha2::{Digest as _, Sha256};
 
 use crate::apply::{ApplyOperationId, RuntimeApplyControl, RuntimeApplyControlCommitment};
 use crate::assignment::TargetAssignments;
@@ -66,6 +68,24 @@ const TERMINAL_RECEIPT_SIGNING_MAGIC: &[u8] =
     b"ParaEGOX\0managed-model-agent-stack-terminal-signing";
 const TERMINAL_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"paraegox.runtime.managed-model-agent-stack-terminal-receipt.sha256.v1";
+const ARTIFACT_EXECUTION_PROFILE_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.artifact.execution-profile.sha256.v1";
+const ARTIFACT_EXECUTION_BINDING_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.artifact-execution-binding.sha256.v1";
+const ARTIFACT_TARGET_EXECUTION_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.target-execution.sha256.v11";
+const ARTIFACT_TARGET_PLAN_ASSIGNMENTS_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.target-plan-assignments.sha256.v12";
+const ARTIFACT_STACK_COMPATIBILITY_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.compiled-artifact-bound-managed-model-agent-stack-compatibility.sha256.v1";
+const ARTIFACT_PROFILE: &[u8] = b"developer-local-echo-prefix-v1";
+const ARTIFACT_RUNTIME_KIND: &[u8] = b"managed_model_data_v1";
+const ARTIFACT_ADAPTER_ABI: &[u8] = b"bounded-text-model-data-v1";
+const ARTIFACT_TARGET_PROFILE: &[u8] = b"developer-local-managed-model-v1";
+const ARTIFACT_ENTRYPOINT: &[u8] = b"literal-prefix-v1";
+const ARTIFACT_ADAPTER_ID: [u8; 16] = *b"px-art-prefix-v1";
+const ARTIFACT_EMPTY_PXTA: [u8; 10] = EMPTY_PXTA;
+const ARTIFACT_TARGET_EXECUTION_FIXED_BYTES: usize = 4 + 2 + STACK_PROJECTION_BYTES + 32 + 2 + 2 + 4 + 4 + 192;
 
 /// Exact projection version for the fixed Fabric/Model/Agent successor.
 pub const MANAGED_MODEL_AGENT_STACK_PROJECTION_VERSION: u16 = 1;
@@ -107,6 +127,23 @@ pub const MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES: usize = 2_048;
 /// Maximum opaque Runtime response signature retained by PXMT.
 pub const MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_SIGNATURE_BYTES: usize =
     MAX_CONTROL_READ_SIGNATURE_BYTES;
+/// Exact fixed width of one external Artifact execution binding.
+pub const ARTIFACT_EXECUTION_BINDING_V1_BYTES: usize = 192;
+/// Exact Artifact profile version carried by PXTE v11.
+pub const ARTIFACT_EXECUTION_PROFILE_VERSION: u16 = 1;
+/// Exact Artifact binding version carried by PXTE v11.
+pub const ARTIFACT_EXECUTION_BINDING_VERSION: u16 = 1;
+/// Strict Artifact-bound target-execution version.
+pub const ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION: u16 = 11;
+/// Strict Artifact-bound apply-request version.
+pub const ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION: u16 = 12;
+/// Maximum canonical PXTE v11 size.
+pub const MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES: usize = 2_506;
+/// Maximum canonical PXTA-zero plus PXTE-v11 Slice bytes.
+pub const MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_PLAN_SLICE_BYTES: usize =
+    ARTIFACT_EMPTY_PXTA.len() + MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES;
+/// Componentwise pre-length ceiling for PXAR v12.
+pub const MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES: usize = 6_630;
 
 /// Nonzero adapter ABI/implementation version selected by desired state.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -899,6 +936,606 @@ impl ManagedModelAgentStackApplyRequestV1 {
     }
 }
 
+/// Exact owner-private binding from one materialized Artifact into Runtime desired state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactExecutionBindingV1 {
+    object_ref: ArtifactObjectRefV1,
+    materialization_receipt_ref: MaterializationReceiptRefV1,
+    execution_profile_commitment: Digest32,
+    canonical_wire: [u8; ARTIFACT_EXECUTION_BINDING_V1_BYTES],
+    binding_digest: Digest32,
+}
+
+impl ArtifactExecutionBindingV1 {
+    pub fn try_new(
+        object_ref: ArtifactObjectRefV1,
+        materialization_receipt_ref: MaterializationReceiptRefV1,
+        execution_profile_commitment: Digest32,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        if digest_is_zero(execution_profile_commitment)
+            || execution_profile_commitment != artifact_execution_profile_commitment_v1()
+        {
+            return Err(ManagedModelAgentStackPlanError::CompatibilityMismatch);
+        }
+        let canonical_wire = encode_artifact_execution_binding(
+            object_ref,
+            materialization_receipt_ref,
+            execution_profile_commitment,
+        );
+        let binding_digest = digest_wire(
+            ARTIFACT_EXECUTION_BINDING_DIGEST_DOMAIN,
+            &canonical_wire,
+        )?;
+        Ok(Self {
+            object_ref,
+            materialization_receipt_ref,
+            execution_profile_commitment,
+            canonical_wire,
+            binding_digest,
+        })
+    }
+
+    pub fn decode(frame: &[u8]) -> Result<Self, ManagedModelAgentStackPlanError> {
+        if frame.len() != ARTIFACT_EXECUTION_BINDING_V1_BYTES {
+            return Err(if frame.len() < ARTIFACT_EXECUTION_BINDING_V1_BYTES {
+                ManagedModelAgentStackPlanError::Truncated
+            } else {
+                ManagedModelAgentStackPlanError::TrailingBytes
+            });
+        }
+        let object_ref = ArtifactObjectRefV1::decode(&frame[..72])?;
+        let store_instance = paraegox_artifact::ArtifactStoreInstanceV1::try_from_bytes(
+            read_array(&frame[72..104]),
+        )?;
+        let operation_sequence = core::num::NonZeroU64::new(u64::from_be_bytes(read_array(
+            &frame[104..112],
+        )))
+        .ok_or(ManagedModelAgentStackPlanError::InvalidLength)?;
+        let operation_id = paraegox_artifact::ArtifactOperationIdV1::try_from_bytes(read_array(
+            &frame[112..128],
+        ))?;
+        let receipt_digest = Digest32::from_bytes(read_array(&frame[128..160]));
+        if digest_is_zero(receipt_digest) {
+            return Err(ManagedModelAgentStackPlanError::InvalidLength);
+        }
+        let receipt_text = format!(
+            "pxamr1:{}:{}:{}:{}",
+            lower_hex(store_instance.as_bytes()),
+            operation_sequence.get(),
+            lower_hex(operation_id.as_bytes()),
+            lower_hex(receipt_digest.as_bytes()),
+        );
+        let materialization_receipt_ref = receipt_text
+            .parse::<MaterializationReceiptRefV1>()
+            .map_err(ManagedModelAgentStackPlanError::Artifact)?;
+        let execution_profile_commitment = Digest32::from_bytes(read_array(&frame[160..192]));
+        let decoded = Self::try_new(
+            object_ref,
+            materialization_receipt_ref,
+            execution_profile_commitment,
+        )?;
+        if decoded.canonical_wire() != frame {
+            return Err(ManagedModelAgentStackPlanError::NonCanonicalFrame);
+        }
+        Ok(decoded)
+    }
+
+    #[must_use]
+    pub const fn object_ref(self) -> ArtifactObjectRefV1 {
+        self.object_ref
+    }
+
+    #[must_use]
+    pub const fn materialization_receipt_ref(self) -> MaterializationReceiptRefV1 {
+        self.materialization_receipt_ref
+    }
+
+    #[must_use]
+    pub const fn execution_profile_commitment(self) -> Digest32 {
+        self.execution_profile_commitment
+    }
+
+    #[must_use]
+    pub const fn canonical_wire(&self) -> &[u8; ARTIFACT_EXECUTION_BINDING_V1_BYTES] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub const fn binding_digest(self) -> Digest32 {
+        self.binding_digest
+    }
+}
+
+fn encode_artifact_execution_binding(
+    object_ref: ArtifactObjectRefV1,
+    receipt_ref: MaterializationReceiptRefV1,
+    execution_profile_commitment: Digest32,
+) -> [u8; ARTIFACT_EXECUTION_BINDING_V1_BYTES] {
+    let mut wire = [0_u8; ARTIFACT_EXECUTION_BINDING_V1_BYTES];
+    wire[..72].copy_from_slice(&object_ref.encode());
+    wire[72..104].copy_from_slice(receipt_ref.store_instance().as_bytes());
+    wire[104..112].copy_from_slice(&receipt_ref.operation_sequence().get().to_be_bytes());
+    wire[112..128].copy_from_slice(receipt_ref.operation_id().as_bytes());
+    wire[128..160].copy_from_slice(receipt_ref.receipt_digest().as_bytes());
+    wire[160..192].copy_from_slice(execution_profile_commitment.as_bytes());
+    wire
+}
+
+/// Canonical PXTE v11 carrying one immutable Artifact binding and exact PXTE v8 base.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+    projection: ManagedModelAgentStackProjectionV1,
+    compatibility_digest: Digest32,
+    binding: ArtifactExecutionBindingV1,
+    embedded: ManagedModelAgentStackTargetExecutionV1,
+    canonical_wire: Box<[u8]>,
+    execution_digest: Digest32,
+}
+
+impl ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+    pub fn try_new(
+        projection: ManagedModelAgentStackProjectionV1,
+        binding: ArtifactExecutionBindingV1,
+        embedded: ManagedModelAgentStackTargetExecutionV1,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        if embedded.projection() != &projection
+            || embedded.mode() != ManagedModelAgentStackTargetModeV1::FabricModelAndAgent
+            || binding.execution_profile_commitment() != artifact_execution_profile_commitment_v1()
+            || !artifact_adapter_is_exact(embedded.model())
+        {
+            return Err(ManagedModelAgentStackPlanError::InvalidShape);
+        }
+        let compatibility_digest =
+            artifact_bound_managed_model_agent_stack_compatibility_digest_v1()?;
+        let embedded_length = u32::try_from(embedded.canonical_wire().len())
+            .map_err(|_| ManagedModelAgentStackPlanError::InvalidLength)?;
+        let mut wire = Vec::with_capacity(
+            ARTIFACT_TARGET_EXECUTION_FIXED_BYTES + embedded.canonical_wire().len(),
+        );
+        wire.extend_from_slice(TARGET_EXECUTION_MAGIC);
+        wire.extend_from_slice(
+            &ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION.to_be_bytes(),
+        );
+        wire.extend_from_slice(projection.canonical_wire());
+        wire.extend_from_slice(compatibility_digest.as_bytes());
+        wire.extend_from_slice(&ARTIFACT_EXECUTION_PROFILE_VERSION.to_be_bytes());
+        wire.extend_from_slice(&ARTIFACT_EXECUTION_BINDING_VERSION.to_be_bytes());
+        wire.extend_from_slice(&(ARTIFACT_EXECUTION_BINDING_V1_BYTES as u32).to_be_bytes());
+        wire.extend_from_slice(&embedded_length.to_be_bytes());
+        wire.extend_from_slice(binding.canonical_wire());
+        wire.extend_from_slice(embedded.canonical_wire());
+        if wire.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES {
+            return Err(ManagedModelAgentStackPlanError::FrameTooLarge);
+        }
+        let execution_digest = digest_wire(ARTIFACT_TARGET_EXECUTION_DIGEST_DOMAIN, &wire)?;
+        Ok(Self {
+            projection,
+            compatibility_digest,
+            binding,
+            embedded,
+            canonical_wire: wire.into_boxed_slice(),
+            execution_digest,
+        })
+    }
+
+    pub fn decode(frame: &[u8]) -> Result<Self, ManagedModelAgentStackPlanError> {
+        if frame.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES {
+            return Err(ManagedModelAgentStackPlanError::FrameTooLarge);
+        }
+        if frame.len() < ARTIFACT_TARGET_EXECUTION_FIXED_BYTES {
+            return Err(ManagedModelAgentStackPlanError::Truncated);
+        }
+        let mut cursor = Cursor::new(frame);
+        if cursor.take(4)? != TARGET_EXECUTION_MAGIC
+            || cursor.u16()?
+                != ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION
+        {
+            return Err(ManagedModelAgentStackPlanError::UnsupportedWire);
+        }
+        let projection =
+            ManagedModelAgentStackProjectionV1::decode(cursor.take(STACK_PROJECTION_BYTES)?)?;
+        let compatibility_digest = Digest32::from_bytes(cursor.array()?);
+        if compatibility_digest
+            != artifact_bound_managed_model_agent_stack_compatibility_digest_v1()?
+            || cursor.u16()? != ARTIFACT_EXECUTION_PROFILE_VERSION
+            || cursor.u16()? != ARTIFACT_EXECUTION_BINDING_VERSION
+            || cursor.usize_u32()? != ARTIFACT_EXECUTION_BINDING_V1_BYTES
+        {
+            return Err(ManagedModelAgentStackPlanError::CompatibilityMismatch);
+        }
+        let embedded_length = cursor.usize_u32()?;
+        if embedded_length == 0
+            || embedded_length > MAX_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES
+        {
+            return Err(ManagedModelAgentStackPlanError::InvalidLength);
+        }
+        let binding = ArtifactExecutionBindingV1::decode(
+            cursor.take(ARTIFACT_EXECUTION_BINDING_V1_BYTES)?,
+        )?;
+        let embedded = ManagedModelAgentStackTargetExecutionV1::decode(
+            cursor.take(embedded_length)?,
+        )?;
+        cursor.finish()?;
+        let decoded = Self::try_new(projection, binding, embedded)?;
+        if decoded.compatibility_digest != compatibility_digest
+            || decoded.canonical_wire() != frame
+        {
+            return Err(ManagedModelAgentStackPlanError::NonCanonicalFrame);
+        }
+        Ok(decoded)
+    }
+
+    #[must_use]
+    pub const fn projection(&self) -> &ManagedModelAgentStackProjectionV1 {
+        &self.projection
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> ArtifactExecutionBindingV1 {
+        self.binding
+    }
+
+    #[must_use]
+    pub const fn embedded(&self) -> &ManagedModelAgentStackTargetExecutionV1 {
+        &self.embedded
+    }
+
+    #[must_use]
+    pub fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub const fn execution_digest(&self) -> Digest32 {
+        self.execution_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactBoundManagedModelAgentStackAssignmentsV1 {
+    bindings: TargetAssignments,
+    execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    assignment_digest: TargetAssignmentDigest,
+}
+
+impl ArtifactBoundManagedModelAgentStackAssignmentsV1 {
+    fn try_from_execution(
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        let bindings = TargetAssignments::try_new(Vec::new())
+            .map_err(|_| ManagedModelAgentStackPlanError::BindingNotAllowed)?;
+        Self::try_new(bindings, execution)
+    }
+
+    fn try_new(
+        bindings: TargetAssignments,
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        bindings
+            .validate()
+            .map_err(|_| ManagedModelAgentStackPlanError::BindingNotAllowed)?;
+        if !bindings.is_empty() || bindings.canonical_wire() != ARTIFACT_EMPTY_PXTA {
+            return Err(ManagedModelAgentStackPlanError::BindingNotAllowed);
+        }
+        let mut builder =
+            Digest32Builder::try_new(ARTIFACT_TARGET_PLAN_ASSIGNMENTS_DIGEST_DOMAIN)?;
+        builder.field_digest(bindings.assignment_digest().value())?;
+        builder.field_digest(&execution.execution_digest())?;
+        Ok(Self {
+            bindings,
+            execution,
+            assignment_digest: TargetAssignmentDigest::new(builder.finish()),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactBoundManagedModelAgentStackPlanSliceV1 {
+    commitment: RuntimeSliceCommitment,
+    assignments: ArtifactBoundManagedModelAgentStackAssignmentsV1,
+}
+
+impl ArtifactBoundManagedModelAgentStackPlanSliceV1 {
+    fn try_new(
+        commitment: RuntimeSliceCommitment,
+        assignments: ArtifactBoundManagedModelAgentStackAssignmentsV1,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        commitment.validate()?;
+        if commitment.header().assignment_digest() != assignments.assignment_digest {
+            return Err(ManagedModelAgentStackPlanError::CommitmentMismatch);
+        }
+        if commitment.header().target() != assignments.execution.projection().target() {
+            return Err(ManagedModelAgentStackPlanError::TargetMismatch);
+        }
+        Ok(Self {
+            commitment,
+            assignments,
+        })
+    }
+}
+
+/// Canonical envelope-v2 signing transcript used by PXAR v12.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2(
+    ApplyRequestSigningTranscriptV2,
+);
+
+impl ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2 {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// Signature-independent PXAR v12 producer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactBoundManagedModelAgentStackApplyRequestDraftV1 {
+    envelope: RuntimeApplyEnvelopeV2Draft,
+    slice: ArtifactBoundManagedModelAgentStackPlanSliceV1,
+}
+
+impl ArtifactBoundManagedModelAgentStackApplyRequestDraftV1 {
+    pub fn try_new(
+        execution: ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        provenance: PlanProvenance,
+        control: RuntimeApplyControl,
+        temporal: ApplyTemporalConstraint,
+        expected_runtime_store_instance_id: [u8; 32],
+        auth_claim: ApplyRequestAuthClaim,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        let assignments =
+            ArtifactBoundManagedModelAgentStackAssignmentsV1::try_from_execution(execution)?;
+        let header = RuntimeSliceHeader::new(
+            assignments.execution.projection().target(),
+            provenance,
+            assignments.assignment_digest,
+        );
+        let commitment = RuntimeSliceCommitment::try_new(header)?;
+        let slice = ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(
+            commitment,
+            assignments,
+        )?;
+        let control_commitment = RuntimeApplyControlCommitment::try_new(commitment, control)?;
+        let store = RuntimeStoreInstanceId::try_from_bytes(expected_runtime_store_instance_id)?;
+        let envelope =
+            RuntimeApplyEnvelopeV2Draft::try_new(control_commitment, temporal, store, auth_claim)?;
+        Ok(Self { envelope, slice })
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2, ManagedModelAgentStackPlanError>
+    {
+        Ok(ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2(
+            self.envelope.signing_transcript()?,
+        ))
+    }
+
+    pub fn finalize(
+        self,
+        signature: &[u8],
+    ) -> Result<ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackPlanError>
+    {
+        let envelope = self.envelope.finalize(signature)?;
+        ArtifactBoundManagedModelAgentStackApplyRequestV1::try_new(envelope, self.slice)
+    }
+}
+
+/// Signed strict PXAR v12 carrying envelope v2, PXTA-zero, and PXTE v11.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactBoundManagedModelAgentStackApplyRequestV1 {
+    envelope: RuntimeApplyEnvelopeV2,
+    slice: ArtifactBoundManagedModelAgentStackPlanSliceV1,
+    canonical_wire: Box<[u8]>,
+}
+
+impl ArtifactBoundManagedModelAgentStackApplyRequestV1 {
+    fn try_new(
+        envelope: RuntimeApplyEnvelopeV2,
+        slice: ArtifactBoundManagedModelAgentStackPlanSliceV1,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        if envelope.control_commitment().slice() != slice.commitment {
+            return Err(ManagedModelAgentStackPlanError::CommitmentMismatch);
+        }
+        let canonical_wire = build_artifact_apply_request_wire(&envelope, &slice)?;
+        if canonical_wire.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES {
+            return Err(ManagedModelAgentStackPlanError::FrameTooLarge);
+        }
+        Ok(Self {
+            envelope,
+            slice,
+            canonical_wire: canonical_wire.into_boxed_slice(),
+        })
+    }
+
+    pub fn decode(frame: &[u8]) -> Result<Self, ManagedModelAgentStackPlanError> {
+        if frame.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES {
+            return Err(ManagedModelAgentStackPlanError::FrameTooLarge);
+        }
+        if frame.len() < APPLY_REQUEST_HEADER_BYTES {
+            return Err(ManagedModelAgentStackPlanError::Truncated);
+        }
+        if &frame[..4] != APPLY_REQUEST_MAGIC
+            || read_u16(&frame[4..6])
+                != ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION
+        {
+            return Err(ManagedModelAgentStackPlanError::UnsupportedWire);
+        }
+        let envelope_length = read_u32(&frame[6..10]) as usize;
+        let bindings_length = read_u32(&frame[10..14]) as usize;
+        let execution_length = read_u32(&frame[14..18]) as usize;
+        if envelope_length > MAX_RUNTIME_APPLY_ENVELOPE_V2_BYTES
+            || bindings_length != ARTIFACT_EMPTY_PXTA.len()
+            || execution_length == 0
+            || execution_length
+                > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES
+        {
+            return Err(ManagedModelAgentStackPlanError::InvalidLength);
+        }
+        let expected_length = APPLY_REQUEST_HEADER_BYTES
+            .checked_add(envelope_length)
+            .and_then(|value| value.checked_add(bindings_length))
+            .and_then(|value| value.checked_add(execution_length))
+            .ok_or(ManagedModelAgentStackPlanError::FrameTooLarge)?;
+        if frame.len() < expected_length {
+            return Err(ManagedModelAgentStackPlanError::Truncated);
+        }
+        if frame.len() > expected_length {
+            return Err(ManagedModelAgentStackPlanError::TrailingBytes);
+        }
+        let envelope_start = APPLY_REQUEST_HEADER_BYTES;
+        let envelope_end = envelope_start + envelope_length;
+        let bindings_end = envelope_end + bindings_length;
+        let envelope = RuntimeApplyEnvelopeV2::decode(&frame[envelope_start..envelope_end])?;
+        let binding_frame = &frame[envelope_end..bindings_end];
+        if binding_frame != ARTIFACT_EMPTY_PXTA {
+            return Err(ManagedModelAgentStackPlanError::BindingNotAllowed);
+        }
+        let bindings = TargetAssignments::decode(binding_frame)
+            .map_err(|_| ManagedModelAgentStackPlanError::BindingNotAllowed)?;
+        let execution = ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(
+            &frame[bindings_end..],
+        )?;
+        let assignments =
+            ArtifactBoundManagedModelAgentStackAssignmentsV1::try_new(bindings, execution)?;
+        let slice = ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(
+            envelope.control_commitment().slice(),
+            assignments,
+        )?;
+        let decoded = Self::try_new(envelope, slice)?;
+        if decoded.canonical_wire() != frame {
+            return Err(ManagedModelAgentStackPlanError::NonCanonicalFrame);
+        }
+        Ok(decoded)
+    }
+
+    #[must_use]
+    pub fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+
+    #[must_use]
+    pub fn canonical_slice_wire(&self) -> &[u8] {
+        let offset = APPLY_REQUEST_HEADER_BYTES + self.envelope.canonical_wire().len();
+        &self.canonical_wire[offset..]
+    }
+
+    #[must_use]
+    pub const fn target_execution(
+        &self,
+    ) -> &ArtifactBoundManagedModelAgentStackTargetExecutionV1 {
+        &self.slice.assignments.execution
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> RuntimeHostId {
+        self.slice.commitment.header().target()
+    }
+
+    #[must_use]
+    pub const fn provenance(&self) -> PlanProvenance {
+        self.slice.commitment.header().provenance()
+    }
+
+    #[must_use]
+    pub const fn assignment_digest(&self) -> TargetAssignmentDigest {
+        self.slice.commitment.header().assignment_digest()
+    }
+
+    #[must_use]
+    pub const fn target_slice_digest(&self) -> TargetSliceDigest {
+        self.slice.commitment.target_slice_digest()
+    }
+
+    #[must_use]
+    pub const fn control_commitment(&self) -> &RuntimeApplyControlCommitment {
+        self.envelope.control_commitment()
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> ApplyOperationId {
+        self.envelope.control_commitment().control().operation_id()
+    }
+
+    #[must_use]
+    pub const fn temporal(&self) -> ApplyTemporalConstraint {
+        self.envelope.temporal()
+    }
+
+    #[must_use]
+    pub const fn expected_runtime_store_instance_id(&self) -> [u8; 32] {
+        *self.envelope.expected_runtime_store_instance_id().as_bytes()
+    }
+
+    #[must_use]
+    pub const fn authentication(&self) -> &ApplyRequestAuthentication {
+        self.envelope.authentication()
+    }
+
+    #[must_use]
+    pub const fn envelope_request_digest(&self) -> Digest32 {
+        self.envelope.request_digest()
+    }
+
+    pub fn signing_transcript(
+        &self,
+    ) -> Result<ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2, ManagedModelAgentStackPlanError>
+    {
+        Ok(ArtifactBoundManagedModelAgentStackApplySigningTranscriptV2(
+            self.envelope.signing_transcript()?,
+        ))
+    }
+
+    pub fn validate_expected_store(
+        &self,
+        local_runtime_store_instance_id: [u8; 32],
+    ) -> Result<(), ManagedModelAgentStackPlanError> {
+        let local = RuntimeStoreInstanceId::try_from_bytes(local_runtime_store_instance_id)?;
+        self.envelope.validate_expected_store(local)?;
+        Ok(())
+    }
+}
+
+/// Reconstructs one durable `PXTA-zero || PXTE-v11` value from owner authority.
+pub fn verify_artifact_bound_managed_model_agent_stack_durable_slice_v1(
+    canonical_slice_wire: &[u8],
+    target: RuntimeHostId,
+    provenance: PlanProvenance,
+    expected_target_slice_digest: TargetSliceDigest,
+) -> Result<ArtifactBoundManagedModelAgentStackTargetExecutionV1, ManagedModelAgentStackPlanError>
+{
+    if canonical_slice_wire.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_PLAN_SLICE_BYTES {
+        return Err(ManagedModelAgentStackPlanError::FrameTooLarge);
+    }
+    if canonical_slice_wire.len() < ARTIFACT_EMPTY_PXTA.len() {
+        return Err(ManagedModelAgentStackPlanError::Truncated);
+    }
+    let (binding_frame, execution_frame) =
+        canonical_slice_wire.split_at(ARTIFACT_EMPTY_PXTA.len());
+    if binding_frame != ARTIFACT_EMPTY_PXTA {
+        return Err(ManagedModelAgentStackPlanError::BindingNotAllowed);
+    }
+    let bindings = TargetAssignments::decode(binding_frame)
+        .map_err(|_| ManagedModelAgentStackPlanError::BindingNotAllowed)?;
+    let execution = ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(execution_frame)?;
+    if execution.projection().target() != target {
+        return Err(ManagedModelAgentStackPlanError::ProjectionMismatch);
+    }
+    let assignments =
+        ArtifactBoundManagedModelAgentStackAssignmentsV1::try_new(bindings, execution)?;
+    let commitment = RuntimeSliceCommitment::try_new(RuntimeSliceHeader::new(
+        target,
+        provenance,
+        assignments.assignment_digest,
+    ))?;
+    if commitment.target_slice_digest() != expected_target_slice_digest {
+        return Err(ManagedModelAgentStackPlanError::CommitmentMismatch);
+    }
+    let slice =
+        ArtifactBoundManagedModelAgentStackPlanSliceV1::try_new(commitment, assignments)?;
+    Ok(slice.assignments.execution)
+}
+
 /// Reconstructs one durable `PXTA-zero || PXTE-v8` value from journal authority.
 pub fn verify_managed_model_agent_stack_durable_slice_v1(
     canonical_slice_wire: &[u8],
@@ -1144,6 +1781,30 @@ impl ManagedModelAgentStackTerminalFactsV1 {
         })
     }
 
+    pub fn try_new_artifact_bound(
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        state: ManagedModelAgentStackTerminalStateV1,
+        evidence: ManagedModelAgentStackTerminalEvidenceV1,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        validate_terminal_state_evidence(state, evidence)?;
+        validate_artifact_terminal_outcome(state.outcome())?;
+        let desired_head_digest = resolve_artifact_terminal_head(request, state.head())?;
+        Ok(Self {
+            target: request.target(),
+            runtime_store_instance_id: request.expected_runtime_store_instance_id(),
+            source_scope: request.provenance().source_scope(),
+            operation_id: request.operation_id(),
+            request_digest: request.envelope_request_digest(),
+            target_slice_digest: request.target_slice_digest(),
+            assignment_digest: request.assignment_digest(),
+            terminal_result_ref: derive_artifact_terminal_result_ref(request)?,
+            request_mode: ManagedModelAgentStackTargetModeV1::FabricModelAndAgent,
+            state,
+            desired_head_digest,
+            evidence,
+        })
+    }
+
     fn validate_against_request(
         self,
         request: &ManagedModelAgentStackApplyRequestV1,
@@ -1160,6 +1821,31 @@ impl ManagedModelAgentStackTerminalFactsV1 {
             || self.terminal_result_ref != derive_terminal_result_ref(request)?
             || self.request_mode != request.target_execution().mode()
             || self.desired_head_digest != resolve_terminal_head(request, self.state.head())?
+            || self.evidence.fields().selection_clock_generation.value()
+                < request.temporal().target_clock_generation().value()
+        {
+            return Err(ManagedModelAgentStackPlanError::TerminalCorrelationMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_against_artifact_request(
+        self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> Result<(), ManagedModelAgentStackPlanError> {
+        validate_terminal_state_evidence(self.state, self.evidence)?;
+        validate_artifact_terminal_outcome(self.state.outcome())?;
+        if self.target != request.target()
+            || self.runtime_store_instance_id != request.expected_runtime_store_instance_id()
+            || self.source_scope != request.provenance().source_scope()
+            || self.operation_id != request.operation_id()
+            || self.request_digest != request.envelope_request_digest()
+            || self.target_slice_digest != request.target_slice_digest()
+            || self.assignment_digest != request.assignment_digest()
+            || self.terminal_result_ref != derive_artifact_terminal_result_ref(request)?
+            || self.request_mode != ManagedModelAgentStackTargetModeV1::FabricModelAndAgent
+            || self.desired_head_digest
+                != resolve_artifact_terminal_head(request, self.state.head())?
             || self.evidence.fields().selection_clock_generation.value()
                 < request.temporal().target_clock_generation().value()
         {
@@ -1324,6 +2010,26 @@ impl ManagedModelAgentStackTerminalReceiptDraftV1 {
         })
     }
 
+    pub fn try_new_artifact_bound(
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        facts: ManagedModelAgentStackTerminalFactsV1,
+        channel: ReferenceChannelBindingV1,
+        auth_claim: ManagedModelAgentStackTerminalAuthClaimV1,
+    ) -> Result<Self, ManagedModelAgentStackPlanError> {
+        facts.validate_against_artifact_request(request)?;
+        if channel.target() != request.target()
+            || auth_claim.runtime_peer() != channel.runtime_peer()
+            || auth_claim.channel_binding_digest() != channel.binding_digest()
+        {
+            return Err(ManagedModelAgentStackPlanError::TerminalCorrelationMismatch);
+        }
+        Ok(Self {
+            facts,
+            channel,
+            auth_claim,
+        })
+    }
+
     pub fn signing_transcript(
         &self,
     ) -> Result<ManagedModelAgentStackTerminalSigningTranscriptV1, ManagedModelAgentStackPlanError>
@@ -1445,6 +2151,22 @@ impl ManagedModelAgentStackTerminalReceiptV1 {
         channel: ReferenceChannelBindingV1,
     ) -> Result<ManagedModelAgentStackTerminalFactsV1, ManagedModelAgentStackPlanError> {
         self.facts.validate_against_request(request)?;
+        if self.channel != channel
+            || channel.target() != request.target()
+            || self.auth_claim.runtime_peer() != channel.runtime_peer()
+            || self.auth_claim.channel_binding_digest() != channel.binding_digest()
+        {
+            return Err(ManagedModelAgentStackPlanError::TerminalCorrelationMismatch);
+        }
+        Ok(self.facts)
+    }
+
+    pub fn validate_against_artifact_request(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        channel: ReferenceChannelBindingV1,
+    ) -> Result<ManagedModelAgentStackTerminalFactsV1, ManagedModelAgentStackPlanError> {
+        self.facts.validate_against_artifact_request(request)?;
         if self.channel != channel
             || channel.target() != request.target()
             || self.auth_claim.runtime_peer() != channel.runtime_peer()
@@ -1643,6 +2365,15 @@ fn validate_terminal_outcome_mode(
     Ok(())
 }
 
+fn validate_artifact_terminal_outcome(
+    outcome: ManagedModelAgentStackTerminalOutcomeV1,
+) -> Result<(), ManagedModelAgentStackPlanError> {
+    if outcome == ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero {
+        return Err(ManagedModelAgentStackPlanError::InvalidTerminalFacts);
+    }
+    Ok(())
+}
+
 fn resolve_terminal_head(
     request: &ManagedModelAgentStackApplyRequestV1,
     head: ManagedModelAgentStackTerminalHeadV1,
@@ -1663,8 +2394,48 @@ fn resolve_terminal_head(
     }
 }
 
+fn resolve_artifact_terminal_head(
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    head: ManagedModelAgentStackTerminalHeadV1,
+) -> Result<Option<TargetSliceDigest>, ManagedModelAgentStackPlanError> {
+    match head {
+        ManagedModelAgentStackTerminalHeadV1::PreservedNone => Ok(None),
+        ManagedModelAgentStackTerminalHeadV1::PreservedExisting(value)
+            if !digest_is_zero(*value.value()) =>
+        {
+            Ok(Some(value))
+        }
+        ManagedModelAgentStackTerminalHeadV1::PreservedExisting(_) => {
+            Err(ManagedModelAgentStackPlanError::InvalidTerminalFacts)
+        }
+        ManagedModelAgentStackTerminalHeadV1::CommittedIncoming => {
+            Ok(Some(request.target_slice_digest()))
+        }
+    }
+}
+
 fn derive_terminal_result_ref(
     request: &ManagedModelAgentStackApplyRequestV1,
+) -> Result<ManagedModelAgentStackTerminalResultRefV1, ManagedModelAgentStackPlanError> {
+    let mut builder = Digest32Builder::try_new(TERMINAL_RESULT_REF_DOMAIN)?;
+    builder.field_bytes(TERMINAL_RECEIPT_MAGIC)?;
+    builder.field_u16(MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_VERSION)?;
+    builder.field_bytes(request.target().as_bytes())?;
+    builder.field_bytes(&request.expected_runtime_store_instance_id())?;
+    builder.field_bytes(request.provenance().source_scope().as_bytes())?;
+    builder.field_bytes(request.operation_id().as_bytes())?;
+    builder.field_digest(&request.envelope_request_digest())?;
+    let digest = builder.finish();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    if bytes_are_zero(&bytes) {
+        return Err(ManagedModelAgentStackPlanError::InvalidTerminalFacts);
+    }
+    Ok(ManagedModelAgentStackTerminalResultRefV1(bytes))
+}
+
+fn derive_artifact_terminal_result_ref(
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
 ) -> Result<ManagedModelAgentStackTerminalResultRefV1, ManagedModelAgentStackPlanError> {
     let mut builder = Digest32Builder::try_new(TERMINAL_RESULT_REF_DOMAIN)?;
     builder.field_bytes(TERMINAL_RECEIPT_MAGIC)?;
@@ -2151,6 +2922,103 @@ fn build_apply_request_wire(
     Ok(wire)
 }
 
+fn build_artifact_apply_request_wire(
+    envelope: &RuntimeApplyEnvelopeV2,
+    slice: &ArtifactBoundManagedModelAgentStackPlanSliceV1,
+) -> Result<Vec<u8>, ManagedModelAgentStackPlanError> {
+    let envelope_length = u32::try_from(envelope.canonical_wire().len())
+        .map_err(|_| ManagedModelAgentStackPlanError::InvalidLength)?;
+    let bindings_length = u32::try_from(slice.assignments.bindings.canonical_wire().len())
+        .map_err(|_| ManagedModelAgentStackPlanError::InvalidLength)?;
+    let execution_length = u32::try_from(slice.assignments.execution.canonical_wire().len())
+        .map_err(|_| ManagedModelAgentStackPlanError::InvalidLength)?;
+    let mut wire = Vec::new();
+    wire.extend_from_slice(APPLY_REQUEST_MAGIC);
+    wire.extend_from_slice(
+        &ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION.to_be_bytes(),
+    );
+    wire.extend_from_slice(&envelope_length.to_be_bytes());
+    wire.extend_from_slice(&bindings_length.to_be_bytes());
+    wire.extend_from_slice(&execution_length.to_be_bytes());
+    wire.extend_from_slice(envelope.canonical_wire());
+    wire.extend_from_slice(slice.assignments.bindings.canonical_wire());
+    wire.extend_from_slice(slice.assignments.execution.canonical_wire());
+    Ok(wire)
+}
+
+fn artifact_adapter_is_exact(model: Option<&ManagedModelServicePlanV1>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    let adapter = model.adapter_binding();
+    adapter.adapter_id() == &ARTIFACT_ADAPTER_ID
+        && adapter.adapter_version().value() == 1
+        && adapter.capability_id().as_bytes() == &MANAGED_MODEL_BOUNDED_TEXT_CAPABILITY_ID
+}
+
+/// Computes the fixed Artifact execution profile commitment carried by every binding.
+#[must_use]
+pub fn artifact_execution_profile_commitment_v1() -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(ARTIFACT_EXECUTION_PROFILE_DIGEST_DOMAIN);
+    for field in [
+        ARTIFACT_PROFILE,
+        ARTIFACT_RUNTIME_KIND,
+        ARTIFACT_ADAPTER_ABI,
+        ARTIFACT_TARGET_PROFILE,
+        ARTIFACT_ENTRYPOINT,
+    ] {
+        hasher.update((field.len() as u16).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher.update(16_384_u32.to_be_bytes());
+    hasher.update(32_768_u32.to_be_bytes());
+    hasher.update(0_u32.to_be_bytes());
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+/// Computes the complete PXTE11/PXAR12 Artifact-bound compatibility fingerprint.
+pub fn artifact_bound_managed_model_agent_stack_compatibility_digest_v1(
+) -> Result<Digest32, DigestBuildError> {
+    let mut builder = Digest32Builder::try_new(ARTIFACT_STACK_COMPATIBILITY_DIGEST_DOMAIN)?;
+    builder.field_digest(&managed_model_agent_stack_compatibility_digest_v1()?)?;
+    builder.field_bytes(TARGET_EXECUTION_MAGIC)?;
+    builder.field_u16(ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION)?;
+    builder.field_bytes(
+        &(MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES as u32)
+            .to_be_bytes(),
+    )?;
+    builder.field_bytes(APPLY_REQUEST_MAGIC)?;
+    builder.field_u16(ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION)?;
+    builder.field_bytes(
+        &(MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES as u32).to_be_bytes(),
+    )?;
+    builder.field_u16(ARTIFACT_EXECUTION_PROFILE_VERSION)?;
+    builder.field_u16(ARTIFACT_EXECUTION_BINDING_VERSION)?;
+    builder.field_bytes(&(ARTIFACT_EXECUTION_BINDING_V1_BYTES as u32).to_be_bytes())?;
+    builder.field_bytes(&ARTIFACT_ADAPTER_ID)?;
+    builder.field_bytes(&1_u32.to_be_bytes())?;
+    builder.field_bytes(&MANAGED_MODEL_BOUNDED_TEXT_CAPABILITY_ID)?;
+    builder.field_digest(&artifact_execution_profile_commitment_v1())?;
+    builder.field_bytes(ARTIFACT_TARGET_EXECUTION_DIGEST_DOMAIN)?;
+    builder.field_bytes(ARTIFACT_TARGET_PLAN_ASSIGNMENTS_DIGEST_DOMAIN)?;
+    builder.field_bytes(ARTIFACT_EXECUTION_BINDING_DIGEST_DOMAIN)?;
+    builder.field_bytes(TERMINAL_RECEIPT_MAGIC)?;
+    builder.field_u16(MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_VERSION)?;
+    builder.field_bytes(&ARTIFACT_EMPTY_PXTA)?;
+    Ok(builder.finish())
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 /// Computes the exact contract fingerprint embedded in PXMM v1.
 pub fn managed_model_agent_stack_compatibility_digest_v1() -> Result<Digest32, DigestBuildError> {
     let mut builder = Digest32Builder::try_new(STACK_COMPATIBILITY_DIGEST_DOMAIN)?;
@@ -2325,6 +3193,7 @@ pub enum ManagedModelAgentStackPlanError {
     Apply(crate::apply::ApplyContractError),
     ReferenceContract,
     ReferenceWire,
+    Artifact(paraegox_artifact::ArtifactContractError),
 }
 
 impl From<DigestBuildError> for ManagedModelAgentStackPlanError {
@@ -2363,6 +3232,12 @@ impl From<crate::reference_assembly::ReferenceWireError> for ManagedModelAgentSt
     }
 }
 
+impl From<paraegox_artifact::ArtifactContractError> for ManagedModelAgentStackPlanError {
+    fn from(value: paraegox_artifact::ArtifactContractError) -> Self {
+        Self::Artifact(value)
+    }
+}
+
 impl fmt::Display for ManagedModelAgentStackPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -2377,6 +3252,98 @@ impl std::error::Error for ManagedModelAgentStackPlanError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn artifact_binding() -> ArtifactExecutionBindingV1 {
+        let object_ref = ArtifactObjectRefV1::try_new(
+            Digest32::from_bytes([0x31; 32]),
+            Digest32::from_bytes([0x32; 32]),
+        )
+        .expect("nonzero object reference");
+        let receipt = format!(
+            "pxamr1:{}:7:{}:{}",
+            "33".repeat(32),
+            "34".repeat(16),
+            "35".repeat(32),
+        )
+        .parse::<MaterializationReceiptRefV1>()
+        .expect("canonical materialization receipt reference");
+        ArtifactExecutionBindingV1::try_new(
+            object_ref,
+            receipt,
+            artifact_execution_profile_commitment_v1(),
+        )
+        .expect("exact Artifact execution binding")
+    }
+
+    #[test]
+    fn artifact_execution_profile_and_binding_are_exact() {
+        assert_eq!(
+            artifact_execution_profile_commitment_v1().as_bytes(),
+            &[
+                0x1f, 0xe2, 0x43, 0xfd, 0x90, 0x34, 0xf0, 0x4d, 0xae, 0xc0, 0xc0, 0x23,
+                0x66, 0x1c, 0x6f, 0x3e, 0x8b, 0x48, 0x78, 0xf6, 0xea, 0xab, 0x6b, 0xa0,
+                0x59, 0x4b, 0x37, 0x16, 0x1e, 0xc8, 0x8c, 0x1e,
+            ],
+        );
+        let binding = artifact_binding();
+        assert_eq!(binding.canonical_wire().len(), 192);
+        assert_eq!(
+            ArtifactExecutionBindingV1::decode(binding.canonical_wire())
+                .expect("canonical binding must reopen"),
+            binding,
+        );
+
+        let mut wrong_profile = *binding.canonical_wire();
+        wrong_profile[191] ^= 1;
+        assert!(matches!(
+            ArtifactExecutionBindingV1::decode(&wrong_profile),
+            Err(ManagedModelAgentStackPlanError::CompatibilityMismatch)
+        ));
+        assert!(ArtifactExecutionBindingV1::decode(&binding.canonical_wire()[..191]).is_err());
+        let mut trailing = binding.canonical_wire().to_vec();
+        trailing.push(0);
+        assert!(ArtifactExecutionBindingV1::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn artifact_successor_versions_and_caps_are_collision_free() {
+        assert_eq!(ARTIFACT_EXECUTION_BINDING_V1_BYTES, 192);
+        assert_eq!(ARTIFACT_TARGET_EXECUTION_FIXED_BYTES, 512);
+        assert_eq!(
+            MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_BYTES,
+            2_506,
+        );
+        assert_eq!(
+            MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
+            6_630,
+        );
+        assert_ne!(
+            ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION,
+            MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION,
+        );
+        assert_ne!(
+            ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
+            MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
+        );
+
+        let mut legacy_target = vec![0; ARTIFACT_TARGET_EXECUTION_FIXED_BYTES];
+        legacy_target[..4].copy_from_slice(TARGET_EXECUTION_MAGIC);
+        legacy_target[4..6]
+            .copy_from_slice(&MANAGED_MODEL_AGENT_STACK_TARGET_EXECUTION_VERSION.to_be_bytes());
+        assert!(matches!(
+            ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(&legacy_target),
+            Err(ManagedModelAgentStackPlanError::UnsupportedWire)
+        ));
+
+        let mut legacy_apply = vec![0; APPLY_REQUEST_HEADER_BYTES];
+        legacy_apply[..4].copy_from_slice(APPLY_REQUEST_MAGIC);
+        legacy_apply[4..6]
+            .copy_from_slice(&MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION.to_be_bytes());
+        assert!(matches!(
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(&legacy_apply),
+            Err(ManagedModelAgentStackPlanError::UnsupportedWire)
+        ));
+    }
 
     #[test]
     fn adapter_binding_requires_u32_version_and_fixed_bounded_text_capability() {

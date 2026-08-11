@@ -8,7 +8,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+paraegox-artifact.workspace = true
 paraegox-kernel.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true
