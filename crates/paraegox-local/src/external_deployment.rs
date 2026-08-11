@@ -33,6 +33,8 @@ use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
 };
 use serde::Serialize;
 
+#[cfg(unix)]
+use crate::lifecycle::{self, ArtifactExternalSupervisorChildStateV1, LocalLifecycleStateV1};
 use crate::{
     artifact,
     config::{
@@ -40,10 +42,6 @@ use crate::{
         ArtifactExternalDeploymentOperationIdInputV1, ArtifactExternalDeploymentQueryCommandV1,
     },
     error::LocalProcessError,
-};
-#[cfg(unix)]
-use crate::lifecycle::{
-    self, ArtifactExternalSupervisorChildStateV1, LocalLifecycleStateV1,
 };
 
 const OUTPUT_SCHEMA_VERSION: u16 = 1;
@@ -344,11 +342,7 @@ fn run_deploy_preflight(command: ArtifactExternalDeployCommandV1) -> ProjectionV
     let child = match lifecycle::spawn_artifact_external_supervisor(&managed_config, request) {
         Ok(value) => value,
         Err(_) => {
-            return verified_request_uncertain_projection(
-                operation_id,
-                &request,
-                Some(false),
-            );
+            return verified_request_uncertain_projection(operation_id, &request, Some(false));
         }
     };
     wait_for_artifact_external_owner(&managed_config, operation_id, request, child)
@@ -468,11 +462,7 @@ fn wait_for_artifact_external_owner(
             }
         };
         if child_state == ArtifactExternalSupervisorChildStateV1::Contended {
-            return verified_request_uncertain_projection(
-                operation_id,
-                &request,
-                Some(false),
-            );
+            return verified_request_uncertain_projection(operation_id, &request, Some(false));
         }
         let child_exit_code = match child_state {
             ArtifactExternalSupervisorChildStateV1::Exited(code) => Some(code),
@@ -485,11 +475,7 @@ fn wait_for_artifact_external_owner(
             .and_then(|observation| observation.generation())
             .is_some_and(|generation| generation != expected_generation)
         {
-            return verified_request_uncertain_projection(
-                operation_id,
-                &request,
-                Some(false),
-            );
+            return verified_request_uncertain_projection(operation_id, &request, Some(false));
         }
         let generation_accepted = lifecycle_observation
             .as_ref()
@@ -508,24 +494,22 @@ fn wait_for_artifact_external_owner(
                         return projection_error_with_changed(
                             operation_id,
                             LocalProcessError::ArtifactExternalDeployConflict,
-                            if generation_accepted { None } else { Some(false) },
+                            if generation_accepted {
+                                None
+                            } else {
+                                Some(false)
+                            },
                         );
                     }
                     match projection.phase() {
                         DeveloperArtifactExternalControllerPhaseV1::ActiveReady
                             if lifecycle_running =>
                         {
-                            return project_controller_state_with_changed(
-                                &projection,
-                                Some(true),
-                            );
+                            return project_controller_state_with_changed(&projection, Some(true));
                         }
                         DeveloperArtifactExternalControllerPhaseV1::Failed
                         | DeveloperArtifactExternalControllerPhaseV1::Uncertain => {
-                            return project_controller_state_with_changed(
-                                &projection,
-                                Some(true),
-                            );
+                            return project_controller_state_with_changed(&projection, Some(true));
                         }
                         DeveloperArtifactExternalControllerPhaseV1::Admitted
                         | DeveloperArtifactExternalControllerPhaseV1::Committed
@@ -535,9 +519,9 @@ fn wait_for_artifact_external_owner(
                         }
                     }
                 }
-                Err(DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(
-                    Some(projection),
-                )) if projection_matches_request(&projection, &request) => {
+                Err(DeveloperArtifactExternalControllerFailureV1::PublicationUncertain(Some(
+                    projection,
+                ))) if projection_matches_request(&projection, &request) => {
                     if child_exit_code.is_some() {
                         return uncertain_controller_projection(&projection, None);
                     }
@@ -570,7 +554,11 @@ fn wait_for_artifact_external_owner(
                     verified_request_uncertain_projection(
                         operation_id,
                         &request,
-                        if generation_accepted { None } else { Some(false) },
+                        if generation_accepted {
+                            None
+                        } else {
+                            Some(false)
+                        },
                     )
                 },
                 |projection| uncertain_controller_projection(projection, Some(true)),

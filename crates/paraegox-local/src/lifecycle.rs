@@ -85,13 +85,13 @@ impl ArtifactExternalSupervisorChildV1 {
             None => Ok(ArtifactExternalSupervisorChildStateV1::Running),
             Some(status)
                 if status.code()
-                    == Some(i32::from(
-                        LOCAL_CHAT_SUPERVISOR_CONTENTION_EXIT_CODE_V1,
-                    )) =>
+                    == Some(i32::from(LOCAL_CHAT_SUPERVISOR_CONTENTION_EXIT_CODE_V1)) =>
             {
                 Ok(ArtifactExternalSupervisorChildStateV1::Contended)
             }
-            Some(status) => Ok(ArtifactExternalSupervisorChildStateV1::Exited(status.code())),
+            Some(status) => Ok(ArtifactExternalSupervisorChildStateV1::Exited(
+                status.code(),
+            )),
         }
     }
 }
