@@ -3006,7 +3006,7 @@ impl std::error::Error for ManagedModelAgentStackApplyControllerError {}
 mod tests {
     use std::cell::Cell;
 
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
     use paraegox_artifact::{
         ArtifactObjectRefV1, MaterializationReceiptRefV1, VerifiedArtifactPairV1,
     };
@@ -3207,6 +3207,174 @@ mod tests {
             .expect("decoded shared PXDK"),
             admission,
         );
+    }
+
+    #[test]
+    fn artifact_runtime_terminal_shared_goldens_decode_correlate_and_verify() {
+        let runtime_request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+            &decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
+            )),
+        )
+        .expect("decoded shared PXAR12");
+        let fixtures = [
+            (
+                include_str!("../../../tests/fixtures/wire/artifact_f0_pxmt_artifact_v1.hex"),
+                ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                Some(7),
+                Some(8),
+                Some(9),
+                2,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmt_artifact_no_effect_rejected_v1.hex"
+                ),
+                ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected,
+                Some(7),
+                None,
+                None,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmt_artifact_uncertain_v1.hex"
+                ),
+                ManagedModelAgentStackTerminalOutcomeV1::Uncertain,
+                Some(7),
+                Some(8),
+                None,
+                0,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmt_artifact_quarantined_v1.hex"
+                ),
+                ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+                Some(7),
+                Some(8),
+                None,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxmt_artifact_quarantined_after_agent_intent_v1.hex"
+                ),
+                ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+                Some(7),
+                Some(8),
+                Some(9),
+                0,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
+        ];
+        let runtime_verifier = SigningKey::from_bytes(&[0x77; 32]).verifying_key();
+        let mut receipt_digests = Vec::new();
+        for (
+            fixture,
+            expected_outcome,
+            expected_fabric_generation,
+            expected_model_generation,
+            expected_agent_generation,
+            expected_census,
+            expected_census_complete,
+            expected_fabric_ready,
+            expected_model_ready,
+            expected_agent_ready,
+            expected_fabric_dependency_ready,
+            expected_model_dependency_ready,
+            expected_quarantined,
+        ) in fixtures
+        {
+            let wire = decode_fixture_hex(fixture);
+            assert_eq!(wire.len(), 591);
+            let terminal = ManagedModelAgentStackTerminalReceiptV1::decode(&wire)
+                .expect("decoded shared PXMT");
+            assert_eq!(terminal.canonical_wire(), wire);
+            let facts = terminal
+                .validate_artifact_request_correlation(&runtime_request)
+                .expect("PXMT correlates with shared PXAR12");
+            let state = facts.state();
+            assert_eq!(state.outcome(), expected_outcome);
+            assert_eq!(
+                state.fabric_generation().map(ManagedServiceGeneration::value),
+                expected_fabric_generation,
+            );
+            assert_eq!(
+                state.model_generation().map(ManagedServiceGeneration::value),
+                expected_model_generation,
+            );
+            assert_eq!(
+                state.agent_generation().map(ManagedServiceGeneration::value),
+                expected_agent_generation,
+            );
+            let evidence = facts.evidence().fields();
+            assert_eq!(evidence.physical_binding_census, expected_census);
+            assert_eq!(evidence.census_complete, expected_census_complete);
+            assert_eq!(evidence.fabric_ready, expected_fabric_ready);
+            assert_eq!(evidence.model_ready, expected_model_ready);
+            assert_eq!(evidence.agent_ready, expected_agent_ready);
+            assert_eq!(
+                evidence.fabric_to_agent_dependency_ready,
+                expected_fabric_dependency_ready,
+            );
+            assert_eq!(
+                evidence.model_to_agent_dependency_ready,
+                expected_model_dependency_ready,
+            );
+            assert_eq!(evidence.quarantined, expected_quarantined);
+            assert_eq!(terminal.authentication_key().as_bytes(), &[0x76; 16]);
+            assert_eq!(terminal.authentication_algorithm().value(), 1);
+            assert_eq!(terminal.authentication_algorithm_version(), 1);
+            let signature = Signature::from_slice(terminal.authentication_signature())
+                .expect("canonical Ed25519 signature");
+            runtime_verifier
+                .verify(
+                    terminal
+                        .signing_transcript()
+                        .expect("PXMT signing transcript")
+                        .as_bytes(),
+                    &signature,
+                )
+                .expect("runtime test key verifies PXMT");
+            assert!(!receipt_digests.contains(&terminal.receipt_digest()));
+            receipt_digests.push(terminal.receipt_digest());
+        }
+        assert_eq!(receipt_digests.len(), 5);
     }
 
     #[test]

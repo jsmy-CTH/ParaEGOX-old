@@ -8,7 +8,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 WIRE = ROOT / "tests" / "fixtures" / "wire"
@@ -37,6 +40,27 @@ ARTIFACT_CUTOVER_MARKER_DIGEST_DOMAIN = (
     b"paraegox.deployment.artifact-external-cutover-marker.sha256.v1"
 )
 PLAN_CONTENT_DIGEST_DOMAIN = b"paraegox.deployment.plan-content.sha256.v2"
+LOCAL_CONTROL_CHANNEL_BINDING_DIGEST_DOMAIN = (
+    b"paraegox.runtime.local-control-channel-binding.sha256.v1"
+)
+TERMINAL_RESULT_REF_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-terminal-result.sha256.v1"
+)
+TERMINAL_RECEIPT_SIGNING_MAGIC = (
+    b"ParaEGOX\0managed-model-agent-stack-terminal-signing"
+)
+TERMINAL_RECEIPT_DIGEST_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-terminal-receipt.sha256.v1"
+)
+STACK_RESOURCE_CENSUS_DIGEST_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-resource-census.sha256.v1"
+)
+STACK_RAW_OUTCOME_DIGEST_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-raw-outcome.sha256.v1"
+)
+STACK_QUARANTINE_DIGEST_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-quarantine.sha256.v1"
+)
 
 
 def _load_agent_oracle() -> ModuleType:
@@ -98,7 +122,6 @@ def _execution_profile_commitment() -> bytes:
 def _model_compatibility_digest() -> bytes:
     return _canonical_digest(
         MODEL_COMPATIBILITY_DOMAIN,
-        AGENT._compatibility_digest(),
         b"PXMM",
         struct.pack(">H", 1),
         struct.pack(">H", MODEL_PROJECTION_BYTES),
@@ -476,6 +499,287 @@ def _encode_artifact_runtime_request() -> dict[str, Any]:
     }
 
 
+def _terminal_generation(value: int | None) -> bytes:
+    return bytes([value is not None]) + struct.pack(">Q", value or 0)
+
+
+def _resource_census_digest(variant: dict[str, Any]) -> bytes:
+    return _canonical_digest(
+        STACK_RESOURCE_CENSUS_DIGEST_DOMAIN,
+        struct.pack(">H", variant["physical_binding_census"]),
+        struct.pack(">H", int(variant["census_complete"])),
+        struct.pack(">H", int(variant["fabric_ready"])),
+        struct.pack(">H", int(variant["model_ready"])),
+        struct.pack(">H", int(variant["agent_ready"])),
+        struct.pack(
+            ">H", int(variant["fabric_to_agent_dependency_ready"])
+        ),
+        struct.pack(">H", int(variant["model_to_agent_dependency_ready"])),
+        struct.pack(">Q", variant["fabric_generation"] or 0),
+        struct.pack(">Q", variant["model_generation"] or 0),
+        struct.pack(">Q", variant["agent_generation"] or 0),
+    )
+
+
+def _quarantine_reason_digest(variant: dict[str, Any], request_digest: bytes) -> bytes:
+    assert variant["raw_context"] == "derived_quarantine_reason"
+    assert variant["model_cleanup_exact_zero"] == "some_true"
+    return _canonical_digest(
+        STACK_QUARANTINE_DIGEST_DOMAIN,
+        struct.pack(">H", variant["raw_code"]),
+        struct.pack(">H", 2),
+        request_digest,
+    )
+
+
+def _raw_outcome_digest(
+    variant: dict[str, Any], request_digest: bytes
+) -> tuple[bytes, bytes | None]:
+    context = None
+    if variant["raw_context"] == "derived_quarantine_reason":
+        context = _quarantine_reason_digest(variant, request_digest)
+    else:
+        assert variant["raw_context"] == "none"
+    fields = [
+        struct.pack(">H", variant["raw_code"]),
+        struct.pack(">H", int(context is not None)),
+    ]
+    if context is not None:
+        fields.append(context)
+    fields.append(request_digest)
+    return _canonical_digest(STACK_RAW_OUTCOME_DIGEST_DOMAIN, *fields), context
+
+
+def _terminal_evidence_flags(variant: dict[str, Any]) -> int:
+    names = (
+        "census_complete",
+        "fabric_ready",
+        "model_ready",
+        "agent_ready",
+        "fabric_to_agent_dependency_ready",
+        "model_to_agent_dependency_ready",
+        "exact_zero",
+        "quarantined",
+    )
+    return sum(int(variant[name]) << bit for bit, name in enumerate(names))
+
+
+def _terminal_body(
+    variant: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, bytes]:
+    values = request["envelope_values"]
+    common = LEDGER["runtime_terminal"]["common"]
+    target = values[2]
+    runtime_store = values[32]
+    source_scope = values[3]
+    operation_id = values[24]
+    request_digest = request["request_digest"]
+    target_slice_digest = request["target_slice_digest"]
+    assignment_digest = request["assignment_digest"]
+    terminal_result_ref = _canonical_digest(
+        TERMINAL_RESULT_REF_DOMAIN,
+        b"PXMT",
+        struct.pack(">H", 1),
+        target,
+        runtime_store,
+        source_scope,
+        operation_id,
+        request_digest,
+    )[:16]
+    outcome = {
+        "active_ready": 1,
+        "no_effect_rejected": 3,
+        "uncertain": 4,
+        "quarantined": 5,
+    }[variant["outcome"]]
+    lifecycle = {
+        "proven_not_started": 1,
+        "may_have_started": 2,
+    }[variant["lifecycle_effect"]]
+    head = {
+        "preserved_none": 1,
+        "committed_incoming": 3,
+    }[variant["head"]]
+    desired = bytes(32) if head == 1 else target_slice_digest
+    resource_digest = _resource_census_digest(variant)
+    raw_digest, quarantine_reason = _raw_outcome_digest(variant, request_digest)
+    channel_target = target
+    runtime_peer = bytes.fromhex(common["runtime_peer_hex"])
+    local_endpoint = bytes.fromhex(common["local_endpoint_identity_digest_hex"])
+    peer_credentials = bytes.fromhex(common["peer_credentials_digest_hex"])
+    channel_digest = _canonical_digest(
+        LOCAL_CONTROL_CHANNEL_BINDING_DIGEST_DOMAIN,
+        struct.pack(">H", 1),
+        channel_target,
+        runtime_peer,
+        local_endpoint,
+        peer_credentials,
+    )
+    response_key = bytes.fromhex(common["response_key_ref_hex"])
+    body = bytearray()
+    body += target + runtime_store + source_scope + operation_id
+    body += request_digest + target_slice_digest + assignment_digest
+    body += terminal_result_ref
+    body += bytes([1, outcome, lifecycle, head, int(head != 1)]) + desired
+    body += _terminal_generation(variant["fabric_generation"])
+    body += _terminal_generation(variant["model_generation"])
+    body += _terminal_generation(variant["agent_generation"])
+    body += struct.pack(">H", variant["physical_binding_census"])
+    body += bytes([_terminal_evidence_flags(variant)])
+    body += resource_digest + raw_digest
+    body += struct.pack(
+        ">QQQQ",
+        common["completion_runtime_host_epoch"],
+        variant["completion_snapshot_sequence"],
+        common["selection_clock_generation"],
+        variant["selection_observed_at_nanos"],
+    )
+    body += channel_target + runtime_peer + local_endpoint + peer_credentials
+    body += runtime_peer + channel_digest + response_key
+    body += struct.pack(
+        ">HH", common["response_algorithm"], common["response_algorithm_version"]
+    )
+    assert len(body) == 519
+    return {
+        "body": bytes(body),
+        "terminal_result_ref": terminal_result_ref,
+        "resource_census_digest": resource_digest,
+        "raw_outcome_digest": raw_digest,
+        "quarantine_reason": quarantine_reason or bytes(32),
+        "channel_binding_digest": channel_digest,
+    }
+
+
+def _encode_artifact_terminals() -> dict[str, dict[str, bytes]]:
+    request = _encode_artifact_runtime_request()
+    signing_key = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(LEDGER["signing"]["runtime_seed_hex"])
+    )
+    terminals: dict[str, dict[str, bytes]] = {}
+    for name, variant in LEDGER["runtime_terminal"]["variants"].items():
+        encoded = _terminal_body(variant, request)
+        transcript = (
+            TERMINAL_RECEIPT_SIGNING_MAGIC
+            + struct.pack(">H", 1)
+            + encoded["body"]
+        )
+        signature = signing_key.sign(transcript)
+        wire = b"PXMT" + struct.pack(">H", 1) + encoded["body"]
+        wire += struct.pack(">H", len(signature)) + signature
+        assert len(wire) == 591
+        terminals[name] = {
+            **encoded,
+            "transcript": transcript,
+            "signature": signature,
+            "wire": wire,
+            "receipt_digest": _canonical_digest(
+                TERMINAL_RECEIPT_DIGEST_DOMAIN, wire
+            ),
+        }
+    return terminals
+
+
+def _decode_artifact_terminal(
+    frame: bytes,
+    variant_name: str,
+    request: dict[str, Any],
+) -> dict[str, bytes | int | None]:
+    assert len(frame) == 591
+    assert frame[:6] == b"PXMT" + struct.pack(">H", 1)
+    expected = _terminal_body(
+        LEDGER["runtime_terminal"]["variants"][variant_name], request
+    )
+    cursor = 6
+
+    def take(length: int) -> bytes:
+        nonlocal cursor
+        value = frame[cursor : cursor + length]
+        assert len(value) == length
+        cursor += length
+        return value
+
+    values = request["envelope_values"]
+    assert take(16) == values[2]
+    assert take(32) == values[32]
+    assert take(16) == values[3]
+    assert take(16) == values[24]
+    assert take(32) == request["request_digest"]
+    assert take(32) == request["target_slice_digest"]
+    assert take(32) == request["assignment_digest"]
+    assert take(16) == expected["terminal_result_ref"]
+    mode, outcome, lifecycle, head, desired_present = take(5)
+    variant = LEDGER["runtime_terminal"]["variants"][variant_name]
+    assert mode == 1
+    assert outcome == {
+        "active_ready": 1,
+        "no_effect_rejected": 3,
+        "uncertain": 4,
+        "quarantined": 5,
+    }[variant["outcome"]]
+    assert lifecycle == {
+        "proven_not_started": 1,
+        "may_have_started": 2,
+    }[variant["lifecycle_effect"]]
+    assert head == {"preserved_none": 1, "committed_incoming": 3}[variant["head"]]
+    assert desired_present == int(head != 1)
+    assert take(32) == (bytes(32) if head == 1 else request["target_slice_digest"])
+    generations: list[int | None] = []
+    for generation_name in (
+        "fabric_generation",
+        "model_generation",
+        "agent_generation",
+    ):
+        present = take(1)[0]
+        value = struct.unpack(">Q", take(8))[0]
+        expected_generation = variant[generation_name]
+        assert (present, value) == (
+            int(expected_generation is not None),
+            expected_generation or 0,
+        )
+        generations.append(expected_generation)
+    assert struct.unpack(">H", take(2))[0] == variant["physical_binding_census"]
+    assert take(1)[0] == _terminal_evidence_flags(variant)
+    assert take(32) == expected["resource_census_digest"]
+    assert take(32) == expected["raw_outcome_digest"]
+    common = LEDGER["runtime_terminal"]["common"]
+    assert struct.unpack(">QQQQ", take(32)) == (
+        common["completion_runtime_host_epoch"],
+        variant["completion_snapshot_sequence"],
+        common["selection_clock_generation"],
+        variant["selection_observed_at_nanos"],
+    )
+    target = values[2]
+    runtime_peer = bytes.fromhex(common["runtime_peer_hex"])
+    assert take(16) == target
+    assert take(16) == runtime_peer
+    assert take(32) == bytes.fromhex(common["local_endpoint_identity_digest_hex"])
+    assert take(32) == bytes.fromhex(common["peer_credentials_digest_hex"])
+    assert take(16) == runtime_peer
+    assert take(32) == expected["channel_binding_digest"]
+    assert take(16) == bytes.fromhex(common["response_key_ref_hex"])
+    assert struct.unpack(">HH", take(4)) == (
+        common["response_algorithm"],
+        common["response_algorithm_version"],
+    )
+    signature_length = struct.unpack(">H", take(2))[0]
+    assert signature_length == 64
+    signature = take(signature_length)
+    assert cursor == len(frame)
+    transcript = TERMINAL_RECEIPT_SIGNING_MAGIC + struct.pack(">H", 1) + frame[6:-66]
+    Ed25519PublicKey.from_public_bytes(
+        bytes.fromhex(LEDGER["signing"]["runtime_public_key_hex"])
+    ).verify(signature, transcript)
+    return {
+        "outcome": outcome,
+        "fabric_generation": generations[0],
+        "model_generation": generations[1],
+        "agent_generation": generations[2],
+        "receipt_digest": _canonical_digest(TERMINAL_RECEIPT_DIGEST_DOMAIN, frame),
+        "quarantine_reason": expected["quarantine_reason"],
+    }
+
+
 def _decode_artifact_binding(frame: bytes) -> dict[str, bytes | int]:
     assert len(frame) == 192
     object_ref = frame[:72]
@@ -766,6 +1070,52 @@ def test_artifact_pxar12_and_runtime_slice_goldens_are_independently_derived() -
     assert values[31] == struct.pack(">Q", runtime["remaining_budget_nanos"])
     assert values[32] == bytes.fromhex(runtime["runtime_store_instance_hex"])
     assert values[37] == bytes.fromhex(runtime["artifact_authentication_nonce_hex"])
+
+
+def test_artifact_pxmt_terminal_goldens_are_independently_derived_and_signed() -> None:
+    request = _encode_artifact_runtime_request()
+    expected = _encode_artifact_terminals()
+    fixtures = {
+        "active_ready": "artifact_f0_pxmt_artifact_v1.hex",
+        "no_effect_rejected": "artifact_f0_pxmt_artifact_no_effect_rejected_v1.hex",
+        "uncertain": "artifact_f0_pxmt_artifact_uncertain_v1.hex",
+        "quarantined": "artifact_f0_pxmt_artifact_quarantined_v1.hex",
+        "quarantined_after_agent_intent": (
+            "artifact_f0_pxmt_artifact_quarantined_after_agent_intent_v1.hex"
+        ),
+    }
+    receipt_digests: set[bytes] = set()
+    signatures: set[bytes] = set()
+    for variant_name, filename in fixtures.items():
+        fixture = _fixture(filename, 591)
+        assert fixture == expected[variant_name]["wire"]
+        decoded = _decode_artifact_terminal(fixture, variant_name, request)
+        assert decoded["receipt_digest"] == expected[variant_name]["receipt_digest"]
+        receipt_digests.add(expected[variant_name]["receipt_digest"])
+        signatures.add(expected[variant_name]["signature"])
+
+    assert len(receipt_digests) == len(fixtures)
+    assert len(signatures) == len(fixtures)
+    assert expected["quarantined"]["quarantine_reason"] != bytes(32)
+    assert expected["quarantined_after_agent_intent"]["quarantine_reason"] != bytes(
+        32
+    )
+    assert (
+        expected["quarantined"]["quarantine_reason"]
+        != expected["quarantined_after_agent_intent"]["quarantine_reason"]
+    )
+
+
+def test_artifact_pxmt_signature_drift_is_rejected_by_independent_decoder() -> None:
+    request = _encode_artifact_runtime_request()
+    fixture = bytearray(_fixture("artifact_f0_pxmt_artifact_v1.hex", 591))
+    fixture[-1] ^= 1
+    try:
+        _decode_artifact_terminal(bytes(fixture), "active_ready", request)
+    except Exception as error:
+        assert error.__class__.__name__ == "InvalidSignature"
+    else:
+        raise AssertionError("PXMT signature drift was accepted")
 
 
 def test_pxdq_pxdk_shared_goldens_have_independent_exact_layout_and_correlation() -> None:
