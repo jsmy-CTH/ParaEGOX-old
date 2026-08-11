@@ -73,9 +73,12 @@ use paraegox_runtime_contracts::{
         ManagedFabricPlanError,
     },
     managed_model_agent_stack_plan::{
+        ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
         MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
+        MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
         MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
-        MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
+        MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
+        ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackApplyRequestV1,
         ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
     },
     managed_service::ManagedServiceGeneration,
@@ -146,9 +149,10 @@ use crate::{
     },
     managed_fabric_state::{ManagedFabricSnapshot, ManagedFabricStateError},
     managed_model_agent_stack_runtime::{
-        ManagedModelAgentStackApplyOutcome, ManagedModelAgentStackCutoverOutcome,
-        ManagedModelAgentStackOwnerConfig, ManagedModelAgentStackRuntimeCore,
-        ManagedModelAgentStackRuntimeError,
+        ArtifactManagedModelAgentStackCutoverOutcome,
+        ArtifactManagedModelAgentStackRuntimeCore, ManagedModelAgentStackApplyOutcome,
+        ManagedModelAgentStackCutoverOutcome, ManagedModelAgentStackOwnerConfig,
+        ManagedModelAgentStackRuntimeCore, ManagedModelAgentStackRuntimeError,
     },
     managed_model_runtime::{
         RuntimeModelBackendResolverV1, UnavailableRuntimeModelBackendResolver,
@@ -2106,6 +2110,7 @@ pub(crate) struct ManagedFabricControlService {
     stack: Option<ManagedAgentStackRuntimeCore>,
     stack_projection: ManagedAgentStackProjectionV1,
     model_stack: Option<ManagedModelAgentStackRuntimeCore>,
+    artifact_model_stack: Option<ArtifactManagedModelAgentStackRuntimeCore>,
     model_stack_projection: ManagedModelAgentStackProjectionV1,
     distributed: Option<DistributedAgentStackRuntimeCore>,
     distributed_projection: DistributedAgentStackProjectionV1,
@@ -2117,6 +2122,27 @@ pub(crate) struct ManagedFabricControlService {
 }
 
 impl ManagedFabricControlService {
+    async fn shutdown_successor_chain(&mut self) -> Result<(), RuntimeBootstrapEndpointError> {
+        if let Some(model_stack) = self.artifact_model_stack.as_mut() {
+            model_stack
+                .shutdown(&mut self.core)
+                .await
+                .map_err(RuntimeBootstrapEndpointError::ManagedModelAgentStack)?;
+            return self
+                .core
+                .shutdown()
+                .await
+                .map_err(RuntimeBootstrapEndpointError::ManagedFabric);
+        }
+        shutdown_managed_successor_chain(
+            &mut self.distributed,
+            &mut self.model_stack,
+            &mut self.stack,
+            &mut self.core,
+        )
+        .await
+    }
+
     /// Sole production mint for a precommit live-lower projection. Selection
     /// comes only from the current Agent owner and the complete live endpoint
     /// Pin; no raw carrier or recovered PXRS selector enters this API.
@@ -2878,6 +2904,7 @@ impl ManagedFabricControlService {
     ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
         if self.stack.is_some()
             || self.model_stack.is_some()
+            || self.artifact_model_stack.is_some()
             || self.distributed.is_some()
             || frame.is_empty()
             || frame.len() > MAX_MANAGED_SERVING_BOOTSTRAP_REQUEST_BYTES
@@ -2979,12 +3006,15 @@ impl ManagedFabricControlService {
             MANAGED_FABRIC_APPLY_REQUEST_VERSION
                 if self.stack.is_none()
                     && self.model_stack.is_none()
+                    && self.artifact_model_stack.is_none()
                     && self.distributed.is_none() =>
             {
                 self.handle_managed_fabric_apply(frame).await
             }
             MANAGED_AGENT_STACK_APPLY_REQUEST_VERSION
-                if self.model_stack.is_none() && self.distributed.is_none() =>
+                if self.model_stack.is_none()
+                    && self.artifact_model_stack.is_none()
+                    && self.distributed.is_none() =>
             {
                 match self.handle_managed_agent_stack_apply(frame).await? {
                     ManagedAgentStackApplyOutcome::Committed(receipt)
@@ -2997,11 +3027,23 @@ impl ManagedFabricControlService {
                 }
             }
             MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION
-                if self.stack.is_none() && self.distributed.is_none() =>
+                if self.stack.is_none()
+                    && self.artifact_model_stack.is_none()
+                    && self.distributed.is_none() =>
             {
                 self.handle_managed_model_agent_stack_apply(frame).await
             }
-            DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_VERSION if self.model_stack.is_none() => {
+            ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION
+                if self.stack.is_none()
+                    && self.model_stack.is_none()
+                    && self.distributed.is_none() =>
+            {
+                self.handle_artifact_managed_model_agent_stack_apply(frame)
+                    .await
+            }
+            DISTRIBUTED_AGENT_STACK_APPLY_REQUEST_VERSION
+                if self.model_stack.is_none() && self.artifact_model_stack.is_none() =>
+            {
                 self.handle_distributed_agent_stack_apply(frame).await
             }
             _ => Err(RuntimeControlRequestError::Rejected),
@@ -3224,6 +3266,74 @@ impl ManagedFabricControlService {
             ManagedModelAgentStackApplyOutcome::Committed(receipt)
             | ManagedModelAgentStackApplyOutcome::Replayed(receipt) => {
                 managed_model_agent_stack_terminal_response_wire(&receipt)
+            }
+        }
+    }
+
+    async fn handle_artifact_managed_model_agent_stack_apply(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Box<[u8]>, RuntimeControlRequestError> {
+        if frame.len() > MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES {
+            return Err(RuntimeControlRequestError::Rejected);
+        }
+        let request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(frame)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        self.provisioning
+            .admission_policy()
+            .authenticate_artifact_managed_model_agent_stack_apply_request(&request)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        if let Some(model_stack) = self.artifact_model_stack.as_ref() {
+            return match model_stack.authenticated_terminal_replay(&request, self.channel) {
+                Ok(Some(receipt)) => managed_model_agent_stack_terminal_response_wire(&receipt),
+                Ok(None) => Err(map_managed_model_agent_stack_error(
+                    ManagedModelAgentStackRuntimeError::OperationConflict,
+                )),
+                Err(error) => Err(map_managed_model_agent_stack_error(error)),
+            };
+        }
+        self.core
+            .require_remote_agent_access_s0_mutation_unfrozen_v2()
+            .map_err(map_managed_fabric_error)?;
+        let reading = self
+            .core
+            .clock_reading()
+            .map_err(map_managed_fabric_error)?;
+        let verified = self
+            .provisioning
+            .admission_policy()
+            .verify_artifact_managed_model_agent_stack_apply_request(&request, reading)
+            .map_err(|_| RuntimeControlRequestError::Rejected)?;
+        let runtime_host_epoch = self.core.runtime_host_epoch();
+        let clock = self.core.stack_clock();
+        let cutover = ArtifactManagedModelAgentStackRuntimeCore::cutover(
+            &mut self.core,
+            ManagedModelAgentStackOwnerConfig {
+                state_directory: self.state_directory.clone(),
+                projection: self.model_stack_projection.clone(),
+                runtime_host_epoch,
+                clock,
+                response_key_ref: self.provisioning.runtime_response_key_ref(),
+                response_signer: self.provisioning.response_signer().clone(),
+                handle_broker: self.handle_broker.clone(),
+                model_backend_resolver: self.dependencies.model_backend_resolver(),
+            },
+            request,
+            verified,
+            self.channel,
+        )
+        .await
+        .map_err(map_managed_model_agent_stack_error)?;
+        match cutover {
+            ArtifactManagedModelAgentStackCutoverOutcome::NoEffect(receipt) => {
+                managed_model_agent_stack_terminal_response_wire(&receipt)
+            }
+            ArtifactManagedModelAgentStackCutoverOutcome::Installed(model_stack, receipt) => {
+                self.artifact_model_stack = Some(*model_stack);
+                match receipt {
+                    Some(receipt) => managed_model_agent_stack_terminal_response_wire(&receipt),
+                    None => Err(RuntimeControlRequestError::Unavailable),
+                }
             }
         }
     }
@@ -4415,15 +4525,7 @@ where
         None => Ok(()),
     };
     let managed_shutdown = match &mut control {
-        DeveloperLocalControlState::Managed(managed) => {
-            shutdown_managed_successor_chain(
-                &mut managed.distributed,
-                &mut managed.model_stack,
-                &mut managed.stack,
-                &mut managed.core,
-            )
-            .await
-        }
+        DeveloperLocalControlState::Managed(managed) => managed.shutdown_successor_chain().await,
         DeveloperLocalControlState::Legacy(_) => Ok(()),
     };
     aggregate_runtime_service_failures(
@@ -4686,6 +4788,7 @@ async fn recover_managed_control_for_existing_channel(
         stack,
         stack_projection,
         model_stack,
+        artifact_model_stack: None,
         model_stack_projection,
         distributed,
         distributed_projection,
@@ -5277,6 +5380,7 @@ where
         stack,
         stack_projection,
         model_stack,
+        artifact_model_stack: None,
         model_stack_projection,
         distributed,
         distributed_projection,
@@ -5291,13 +5395,7 @@ where
         Err(error) => {
             let primary = RuntimeBootstrapEndpointError::Socket(error.kind());
             let cleanup_result = guard.cleanup();
-            let shutdown_result = shutdown_managed_successor_chain(
-                &mut control.distributed,
-                &mut control.model_stack,
-                &mut control.stack,
-                &mut control.core,
-            )
-            .await;
+            let shutdown_result = control.shutdown_successor_chain().await;
             return aggregate_runtime_service_failures(
                 Err(primary),
                 shutdown_result,
@@ -5322,13 +5420,7 @@ where
                 Err(error) => {
                     drop(listener);
                     let cleanup_result = guard.cleanup();
-                    let shutdown_result = shutdown_managed_successor_chain(
-                        &mut control.distributed,
-                        &mut control.model_stack,
-                        &mut control.stack,
-                        &mut control.core,
-                    )
-                    .await;
+                    let shutdown_result = control.shutdown_successor_chain().await;
                     return aggregate_runtime_service_failures(
                         Err(error),
                         shutdown_result,
@@ -5351,13 +5443,7 @@ where
             Some(endpoint) => endpoint.shutdown().await,
             None => Ok(()),
         };
-        let shutdown_result = shutdown_managed_successor_chain(
-            &mut control.distributed,
-            &mut control.model_stack,
-            &mut control.stack,
-            &mut control.core,
-        )
-        .await;
+        let shutdown_result = control.shutdown_successor_chain().await;
         return aggregate_runtime_service_failures(
             Err(error),
             shutdown_result,
@@ -5491,13 +5577,7 @@ where
         Some(endpoint) => endpoint.shutdown().await,
         None => Ok(()),
     };
-    let shutdown_result = shutdown_managed_successor_chain(
-        &mut control.distributed,
-        &mut control.model_stack,
-        &mut control.stack,
-        &mut control.core,
-    )
-    .await;
+    let shutdown_result = control.shutdown_successor_chain().await;
     aggregate_runtime_service_failures(
         service_result,
         shutdown_result,
@@ -8483,6 +8563,7 @@ mod tests {
             stack: started.stack,
             stack_projection: started.stack_projection,
             model_stack: started.model_stack,
+            artifact_model_stack: None,
             model_stack_projection: started.model_stack_projection,
             distributed: started.distributed,
             distributed_projection: started.distributed_projection,
@@ -9339,6 +9420,7 @@ mod tests {
             stack: started.stack,
             stack_projection: started.stack_projection,
             model_stack: started.model_stack,
+            artifact_model_stack: None,
             model_stack_projection: started.model_stack_projection,
             distributed: started.distributed,
             distributed_projection: started.distributed_projection,
@@ -15038,6 +15120,7 @@ mod tests {
             stack: started.stack,
             stack_projection: started.stack_projection,
             model_stack: started.model_stack,
+            artifact_model_stack: None,
             model_stack_projection: started.model_stack_projection,
             distributed: started.distributed,
             distributed_projection: started.distributed_projection,
@@ -15169,6 +15252,7 @@ mod tests {
             stack: started.stack,
             stack_projection: started.stack_projection,
             model_stack: started.model_stack,
+            artifact_model_stack: None,
             model_stack_projection: started.model_stack_projection,
             distributed: started.distributed,
             distributed_projection: started.distributed_projection,
@@ -15343,6 +15427,7 @@ mod tests {
             stack,
             stack_projection,
             model_stack,
+            artifact_model_stack: None,
             model_stack_projection,
             distributed,
             distributed_projection,
@@ -15659,7 +15744,7 @@ mod tests {
         let model = section(
             source,
             "    async fn handle_managed_model_agent_stack_apply(",
-            "    async fn handle_distributed_agent_stack_apply(",
+            "    async fn handle_artifact_managed_model_agent_stack_apply(",
         );
         assert_order(
             "managed Model+Agent stack",
@@ -15676,6 +15761,26 @@ mod tests {
                     .find("ManagedModelAgentStackRuntimeCore::cutover(")
                     .unwrap_or_else(|| panic!("managed Model+Agent cutover disappeared")),
         );
+
+        let artifact_model = section(
+            source,
+            "    async fn handle_artifact_managed_model_agent_stack_apply(",
+            "    async fn handle_distributed_agent_stack_apply(",
+        );
+        assert_order(
+            "Artifact-bound managed Model+Agent stack",
+            artifact_model,
+            "authenticate_artifact_managed_model_agent_stack_apply_request",
+            "verify_artifact_managed_model_agent_stack_apply_request",
+            "ArtifactManagedModelAgentStackRuntimeCore::cutover(",
+        );
+        let install = artifact_model
+            .find("self.artifact_model_stack = Some(*model_stack)")
+            .unwrap_or_else(|| panic!("Artifact-bound owner retention disappeared"));
+        let transport_unknown = artifact_model[install..]
+            .find("None => Err(RuntimeControlRequestError::Unavailable)")
+            .unwrap_or_else(|| panic!("Artifact-bound missing terminal transport failed open"));
+        assert!(install < install + transport_unknown);
 
         let distributed = section(
             source,
@@ -16490,6 +16595,7 @@ mod tests {
             stack: started.stack,
             stack_projection: started.stack_projection,
             model_stack: started.model_stack,
+            artifact_model_stack: None,
             model_stack_projection: started.model_stack_projection,
             distributed: started.distributed,
             distributed_projection: started.distributed_projection,
@@ -16594,6 +16700,7 @@ mod tests {
             stack: started.stack,
             stack_projection: started.stack_projection,
             model_stack: started.model_stack,
+            artifact_model_stack: None,
             model_stack_projection: started.model_stack_projection,
             distributed: started.distributed,
             distributed_projection: started.distributed_projection,
