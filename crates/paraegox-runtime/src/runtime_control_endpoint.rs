@@ -74,11 +74,11 @@ use paraegox_runtime_contracts::{
     },
     managed_model_agent_stack_plan::{
         ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
+        ArtifactBoundManagedModelAgentStackApplyRequestV1,
         MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_VERSION,
         MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
         MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
-        MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES,
-        ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackApplyRequestV1,
+        MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
         ManagedModelAgentStackPlanError, ManagedModelAgentStackProjectionV1,
     },
     managed_service::ManagedServiceGeneration,
@@ -149,10 +149,10 @@ use crate::{
     },
     managed_fabric_state::{ManagedFabricSnapshot, ManagedFabricStateError},
     managed_model_agent_stack_runtime::{
-        ArtifactManagedModelAgentStackCutoverOutcome,
-        ArtifactManagedModelAgentStackRuntimeCore, ManagedModelAgentStackApplyOutcome,
-        ManagedModelAgentStackCutoverOutcome, ManagedModelAgentStackOwnerConfig,
-        ManagedModelAgentStackRuntimeCore, ManagedModelAgentStackRuntimeError,
+        ArtifactManagedModelAgentStackCutoverOutcome, ArtifactManagedModelAgentStackRuntimeCore,
+        ManagedModelAgentStackApplyOutcome, ManagedModelAgentStackCutoverOutcome,
+        ManagedModelAgentStackOwnerConfig, ManagedModelAgentStackRuntimeCore,
+        ManagedModelAgentStackRuntimeError,
     },
     managed_model_runtime::{
         RuntimeModelBackendResolverV1, UnavailableRuntimeModelBackendResolver,
