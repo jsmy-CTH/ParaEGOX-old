@@ -49,9 +49,13 @@ pub(crate) const MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES: usize = 4 * 1024 
 const _: fn() = artifact_snapshot_v2_compile_time_anchor;
 
 fn artifact_snapshot_v2_compile_time_anchor() {
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::try_initial_at_sequence;
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::try_successor_at_epoch;
     let _ = ArtifactManagedModelAgentStackSnapshotV2::decode;
     let _ = ArtifactManagedModelAgentStackSnapshotV2::validate_successor;
     let _ = ArtifactManagedModelAgentStackSnapshotV2::sequence;
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::runtime_host_epoch;
+    let _ = ArtifactManagedModelAgentStackSnapshotV2::transition;
     let _ = ArtifactManagedModelAgentStackSnapshotV2::canonical_wire;
 }
 
@@ -235,6 +239,30 @@ pub(crate) struct ArtifactManagedModelAgentStackSnapshotV2 {
     pub(crate) model_to_agent_dependency_ready: bool,
     pub(crate) quarantine_reason: Option<Digest32>,
     canonical_wire: Box<[u8]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactManagedModelAgentStackSnapshotTransitionV2 {
+    pub(crate) fabric_generation_high_water: u64,
+    pub(crate) model_generation_high_water: u64,
+    pub(crate) agent_generation_high_water: u64,
+    pub(crate) phase: ManagedModelAgentStackDurablePhase,
+    pub(crate) writer_fence: Option<ManagedModelAgentStackWriterFence>,
+    pub(crate) revision_high_water: Option<ManagedModelAgentStackRevisionHighWater>,
+    pub(crate) active: Option<ArtifactManagedModelAgentStackDurableActiveV2>,
+    pub(crate) pending: Option<ArtifactManagedModelAgentStackDurablePendingV2>,
+    pub(crate) tenure_nonces: Vec<ManagedModelAgentStackReplayRecord>,
+    pub(crate) request_nonces: Vec<ManagedModelAgentStackReplayRecord>,
+    pub(crate) temporal_lineages: Vec<ManagedModelAgentStackReplayRecord>,
+    pub(crate) terminals: Vec<ArtifactManagedModelAgentStackTerminalRecordV2>,
+    pub(crate) physical_binding_census: u16,
+    pub(crate) census_complete: bool,
+    pub(crate) fabric_ready: bool,
+    pub(crate) model_ready: bool,
+    pub(crate) agent_ready: bool,
+    pub(crate) fabric_to_agent_dependency_ready: bool,
+    pub(crate) model_to_agent_dependency_ready: bool,
+    pub(crate) quarantine_reason: Option<Digest32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -678,6 +706,93 @@ impl ManagedModelAgentStackSnapshot {
 }
 
 impl ArtifactManagedModelAgentStackSnapshotV2 {
+    pub(crate) fn try_initial_at_sequence(
+        store_instance_id: [u8; 32],
+        owner_target_fingerprint: Digest32,
+        transition_projection_digest: Digest32,
+        sequence: u64,
+        runtime_host_epoch: u64,
+        transition: ArtifactManagedModelAgentStackSnapshotTransitionV2,
+        projection: &ManagedModelAgentStackProjectionV1,
+    ) -> Result<Self, ManagedModelAgentStackStateError> {
+        Self::try_build(
+            SnapshotIdentity {
+                store_instance_id,
+                owner_target_fingerprint,
+                transition_projection_digest,
+            },
+            sequence,
+            runtime_host_epoch,
+            transition,
+            projection,
+        )
+    }
+
+    pub(crate) fn try_successor_at_epoch(
+        &self,
+        runtime_host_epoch: u64,
+        transition: ArtifactManagedModelAgentStackSnapshotTransitionV2,
+        projection: &ManagedModelAgentStackProjectionV1,
+    ) -> Result<Self, ManagedModelAgentStackStateError> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(ManagedModelAgentStackStateError::SequenceOverflow)?;
+        let next = Self::try_build(
+            SnapshotIdentity {
+                store_instance_id: self.store_instance_id,
+                owner_target_fingerprint: self.owner_target_fingerprint,
+                transition_projection_digest: self.transition_projection_digest,
+            },
+            sequence,
+            runtime_host_epoch,
+            transition,
+            projection,
+        )?;
+        self.validate_successor(&next)?;
+        Ok(next)
+    }
+
+    fn try_build(
+        identity: SnapshotIdentity,
+        sequence: u64,
+        runtime_host_epoch: u64,
+        transition: ArtifactManagedModelAgentStackSnapshotTransitionV2,
+        projection: &ManagedModelAgentStackProjectionV1,
+    ) -> Result<Self, ManagedModelAgentStackStateError> {
+        let mut snapshot = Self {
+            store_instance_id: identity.store_instance_id,
+            owner_target_fingerprint: identity.owner_target_fingerprint,
+            transition_projection_digest: identity.transition_projection_digest,
+            sequence,
+            runtime_host_epoch,
+            fabric_generation_high_water: transition.fabric_generation_high_water,
+            model_generation_high_water: transition.model_generation_high_water,
+            agent_generation_high_water: transition.agent_generation_high_water,
+            phase: transition.phase,
+            writer_fence: transition.writer_fence,
+            revision_high_water: transition.revision_high_water,
+            active: transition.active,
+            pending: transition.pending,
+            tenure_nonces: transition.tenure_nonces,
+            request_nonces: transition.request_nonces,
+            temporal_lineages: transition.temporal_lineages,
+            terminals: transition.terminals,
+            physical_binding_census: transition.physical_binding_census,
+            census_complete: transition.census_complete,
+            fabric_ready: transition.fabric_ready,
+            model_ready: transition.model_ready,
+            agent_ready: transition.agent_ready,
+            fabric_to_agent_dependency_ready: transition.fabric_to_agent_dependency_ready,
+            model_to_agent_dependency_ready: transition.model_to_agent_dependency_ready,
+            quarantine_reason: transition.quarantine_reason,
+            canonical_wire: Box::new([]),
+        };
+        snapshot.validate(projection)?;
+        snapshot.canonical_wire = snapshot.encode()?.into_boxed_slice();
+        Ok(snapshot)
+    }
+
     pub(crate) fn decode(
         frame: &[u8],
         expected_store_instance_id: [u8; 32],
@@ -935,6 +1050,36 @@ impl ArtifactManagedModelAgentStackSnapshotV2 {
     #[must_use]
     pub(crate) const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_host_epoch(&self) -> u64 {
+        self.runtime_host_epoch
+    }
+
+    pub(crate) fn transition(&self) -> ArtifactManagedModelAgentStackSnapshotTransitionV2 {
+        ArtifactManagedModelAgentStackSnapshotTransitionV2 {
+            fabric_generation_high_water: self.fabric_generation_high_water,
+            model_generation_high_water: self.model_generation_high_water,
+            agent_generation_high_water: self.agent_generation_high_water,
+            phase: self.phase,
+            writer_fence: self.writer_fence,
+            revision_high_water: self.revision_high_water,
+            active: self.active.clone(),
+            pending: self.pending.clone(),
+            tenure_nonces: self.tenure_nonces.clone(),
+            request_nonces: self.request_nonces.clone(),
+            temporal_lineages: self.temporal_lineages.clone(),
+            terminals: self.terminals.clone(),
+            physical_binding_census: self.physical_binding_census,
+            census_complete: self.census_complete,
+            fabric_ready: self.fabric_ready,
+            model_ready: self.model_ready,
+            agent_ready: self.agent_ready,
+            fabric_to_agent_dependency_ready: self.fabric_to_agent_dependency_ready,
+            model_to_agent_dependency_ready: self.model_to_agent_dependency_ready,
+            quarantine_reason: self.quarantine_reason,
+        }
     }
 
     #[must_use]
@@ -2818,10 +2963,30 @@ mod tests {
                 snapshot
             })
             .collect();
+        let reconstructed_initial =
+            ArtifactManagedModelAgentStackSnapshotV2::try_initial_at_sequence(
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                decoded[0].sequence(),
+                decoded[0].runtime_host_epoch(),
+                decoded[0].transition(),
+                &projection(),
+            )
+            .expect("shared initial PXMA2 must be constructible by the owner API");
+        assert_eq!(reconstructed_initial, decoded[0]);
         for pair in decoded.windows(2) {
             pair[0]
                 .validate_successor(&pair[1])
                 .unwrap_or_else(|error| panic!("shared PXMA2 successor rejected: {error}"));
+            let reconstructed = pair[0]
+                .try_successor_at_epoch(
+                    pair[1].runtime_host_epoch(),
+                    pair[1].transition(),
+                    &projection(),
+                )
+                .expect("shared PXMA2 successor must be constructible by the owner API");
+            assert_eq!(reconstructed, pair[1]);
         }
         assert_eq!(
             decoded[1].pending.as_ref().map(|pending| pending.kind),
@@ -2884,6 +3049,16 @@ mod tests {
             model_intent
                 .validate_successor(&failure)
                 .expect("model-intent failure successor");
+            assert_eq!(
+                model_intent
+                    .try_successor_at_epoch(
+                        failure.runtime_host_epoch(),
+                        failure.transition(),
+                        &projection(),
+                    )
+                    .expect("model-intent failure must be constructible by the owner API"),
+                failure,
+            );
         }
 
         let agent_intent = ArtifactManagedModelAgentStackSnapshotV2::decode(
@@ -2920,6 +3095,16 @@ mod tests {
         agent_intent
             .validate_successor(&agent_quarantine)
             .expect("agent-intent quarantine successor");
+        assert_eq!(
+            agent_intent
+                .try_successor_at_epoch(
+                    agent_quarantine.runtime_host_epoch(),
+                    agent_quarantine.transition(),
+                    &projection(),
+                )
+                .expect("agent-intent quarantine must be constructible by the owner API"),
+            agent_quarantine,
+        );
     }
 
     #[test]
