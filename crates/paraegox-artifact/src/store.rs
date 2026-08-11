@@ -197,7 +197,7 @@ pub enum ArtifactStoreFailureV1 {
     NotFound,
     Contended,
     PublicationUncertain {
-        operation: Option<MaterializationOperationV1>,
+        operation: Option<Box<MaterializationOperationV1>>,
     },
     Owner,
     Io,
@@ -207,7 +207,7 @@ impl ArtifactStoreFailureV1 {
     #[must_use]
     pub const fn operation(&self) -> Option<&MaterializationOperationV1> {
         match self {
-            Self::PublicationUncertain { operation } => operation.as_ref(),
+            Self::PublicationUncertain { operation } => operation.as_deref(),
             Self::UnsafePath
             | Self::ConfigurationMismatch
             | Self::Conflict
@@ -265,7 +265,6 @@ impl ArtifactStoreInvocationV1 {
         self.change
     }
 
-    #[must_use]
     pub fn result(&self) -> Result<&ArtifactStoreOperationViewV1, &ArtifactStoreFailureV1> {
         self.result.as_ref()
     }
@@ -364,7 +363,7 @@ enum StoreError {
     Capacity,
     NotFound,
     Contended,
-    PublicationUncertain(Option<MaterializationOperationV1>),
+    PublicationUncertain(Option<Box<MaterializationOperationV1>>),
     OwnerEffectUnknown,
     Owner,
     Io,
@@ -908,10 +907,16 @@ fn strict_indexed_object(
     Ok(pair)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PartialPairFacts {
+    regular_file_bytes: u64,
+    entries: Vec<(OsString, FileIdentity)>,
+}
+
 fn validate_partial_pair_entry(
     directory: &DirectoryHandle,
     expected_ref: ArtifactObjectRefV1,
-) -> Result<u64, StoreError> {
+) -> Result<PartialPairFacts, StoreError> {
     let names = scan_names(directory)?;
     let allowed = [
         MANIFEST_NEXT_NAME,
@@ -927,16 +932,24 @@ fn validate_partial_pair_entry(
     }
 
     let mut regular_bytes = 0_u64;
+    let mut entries = Vec::with_capacity(names.len());
     let mut manifest_bytes: Option<Box<[u8]>> = None;
     let mut payload_bytes: Option<Box<[u8]>> = None;
     for name in names {
         let is_manifest =
             name == OsStr::new(MANIFEST_NAME) || name == OsStr::new(MANIFEST_NEXT_NAME);
+        let is_temporary =
+            name == OsStr::new(MANIFEST_NEXT_NAME) || name == OsStr::new(PAYLOAD_NEXT_NAME);
         let maximum = if is_manifest { 206 } else { 64 };
-        let (bytes, _) = read_regular_bounded(directory, &name, maximum, false)?;
+        let (bytes, identity) =
+            read_regular_bounded(directory, &name, maximum, is_temporary)?;
+        entries.push((name, identity));
         regular_bytes = regular_bytes
             .checked_add(u64::try_from(bytes.len()).map_err(|_| StoreError::Owner)?)
             .ok_or(StoreError::Owner)?;
+        if bytes.is_empty() {
+            continue;
+        }
         if is_manifest {
             let manifest = ArtifactManifestV1::decode(&bytes).map_err(|_| StoreError::Owner)?;
             if ArtifactObjectRefV1::from_manifest(&manifest).map_err(|_| StoreError::Owner)?
@@ -974,7 +987,28 @@ fn validate_partial_pair_entry(
     {
         return Err(StoreError::Owner);
     }
-    Ok(regular_bytes)
+    Ok(PartialPairFacts {
+        regular_file_bytes: regular_bytes,
+        entries,
+    })
+}
+
+fn strict_partial_child(
+    objects: &DirectoryHandle,
+    name: &OsStr,
+    expected_ref: ArtifactObjectRefV1,
+) -> Result<(FileIdentity, PartialPairFacts), StoreError> {
+    let child = open_directory_at(objects, name)?;
+    let identity = child.identity;
+    let facts = validate_partial_pair_entry(&child, expected_ref)?;
+    let reopened = reopen_named_directory(objects, name, identity)?;
+    let reopened_facts = validate_partial_pair_entry(&reopened, expected_ref)?;
+    if reopened_facts != facts {
+        return Err(StoreError::Owner);
+    }
+    drop(reopened);
+    drop(child);
+    Ok((identity, facts))
 }
 
 fn validate_candidate_filesystem(
@@ -1020,9 +1054,7 @@ fn validate_candidate_filesystem(
                 if extra.as_os_str() != OsStr::new(&expected) {
                     return Err(StoreError::Owner);
                 }
-                let child = open_directory_at(objects, extra)?;
-                validate_partial_pair_entry(&child, *object_ref)?;
-                drop(child);
+                strict_partial_child(objects, extra, *object_ref)?;
             }
         }
         ArtifactFilesystemClaimV1::Quarantined {
@@ -1042,12 +1074,10 @@ fn validate_candidate_filesystem(
             if extras[0].as_os_str() != OsStr::new(&expected) {
                 return Err(StoreError::Owner);
             }
-            let child = open_directory_at(objects, &extras[0])?;
-            let actual_bytes = validate_partial_pair_entry(&child, *object_ref)?;
-            if actual_bytes != *regular_file_bytes {
+            let (_, facts) = strict_partial_child(objects, &extras[0], *object_ref)?;
+            if facts.regular_file_bytes != *regular_file_bytes {
                 return Err(StoreError::Owner);
             }
-            drop(child);
         }
     }
     candidate
@@ -1334,22 +1364,29 @@ fn root_selection(state_root: &DirectoryHandle) -> Result<(bool, bool), StoreErr
     ))
 }
 
+enum InitialStagingInspection {
+    NotFound,
+    Operation(MaterializationOperationV1),
+    FinalAppeared,
+}
+
 fn inspect_initial_staging(
     state_root: &StateRootHandle,
     binding: &ArtifactStoreAuthorityBindingV1,
     operation_id: ArtifactOperationIdV1,
-) -> Result<Option<MaterializationOperationV1>, StoreError> {
+) -> Result<InitialStagingInspection, StoreError> {
     let staging = open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?;
-    let mut names = scan_names(&staging)?;
+    let staging_identity = staging.identity;
+    let names = scan_names(&staging)?;
     if names.is_empty() {
         drop(staging);
-        return Ok(None);
+        return Ok(InitialStagingInspection::NotFound);
     }
     if !names.contains(OsStr::new(STORE_LOCK_NAME)) {
+        drop(staging);
         return Err(StoreError::Owner);
     }
-    let (lock, _) = acquire_lock(&staging, LockMode::Shared)?;
-    names = scan_names(&staging)?;
+    let (lock, lock_identity) = acquire_lock(&staging, LockMode::Shared)?;
     let lock_only = [STORE_LOCK_NAME]
         .into_iter()
         .map(OsString::from)
@@ -1363,22 +1400,46 @@ fn inspect_initial_staging(
         .map(OsString::from)
         .collect::<BTreeSet<_>>();
     let result = (|| {
+        let (has_final, has_staging) = root_selection(&state_root.leaf)?;
+        if has_final && !has_staging {
+            return Ok(InitialStagingInspection::FinalAppeared);
+        }
+        if has_final || !has_staging {
+            return Err(StoreError::Owner);
+        }
+        let reopened_staging = reopen_named_directory(
+            &state_root.leaf,
+            OsStr::new(STORE_STAGING_NAME),
+            staging_identity,
+        )?;
+        validate_named_regular(
+            &reopened_staging,
+            OsStr::new(STORE_LOCK_NAME),
+            lock_identity,
+            Some(0),
+        )?;
+        let names = scan_names(&reopened_staging)?;
         if names == lock_only {
-            Ok(None)
+            Ok(InitialStagingInspection::NotFound)
         } else if names == lock_objects {
-            let objects = open_directory_at(&staging, OsStr::new(OBJECTS_NAME))?;
+            let objects = open_directory_at(&reopened_staging, OsStr::new(OBJECTS_NAME))?;
             exact_names(&objects, &[])?;
             drop(objects);
-            Ok(None)
+            Ok(InitialStagingInspection::NotFound)
         } else if names == complete {
-            let objects = open_directory_at(&staging, OsStr::new(OBJECTS_NAME))?;
-            let (candidate, _, _) = decode_snapshot(&staging, STORE_SNAPSHOT_NAME)?;
-            if candidate.config_commitment() != binding.config_commitment() {
+            let objects = open_directory_at(&reopened_staging, OsStr::new(OBJECTS_NAME))?;
+            let (candidate, _, _) = decode_snapshot(&reopened_staging, STORE_SNAPSHOT_NAME)?;
+            let operation = if candidate.config_commitment() != binding.config_commitment() {
                 Err(StoreError::ConfigurationMismatch)
             } else {
                 let snapshot = validate_candidate_filesystem(&objects, candidate)?;
                 initial_staging_operation(&snapshot, operation_id)
-            }
+            }?;
+            drop(objects);
+            Ok(operation.map_or(
+                InitialStagingInspection::NotFound,
+                InitialStagingInspection::Operation,
+            ))
         } else {
             Err(StoreError::Owner)
         }
@@ -1449,27 +1510,35 @@ fn run_query(
     }
     if !has_final {
         if has_staging {
-            return match inspect_initial_staging(&state_root, &binding, operation_id) {
-                Ok(Some(operation)) => ArtifactStoreInvocationV1::failure(
-                    ArtifactStoreChangeV1::Unchanged,
-                    ArtifactStoreFailureV1::PublicationUncertain {
-                        operation: Some(operation),
-                    },
-                ),
-                Ok(None) => ArtifactStoreInvocationV1::failure(
-                    ArtifactStoreChangeV1::Unchanged,
-                    ArtifactStoreFailureV1::NotFound,
-                ),
-                Err(error) => ArtifactStoreInvocationV1::failure(
-                    ArtifactStoreChangeV1::Unchanged,
-                    error.into_public(),
-                ),
-            };
+            match inspect_initial_staging(&state_root, &binding, operation_id) {
+                Ok(InitialStagingInspection::Operation(operation)) => {
+                    return ArtifactStoreInvocationV1::failure(
+                        ArtifactStoreChangeV1::Unchanged,
+                        ArtifactStoreFailureV1::PublicationUncertain {
+                            operation: Some(Box::new(operation)),
+                        },
+                    );
+                }
+                Ok(InitialStagingInspection::NotFound) => {
+                    return ArtifactStoreInvocationV1::failure(
+                        ArtifactStoreChangeV1::Unchanged,
+                        ArtifactStoreFailureV1::NotFound,
+                    );
+                }
+                Ok(InitialStagingInspection::FinalAppeared) => {}
+                Err(error) => {
+                    return ArtifactStoreInvocationV1::failure(
+                        ArtifactStoreChangeV1::Unchanged,
+                        error.into_public(),
+                    );
+                }
+            }
+        } else {
+            return ArtifactStoreInvocationV1::failure(
+                ArtifactStoreChangeV1::Unchanged,
+                ArtifactStoreFailureV1::NotFound,
+            );
         }
-        return ArtifactStoreInvocationV1::failure(
-            ArtifactStoreChangeV1::Unchanged,
-            ArtifactStoreFailureV1::NotFound,
-        );
     }
     let store = match open_final_locked(state_root, &binding, LockMode::Shared) {
         Ok(store) => store,
@@ -1491,7 +1560,9 @@ fn run_query(
                 return Ok(active_operation.expect("checked as present"));
             }
             if next_operation_id == operation_id {
-                return Err(StoreError::PublicationUncertain(active_operation));
+                return Err(StoreError::PublicationUncertain(
+                    active_operation.map(Box::new),
+                ));
             }
             return Err(StoreError::Owner);
         }
@@ -1854,10 +1925,8 @@ fn seal_initial_prefix(
     Ok((state_root, reopened_staging, reopened_objects))
 }
 
-fn publish_initial_staging(
-    authority: &mut dyn ArtifactStoreAuthorityV1,
-    binding: &ArtifactStoreAuthorityBindingV1,
-    mut state_root: StateRootHandle,
+struct InitialPublicationInput {
+    state_root: StateRootHandle,
     staging: DirectoryHandle,
     objects_identity: FileIdentity,
     lock: File,
@@ -1865,8 +1934,24 @@ fn publish_initial_staging(
     snapshot: ArtifactStoreSnapshotV1,
     snapshot_bytes: Box<[u8]>,
     snapshot_identity: FileIdentity,
+}
+
+fn publish_initial_staging(
+    authority: &mut dyn ArtifactStoreAuthorityV1,
+    binding: &ArtifactStoreAuthorityBindingV1,
+    input: InitialPublicationInput,
     tracker: &mut ChangeTracker,
 ) -> Result<LockedStore, StoreError> {
+    let InitialPublicationInput {
+        mut state_root,
+        staging,
+        objects_identity,
+        lock,
+        lock_identity,
+        snapshot,
+        snapshot_bytes,
+        snapshot_identity,
+    } = input;
     let mut lock = Some(lock);
     let staging_identity = staging.identity;
     let result = (|| {
@@ -2147,14 +2232,16 @@ fn continue_initialization(
             return publish_initial_staging(
                 authority,
                 binding,
-                state_root,
-                staging,
-                objects_identity,
-                lock.take().ok_or(StoreError::Owner)?,
-                lock_identity,
-                snapshot,
-                snapshot_bytes,
-                snapshot_identity,
+                InitialPublicationInput {
+                    state_root,
+                    staging,
+                    objects_identity,
+                    lock: lock.take().ok_or(StoreError::Owner)?,
+                    lock_identity,
+                    snapshot,
+                    snapshot_bytes,
+                    snapshot_identity,
+                },
                 tracker,
             );
         }
@@ -2189,14 +2276,16 @@ fn continue_initialization(
         publish_initial_staging(
             authority,
             binding,
-            state_root,
-            staging,
-            objects_identity,
-            lock.take().ok_or(StoreError::Owner)?,
-            lock_identity,
-            snapshot,
-            snapshot_bytes,
-            snapshot_identity,
+            InitialPublicationInput {
+                state_root,
+                staging,
+                objects_identity,
+                lock: lock.take().ok_or(StoreError::Owner)?,
+                lock_identity,
+                snapshot,
+                snapshot_bytes,
+                snapshot_identity,
+            },
             tracker,
         )
     })();
@@ -2244,7 +2333,7 @@ fn commit_successor(
     tracker: &mut ChangeTracker,
 ) -> Result<(), StoreError> {
     let operation_id = permitted_next(&store.snapshot, &next)?;
-    let operation = next.operation(operation_id).cloned();
+    let operation = next.operation(operation_id).cloned().map(Box::new);
     if scan_names(&store.root)?.contains(OsStr::new(STORE_SNAPSHOT_NEXT_NAME)) {
         return Err(StoreError::Owner);
     }
@@ -2388,22 +2477,24 @@ fn settle_existing_next(
         &store.root.file,
         STORE_SNAPSHOT_NAME,
     )
-    .map_err(|_| StoreError::PublicationUncertain(Some(operation.clone())))?;
+    .map_err(|_| StoreError::PublicationUncertain(Some(Box::new(operation.clone()))))?;
     tracker.ambiguous();
     store
         .root
         .file
         .sync_all()
-        .map_err(|_| StoreError::PublicationUncertain(Some(operation.clone())))?;
+        .map_err(|_| StoreError::PublicationUncertain(Some(Box::new(operation.clone()))))?;
     let (candidate, bytes, identity) = decode_snapshot(&store.root, STORE_SNAPSHOT_NAME)
-        .map_err(|_| StoreError::PublicationUncertain(Some(operation.clone())))?;
+        .map_err(|_| StoreError::PublicationUncertain(Some(Box::new(operation.clone()))))?;
     if bytes.as_ref()
         != next
             .encode_canonical()
             .map_err(|_| StoreError::Owner)?
             .as_ref()
     {
-        return Err(StoreError::PublicationUncertain(Some(operation.clone())));
+        return Err(StoreError::PublicationUncertain(Some(Box::new(
+            operation.clone(),
+        ))));
     }
     let (has_final, has_staging) = root_selection(&store.state_root.leaf)?;
     if !has_final || has_staging {
@@ -2433,7 +2524,9 @@ fn settle_existing_next(
     )?;
     let reopened = validate_candidate_filesystem(&public_objects, candidate)?;
     if reopened != next {
-        return Err(StoreError::PublicationUncertain(Some(operation.clone())));
+        return Err(StoreError::PublicationUncertain(Some(Box::new(
+            operation.clone(),
+        ))));
     }
     drop(public_objects);
     drop(public_root);
@@ -2445,54 +2538,66 @@ fn settle_existing_next(
 }
 
 enum PairPublication {
-    Complete(VerifiedArtifactPairV1),
+    Complete(Box<VerifiedArtifactPairV1>),
     Quarantined(u64),
     NoEffectFailure,
 }
 
 fn sync_partial_child(
-    store: &LockedStore,
+    root: &DirectoryHandle,
+    objects: &DirectoryHandle,
     child_name: &str,
     expected_ref: ArtifactObjectRefV1,
     expected_identity: FileIdentity,
 ) -> Result<u64, StoreError> {
-    let child = open_directory_at(&store.objects, OsStr::new(child_name))?;
+    let child = open_directory_at(objects, OsStr::new(child_name))?;
     if child.identity != expected_identity {
+        drop(child);
         return Err(StoreError::Owner);
     }
-    let names = scan_names(&child)?;
-    for name in &names {
-        let (file, _) = open_regular_at(&child, name, OFlag::O_RDONLY)?;
+    let facts = validate_partial_pair_entry(&child, expected_ref)?;
+    for (name, expected_file_identity) in &facts.entries {
+        let (file, file_identity) = open_regular_at(&child, name, OFlag::O_RDONLY)?;
+        if file_identity != *expected_file_identity {
+            drop(file);
+            drop(child);
+            return Err(StoreError::Owner);
+        }
         file.sync_all().map_err(|_| StoreError::Io)?;
         drop(file);
     }
-    let bytes = validate_partial_pair_entry(&child, expected_ref)?;
+    if validate_partial_pair_entry(&child, expected_ref)? != facts {
+        drop(child);
+        return Err(StoreError::Owner);
+    }
     child.file.sync_all().map_err(|_| StoreError::Io)?;
-    store.objects.file.sync_all().map_err(|_| StoreError::Io)?;
-    let reopened_objects = reopen_named_directory(
-        &store.root,
-        OsStr::new(OBJECTS_NAME),
-        store.objects.identity,
-    )?;
+    objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    let reopened_objects =
+        reopen_named_directory(root, OsStr::new(OBJECTS_NAME), objects.identity)?;
     let reopened_child =
         reopen_named_directory(&reopened_objects, OsStr::new(child_name), child.identity)?;
-    if validate_partial_pair_entry(&reopened_child, expected_ref)? != bytes {
+    if validate_partial_pair_entry(&reopened_child, expected_ref)? != facts {
+        drop(reopened_child);
+        drop(reopened_objects);
+        drop(child);
         return Err(StoreError::Owner);
     }
     drop(reopened_child);
     drop(reopened_objects);
     drop(child);
-    Ok(bytes)
+    Ok(facts.regular_file_bytes)
 }
 
 fn sync_complete_child(
-    store: &LockedStore,
+    root: &DirectoryHandle,
+    objects: &DirectoryHandle,
     child_name: &str,
     expected_pair: &VerifiedArtifactPairV1,
     expected_identity: FileIdentity,
 ) -> Result<VerifiedArtifactPairV1, StoreError> {
-    let child = open_directory_at(&store.objects, OsStr::new(child_name))?;
+    let child = open_directory_at(objects, OsStr::new(child_name))?;
     if child.identity != expected_identity {
+        drop(child);
         return Err(StoreError::Owner);
     }
     let (manifest, _) = open_regular_at(&child, OsStr::new(MANIFEST_NAME), OFlag::O_RDONLY)?;
@@ -2502,26 +2607,69 @@ fn sync_complete_child(
     drop(payload);
     drop(manifest);
     child.file.sync_all().map_err(|_| StoreError::Io)?;
-    store.objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    objects.file.sync_all().map_err(|_| StoreError::Io)?;
     let pair = strict_pair_from_directory(&child)?;
     if &pair != expected_pair {
+        drop(child);
         return Err(StoreError::Owner);
     }
-    let reopened_objects = reopen_named_directory(
-        &store.root,
-        OsStr::new(OBJECTS_NAME),
-        store.objects.identity,
-    )?;
+    let reopened_objects =
+        reopen_named_directory(root, OsStr::new(OBJECTS_NAME), objects.identity)?;
     let reopened_child =
         reopen_named_directory(&reopened_objects, OsStr::new(child_name), child.identity)?;
     let reopened_pair = strict_pair_from_directory(&reopened_child)?;
     if reopened_pair != pair {
+        drop(reopened_child);
+        drop(reopened_objects);
+        drop(child);
         return Err(StoreError::Owner);
     }
     drop(reopened_child);
     drop(reopened_objects);
     drop(child);
     Ok(pair)
+}
+
+fn recover_pair_from_existing_child(
+    store: &LockedStore,
+    pair: &VerifiedArtifactPairV1,
+    tracker: &mut ChangeTracker,
+) -> Result<PairPublication, StoreError> {
+    tracker.ambiguous();
+    store.objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    let objects = reopen_named_directory(
+        &store.root,
+        OsStr::new(OBJECTS_NAME),
+        store.objects.identity,
+    )?;
+    let child_name = object_directory_name(pair.object_ref());
+    let (child_identity, facts) =
+        strict_partial_child(&objects, OsStr::new(&child_name), pair.object_ref())?;
+    let complete_names = [MANIFEST_NAME, PAYLOAD_NAME]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+    let actual_names = facts
+        .entries
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let result = if actual_names == complete_names {
+        sync_complete_child(&store.root, &objects, &child_name, pair, child_identity)
+            .map(Box::new)
+            .map(PairPublication::Complete)
+    } else {
+        sync_partial_child(
+            &store.root,
+            &objects,
+            &child_name,
+            pair.object_ref(),
+            child_identity,
+        )
+        .map(PairPublication::Quarantined)
+    };
+    drop(objects);
+    result
 }
 
 fn publish_pair_file(
@@ -2563,20 +2711,7 @@ fn publish_or_recover_pair(
     let child_name = object_directory_name(pair.object_ref());
     let names = scan_names(&store.objects)?;
     if names.contains(OsStr::new(&child_name)) {
-        let child = open_directory_at(&store.objects, OsStr::new(&child_name))?;
-        let child_identity = child.identity;
-        let child_names = scan_names(&child)?;
-        drop(child);
-        let complete_names = [MANIFEST_NAME, PAYLOAD_NAME]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<BTreeSet<_>>();
-        if child_names == complete_names {
-            return sync_complete_child(store, &child_name, pair, child_identity)
-                .map(PairPublication::Complete);
-        }
-        return sync_partial_child(store, &child_name, pair.object_ref(), child_identity)
-            .map(PairPublication::Quarantined);
+        return recover_pair_from_existing_child(store, pair, tracker);
     }
 
     if let Err(error) = mkdirat(&store.objects.file, child_name.as_str(), DIRECTORY_MODE) {
@@ -2585,7 +2720,7 @@ fn publish_or_recover_pair(
             let _ = error;
             return Ok(PairPublication::NoEffectFailure);
         }
-        return Err(StoreError::Owner);
+        return recover_pair_from_existing_child(store, pair, tracker);
     }
     tracker.ambiguous();
     let child = open_directory_at(&store.objects, OsStr::new(&child_name))?;
@@ -2615,15 +2750,19 @@ fn publish_or_recover_pair(
             pair.payload(),
         )?;
         drop(reopened_child);
+        let verified = sync_complete_child(
+            &store.root,
+            &reopened_objects,
+            &child_name,
+            pair,
+            child_identity,
+        );
         drop(reopened_objects);
-        sync_complete_child(store, &child_name, pair, child_identity)
+        verified
     })();
     match publication {
-        Ok(verified) => Ok(PairPublication::Complete(verified)),
-        Err(_) => match sync_partial_child(store, &child_name, pair.object_ref(), child_identity) {
-            Ok(bytes) => Ok(PairPublication::Quarantined(bytes)),
-            Err(error) => Err(error),
-        },
+        Ok(verified) => Ok(PairPublication::Complete(Box::new(verified))),
+        Err(_) => recover_pair_from_existing_child(store, pair, tracker),
     }
 }
 
@@ -2656,16 +2795,26 @@ fn commit_receipt(
         .ok_or(StoreError::Owner)
 }
 
+struct TerminalCommitInput<'a> {
+    operation_id: ArtifactOperationIdV1,
+    object: Option<&'a ArtifactObjectRecordV1>,
+    state: MaterializationTerminalStateV1,
+    quarantine: ArtifactQuarantineFactsV1,
+}
+
 fn commit_terminal_and_receipt(
     store: &mut LockedStore,
     authority: &mut dyn ArtifactStoreAuthorityV1,
     binding: &ArtifactStoreAuthorityBindingV1,
-    operation_id: ArtifactOperationIdV1,
-    object: Option<&ArtifactObjectRecordV1>,
-    state: MaterializationTerminalStateV1,
-    quarantine: ArtifactQuarantineFactsV1,
+    input: TerminalCommitInput<'_>,
     tracker: &mut ChangeTracker,
 ) -> Result<MaterializationOperationV1, StoreError> {
+    let TerminalCommitInput {
+        operation_id,
+        object,
+        state,
+        quarantine,
+    } = input;
     let operation = store
         .snapshot
         .operation(operation_id)
@@ -2848,10 +2997,12 @@ fn drive_materialization(
                 store,
                 authority,
                 binding,
-                operation_id,
-                Some(&object),
-                MaterializationTerminalStateV1::Materialized,
-                ArtifactQuarantineFactsV1::Absent,
+                TerminalCommitInput {
+                    operation_id,
+                    object: Some(&object),
+                    state: MaterializationTerminalStateV1::Materialized,
+                    quarantine: ArtifactQuarantineFactsV1::Absent,
+                },
                 tracker,
             )
         }
@@ -2864,10 +3015,12 @@ fn drive_materialization(
                 store,
                 authority,
                 binding,
-                operation_id,
-                Some(&object),
-                MaterializationTerminalStateV1::AlreadyMaterialized,
-                ArtifactQuarantineFactsV1::Absent,
+                TerminalCommitInput {
+                    operation_id,
+                    object: Some(&object),
+                    state: MaterializationTerminalStateV1::AlreadyMaterialized,
+                    quarantine: ArtifactQuarantineFactsV1::Absent,
+                },
                 tracker,
             )
         }
@@ -2880,10 +3033,12 @@ fn drive_materialization(
                         store,
                         authority,
                         binding,
-                        operation_id,
-                        None,
-                        MaterializationTerminalStateV1::Failed,
-                        ArtifactQuarantineFactsV1::Absent,
+                        TerminalCommitInput {
+                            operation_id,
+                            object: None,
+                            state: MaterializationTerminalStateV1::Failed,
+                            quarantine: ArtifactQuarantineFactsV1::Absent,
+                        },
                         tracker,
                     );
                 }
@@ -2894,27 +3049,31 @@ fn drive_materialization(
                     store,
                     authority,
                     binding,
-                    operation_id,
-                    None,
-                    MaterializationTerminalStateV1::Failed,
-                    ArtifactQuarantineFactsV1::Absent,
+                    TerminalCommitInput {
+                        operation_id,
+                        object: None,
+                        state: MaterializationTerminalStateV1::Failed,
+                        quarantine: ArtifactQuarantineFactsV1::Absent,
+                    },
                     tracker,
                 ),
                 PairPublication::Quarantined(regular_file_bytes) => commit_terminal_and_receipt(
                     store,
                     authority,
                     binding,
-                    operation_id,
-                    None,
-                    MaterializationTerminalStateV1::Uncertain,
-                    ArtifactQuarantineFactsV1::Present {
+                    TerminalCommitInput {
                         operation_id,
-                        regular_file_bytes,
+                        object: None,
+                        state: MaterializationTerminalStateV1::Uncertain,
+                        quarantine: ArtifactQuarantineFactsV1::Present {
+                            operation_id,
+                            regular_file_bytes,
+                        },
                     },
                     tracker,
                 ),
                 PairPublication::Complete(verified) => {
-                    if &verified != pair {
+                    if verified.as_ref() != pair {
                         return Err(StoreError::Owner);
                     }
                     commit_successor(store, authority, binding, object_successor, tracker)?;
@@ -2922,10 +3081,12 @@ fn drive_materialization(
                         store,
                         authority,
                         binding,
-                        operation_id,
-                        Some(&object),
-                        MaterializationTerminalStateV1::Materialized,
-                        ArtifactQuarantineFactsV1::Absent,
+                        TerminalCommitInput {
+                            operation_id,
+                            object: Some(&object),
+                            state: MaterializationTerminalStateV1::Materialized,
+                            quarantine: ArtifactQuarantineFactsV1::Absent,
+                        },
                         tracker,
                     )
                 }
