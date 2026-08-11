@@ -4333,6 +4333,49 @@ mod tests {
                 selection_observed_at_nanos,
             },
         )?;
+        sign_artifact_terminal(request, state, evidence)
+    }
+
+    fn signed_artifact_agent_quarantined_receipt(
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackPlanError> {
+        let generation =
+            |value| Some(ManagedServiceGeneration::try_new(value).expect("service generation"));
+        let state = ManagedModelAgentStackTerminalStateV1::try_new(
+            ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+            ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+            ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+            generation(7),
+            generation(8),
+            generation(9),
+        )?;
+        let evidence = ManagedModelAgentStackTerminalEvidenceV1::try_new(
+            ManagedModelAgentStackTerminalEvidenceFieldsV1 {
+                physical_binding_census: 0,
+                census_complete: false,
+                fabric_ready: true,
+                model_ready: false,
+                agent_ready: false,
+                fabric_to_agent_dependency_ready: false,
+                model_to_agent_dependency_ready: false,
+                exact_zero: false,
+                quarantined: true,
+                resource_census_digest: Digest32::from_bytes([0xab; 32]),
+                raw_outcome_digest: Digest32::from_bytes([0xac; 32]),
+                completion_runtime_host_epoch: 9,
+                completion_snapshot_sequence: 12,
+                selection_clock_generation: request.temporal().target_clock_generation(),
+                selection_observed_at_nanos: 24,
+            },
+        )?;
+        sign_artifact_terminal(request, state, evidence)
+    }
+
+    fn sign_artifact_terminal(
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        state: ManagedModelAgentStackTerminalStateV1,
+        evidence: ManagedModelAgentStackTerminalEvidenceV1,
+    ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackPlanError> {
         let facts = ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(
             request, state, evidence,
         )?;
@@ -4652,6 +4695,101 @@ mod tests {
                 .is_err()
             );
         }
+
+        let agent_quarantined = signed_artifact_agent_quarantined_receipt(&runtime_request)
+            .expect("agent-intent Quarantined PXMT");
+        let agent_quarantined_progress = ArtifactExternalDeploymentProgressV1::try_new(
+            NonZeroU64::new(1),
+            NonZeroU64::new(2),
+            Some(desired_head),
+            Some(runtime_request.envelope_request_digest()),
+            Some(agent_quarantined.receipt_digest()),
+            Some([0x54; 16]),
+        )
+        .expect("agent-intent Quarantined progress");
+        let agent_quarantined_record = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Failed,
+            NonZeroU64::new(3).expect("record sequence"),
+            &request,
+            &admission,
+            agent_quarantined_progress,
+            Some(&applying_record),
+        )
+        .expect("agent-intent Quarantined PXDM");
+        let agent_quarantined_receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+            NonZeroU64::new(1).expect("receipt sequence"),
+            &request,
+            &admission,
+            &agent_quarantined_record,
+        )
+        .expect("agent-intent Quarantined PXDO");
+        let expected_pxmt = agent_quarantined.canonical_wire().to_vec();
+        let expected_pxdo = agent_quarantined_receipt.canonical_wire().to_vec();
+        let agent_quarantined_controller = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Failed,
+                controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
+                request: request.clone(),
+                admission: admission.clone(),
+                plan_content: Some(plan_content.clone()),
+                execution: Some(execution.clone()),
+                runtime_request: Some(runtime_request.clone()),
+                runtime_terminal: Some(agent_quarantined.clone()),
+                records: vec![
+                    committed_record.clone(),
+                    applying_record.clone(),
+                    agent_quarantined_record,
+                ],
+                receipt: Some(agent_quarantined_receipt),
+            },
+        )
+        .expect("agent-intent Quarantined PXMJ2-F");
+        let agent_quarantined_wire = agent_quarantined_controller
+            .encode()
+            .expect("agent-intent Quarantined PXMJ2 wire");
+        let reopened_agent_quarantined =
+            ArtifactExternalControllerStateV2::decode(&agent_quarantined_wire)
+                .expect("reopen agent-intent Quarantined PXMJ2");
+        assert_eq!(reopened_agent_quarantined, agent_quarantined_controller);
+        assert_eq!(
+            reopened_agent_quarantined
+                .runtime_terminal()
+                .expect("archived agent-intent PXMT")
+                .canonical_wire(),
+            expected_pxmt.as_slice(),
+        );
+        assert_eq!(
+            reopened_agent_quarantined
+                .runtime_terminal()
+                .expect("archived agent-intent PXMT")
+                .facts()
+                .state()
+                .agent_generation()
+                .expect("Agent generation")
+                .value(),
+            9,
+        );
+        assert_eq!(
+            reopened_agent_quarantined
+                .records()
+                .last()
+                .expect("agent-intent terminal record")
+                .progress()
+                .runtime_terminal_receipt_digest,
+            *agent_quarantined.receipt_digest().as_bytes(),
+        );
+        assert_eq!(
+            reopened_agent_quarantined
+                .receipt()
+                .expect("agent-intent PXDO")
+                .canonical_wire()
+                .as_slice(),
+            expected_pxdo.as_slice(),
+        );
+        assert_eq!(
+            reopened_agent_quarantined.encode().expect("canonical re-encode"),
+            agent_quarantined_wire,
+        );
 
         assert!(
             signed_artifact_receipt(
