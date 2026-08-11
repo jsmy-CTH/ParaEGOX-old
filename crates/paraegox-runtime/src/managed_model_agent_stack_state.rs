@@ -9,15 +9,17 @@
 
 use core::fmt;
 
-use paraegox_kernel::digest::Digest32;
+use paraegox_kernel::digest::{Digest32, Digest32Builder};
 use paraegox_kernel::identity::{PrincipalRef, RuntimeHostId};
 use paraegox_kernel::time::ClockGeneration;
 use paraegox_runtime_contracts::apply::{ApplyOperationId, PlanWriterRef};
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+    ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
     MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES, ManagedModelAgentStackApplyRequestV1,
     ManagedModelAgentStackProjectionV1, ManagedModelAgentStackTargetModeV1,
-    ManagedModelAgentStackTerminalReceiptV1,
+    ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
 };
 use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
 use paraegox_runtime_contracts::provenance::{SourcePlanDigest, SourceScopeRef};
@@ -30,6 +32,16 @@ const SNAPSHOT_HEADER_BYTES: usize = 208;
 const SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES: usize = 176;
 const SNAPSHOT_CHECKSUM_DOMAIN: &[u8] =
     b"paraegox.runtime.managed-model-agent-stack-snapshot.sha256.v1";
+const ARTIFACT_SNAPSHOT_VERSION: u16 = 2;
+const ARTIFACT_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-model-agent-stack-snapshot.sha256.v2";
+const ARTIFACT_TERMINAL_BYTES: usize = 8_750;
+const STACK_RESOURCE_CENSUS_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-model-agent-stack-resource-census.sha256.v1";
+const STACK_RAW_OUTCOME_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-model-agent-stack-raw-outcome.sha256.v1";
+const STACK_QUARANTINE_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.runtime.managed-model-agent-stack-quarantine.sha256.v1";
 const MAX_TERMINALS: usize = 256;
 const MAX_REPLAY_ENTRIES: usize = 256;
 pub(crate) const MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
@@ -136,6 +148,84 @@ pub(crate) struct ManagedModelAgentStackTerminalRecord {
     pub(crate) operation_id: ApplyOperationId,
     pub(crate) request_digest: Digest32,
     pub(crate) receipt: ManagedModelAgentStackTerminalReceiptV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ArtifactManagedModelAgentStackPendingKindV2 {
+    ActivateArtifactV12 = 1,
+    RetireCurrentArtifactV12 = 2,
+}
+
+impl ArtifactManagedModelAgentStackPendingKindV2 {
+    fn decode(value: u8) -> Result<Self, ManagedModelAgentStackStateError> {
+        match value {
+            1 => Ok(Self::ActivateArtifactV12),
+            2 => Ok(Self::RetireCurrentArtifactV12),
+            _ => Err(ManagedModelAgentStackStateError::UnknownEnumValue),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactManagedModelAgentStackDurableActiveV2 {
+    pub(crate) fabric_generation: ManagedServiceGeneration,
+    pub(crate) model_generation: ManagedServiceGeneration,
+    pub(crate) agent_generation: ManagedServiceGeneration,
+    pub(crate) response_channel: ReferenceChannelBindingV1,
+    pub(crate) request: ArtifactBoundManagedModelAgentStackApplyRequestV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactManagedModelAgentStackDurablePendingV2 {
+    pub(crate) kind: ArtifactManagedModelAgentStackPendingKindV2,
+    pub(crate) fabric_generation: Option<ManagedServiceGeneration>,
+    pub(crate) model_generation: Option<ManagedServiceGeneration>,
+    pub(crate) agent_generation: Option<ManagedServiceGeneration>,
+    pub(crate) admitted_clock_generation: ClockGeneration,
+    pub(crate) admitted_at_nanos: u64,
+    pub(crate) deadline_nanos: u64,
+    pub(crate) response_channel: ReferenceChannelBindingV1,
+    pub(crate) request: ArtifactBoundManagedModelAgentStackApplyRequestV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactManagedModelAgentStackTerminalRecordV2 {
+    pub(crate) source_scope: SourceScopeRef,
+    pub(crate) operation_id: ApplyOperationId,
+    pub(crate) request_digest: Digest32,
+    pub(crate) request: ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    pub(crate) receipt: ManagedModelAgentStackTerminalReceiptV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactManagedModelAgentStackSnapshotV2 {
+    store_instance_id: [u8; 32],
+    owner_target_fingerprint: Digest32,
+    transition_projection_digest: Digest32,
+    sequence: u64,
+    runtime_host_epoch: u64,
+    pub(crate) fabric_generation_high_water: u64,
+    pub(crate) model_generation_high_water: u64,
+    pub(crate) agent_generation_high_water: u64,
+    pub(crate) phase: ManagedModelAgentStackDurablePhase,
+    pub(crate) writer_fence: Option<ManagedModelAgentStackWriterFence>,
+    pub(crate) revision_high_water: Option<ManagedModelAgentStackRevisionHighWater>,
+    pub(crate) active: Option<ArtifactManagedModelAgentStackDurableActiveV2>,
+    pub(crate) pending: Option<ArtifactManagedModelAgentStackDurablePendingV2>,
+    pub(crate) tenure_nonces: Vec<ManagedModelAgentStackReplayRecord>,
+    pub(crate) request_nonces: Vec<ManagedModelAgentStackReplayRecord>,
+    pub(crate) temporal_lineages: Vec<ManagedModelAgentStackReplayRecord>,
+    pub(crate) terminals: Vec<ArtifactManagedModelAgentStackTerminalRecordV2>,
+    pub(crate) physical_binding_census: u16,
+    pub(crate) census_complete: bool,
+    pub(crate) fabric_ready: bool,
+    pub(crate) model_ready: bool,
+    pub(crate) agent_ready: bool,
+    pub(crate) fabric_to_agent_dependency_ready: bool,
+    pub(crate) model_to_agent_dependency_ready: bool,
+    pub(crate) quarantine_reason: Option<Digest32>,
+    canonical_wire: Box<[u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -578,6 +668,272 @@ impl ManagedModelAgentStackSnapshot {
     }
 }
 
+impl ArtifactManagedModelAgentStackSnapshotV2 {
+    pub(crate) fn decode(
+        frame: &[u8],
+        expected_store_instance_id: [u8; 32],
+        expected_owner_target_fingerprint: Digest32,
+        expected_transition_projection_digest: Digest32,
+        projection: &ManagedModelAgentStackProjectionV1,
+    ) -> Result<Self, ManagedModelAgentStackStateError> {
+        if frame.len() < SNAPSHOT_HEADER_BYTES {
+            return Err(ManagedModelAgentStackStateError::Truncated);
+        }
+        if frame.len() > MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES {
+            return Err(ManagedModelAgentStackStateError::FrameTooLarge);
+        }
+        if &frame[..4] != SNAPSHOT_MAGIC
+            || read_u16(&frame[4..6]) != ARTIFACT_SNAPSHOT_VERSION
+            || usize::from(read_u16(&frame[6..8])) != SNAPSHOT_HEADER_BYTES
+        {
+            return Err(ManagedModelAgentStackStateError::UnsupportedFrame);
+        }
+        let total = read_u32(&frame[8..12]) as usize;
+        let payload_length = read_u32(&frame[168..172]) as usize;
+        if total != frame.len()
+            || SNAPSHOT_HEADER_BYTES.checked_add(payload_length) != Some(frame.len())
+            || frame[149..168].iter().any(|byte| *byte != 0)
+            || frame[172..176].iter().any(|byte| *byte != 0)
+        {
+            return Err(ManagedModelAgentStackStateError::InvalidLength);
+        }
+        let expected_checksum = artifact_snapshot_checksum(
+            &frame[..SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES],
+            &frame[SNAPSHOT_HEADER_BYTES..],
+        );
+        if frame[176..208] != *expected_checksum.as_bytes() {
+            return Err(ManagedModelAgentStackStateError::ChecksumMismatch);
+        }
+        let store_instance_id = read_array(&frame[20..52]);
+        let owner_target_fingerprint = Digest32::from_bytes(read_array(&frame[52..84]));
+        let transition_projection_digest = Digest32::from_bytes(read_array(&frame[84..116]));
+        if store_instance_id != expected_store_instance_id
+            || owner_target_fingerprint != expected_owner_target_fingerprint
+            || transition_projection_digest != expected_transition_projection_digest
+        {
+            return Err(ManagedModelAgentStackStateError::IdentityMismatch);
+        }
+        let mut cursor = Cursor::new(&frame[SNAPSHOT_HEADER_BYTES..]);
+        let runtime_host_epoch = cursor.u64()?;
+        let writer_fence = decode_writer_fence(&mut cursor)?;
+        let revision_high_water = decode_revision_high_water(&mut cursor)?;
+        let active = decode_artifact_active(&mut cursor)?;
+        let pending = decode_artifact_pending(&mut cursor)?;
+        let tenure_nonces = decode_replay_records(&mut cursor)?;
+        let request_nonces = decode_replay_records(&mut cursor)?;
+        let temporal_lineages = decode_replay_records(&mut cursor)?;
+        let terminals = decode_artifact_terminals(&mut cursor)?;
+        let quarantine_reason = decode_optional_digest(&mut cursor)?;
+        if !cursor.done() {
+            return Err(ManagedModelAgentStackStateError::TrailingBytes);
+        }
+        let mut snapshot = Self {
+            store_instance_id,
+            owner_target_fingerprint,
+            transition_projection_digest,
+            sequence: read_u64(&frame[12..20]),
+            runtime_host_epoch,
+            fabric_generation_high_water: read_u64(&frame[116..124]),
+            model_generation_high_water: read_u64(&frame[124..132]),
+            agent_generation_high_water: read_u64(&frame[132..140]),
+            phase: ManagedModelAgentStackDurablePhase::decode(frame[140])?,
+            writer_fence,
+            revision_high_water,
+            active,
+            pending,
+            tenure_nonces,
+            request_nonces,
+            temporal_lineages,
+            terminals,
+            physical_binding_census: read_u16(&frame[141..143]),
+            census_complete: decode_bool(frame[143])?,
+            fabric_ready: decode_bool(frame[144])?,
+            model_ready: decode_bool(frame[145])?,
+            agent_ready: decode_bool(frame[146])?,
+            fabric_to_agent_dependency_ready: decode_bool(frame[147])?,
+            model_to_agent_dependency_ready: decode_bool(frame[148])?,
+            quarantine_reason,
+            canonical_wire: Box::new([]),
+        };
+        snapshot.validate(projection)?;
+        snapshot.canonical_wire = snapshot.encode()?.into_boxed_slice();
+        if snapshot.canonical_wire() != frame {
+            return Err(ManagedModelAgentStackStateError::NonCanonicalEncoding);
+        }
+        Ok(snapshot)
+    }
+
+    fn validate(
+        &self,
+        projection: &ManagedModelAgentStackProjectionV1,
+    ) -> Result<(), ManagedModelAgentStackStateError> {
+        if self.store_instance_id.iter().all(|byte| *byte == 0)
+            || digest_is_zero(self.owner_target_fingerprint)
+            || digest_is_zero(self.transition_projection_digest)
+            || self.sequence == 0
+            || self.runtime_host_epoch == 0
+            || self.physical_binding_census > 2
+            || self.tenure_nonces.len() > MAX_REPLAY_ENTRIES
+            || self.request_nonces.len() > MAX_REPLAY_ENTRIES
+            || self.temporal_lineages.len() > MAX_REPLAY_ENTRIES
+            || self.terminals.len() > MAX_TERMINALS
+            || self.quarantine_reason.is_some_and(digest_is_zero)
+            || (self.fabric_to_agent_dependency_ready && !self.fabric_ready)
+            || (self.model_to_agent_dependency_ready && !self.model_ready)
+            || (self.agent_ready
+                && (!self.fabric_ready
+                    || !self.model_ready
+                    || !self.fabric_to_agent_dependency_ready
+                    || !self.model_to_agent_dependency_ready))
+            || self.phase == ManagedModelAgentStackDurablePhase::RecoveryIntent
+        {
+            return Err(ManagedModelAgentStackStateError::InvalidState);
+        }
+        validate_sorted_replays(&self.tenure_nonces)?;
+        validate_sorted_replays(&self.request_nonces)?;
+        validate_sorted_replays(&self.temporal_lineages)?;
+        validate_fence_values(self.writer_fence, self.revision_high_water)?;
+        if let Some(active) = &self.active {
+            validate_artifact_request(&active.request, self, projection, false)?;
+            if active.response_channel.target() != active.request.target()
+                || active.fabric_generation.value() > self.fabric_generation_high_water
+                || active.model_generation.value() > self.model_generation_high_water
+                || active.agent_generation.value() > self.agent_generation_high_water
+            {
+                return Err(ManagedModelAgentStackStateError::InvalidState);
+            }
+        }
+        if let Some(pending) = &self.pending {
+            validate_artifact_request(&pending.request, self, projection, true)?;
+            if pending.admitted_at_nanos == 0
+                || pending.deadline_nanos < pending.admitted_at_nanos
+                || pending.response_channel.target() != pending.request.target()
+                || !optional_generation_within(
+                    pending.fabric_generation,
+                    self.fabric_generation_high_water,
+                )
+                || !optional_generation_within(
+                    pending.model_generation,
+                    self.model_generation_high_water,
+                )
+                || !optional_generation_within(
+                    pending.agent_generation,
+                    self.agent_generation_high_water,
+                )
+            {
+                return Err(ManagedModelAgentStackStateError::InvalidState);
+            }
+            match pending.kind {
+                ArtifactManagedModelAgentStackPendingKindV2::ActivateArtifactV12
+                    if self.active.is_none() => {}
+                ArtifactManagedModelAgentStackPendingKindV2::RetireCurrentArtifactV12 => {
+                    let Some(active) = &self.active else {
+                        return Err(ManagedModelAgentStackStateError::InvalidState);
+                    };
+                    if pending.fabric_generation != Some(active.fabric_generation)
+                        || pending.model_generation != Some(active.model_generation)
+                        || pending.agent_generation != Some(active.agent_generation)
+                        || pending.response_channel != active.response_channel
+                        || pending.request != active.request
+                    {
+                        return Err(ManagedModelAgentStackStateError::InvalidState);
+                    }
+                }
+                _ => return Err(ManagedModelAgentStackStateError::InvalidState),
+            }
+        }
+        validate_artifact_terminals(self, projection)?;
+        validate_artifact_phase_shape(self)?;
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, ManagedModelAgentStackStateError> {
+        let mut payload = Encoder::new();
+        payload.u64(self.runtime_host_epoch);
+        encode_writer_fence(&mut payload, self.writer_fence);
+        encode_revision_high_water(&mut payload, self.revision_high_water);
+        encode_artifact_active(&mut payload, self.active.as_ref())?;
+        encode_artifact_pending(&mut payload, self.pending.as_ref())?;
+        encode_replay_records(&mut payload, &self.tenure_nonces)?;
+        encode_replay_records(&mut payload, &self.request_nonces)?;
+        encode_replay_records(&mut payload, &self.temporal_lineages)?;
+        encode_artifact_terminals(&mut payload, &self.terminals)?;
+        encode_optional_digest(&mut payload, self.quarantine_reason);
+        let payload = payload.finish();
+        let total = SNAPSHOT_HEADER_BYTES
+            .checked_add(payload.len())
+            .ok_or(ManagedModelAgentStackStateError::FrameTooLarge)?;
+        if total > MAX_MANAGED_MODEL_AGENT_STACK_SNAPSHOT_BYTES {
+            return Err(ManagedModelAgentStackStateError::FrameTooLarge);
+        }
+        let mut frame = vec![0_u8; SNAPSHOT_HEADER_BYTES];
+        frame[..4].copy_from_slice(SNAPSHOT_MAGIC);
+        frame[4..6].copy_from_slice(&ARTIFACT_SNAPSHOT_VERSION.to_be_bytes());
+        frame[6..8].copy_from_slice(&(SNAPSHOT_HEADER_BYTES as u16).to_be_bytes());
+        frame[8..12].copy_from_slice(&(total as u32).to_be_bytes());
+        frame[12..20].copy_from_slice(&self.sequence.to_be_bytes());
+        frame[20..52].copy_from_slice(&self.store_instance_id);
+        frame[52..84].copy_from_slice(self.owner_target_fingerprint.as_bytes());
+        frame[84..116].copy_from_slice(self.transition_projection_digest.as_bytes());
+        frame[116..124].copy_from_slice(&self.fabric_generation_high_water.to_be_bytes());
+        frame[124..132].copy_from_slice(&self.model_generation_high_water.to_be_bytes());
+        frame[132..140].copy_from_slice(&self.agent_generation_high_water.to_be_bytes());
+        frame[140] = self.phase as u8;
+        frame[141..143].copy_from_slice(&self.physical_binding_census.to_be_bytes());
+        frame[143] = u8::from(self.census_complete);
+        frame[144] = u8::from(self.fabric_ready);
+        frame[145] = u8::from(self.model_ready);
+        frame[146] = u8::from(self.agent_ready);
+        frame[147] = u8::from(self.fabric_to_agent_dependency_ready);
+        frame[148] = u8::from(self.model_to_agent_dependency_ready);
+        frame[168..172].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        let checksum = artifact_snapshot_checksum(
+            &frame[..SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES],
+            &payload,
+        );
+        frame[176..208].copy_from_slice(checksum.as_bytes());
+        frame.extend_from_slice(&payload);
+        Ok(frame)
+    }
+
+    pub(crate) fn validate_successor(
+        &self,
+        next: &Self,
+    ) -> Result<(), ManagedModelAgentStackStateError> {
+        if next.store_instance_id != self.store_instance_id
+            || next.owner_target_fingerprint != self.owner_target_fingerprint
+            || next.transition_projection_digest != self.transition_projection_digest
+            || next.sequence != self.sequence.checked_add(1).ok_or(
+                ManagedModelAgentStackStateError::SequenceOverflow,
+            )?
+            || next.runtime_host_epoch < self.runtime_host_epoch
+            || next.fabric_generation_high_water < self.fabric_generation_high_water
+            || next.model_generation_high_water < self.model_generation_high_water
+            || next.agent_generation_high_water < self.agent_generation_high_water
+            || !writer_fence_advances(self.writer_fence, next.writer_fence)
+            || !revision_advances(self.revision_high_water, next.revision_high_water)
+            || !retains_replays(&self.tenure_nonces, &next.tenure_nonces)
+            || !retains_replays(&self.request_nonces, &next.request_nonces)
+            || !retains_replays(&self.temporal_lineages, &next.temporal_lineages)
+            || !retains_artifact_terminals(&self.terminals, &next.terminals)
+            || !artifact_phase_advances(self, next)
+        {
+            return Err(ManagedModelAgentStackStateError::FenceRegression);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_wire(&self) -> &[u8] {
+        &self.canonical_wire
+    }
+}
+
 fn validate_request(
     request: &ManagedModelAgentStackApplyRequestV1,
     snapshot: &ManagedModelAgentStackSnapshot,
@@ -591,6 +947,53 @@ fn validate_request(
         .validate_projection(projection)
         .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
     if request.target() != projection.target() {
+        return Err(ManagedModelAgentStackStateError::InvalidState);
+    }
+    let provenance = request.provenance();
+    if let Some(revision) = snapshot.revision_high_water {
+        let request_revision = provenance.source_revision().value();
+        if revision.source_scope != provenance.source_scope()
+            || request_revision > revision.revision
+            || (request_revision == revision.revision
+                && revision.source_plan_digest != provenance.source_plan_digest())
+            || (pending && request_revision != revision.revision)
+        {
+            return Err(ManagedModelAgentStackStateError::FenceMismatch);
+        }
+    }
+    if let Some(fence) = snapshot.writer_fence {
+        let context = request.control_commitment().control().writer_context();
+        let request_epoch = context.epoch().value();
+        let proof_digest = context
+            .proof()
+            .envelope_digest()
+            .map_err(|_| ManagedModelAgentStackStateError::FenceMismatch)?;
+        if fence.source_scope != provenance.source_scope()
+            || request_epoch > fence.epoch
+            || (request_epoch == fence.epoch
+                && (fence.writer != context.writer()
+                    || fence.principal != request.authentication().claim().principal()
+                    || fence.proof_envelope_digest != proof_digest))
+            || (pending && request_epoch != fence.epoch)
+        {
+            return Err(ManagedModelAgentStackStateError::FenceMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_artifact_request(
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+    projection: &ManagedModelAgentStackProjectionV1,
+    pending: bool,
+) -> Result<(), ManagedModelAgentStackStateError> {
+    request
+        .validate_expected_store(snapshot.store_instance_id)
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    if request.target() != projection.target()
+        || request.target_execution().projection() != projection
+    {
         return Err(ManagedModelAgentStackStateError::InvalidState);
     }
     let provenance = request.provenance();
@@ -823,6 +1226,451 @@ fn validate_phase_shape(
         .ok_or(ManagedModelAgentStackStateError::InvalidState)
 }
 
+fn validate_artifact_terminals(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+    projection: &ManagedModelAgentStackProjectionV1,
+) -> Result<(), ManagedModelAgentStackStateError> {
+    let mut prior_key = None;
+    for terminal in &snapshot.terminals {
+        let key = (
+            *terminal.source_scope.as_bytes(),
+            *terminal.operation_id.as_bytes(),
+        );
+        validate_artifact_request(&terminal.request, snapshot, projection, false)?;
+        let facts = terminal
+            .receipt
+            .validate_artifact_request_correlation(&terminal.request)
+            .map_err(|_| ManagedModelAgentStackStateError::InvalidNestedContract)?;
+        let evidence = facts.evidence().fields();
+        let state = facts.state();
+        if prior_key.is_some_and(|prior| prior >= key)
+            || terminal.source_scope != terminal.request.provenance().source_scope()
+            || terminal.operation_id != terminal.request.operation_id()
+            || terminal.request_digest != terminal.request.envelope_request_digest()
+            || facts.source_scope() != terminal.source_scope
+            || facts.operation_id() != terminal.operation_id
+            || facts.request_digest() != terminal.request_digest
+            || facts.runtime_store_instance_id() != snapshot.store_instance_id
+            || facts.target() != projection.target()
+            || evidence.completion_snapshot_sequence > snapshot.sequence
+            || evidence.completion_runtime_host_epoch > snapshot.runtime_host_epoch
+            || state.fabric_generation().is_some_and(|generation| {
+                generation.value() > snapshot.fabric_generation_high_water
+            })
+            || state
+                .model_generation()
+                .is_some_and(|generation| generation.value() > snapshot.model_generation_high_water)
+            || state
+                .agent_generation()
+                .is_some_and(|generation| generation.value() > snapshot.agent_generation_high_water)
+            || evidence.resource_census_digest
+                != artifact_resource_census_digest(state, evidence)?
+        {
+            return Err(ManagedModelAgentStackStateError::InvalidState);
+        }
+        if let Some(active) = &snapshot.active
+            && active.request == terminal.request
+        {
+            terminal
+                .receipt
+                .validate_against_artifact_request(&terminal.request, active.response_channel)
+                .map_err(|_| ManagedModelAgentStackStateError::InvalidNestedContract)?;
+        } else if let Some(pending) = &snapshot.pending
+            && pending.request == terminal.request
+        {
+            terminal
+                .receipt
+                .validate_against_artifact_request(&terminal.request, pending.response_channel)
+                .map_err(|_| ManagedModelAgentStackStateError::InvalidNestedContract)?;
+        }
+        prior_key = Some(key);
+    }
+    Ok(())
+}
+
+fn validate_artifact_phase_shape(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+) -> Result<(), ManagedModelAgentStackStateError> {
+    let pending = snapshot.pending.as_ref();
+    let valid = match snapshot.phase {
+        ManagedModelAgentStackDurablePhase::ExactZero => {
+            let shape = snapshot.active.is_none()
+                && pending.is_none()
+                && snapshot.physical_binding_census == 0
+                && snapshot.census_complete
+                && !snapshot.fabric_ready
+                && !snapshot.model_ready
+                && !snapshot.agent_ready
+                && !snapshot.fabric_to_agent_dependency_ready
+                && !snapshot.model_to_agent_dependency_ready
+                && snapshot.quarantine_reason.is_none();
+            shape
+                && match snapshot.terminals.as_slice() {
+                    [] => true,
+                    [terminal] => validate_artifact_terminal_variant(
+                        snapshot,
+                        terminal,
+                        ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                        1,
+                        None,
+                        false,
+                    )
+                    .is_ok(),
+                    _ => false,
+                }
+        }
+        ManagedModelAgentStackDurablePhase::ModelStartIntent => {
+            snapshot.active.is_none()
+                && artifact_activate_pending_shape(pending, false)
+                && snapshot.terminals.is_empty()
+                && snapshot.physical_binding_census == 0
+                && snapshot.census_complete
+                && snapshot.fabric_ready
+                && !snapshot.model_ready
+                && !snapshot.agent_ready
+                && snapshot.fabric_to_agent_dependency_ready
+                && !snapshot.model_to_agent_dependency_ready
+                && snapshot.quarantine_reason.is_none()
+        }
+        ManagedModelAgentStackDurablePhase::AgentStartIntent => {
+            snapshot.active.is_none()
+                && artifact_activate_pending_shape(pending, true)
+                && snapshot.terminals.is_empty()
+                && snapshot.physical_binding_census == 0
+                && snapshot.census_complete
+                && snapshot.fabric_ready
+                && snapshot.model_ready
+                && !snapshot.agent_ready
+                && snapshot.fabric_to_agent_dependency_ready
+                && snapshot.model_to_agent_dependency_ready
+                && snapshot.quarantine_reason.is_none()
+        }
+        ManagedModelAgentStackDurablePhase::ActiveReady => {
+            let Some(active) = &snapshot.active else {
+                return Err(ManagedModelAgentStackStateError::InvalidState);
+            };
+            pending.is_none()
+                && snapshot.physical_binding_census == 2
+                && snapshot.census_complete
+                && snapshot.fabric_ready
+                && snapshot.model_ready
+                && snapshot.agent_ready
+                && snapshot.fabric_to_agent_dependency_ready
+                && snapshot.model_to_agent_dependency_ready
+                && snapshot.quarantine_reason.is_none()
+                && artifact_terminal_matches_request(snapshot, &active.request)
+                && snapshot.terminals.first().is_some_and(|terminal| {
+                    validate_artifact_terminal_variant(
+                        snapshot,
+                        terminal,
+                        ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                        1,
+                        None,
+                        true,
+                    )
+                    .is_ok()
+                })
+        }
+        ManagedModelAgentStackDurablePhase::AgentRetireIntent
+        | ManagedModelAgentStackDurablePhase::ModelRetireIntent
+        | ManagedModelAgentStackDurablePhase::FabricStopIntent => {
+            let Some(active) = &snapshot.active else {
+                return Err(ManagedModelAgentStackStateError::InvalidState);
+            };
+            let retire_shape = pending.is_some_and(|pending| {
+                pending.kind
+                    == ArtifactManagedModelAgentStackPendingKindV2::RetireCurrentArtifactV12
+            }) && artifact_terminal_matches_request(snapshot, &active.request)
+                && snapshot.terminals.first().is_some_and(|terminal| {
+                    validate_artifact_terminal_variant(
+                        snapshot,
+                        terminal,
+                        ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+                        1,
+                        None,
+                        false,
+                    )
+                    .is_ok()
+                })
+                && snapshot.quarantine_reason.is_none();
+            retire_shape
+                && match snapshot.phase {
+                    ManagedModelAgentStackDurablePhase::AgentRetireIntent => {
+                        snapshot.physical_binding_census == 2
+                            && snapshot.census_complete
+                            && snapshot.fabric_ready
+                            && snapshot.model_ready
+                            && snapshot.agent_ready
+                            && snapshot.fabric_to_agent_dependency_ready
+                            && snapshot.model_to_agent_dependency_ready
+                    }
+                    ManagedModelAgentStackDurablePhase::ModelRetireIntent => {
+                        snapshot.physical_binding_census == 0
+                            && snapshot.census_complete
+                            && snapshot.fabric_ready
+                            && snapshot.model_ready
+                            && !snapshot.agent_ready
+                            && !snapshot.fabric_to_agent_dependency_ready
+                            && !snapshot.model_to_agent_dependency_ready
+                    }
+                    ManagedModelAgentStackDurablePhase::FabricStopIntent => {
+                        snapshot.physical_binding_census == 0
+                            && snapshot.census_complete
+                            && snapshot.fabric_ready
+                            && !snapshot.model_ready
+                            && !snapshot.agent_ready
+                            && !snapshot.fabric_to_agent_dependency_ready
+                            && !snapshot.model_to_agent_dependency_ready
+                    }
+                    _ => false,
+                }
+        }
+        ManagedModelAgentStackDurablePhase::Uncertain => {
+            snapshot.active.is_none()
+                && artifact_activate_pending_shape(pending, false)
+                && snapshot.physical_binding_census == 0
+                && !snapshot.census_complete
+                && !snapshot.fabric_ready
+                && !snapshot.model_ready
+                && !snapshot.agent_ready
+                && !snapshot.fabric_to_agent_dependency_ready
+                && !snapshot.model_to_agent_dependency_ready
+                && snapshot.quarantine_reason.is_none()
+                && snapshot.terminals.first().is_some_and(|terminal| {
+                    validate_artifact_terminal_variant(
+                        snapshot,
+                        terminal,
+                        ManagedModelAgentStackTerminalOutcomeV1::Uncertain,
+                        32,
+                        None,
+                        true,
+                    )
+                    .is_ok()
+                })
+        }
+        ManagedModelAgentStackDurablePhase::Quarantined => {
+            let agent_present = pending.is_some_and(|pending| pending.agent_generation.is_some());
+            let code = if agent_present { 31 } else { 30 };
+            let context = snapshot.quarantine_reason;
+            snapshot.active.is_none()
+                && artifact_activate_pending_shape(pending, agent_present)
+                && snapshot.physical_binding_census == 0
+                && snapshot.fabric_ready
+                && !snapshot.model_ready
+                && !snapshot.agent_ready
+                && !snapshot.fabric_to_agent_dependency_ready
+                && !snapshot.model_to_agent_dependency_ready
+                && snapshot.census_complete != agent_present
+                && context.is_some_and(|reason| {
+                    artifact_quarantine_reason_digest(code, snapshot.terminals.first())
+                        == Ok(reason)
+                })
+                && snapshot.terminals.first().is_some_and(|terminal| {
+                    validate_artifact_terminal_variant(
+                        snapshot,
+                        terminal,
+                        ManagedModelAgentStackTerminalOutcomeV1::Quarantined,
+                        code,
+                        context,
+                        true,
+                    )
+                    .is_ok()
+                })
+        }
+        ManagedModelAgentStackDurablePhase::RecoveryIntent => false,
+    };
+    (valid && snapshot.terminals.len() <= 1)
+        .then_some(())
+        .ok_or(ManagedModelAgentStackStateError::InvalidState)
+}
+
+fn artifact_activate_pending_shape(
+    pending: Option<&ArtifactManagedModelAgentStackDurablePendingV2>,
+    agent_present: bool,
+) -> bool {
+    pending.is_some_and(|pending| {
+        pending.kind == ArtifactManagedModelAgentStackPendingKindV2::ActivateArtifactV12
+            && pending.fabric_generation.is_some()
+            && pending.model_generation.is_some()
+            && pending.agent_generation.is_some() == agent_present
+    })
+}
+
+fn artifact_terminal_matches_request(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+) -> bool {
+    matches!(
+        snapshot.terminals.as_slice(),
+        [terminal]
+            if terminal.request == *request
+                && terminal.request_digest == request.envelope_request_digest()
+                && terminal.operation_id == request.operation_id()
+    )
+}
+
+fn validate_artifact_terminal_variant(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+    terminal: &ArtifactManagedModelAgentStackTerminalRecordV2,
+    outcome: ManagedModelAgentStackTerminalOutcomeV1,
+    raw_code: u16,
+    raw_context: Option<Digest32>,
+    outer_matches_terminal: bool,
+) -> Result<(), ManagedModelAgentStackStateError> {
+    let facts = terminal.receipt.facts();
+    let state = facts.state();
+    let evidence = facts.evidence().fields();
+    if state.outcome() != outcome
+        || evidence.raw_outcome_digest
+            != artifact_raw_outcome_digest(raw_code, raw_context, terminal.request_digest)?
+        || outer_matches_terminal
+            && (state.fabric_generation().map(ManagedServiceGeneration::value)
+                != snapshot
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.fabric_generation)
+                    .or_else(|| snapshot.active.as_ref().map(|active| active.fabric_generation))
+                    .map(ManagedServiceGeneration::value)
+                || state.model_generation().map(ManagedServiceGeneration::value)
+                    != snapshot
+                        .pending
+                        .as_ref()
+                        .and_then(|pending| pending.model_generation)
+                        .or_else(|| snapshot.active.as_ref().map(|active| active.model_generation))
+                        .map(ManagedServiceGeneration::value)
+                || state.agent_generation().map(ManagedServiceGeneration::value)
+                    != snapshot
+                        .pending
+                        .as_ref()
+                        .and_then(|pending| pending.agent_generation)
+                        .or_else(|| snapshot.active.as_ref().map(|active| active.agent_generation))
+                        .map(ManagedServiceGeneration::value)
+                || evidence.physical_binding_census != snapshot.physical_binding_census
+                || evidence.census_complete != snapshot.census_complete
+                || evidence.fabric_ready != snapshot.fabric_ready
+                || evidence.model_ready != snapshot.model_ready
+                || evidence.agent_ready != snapshot.agent_ready
+                || evidence.fabric_to_agent_dependency_ready
+                    != snapshot.fabric_to_agent_dependency_ready
+                || evidence.model_to_agent_dependency_ready
+                    != snapshot.model_to_agent_dependency_ready)
+    {
+        return Err(ManagedModelAgentStackStateError::InvalidState);
+    }
+    Ok(())
+}
+
+fn artifact_resource_census_digest(
+    state: paraegox_runtime_contracts::managed_model_agent_stack_plan::ManagedModelAgentStackTerminalStateV1,
+    evidence: paraegox_runtime_contracts::managed_model_agent_stack_plan::ManagedModelAgentStackTerminalEvidenceFieldsV1,
+) -> Result<Digest32, ManagedModelAgentStackStateError> {
+    let mut builder = Digest32Builder::try_new(STACK_RESOURCE_CENSUS_DIGEST_DOMAIN)
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    builder
+        .field_bytes(&evidence.physical_binding_census.to_be_bytes())
+        .and_then(|builder| builder.field_u16(u16::from(evidence.census_complete)))
+        .and_then(|builder| builder.field_u16(u16::from(evidence.fabric_ready)))
+        .and_then(|builder| builder.field_u16(u16::from(evidence.model_ready)))
+        .and_then(|builder| builder.field_u16(u16::from(evidence.agent_ready)))
+        .and_then(|builder| {
+            builder.field_u16(u16::from(evidence.fabric_to_agent_dependency_ready))
+        })
+        .and_then(|builder| {
+            builder.field_u16(u16::from(evidence.model_to_agent_dependency_ready))
+        })
+        .and_then(|builder| {
+            builder.field_u64(state.fabric_generation().map_or(0, ManagedServiceGeneration::value))
+        })
+        .and_then(|builder| {
+            builder.field_u64(state.model_generation().map_or(0, ManagedServiceGeneration::value))
+        })
+        .and_then(|builder| {
+            builder.field_u64(state.agent_generation().map_or(0, ManagedServiceGeneration::value))
+        })
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    Ok(builder.finish())
+}
+
+fn artifact_raw_outcome_digest(
+    raw_code: u16,
+    raw_context: Option<Digest32>,
+    request_digest: Digest32,
+) -> Result<Digest32, ManagedModelAgentStackStateError> {
+    let mut builder = Digest32Builder::try_new(STACK_RAW_OUTCOME_DIGEST_DOMAIN)
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    builder
+        .field_u16(raw_code)
+        .and_then(|builder| builder.field_u16(u16::from(raw_context.is_some())))
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    if let Some(context) = raw_context {
+        builder
+            .field_digest(&context)
+            .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    }
+    builder
+        .field_digest(&request_digest)
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    Ok(builder.finish())
+}
+
+fn artifact_quarantine_reason_digest(
+    raw_code: u16,
+    terminal: Option<&ArtifactManagedModelAgentStackTerminalRecordV2>,
+) -> Result<Digest32, ManagedModelAgentStackStateError> {
+    let request_digest = terminal
+        .ok_or(ManagedModelAgentStackStateError::InvalidState)?
+        .request_digest;
+    let mut builder = Digest32Builder::try_new(STACK_QUARANTINE_DIGEST_DOMAIN)
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    builder
+        .field_u16(raw_code)
+        .and_then(|builder| builder.field_u16(2))
+        .and_then(|builder| builder.field_digest(&request_digest))
+        .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?;
+    Ok(builder.finish())
+}
+
+fn retains_artifact_terminals(
+    current: &[ArtifactManagedModelAgentStackTerminalRecordV2],
+    next: &[ArtifactManagedModelAgentStackTerminalRecordV2],
+) -> bool {
+    current.iter().all(|record| next.contains(record))
+}
+
+fn artifact_phase_advances(
+    current: &ArtifactManagedModelAgentStackSnapshotV2,
+    next: &ArtifactManagedModelAgentStackSnapshotV2,
+) -> bool {
+    matches!(
+        (current.phase, next.phase),
+        (
+            ManagedModelAgentStackDurablePhase::ExactZero,
+            ManagedModelAgentStackDurablePhase::ModelStartIntent
+        ) | (
+            ManagedModelAgentStackDurablePhase::ModelStartIntent,
+            ManagedModelAgentStackDurablePhase::AgentStartIntent
+                | ManagedModelAgentStackDurablePhase::Uncertain
+                | ManagedModelAgentStackDurablePhase::Quarantined
+        ) | (
+            ManagedModelAgentStackDurablePhase::AgentStartIntent,
+            ManagedModelAgentStackDurablePhase::ActiveReady
+                | ManagedModelAgentStackDurablePhase::Quarantined
+        ) | (
+            ManagedModelAgentStackDurablePhase::ActiveReady,
+            ManagedModelAgentStackDurablePhase::AgentRetireIntent
+        ) | (
+            ManagedModelAgentStackDurablePhase::AgentRetireIntent,
+            ManagedModelAgentStackDurablePhase::ModelRetireIntent
+        ) | (
+            ManagedModelAgentStackDurablePhase::ModelRetireIntent,
+            ManagedModelAgentStackDurablePhase::FabricStopIntent
+        ) | (
+            ManagedModelAgentStackDurablePhase::FabricStopIntent,
+            ManagedModelAgentStackDurablePhase::ExactZero
+        )
+    )
+}
+
 fn deactivation_matches_active(snapshot: &ManagedModelAgentStackSnapshot) -> bool {
     let (Some(active), Some(pending)) = (&snapshot.active, &snapshot.pending) else {
         return false;
@@ -976,6 +1824,152 @@ fn decode_revision_high_water(
         })),
         _ => Err(ManagedModelAgentStackStateError::InvalidPresence),
     }
+}
+
+fn encode_artifact_active(
+    encoder: &mut Encoder,
+    value: Option<&ArtifactManagedModelAgentStackDurableActiveV2>,
+) -> Result<(), ManagedModelAgentStackStateError> {
+    let Some(value) = value else {
+        encoder.u8(0);
+        return Ok(());
+    };
+    encoder.u8(1);
+    encoder.u64(value.fabric_generation.value());
+    encoder.u64(value.model_generation.value());
+    encoder.u64(value.agent_generation.value());
+    encode_channel(encoder, value.response_channel);
+    encoder.bounded(value.request.canonical_wire())?;
+    Ok(())
+}
+
+fn decode_artifact_active(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<ArtifactManagedModelAgentStackDurableActiveV2>, ManagedModelAgentStackStateError>
+{
+    match cursor.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(ArtifactManagedModelAgentStackDurableActiveV2 {
+            fabric_generation: decode_generation(cursor)?,
+            model_generation: decode_generation(cursor)?,
+            agent_generation: decode_generation(cursor)?,
+            response_channel: decode_channel(cursor)?,
+            request: ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+                cursor.bounded(MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES)?,
+            )
+            .map_err(|_| ManagedModelAgentStackStateError::InvalidNestedContract)?,
+        })),
+        _ => Err(ManagedModelAgentStackStateError::InvalidPresence),
+    }
+}
+
+fn encode_artifact_pending(
+    encoder: &mut Encoder,
+    value: Option<&ArtifactManagedModelAgentStackDurablePendingV2>,
+) -> Result<(), ManagedModelAgentStackStateError> {
+    let Some(value) = value else {
+        encoder.u8(0);
+        return Ok(());
+    };
+    encoder.u8(1);
+    encoder.u8(value.kind as u8);
+    encode_optional_generation(encoder, value.fabric_generation);
+    encode_optional_generation(encoder, value.model_generation);
+    encode_optional_generation(encoder, value.agent_generation);
+    encoder.u64(value.admitted_clock_generation.value());
+    encoder.u64(value.admitted_at_nanos);
+    encoder.u64(value.deadline_nanos);
+    encode_channel(encoder, value.response_channel);
+    encoder.bounded(value.request.canonical_wire())?;
+    Ok(())
+}
+
+fn decode_artifact_pending(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<ArtifactManagedModelAgentStackDurablePendingV2>, ManagedModelAgentStackStateError>
+{
+    match cursor.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(ArtifactManagedModelAgentStackDurablePendingV2 {
+            kind: ArtifactManagedModelAgentStackPendingKindV2::decode(cursor.u8()?)?,
+            fabric_generation: decode_optional_generation(cursor)?,
+            model_generation: decode_optional_generation(cursor)?,
+            agent_generation: decode_optional_generation(cursor)?,
+            admitted_clock_generation: ClockGeneration::try_new(cursor.u64()?)
+                .map_err(|_| ManagedModelAgentStackStateError::InvalidState)?,
+            admitted_at_nanos: cursor.u64()?,
+            deadline_nanos: cursor.u64()?,
+            response_channel: decode_channel(cursor)?,
+            request: ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+                cursor.bounded(MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES)?,
+            )
+            .map_err(|_| ManagedModelAgentStackStateError::InvalidNestedContract)?,
+        })),
+        _ => Err(ManagedModelAgentStackStateError::InvalidPresence),
+    }
+}
+
+fn encode_artifact_terminals(
+    encoder: &mut Encoder,
+    terminals: &[ArtifactManagedModelAgentStackTerminalRecordV2],
+) -> Result<(), ManagedModelAgentStackStateError> {
+    encoder.count(terminals.len())?;
+    for terminal in terminals {
+        let terminal_bytes = 16_usize
+            .checked_add(16)
+            .and_then(|value| value.checked_add(32))
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(terminal.request.canonical_wire().len()))
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(terminal.receipt.canonical_wire().len()))
+            .ok_or(ManagedModelAgentStackStateError::FrameTooLarge)?;
+        if terminal_bytes > ARTIFACT_TERMINAL_BYTES {
+            return Err(ManagedModelAgentStackStateError::FrameTooLarge);
+        }
+        encoder.bytes(terminal.source_scope.as_bytes());
+        encoder.bytes(terminal.operation_id.as_bytes());
+        encoder.digest(terminal.request_digest);
+        encoder.bounded(terminal.request.canonical_wire())?;
+        encoder.bounded(terminal.receipt.canonical_wire())?;
+    }
+    Ok(())
+}
+
+fn decode_artifact_terminals(
+    cursor: &mut Cursor<'_>,
+) -> Result<Vec<ArtifactManagedModelAgentStackTerminalRecordV2>, ManagedModelAgentStackStateError> {
+    let count = cursor.count(MAX_TERMINALS)?;
+    let mut terminals = Vec::with_capacity(count);
+    for _ in 0..count {
+        let source_scope = SourceScopeRef::from_bytes(cursor.array()?);
+        let operation_id = ApplyOperationId::from_bytes(cursor.array()?);
+        let request_digest = cursor.digest()?;
+        let request_wire = cursor.bounded(
+            MAX_ARTIFACT_BOUND_MANAGED_MODEL_AGENT_STACK_APPLY_REQUEST_BYTES,
+        )?;
+        let receipt_wire = cursor.bounded(MAX_MANAGED_MODEL_AGENT_STACK_TERMINAL_RECEIPT_BYTES)?;
+        let terminal_bytes = 16_usize
+            .checked_add(16)
+            .and_then(|value| value.checked_add(32))
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(request_wire.len()))
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(receipt_wire.len()))
+            .ok_or(ManagedModelAgentStackStateError::FrameTooLarge)?;
+        if terminal_bytes > ARTIFACT_TERMINAL_BYTES {
+            return Err(ManagedModelAgentStackStateError::FrameTooLarge);
+        }
+        terminals.push(ArtifactManagedModelAgentStackTerminalRecordV2 {
+            source_scope,
+            operation_id,
+            request_digest,
+            request: ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(request_wire)
+                .map_err(|_| ManagedModelAgentStackStateError::InvalidNestedContract)?,
+            receipt: ManagedModelAgentStackTerminalReceiptV1::decode(receipt_wire)
+                .map_err(|_| ManagedModelAgentStackStateError::InvalidNestedContract)?,
+        });
+    }
+    Ok(terminals)
 }
 
 fn encode_active(
@@ -1184,6 +2178,16 @@ fn decode_optional_digest(
 fn snapshot_checksum(header: &[u8], payload: &[u8]) -> Digest32 {
     let mut hasher = Sha256::new();
     hasher.update(SNAPSHOT_CHECKSUM_DOMAIN);
+    hasher.update((header.len() as u64).to_be_bytes());
+    hasher.update(header);
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    Digest32::from_bytes(hasher.finalize().into())
+}
+
+fn artifact_snapshot_checksum(header: &[u8], payload: &[u8]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(ARTIFACT_SNAPSHOT_CHECKSUM_DOMAIN);
     hasher.update((header.len() as u64).to_be_bytes());
     hasher.update(header);
     hasher.update((payload.len() as u64).to_be_bytes());
@@ -1655,6 +2659,245 @@ mod tests {
                 &projection(),
             ),
             Err(ManagedModelAgentStackStateError::FenceRegression)
+        );
+    }
+
+    #[test]
+    fn artifact_snapshot_v2_shared_phase_goldens_decode_and_advance_strictly() {
+        let fixtures = [
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_exact_zero_initial.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::ExactZero,
+                9,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_activate.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::ModelStartIntent,
+                10,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_agent_start.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::AgentStartIntent,
+                11,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_active_ready.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::ActiveReady,
+                12,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_retire_current.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::AgentRetireIntent,
+                13,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_model_retire.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::ModelRetireIntent,
+                14,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_fabric_stop.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::FabricStopIntent,
+                15,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_exact_zero_after_retire.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::ExactZero,
+                16,
+            ),
+        ];
+        let decoded: Vec<_> = fixtures
+            .into_iter()
+            .map(|(fixture, phase, sequence)| {
+                let wire = decode_hex(fixture.trim_end());
+                let snapshot = ArtifactManagedModelAgentStackSnapshotV2::decode(
+                    &wire,
+                    STORE,
+                    OWNER,
+                    PROJECTION_DIGEST,
+                    &projection(),
+                )
+                .unwrap_or_else(|error| panic!("shared PXMA2 phase rejected: {error}"));
+                assert_eq!(snapshot.phase, phase);
+                assert_eq!(snapshot.sequence(), sequence);
+                assert_eq!(snapshot.canonical_wire(), wire);
+                snapshot
+            })
+            .collect();
+        for pair in decoded.windows(2) {
+            pair[0]
+                .validate_successor(&pair[1])
+                .unwrap_or_else(|error| panic!("shared PXMA2 successor rejected: {error}"));
+        }
+        assert_eq!(decoded[1].pending.as_ref().map(|pending| pending.kind), Some(
+            ArtifactManagedModelAgentStackPendingKindV2::ActivateArtifactV12
+        ));
+        assert_eq!(decoded[4].pending.as_ref().map(|pending| pending.kind), Some(
+            ArtifactManagedModelAgentStackPendingKindV2::RetireCurrentArtifactV12
+        ));
+    }
+
+    #[test]
+    fn artifact_snapshot_v2_failure_branches_are_exact_successors() {
+        let model_intent = ArtifactManagedModelAgentStackSnapshotV2::decode(
+            &decode_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_activate.hex"
+            )
+            .trim_end()),
+            STORE,
+            OWNER,
+            PROJECTION_DIGEST,
+            &projection(),
+        )
+        .expect("shared model intent");
+        for (fixture, phase, agent_present) in [
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_uncertain_after_model_intent.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::Uncertain,
+                false,
+            ),
+            (
+                include_str!(
+                    "../../../tests/fixtures/wire/artifact_f0_pxma_v2_quarantined_after_model_intent.hex"
+                ),
+                ManagedModelAgentStackDurablePhase::Quarantined,
+                false,
+            ),
+        ] {
+            let failure = ArtifactManagedModelAgentStackSnapshotV2::decode(
+                &decode_hex(fixture.trim_end()),
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            )
+            .expect("shared model-intent failure");
+            assert_eq!(failure.phase, phase);
+            assert_eq!(
+                failure
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.agent_generation)
+                    .is_some(),
+                agent_present,
+            );
+            model_intent
+                .validate_successor(&failure)
+                .expect("model-intent failure successor");
+        }
+
+        let agent_intent = ArtifactManagedModelAgentStackSnapshotV2::decode(
+            &decode_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_agent_start.hex"
+            )
+            .trim_end()),
+            STORE,
+            OWNER,
+            PROJECTION_DIGEST,
+            &projection(),
+        )
+        .expect("shared agent intent");
+        let agent_quarantine = ArtifactManagedModelAgentStackSnapshotV2::decode(
+            &decode_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_quarantined_after_agent_intent.hex"
+            )
+            .trim_end()),
+            STORE,
+            OWNER,
+            PROJECTION_DIGEST,
+            &projection(),
+        )
+        .expect("shared agent quarantine");
+        assert!(agent_quarantine
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.agent_generation)
+            .is_some());
+        agent_intent
+            .validate_successor(&agent_quarantine)
+            .expect("agent-intent quarantine successor");
+    }
+
+    #[test]
+    fn artifact_snapshot_v2_rejects_cross_version_tag_phase_and_terminal_swaps() {
+        let v1 = initial_exact_zero();
+        assert_eq!(
+            ArtifactManagedModelAgentStackSnapshotV2::decode(
+                v1.canonical_wire(),
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            ),
+            Err(ManagedModelAgentStackStateError::UnsupportedFrame),
+        );
+        let pending = decode_hex(include_str!(
+            "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_activate.hex"
+        )
+        .trim_end());
+        assert_eq!(
+            ManagedModelAgentStackSnapshot::decode(
+                &pending,
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            ),
+            Err(ManagedModelAgentStackStateError::UnsupportedFrame),
+        );
+
+        let mut reserved_tag = pending.clone();
+        reserved_tag[364] = 3;
+        let checksum = artifact_snapshot_checksum(
+            &reserved_tag[..SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES],
+            &reserved_tag[SNAPSHOT_HEADER_BYTES..],
+        );
+        reserved_tag[176..208].copy_from_slice(checksum.as_bytes());
+        assert_eq!(
+            ArtifactManagedModelAgentStackSnapshotV2::decode(
+                &reserved_tag,
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            ),
+            Err(ManagedModelAgentStackStateError::UnknownEnumValue),
+        );
+
+        let mut recovery_phase = pending;
+        recovery_phase[140] = ManagedModelAgentStackDurablePhase::RecoveryIntent as u8;
+        let checksum = artifact_snapshot_checksum(
+            &recovery_phase[..SNAPSHOT_HEADER_WITHOUT_CHECKSUM_BYTES],
+            &recovery_phase[SNAPSHOT_HEADER_BYTES..],
+        );
+        recovery_phase[176..208].copy_from_slice(checksum.as_bytes());
+        assert_eq!(
+            ArtifactManagedModelAgentStackSnapshotV2::decode(
+                &recovery_phase,
+                STORE,
+                OWNER,
+                PROJECTION_DIGEST,
+                &projection(),
+            ),
+            Err(ManagedModelAgentStackStateError::InvalidState),
         );
     }
 }

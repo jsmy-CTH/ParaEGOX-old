@@ -61,6 +61,18 @@ STACK_RAW_OUTCOME_DIGEST_DOMAIN = (
 STACK_QUARANTINE_DIGEST_DOMAIN = (
     b"paraegox.runtime.managed-model-agent-stack-quarantine.sha256.v1"
 )
+STACK_SNAPSHOT_V2_CHECKSUM_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-snapshot.sha256.v2"
+)
+STACK_TENURE_REPLAY_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-tenure-nonce.sha256.v1"
+)
+STACK_REQUEST_REPLAY_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-request-nonce.sha256.v1"
+)
+STACK_TEMPORAL_REPLAY_DOMAIN = (
+    b"paraegox.runtime.managed-model-agent-stack-temporal-lineage.sha256.v1"
+)
 
 
 def _load_agent_oracle() -> ModuleType:
@@ -1225,6 +1237,274 @@ def _decode_pxmj2_full_state(frame: bytes, shape_name: str) -> None:
     )
 
 
+def _pxma_channel() -> bytes:
+    common = LEDGER["runtime_terminal"]["common"]
+    return (
+        bytes.fromhex(LEDGER["predecessor"]["target_hex"])
+        + bytes.fromhex(common["runtime_peer_hex"])
+        + bytes.fromhex(common["local_endpoint_identity_digest_hex"])
+        + bytes.fromhex(common["peer_credentials_digest_hex"])
+    )
+
+
+def _pxma_replay_facts(request: dict[str, Any]) -> dict[str, bytes]:
+    authority = LEDGER["authority"]
+    runtime = LEDGER["runtime_apply"]
+    values = request["envelope_values"]
+    source_scope = values[3]
+    target = values[2]
+    principal = values[33]
+    writer = values[9]
+    request_key = values[34]
+    return {
+        "proof_digest": values[21],
+        "tenure_identity": _canonical_digest(
+            STACK_TENURE_REPLAY_DOMAIN,
+            source_scope,
+            bytes.fromhex(authority["tenure_authority_hex"]),
+            bytes.fromhex(authority["tenure_key_ref_hex"]),
+            authority["tenure_nonce_utf8"].encode("utf-8"),
+        ),
+        "request_identity": _canonical_digest(
+            STACK_REQUEST_REPLAY_DOMAIN,
+            source_scope,
+            target,
+            principal,
+            writer,
+            request_key,
+            bytes.fromhex(runtime["artifact_authentication_nonce_hex"]),
+        ),
+        "temporal_identity": _canonical_digest(
+            STACK_TEMPORAL_REPLAY_DOMAIN,
+            source_scope,
+            target,
+            bytes.fromhex(runtime["artifact_temporal_constraint_id_hex"]),
+        ),
+    }
+
+
+def _pxma_writer_and_revision(request: dict[str, Any]) -> bytes:
+    values = request["envelope_values"]
+    replay = _pxma_replay_facts(request)
+    return (
+        bytes([1])
+        + values[3]
+        + values[9]
+        + values[33]
+        + values[10]
+        + replay["proof_digest"]
+        + bytes([1])
+        + values[3]
+        + values[5]
+        + values[6]
+    )
+
+
+def _pxma_replays(request: dict[str, Any]) -> bytes:
+    replay = _pxma_replay_facts(request)
+    request_digest = request["request_digest"]
+    return (
+        struct.pack(">H", 1)
+        + replay["tenure_identity"]
+        + replay["proof_digest"]
+        + struct.pack(">H", 1)
+        + replay["request_identity"]
+        + request_digest
+        + struct.pack(">H", 1)
+        + replay["temporal_identity"]
+        + request_digest
+    )
+
+
+def _pxma_active(request: dict[str, Any], present: bool) -> bytes:
+    if not present:
+        return bytes([0])
+    return (
+        bytes([1])
+        + struct.pack(">QQQ", 7, 8, 9)
+        + _pxma_channel()
+        + struct.pack(">I", len(request["wire"]))
+        + request["wire"]
+    )
+
+
+def _pxma_pending(
+    request: dict[str, Any],
+    tag: int | None,
+    generations: tuple[int | None, int | None, int | None] = (None, None, None),
+) -> bytes:
+    if tag is None:
+        return bytes([0])
+    runtime_state = LEDGER["runtime_state"]
+    if tag == 1:
+        clock = runtime_state["activate_pending_clock_generation"]
+        admitted = runtime_state["activate_pending_admitted_at_nanos"]
+        deadline = runtime_state["activate_pending_deadline_nanos"]
+    else:
+        assert tag == 2
+        clock = runtime_state["retire_pending_clock_generation"]
+        admitted = runtime_state["retire_pending_admitted_at_nanos"]
+        deadline = runtime_state["retire_pending_deadline_nanos"]
+    return (
+        bytes([1, tag])
+        + b"".join(struct.pack(">Q", generation or 0) for generation in generations)
+        + struct.pack(">QQQ", clock, admitted, deadline)
+        + _pxma_channel()
+        + struct.pack(">I", len(request["wire"]))
+        + request["wire"]
+    )
+
+
+def _pxma_terminals(
+    request: dict[str, Any], terminal: bytes | None
+) -> bytes:
+    if terminal is None:
+        return struct.pack(">H", 0)
+    return (
+        struct.pack(">H", 1)
+        + request["envelope_values"][3]
+        + request["envelope_values"][24]
+        + request["request_digest"]
+        + struct.pack(">I", len(request["wire"]))
+        + request["wire"]
+        + struct.pack(">I", len(terminal))
+        + terminal
+    )
+
+
+def _pxma_checksum(header: bytes, payload: bytes) -> bytes:
+    assert len(header) == 176
+    return _raw_digest(
+        STACK_SNAPSHOT_V2_CHECKSUM_DOMAIN,
+        struct.pack(">Q", len(header))
+        + header
+        + struct.pack(">Q", len(payload))
+        + payload,
+    )
+
+
+def _encode_pxma2_states() -> dict[str, bytes]:
+    request = _encode_artifact_runtime_request()
+    terminals = _encode_artifact_terminals()
+    runtime = LEDGER["runtime_apply"]
+    state = LEDGER["runtime_state"]
+    fixed = _pxma_writer_and_revision(request)
+    replays = _pxma_replays(request)
+    phase_shapes = {
+        "exact_zero_initial": (9, 1, False, None, (None, None, None), None, 0, 1, 0),
+        "pending_activate": (10, 2, False, 1, (7, 8, None), None, 0, 19, 0),
+        "pending_agent_start": (11, 3, False, 1, (7, 8, 9), None, 0, 55, 0),
+        "active_ready": (12, 4, True, None, (None, None, None), "active_ready", 2, 63, 0),
+        "uncertain_after_model_intent": (11, 9, False, 1, (7, 8, None), "uncertain", 0, 0, 0),
+        "quarantined_after_model_intent": (11, 10, False, 1, (7, 8, None), "quarantined", 0, 3, 1),
+        "quarantined_after_agent_intent": (
+            12,
+            10,
+            False,
+            1,
+            (7, 8, 9),
+            "quarantined_after_agent_intent",
+            0,
+            2,
+            1,
+        ),
+        "pending_retire_current": (13, 5, True, 2, (7, 8, 9), "active_ready", 2, 63, 0),
+        "pending_model_retire": (14, 6, True, 2, (7, 8, 9), "active_ready", 0, 7, 0),
+        "pending_fabric_stop": (15, 7, True, 2, (7, 8, 9), "active_ready", 0, 3, 0),
+        "exact_zero_after_retire": (
+            16,
+            1,
+            False,
+            None,
+            (None, None, None),
+            "active_ready",
+            0,
+            1,
+            0,
+        ),
+    }
+    result: dict[str, bytes] = {}
+    for name, (
+        sequence,
+        phase,
+        active,
+        pending_tag,
+        pending_generations,
+        terminal_name,
+        census,
+        readiness_flags,
+        quarantine_present,
+    ) in phase_shapes.items():
+        terminal = None if terminal_name is None else terminals[terminal_name]["wire"]
+        quarantine = (
+            terminals[terminal_name]["quarantine_reason"]
+            if quarantine_present and terminal_name is not None
+            else None
+        )
+        payload = bytearray(struct.pack(">Q", state["runtime_host_epoch"]))
+        payload += fixed
+        payload += _pxma_active(request, active)
+        payload += _pxma_pending(request, pending_tag, pending_generations)
+        payload += replays
+        payload += _pxma_terminals(request, terminal)
+        payload += bytes([quarantine is not None])
+        if quarantine is not None:
+            payload += quarantine
+        total = 208 + len(payload)
+        header = bytearray(176)
+        header[:4] = b"PXMA"
+        header[4:12] = struct.pack(">HHI", 2, 208, total)
+        header[12:20] = struct.pack(">Q", sequence)
+        header[20:52] = bytes.fromhex(runtime["runtime_store_instance_hex"])
+        header[52:84] = bytes.fromhex(state["owner_target_fingerprint_hex"])
+        header[84:116] = bytes.fromhex(state["transition_projection_digest_hex"])
+        header[116:140] = struct.pack(">QQQ", 7, 8, 9)
+        header[140] = phase
+        header[141:143] = struct.pack(">H", census)
+        for index in range(6):
+            header[143 + index] = (readiness_flags >> index) & 1
+        header[168:172] = struct.pack(">I", len(payload))
+        frame = bytes(header) + _pxma_checksum(bytes(header), bytes(payload)) + bytes(payload)
+        assert len(frame) == total
+        result[name] = frame
+    return result
+
+
+def _decode_pxma2_state(frame: bytes, shape_name: str) -> None:
+    expected = _encode_pxma2_states()[shape_name]
+    assert frame == expected
+    assert frame[:4] == b"PXMA"
+    version, header_length, total = struct.unpack(">HHI", frame[4:12])
+    assert (version, header_length, total) == (2, 208, len(frame))
+    assert frame[149:168] == bytes(19) and frame[172:176] == bytes(4)
+    payload_length = struct.unpack(">I", frame[168:172])[0]
+    assert payload_length == len(frame) - 208
+    assert frame[176:208] == _pxma_checksum(frame[:176], frame[208:])
+    sequence, phase, terminal_name = {
+        "exact_zero_initial": (9, 1, None),
+        "pending_activate": (10, 2, None),
+        "pending_agent_start": (11, 3, None),
+        "active_ready": (12, 4, "active_ready"),
+        "uncertain_after_model_intent": (11, 9, "uncertain"),
+        "quarantined_after_model_intent": (11, 10, "quarantined"),
+        "quarantined_after_agent_intent": (12, 10, "quarantined_after_agent_intent"),
+        "pending_retire_current": (13, 5, "active_ready"),
+        "pending_model_retire": (14, 6, "active_ready"),
+        "pending_fabric_stop": (15, 7, "active_ready"),
+        "exact_zero_after_retire": (16, 1, "active_ready"),
+    }[shape_name]
+    assert struct.unpack(">Q", frame[12:20])[0] == sequence
+    assert frame[140] == phase
+    assert frame[20:52] == bytes.fromhex(LEDGER["runtime_apply"]["runtime_store_instance_hex"])
+    assert frame[52:84] == bytes.fromhex(LEDGER["runtime_state"]["owner_target_fingerprint_hex"])
+    assert frame[84:116] == bytes.fromhex(
+        LEDGER["runtime_state"]["transition_projection_digest_hex"]
+    )
+    if terminal_name is not None:
+        terminal = _encode_artifact_terminals()[terminal_name]["wire"]
+        assert terminal in frame[208:]
+
+
 def test_artifact_execution_binding_shared_golden_is_independently_derived() -> None:
     binding_wire = _fixture("artifact_f0_binding_v1.hex", 192)
     binding = _decode_artifact_binding(binding_wire)
@@ -1462,6 +1742,49 @@ def test_pxmj2_full_successor_goldens_are_independently_derived() -> None:
     assert expected["active_ready"] != expected["failed_post_p"]
     assert expected["failed_post_p"] != expected["failed_quarantined_post_p"]
     assert expected["uncertain_post_p"] != expected["uncertain_post_p_no_pxmt"]
+
+
+def test_pxma2_full_runtime_owner_goldens_are_independently_derived() -> None:
+    expected_sizes = {
+        "exact_zero_initial": 565,
+        "pending_activate": 3_494,
+        "pending_agent_start": 3_494,
+        "active_ready": 6_912,
+        "uncertain_after_model_intent": 6_937,
+        "quarantined_after_model_intent": 6_969,
+        "quarantined_after_agent_intent": 6_969,
+        "pending_retire_current": 9_841,
+        "pending_model_retire": 9_841,
+        "pending_fabric_stop": 9_841,
+        "exact_zero_after_retire": 4_008,
+    }
+    expected = _encode_pxma2_states()
+    for shape_name, size in expected_sizes.items():
+        fixture = _fixture(f"artifact_f0_pxma_v2_{shape_name}.hex", size)
+        assert fixture == expected[shape_name]
+        _decode_pxma2_state(fixture, shape_name)
+
+    assert expected["pending_activate"] != expected["pending_agent_start"]
+    assert expected["uncertain_after_model_intent"] != expected[
+        "quarantined_after_model_intent"
+    ]
+    assert expected["quarantined_after_model_intent"] != expected[
+        "quarantined_after_agent_intent"
+    ]
+
+
+def test_pxma2_checksum_version_and_phase_drift_fail_independent_decoder() -> None:
+    for offset in (-1, 5, 140):
+        drift = bytearray(
+            _fixture("artifact_f0_pxma_v2_pending_activate.hex", 3_494)
+        )
+        drift[offset] ^= 1
+        try:
+            _decode_pxma2_state(bytes(drift), "pending_activate")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"PXMA2 drift at {offset} was accepted")
 
 
 def test_pxmj2_pre_c_outer_checksum_and_terminal_pin_drift_are_rejected() -> None:
