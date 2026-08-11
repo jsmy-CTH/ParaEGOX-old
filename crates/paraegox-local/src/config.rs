@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, File},
     io::Read,
