@@ -3147,6 +3147,25 @@ mod tests {
         assert_eq!(plan_content.canonical_bytes(), plan_content_wire);
         assert_eq!(plan_content.binding(), binding);
         assert_eq!(plan_content.execution(), &execution);
+        let runtime_slice_wire = decode_fixture_hex(include_str!(
+            "../../../tests/fixtures/wire/artifact_f0_runtime_slice_v11.hex"
+        ));
+        let runtime_request_wire = decode_fixture_hex(include_str!(
+            "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
+        ));
+        let runtime_request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+            &runtime_request_wire,
+        )
+        .expect("decoded shared PXAR12");
+        assert_eq!(runtime_request.canonical_wire(), runtime_request_wire);
+        assert_eq!(runtime_request.canonical_slice_wire(), runtime_slice_wire);
+        assert_eq!(runtime_request.target_execution(), &execution);
+        assert_eq!(runtime_request.target().as_bytes(), &[0x05; 16]);
+        assert_eq!(runtime_request.operation_id().as_bytes(), &[0xd4; 16]);
+        assert_eq!(runtime_request.provenance().source_revision().value(), 4);
+        runtime_request
+            .validate_expected_store([0x44; 32])
+            .expect("shared Runtime store pin");
         let request = ArtifactExternalDeploymentRequestV1::try_new(
             ArtifactDeploymentOperationIdV1::try_from_bytes([0xd1; 16])
                 .expect("deployment operation id"),

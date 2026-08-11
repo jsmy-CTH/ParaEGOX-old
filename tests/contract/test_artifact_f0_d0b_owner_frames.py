@@ -8,6 +8,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 ROOT = Path(__file__).resolve().parents[2]
 WIRE = ROOT / "tests" / "fixtures" / "wire"
 LEDGER = json.loads((WIRE / "artifact_f0_semantic_ledger_v1.json").read_text())
@@ -28,6 +30,13 @@ ARTIFACT_COMPATIBILITY_DOMAIN = (
 ARTIFACT_EXECUTION_DIGEST_DOMAIN = b"paraegox.runtime.target-execution.sha256.v11"
 ARTIFACT_ASSIGNMENT_DIGEST_DOMAIN = b"paraegox.runtime.target-plan-assignments.sha256.v12"
 ARTIFACT_BINDING_DIGEST_DOMAIN = b"paraegox.runtime.artifact-execution-binding.sha256.v1"
+ARTIFACT_SOURCE_PLAN_DIGEST_DOMAIN = (
+    b"paraegox.deployment.artifact-bound-managed-model-agent-stack-desired.sha256.v1"
+)
+ARTIFACT_CUTOVER_MARKER_DIGEST_DOMAIN = (
+    b"paraegox.deployment.artifact-external-cutover-marker.sha256.v1"
+)
+PLAN_CONTENT_DIGEST_DOMAIN = b"paraegox.deployment.plan-content.sha256.v2"
 
 
 def _load_agent_oracle() -> ModuleType:
@@ -266,6 +275,204 @@ def _encode_artifact_execution_stack() -> dict[str, bytes]:
         "model_pxte": bytes(model_pxte),
         "artifact_pxte": bytes(artifact_pxte),
         "plan_content": bytes(plan_content),
+    }
+
+
+def _encode_artifact_runtime_request() -> dict[str, Any]:
+    execution = _encode_artifact_execution_stack()
+    pxte = execution["artifact_pxte"]
+    plan_content = execution["plan_content"]
+    pxdq = _fixture("artifact_f0_pxdq_v1.hex", 288)
+    pxdk = _fixture("artifact_f0_pxdk_v1.hex", 240)
+    predecessor = LEDGER["predecessor"]
+    deployment = LEDGER["deployment"]
+    runtime = LEDGER["runtime_apply"]
+    authority = LEDGER["authority"]
+    signing = LEDGER["signing"]
+    legacy = AGENT.FABRIC.LEGACY
+
+    cutover_marker = _canonical_digest(
+        ARTIFACT_CUTOVER_MARKER_DIGEST_DOMAIN,
+        pxdk[16:48],
+        struct.pack(">Q", deployment["admission_sequence"]),
+        pxdq[256:288],
+        pxdk[208:240],
+    )
+    plan_content_digest = _canonical_digest(PLAN_CONTENT_DIGEST_DOMAIN, plan_content)
+    source_revision = predecessor["legacy_successor_revision"]
+    target = bytes.fromhex(predecessor["target_hex"])
+    scope = bytes.fromhex(authority["source_scope_hex"])
+    source_plan = bytes.fromhex(authority["source_plan_ref_hex"])
+    predecessor_slice = bytes.fromhex(predecessor["active_target_slice_digest_hex"])
+    source_plan_digest = _canonical_digest(
+        ARTIFACT_SOURCE_PLAN_DIGEST_DOMAIN,
+        cutover_marker,
+        target,
+        scope,
+        source_plan,
+        struct.pack(">Q", source_revision),
+        predecessor_slice,
+        pxdq[256:288],
+        pxdk[208:240],
+        plan_content_digest,
+        pxte,
+    )
+    pxta_digest = _canonical_digest(
+        b"paraegox.runtime.target-assignments.sha256.v1", PXTA_ZERO
+    )
+    pxte_digest = _canonical_digest(ARTIFACT_EXECUTION_DIGEST_DOMAIN, pxte)
+    assignment_digest = _canonical_digest(
+        ARTIFACT_ASSIGNMENT_DIGEST_DOMAIN, pxta_digest, pxte_digest
+    )
+
+    writer = bytes.fromhex(authority["writer_hex"])
+    writer_epoch = struct.pack(">Q", authority["writer_epoch"])
+    tenure_authority = bytes.fromhex(authority["tenure_authority_hex"])
+    tenure_key = bytes.fromhex(authority["tenure_key_ref_hex"])
+    tenure_algorithm = struct.pack(">H", authority["tenure_algorithm"])
+    tenure_algorithm_version = struct.pack(
+        ">H", authority["tenure_algorithm_version"]
+    )
+    supersedes = struct.pack(">Q", authority["tenure_supersedes_through_epoch"])
+    tenure_nonce = authority["tenure_nonce_utf8"].encode("utf-8")
+    tenure_fields = [
+        (1, tenure_authority),
+        (2, tenure_key),
+        (3, tenure_algorithm),
+        (4, tenure_algorithm_version),
+        (5, scope),
+        (6, writer),
+        (7, writer_epoch),
+        (8, supersedes),
+        (9, tenure_nonce),
+    ]
+    tenure_keypair = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(signing["tenure_seed_hex"])
+    )
+    tenure_signature = tenure_keypair.sign(
+        legacy._signing_transcript(1, legacy.TENURE_SIGNING_DOMAIN, tenure_fields)
+    )
+    tenure_digest = _canonical_digest(
+        legacy.TENURE_PROOF_DIGEST_DOMAIN,
+        tenure_authority,
+        tenure_key,
+        tenure_algorithm,
+        tenure_algorithm_version,
+        scope,
+        writer,
+        writer_epoch,
+        supersedes,
+        tenure_nonce,
+        tenure_signature,
+    )
+    operation_id = bytes.fromhex(runtime["artifact_operation_id_hex"])
+    expected_tag = struct.pack(">H", 1)
+    control_digest = _canonical_digest(
+        legacy.APPLY_CONTROL_DIGEST_DOMAIN,
+        _canonical_digest(
+            legacy.TARGET_SLICE_DIGEST_DOMAIN,
+            struct.pack(">H", 1),
+            target,
+            scope,
+            source_plan,
+            struct.pack(">Q", source_revision),
+            source_plan_digest,
+            assignment_digest,
+        ),
+        struct.pack(">H", 1),
+        target,
+        scope,
+        source_plan,
+        struct.pack(">Q", source_revision),
+        source_plan_digest,
+        assignment_digest,
+        writer,
+        writer_epoch,
+        tenure_digest,
+        expected_tag,
+        predecessor_slice,
+        operation_id,
+    )
+    target_slice_digest = _canonical_digest(
+        legacy.TARGET_SLICE_DIGEST_DOMAIN,
+        struct.pack(">H", 1),
+        target,
+        scope,
+        source_plan,
+        struct.pack(">Q", source_revision),
+        source_plan_digest,
+        assignment_digest,
+    )
+    unsigned_fields = [
+        (1, struct.pack(">H", 1)),
+        (2, target),
+        (3, scope),
+        (4, source_plan),
+        (5, struct.pack(">Q", source_revision)),
+        (6, source_plan_digest),
+        (7, assignment_digest),
+        (8, target_slice_digest),
+        (9, writer),
+        (10, writer_epoch),
+        (11, tenure_authority),
+        (12, tenure_key),
+        (13, tenure_algorithm),
+        (14, tenure_algorithm_version),
+        (15, scope),
+        (16, writer),
+        (17, writer_epoch),
+        (18, supersedes),
+        (19, tenure_nonce),
+        (20, tenure_signature),
+        (21, tenure_digest),
+        (22, expected_tag),
+        (23, predecessor_slice),
+        (24, operation_id),
+        (25, control_digest),
+        (26, struct.pack(">H", 1)),
+        (27, bytes.fromhex(runtime["artifact_temporal_constraint_id_hex"])),
+        (28, bytes.fromhex(runtime["clock_domain_hex"])),
+        (29, struct.pack(">Q", runtime["clock_generation"])),
+        (30, struct.pack(">Q", runtime["original_budget_nanos"])),
+        (31, struct.pack(">Q", runtime["remaining_budget_nanos"])),
+        (32, bytes.fromhex(runtime["runtime_store_instance_hex"])),
+        (33, bytes.fromhex(authority["request_principal_hex"])),
+        (34, bytes.fromhex(authority["request_key_ref_hex"])),
+        (35, struct.pack(">H", authority["request_algorithm"])),
+        (36, struct.pack(">H", authority["request_algorithm_version"])),
+        (37, bytes.fromhex(runtime["artifact_authentication_nonce_hex"])),
+    ]
+    request_keypair = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(signing["controller_seed_hex"])
+    )
+    request_signature = request_keypair.sign(
+        legacy._signing_transcript(2, legacy.AUTH_SIGNING_DOMAIN, unsigned_fields)
+    )
+    envelope = legacy._encode_envelope_fields([*unsigned_fields, (38, request_signature)])
+    values = legacy._decode_envelope(envelope)
+    legacy._verify_envelope_signatures(
+        values,
+        bytes.fromhex(signing["tenure_public_key_hex"]),
+        bytes.fromhex(signing["controller_public_key_hex"]),
+    )
+    outer = (
+        b"PXAR"
+        + struct.pack(">HIII", 12, len(envelope), len(PXTA_ZERO), len(pxte))
+        + envelope
+        + PXTA_ZERO
+        + pxte
+    )
+    return {
+        "wire": outer,
+        "envelope": envelope,
+        "envelope_values": values,
+        "runtime_slice": PXTA_ZERO + pxte,
+        "cutover_marker_digest": cutover_marker,
+        "plan_content_digest": plan_content_digest,
+        "source_plan_digest": source_plan_digest,
+        "assignment_digest": assignment_digest,
+        "target_slice_digest": target_slice_digest,
+        "request_digest": _canonical_digest(legacy.REQUEST_DIGEST_DOMAIN, envelope),
     }
 
 
@@ -524,6 +731,41 @@ def test_artifact_pxte11_and_plan_content_goldens_are_independently_derived() ->
     assert plan[56:248] == binding
     assert struct.unpack(">I", plan[248:252])[0] == len(pxte)
     assert plan[252:] == pxte
+
+
+def test_artifact_pxar12_and_runtime_slice_goldens_are_independently_derived() -> None:
+    expected = _encode_artifact_runtime_request()
+    pxar = _fixture("artifact_f0_pxar_v12.hex", 2_780)
+    runtime_slice = _fixture("artifact_f0_runtime_slice_v11.hex", 1_815)
+    pxte = _fixture("artifact_f0_pxte_v11.hex", 1_805)
+    runtime = LEDGER["runtime_apply"]
+    predecessor = LEDGER["predecessor"]
+    values = expected["envelope_values"]
+
+    assert pxar == expected["wire"]
+    assert runtime_slice == expected["runtime_slice"] == PXTA_ZERO + pxte
+    assert pxar[:6] == b"PXAR" + struct.pack(">H", 12)
+    envelope_length, binding_length, execution_length = struct.unpack(">III", pxar[6:18])
+    assert (envelope_length, binding_length, execution_length) == (
+        len(expected["envelope"]),
+        len(PXTA_ZERO),
+        len(pxte),
+    )
+    assert pxar[18 : 18 + envelope_length] == expected["envelope"]
+    assert pxar[18 + envelope_length :] == runtime_slice
+    assert values[2] == bytes.fromhex(predecessor["target_hex"])
+    assert values[5] == struct.pack(">Q", predecessor["legacy_successor_revision"])
+    assert values[6] == expected["source_plan_digest"]
+    assert values[7] == expected["assignment_digest"]
+    assert values[8] == expected["target_slice_digest"]
+    assert values[22] == struct.pack(">H", 1)
+    assert values[23] == bytes.fromhex(predecessor["active_target_slice_digest_hex"])
+    assert values[24] == bytes.fromhex(runtime["artifact_operation_id_hex"])
+    assert values[27] == bytes.fromhex(runtime["artifact_temporal_constraint_id_hex"])
+    assert values[30] == struct.pack(">Q", runtime["original_budget_nanos"])
+    assert values[31] == struct.pack(">Q", runtime["remaining_budget_nanos"])
+    assert values[32] == bytes.fromhex(runtime["runtime_store_instance_hex"])
+    assert values[37] == bytes.fromhex(runtime["artifact_authentication_nonce_hex"])
 
 
 def test_pxdq_pxdk_shared_goldens_have_independent_exact_layout_and_correlation() -> None:
