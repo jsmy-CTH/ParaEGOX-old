@@ -941,8 +941,7 @@ fn validate_partial_pair_entry(
         let is_temporary =
             name == OsStr::new(MANIFEST_NEXT_NAME) || name == OsStr::new(PAYLOAD_NEXT_NAME);
         let maximum = if is_manifest { 206 } else { 64 };
-        let (bytes, identity) =
-            read_regular_bounded(directory, &name, maximum, is_temporary)?;
+        let (bytes, identity) = read_regular_bounded(directory, &name, maximum, is_temporary)?;
         entries.push((name, identity));
         regular_bytes = regular_bytes
             .checked_add(u64::try_from(bytes.len()).map_err(|_| StoreError::Owner)?)
