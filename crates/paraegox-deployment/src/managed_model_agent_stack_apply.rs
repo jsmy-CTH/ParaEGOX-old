@@ -3128,6 +3128,26 @@ mod tests {
                 0x1e, 0xc8, 0x8c, 0x1e,
             ],
         );
+        let execution_wire = decode_fixture_hex(include_str!(
+            "../../../tests/fixtures/wire/artifact_f0_pxte_v11.hex"
+        ));
+        let execution = ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(
+            &execution_wire,
+        )
+        .expect("decoded shared PXTE11");
+        assert_eq!(execution.canonical_wire(), execution_wire);
+        assert_eq!(execution.binding(), binding);
+        let plan_content_wire = decode_fixture_hex(include_str!(
+            "../../../tests/fixtures/wire/artifact_f0_plan_content_v2.hex"
+        ));
+        let plan_content = ArtifactBoundManagedModelAgentStackPlanContentV2::decode(
+            paraegox_kernel::identity::RuntimeHostId::from_bytes([0x05; 16]),
+            &plan_content_wire,
+        )
+        .expect("decoded shared PlanContent v2");
+        assert_eq!(plan_content.canonical_bytes(), plan_content_wire);
+        assert_eq!(plan_content.binding(), binding);
+        assert_eq!(plan_content.execution(), &execution);
         let request = ArtifactExternalDeploymentRequestV1::try_new(
             ArtifactDeploymentOperationIdV1::try_from_bytes([0xd1; 16])
                 .expect("deployment operation id"),
