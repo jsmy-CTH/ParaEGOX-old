@@ -486,7 +486,13 @@ fn wait_for_artifact_external_owner(
                 .as_ref()
                 .is_some_and(|observation| observation.state() == LocalLifecycleStateV1::Running);
 
-        if generation_accepted || child_exit_code.is_some() {
+        // The hidden owner releases the Controller lock while Runtime applies
+        // and reacquires it only after PXMT returns. Querying PXMJ during that
+        // window can let this follower win the shared-lock race and make the
+        // actual owner fail its one-shot exclusive reopen. Wait for lifecycle
+        // Running (which is emitted only after the owner committed Ready) or
+        // for the child to exit before reading owner state.
+        if controller_observation_allowed(lifecycle_running, child_exit_code.is_some()) {
             let invocation = query_external_controller(config, request.operation_id());
             match invocation.into_result() {
                 Ok(projection) => {
@@ -572,6 +578,11 @@ fn wait_for_artifact_external_owner(
         }
         thread::sleep(EXTERNAL_DEPLOY_POLL_INTERVAL);
     }
+}
+
+#[cfg(unix)]
+const fn controller_observation_allowed(lifecycle_running: bool, child_exited: bool) -> bool {
+    lifecycle_running || child_exited
 }
 
 #[cfg(unix)]
@@ -856,6 +867,14 @@ fn minimal_uncertain_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deploy_follower_never_queries_top_while_the_owner_is_still_starting() {
+        assert!(!controller_observation_allowed(false, false));
+        assert!(controller_observation_allowed(true, false));
+        assert!(controller_observation_allowed(false, true));
+        assert!(controller_observation_allowed(true, true));
+    }
 
     #[test]
     fn grammar_error_uses_exact_nineteen_key_envelope() {
