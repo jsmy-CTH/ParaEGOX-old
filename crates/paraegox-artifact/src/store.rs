@@ -1352,9 +1352,7 @@ struct ValidatedNext {
     identity: FileIdentity,
 }
 
-fn read_and_validate_next(
-    store: &LockedStore,
-) -> Result<Option<ValidatedNext>, StoreError> {
+fn read_and_validate_next(store: &LockedStore) -> Result<Option<ValidatedNext>, StoreError> {
     let names = scan_names(&store.root)?;
     if !names.contains(OsStr::new(STORE_SNAPSHOT_NEXT_NAME)) {
         return Ok(None);
@@ -1575,10 +1573,7 @@ fn run_query(
             }
             if next.operation_id == operation_id {
                 return Err(StoreError::PublicationUncertain(
-                    next.snapshot
-                        .operation(operation_id)
-                        .cloned()
-                        .map(Box::new),
+                    next.snapshot.operation(operation_id).cloned().map(Box::new),
                 ));
             }
             return Err(StoreError::Owner);
@@ -1649,10 +1644,11 @@ fn pin_or_create_state_root(
     binding: &ArtifactStoreAuthorityBindingV1,
     tracker: &mut ChangeTracker,
 ) -> Result<StateRootHandle, StoreError> {
-    let (parent, leaf_name) = open_state_parent(binding.state_root()).map_err(|error| match error {
-        StoreError::NotFound => StoreError::UnsafePath,
-        other => other,
-    })?;
+    let (parent, leaf_name) =
+        open_state_parent(binding.state_root()).map_err(|error| match error {
+            StoreError::NotFound => StoreError::UnsafePath,
+            other => other,
+        })?;
     match open_state_leaf_at(&parent, &leaf_name) {
         Ok(leaf) => Ok(StateRootHandle {
             parent,
@@ -1674,10 +1670,12 @@ fn pin_or_create_state_root(
                     {
                         return Err(StoreError::Owner);
                     }
-                    let reopened_leaf = open_state_leaf_at(&reopened_parent, &leaf_name)
-                        .map_err(|error| match error {
-                            StoreError::NotFound => StoreError::PublicationUncertain(None),
-                            other => other,
+                    let reopened_leaf =
+                        open_state_leaf_at(&reopened_parent, &leaf_name).map_err(|error| {
+                            match error {
+                                StoreError::NotFound => StoreError::PublicationUncertain(None),
+                                other => other,
+                            }
                         })?;
                     require_same_authority(authority, binding)?;
                     return Ok(StateRootHandle {
@@ -1993,11 +1991,7 @@ fn initial_directory_matches(
     claim: &InitialDirectoryClaim<'_>,
 ) -> bool {
     let validation = (|| {
-        let directory = reopen_named_directory(
-            parent,
-            OsStr::new(name),
-            claim.directory_identity,
-        )?;
+        let directory = reopen_named_directory(parent, OsStr::new(name), claim.directory_identity)?;
         exact_names(
             &directory,
             &[STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME],
@@ -2019,11 +2013,8 @@ fn initial_directory_matches(
         {
             return Err(StoreError::Owner);
         }
-        let objects = reopen_named_directory(
-            &directory,
-            OsStr::new(OBJECTS_NAME),
-            claim.objects_identity,
-        )?;
+        let objects =
+            reopen_named_directory(&directory, OsStr::new(OBJECTS_NAME), claim.objects_identity)?;
         exact_names(&objects, &[])?;
         drop(objects);
         drop(directory);
@@ -2283,9 +2274,7 @@ fn open_or_initialize_store(
         }
     };
     let names_before_lock = scan_names(&staging)?;
-    if !names_before_lock.is_empty()
-        && !names_before_lock.contains(OsStr::new(STORE_LOCK_NAME))
-    {
+    if !names_before_lock.is_empty() && !names_before_lock.contains(OsStr::new(STORE_LOCK_NAME)) {
         return Err(StoreError::Owner);
     }
 
@@ -3096,10 +3085,7 @@ fn recover_pair_from_existing_child(
         .file
         .sync_all()
         .map_err(|_| StoreError::Owner)?;
-    recovery_fault_checkpoint(
-        observer,
-        StoreFaultPoint::ExistingChildBeforeObjectsReopen,
-    )?;
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeObjectsReopen)?;
     let objects = reopen_named_directory(
         &store.root,
         OsStr::new(OBJECTS_NAME),
@@ -3194,10 +3180,7 @@ fn publish_or_recover_pair_observed(
     if mkdirat(&store.objects.file, child_name.as_str(), DIRECTORY_MODE).is_err() {
         let checkpoint = *tracker;
         tracker.ambiguous();
-        recovery_fault_checkpoint(
-            observer,
-            StoreFaultPoint::PairMkdirFailureBeforeObjectsSync,
-        )?;
+        recovery_fault_checkpoint(observer, StoreFaultPoint::PairMkdirFailureBeforeObjectsSync)?;
         store
             .objects
             .file
