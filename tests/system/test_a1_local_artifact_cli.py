@@ -7,6 +7,7 @@ strictly decode them with only ``struct``, ``hashlib``, and ``json``.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -1395,6 +1396,52 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
         assert not state_root.exists(), "offline inspect must not construct Store authority"
 
         primary = "a2" * 16
+        deployment_operation = "d1" * 16
+        returncode, raw, deployment_not_found = _invoke_artifact(
+            binary,
+            [
+                "deployment",
+                "operation",
+                "query",
+                "--config",
+                os.fspath(config_path),
+                "--operation-id",
+                deployment_operation,
+                "--json",
+            ],
+        )
+        assert returncode == 1
+        assert raw == _compact_json(
+            {
+                "schema_version": 1,
+                "command": "deployment.operation.query",
+                "mode": "local",
+                "ok": False,
+                "changed": False,
+                "operation_id": deployment_operation,
+                "state": None,
+                "profile": None,
+                "artifact_object_ref": None,
+                "materialization_receipt_ref": None,
+                "generation": None,
+                "deployment_revision": None,
+                "controller_snapshot_sequence": None,
+                "deployment_receipt_ref": None,
+                "runtime_apply_request_digest": None,
+                "runtime_terminal_receipt_digest": None,
+                "terminal_outcome": None,
+                "current_health_checked": False,
+                "diagnostics": [
+                    {
+                        "code": "PXLC-DEPLOY-NOT-FOUND",
+                        "message": "deployment operation was not found",
+                    }
+                ],
+            }
+        )
+        assert deployment_not_found["operation_id"] == deployment_operation
+        assert not state_root.exists(), "deployment query must not create a missing state root"
+
         returncode, raw, _ = _invoke_artifact(
             binary,
             [
@@ -1599,5 +1646,61 @@ def test_artifact_f0_a1_exact_binary_build_inspect_and_store_sequence() -> None:
         assert returncode == 2 and raw == fixtures[3]
         assert malformed["diagnostics"][0]["code"] == "PXLC-ARTIFACT-GRAMMAR"
         assert not (workspace / "operator-v1").exists()
+
+        operator_root = state_root / "operator-v1"
+        operator_root.mkdir(mode=0o700)
+        lifecycle_lock_path = operator_root / "owner.lock"
+        lifecycle_lock = os.open(
+            lifecycle_lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(lifecycle_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            returncode, raw, contended = _invoke_artifact(
+                binary,
+                [
+                    "deployment",
+                    "operation",
+                    "query",
+                    "--config",
+                    os.fspath(config_path),
+                    "--operation-id",
+                    deployment_operation,
+                    "--json",
+                ],
+            )
+            assert returncode == 1
+            assert raw == _compact_json(
+                {
+                    "schema_version": 1,
+                    "command": "deployment.operation.query",
+                    "mode": "local",
+                    "ok": False,
+                    "changed": False,
+                    "operation_id": deployment_operation,
+                    "state": "uncertain",
+                    "profile": None,
+                    "artifact_object_ref": None,
+                    "materialization_receipt_ref": None,
+                    "generation": None,
+                    "deployment_revision": None,
+                    "controller_snapshot_sequence": None,
+                    "deployment_receipt_ref": None,
+                    "runtime_apply_request_digest": None,
+                    "runtime_terminal_receipt_digest": None,
+                    "terminal_outcome": "uncertain",
+                    "current_health_checked": False,
+                    "diagnostics": [
+                        {
+                            "code": "PXLC-DEPLOY-UNCERTAIN",
+                            "message": "deployment operation outcome is uncertain",
+                        }
+                    ],
+                }
+            )
+            assert contended["state"] == "uncertain"
+        finally:
+            os.close(lifecycle_lock)
     finally:
         shutil.rmtree(base)
