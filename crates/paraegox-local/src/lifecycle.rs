@@ -5545,7 +5545,7 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("async fn wait_for_thread_exit(").next())
             .expect("bounded lifecycle owner source");
-        assert!(asynchronous.contains("prepared: PreparedHeadlessChatV1"));
+        assert!(asynchronous.contains("prepared: PreparedLifecycleOwnerV1"));
         assert!(!asynchronous.contains("std::env::"));
         assert!(!asynchronous.contains("resolve_provisioned_api_key"));
     }
