@@ -120,6 +120,9 @@ def _invoke_json(
         timeout=_COMMAND_TIMEOUT_SECONDS,
         check=False,
     )
+    if process.returncode != expected_returncode:
+        print(f"D0B-STDOUT:{process.stdout.decode(errors='backslashreplace')}")
+        print(f"D0B-STDERR:{process.stderr.decode(errors='backslashreplace')}")
     assert process.returncode == expected_returncode, (
         arguments,
         process.returncode,
