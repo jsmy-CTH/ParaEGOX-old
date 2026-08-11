@@ -29,7 +29,9 @@ use paraegox_runtime_contracts::managed_agent_stack_plan::ManagedAgentStackApply
 use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricApplyRequestV1, ManagedFabricPlanError,
 };
-use paraegox_runtime_contracts::managed_model_agent_stack_plan::ManagedModelAgentStackApplyRequestV1;
+use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
+    ArtifactBoundManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackApplyRequestV1,
+};
 use paraegox_runtime_contracts::process_execution::{
     RequestV4WireError, RuntimeApplyRequestV4, RuntimePlanSliceV4,
 };
@@ -891,6 +893,141 @@ impl ApplyAdmissionPolicy {
         })
     }
 
+    /// Authenticates one strict PXAR v12 in the same logical managed
+    /// Model+Agent owner namespace. The v2 durable successor retains these
+    /// replay identities instead of creating a second ingress authority.
+    pub(crate) fn authenticate_artifact_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> Result<AuthenticatedManagedModelAgentStackApplyV1, ManagedFabricApplyAdmissionError> {
+        let provenance = request.provenance();
+        let control = request.control_commitment().control();
+        let writer_context = control.writer_context();
+        let proof = writer_context.proof();
+        let proof_authority = proof.authority();
+        let proof_claim = proof.claim();
+        let authentication = request.authentication();
+        let auth_claim = authentication.claim();
+        if proof_claim.source_scope() != provenance.source_scope()
+            || proof_claim.writer() != writer_context.writer()
+            || proof_claim.epoch() != writer_context.epoch()
+        {
+            return Err(ManagedFabricApplyAdmissionError::CanonicalCorrelation);
+        }
+        let tenure_selector = TenureTrustSelector {
+            source_scope: provenance.source_scope(),
+            authority: proof_authority.authority(),
+            key: proof_authority.key(),
+            algorithm: proof_authority.algorithm(),
+            algorithm_version: proof_authority.algorithm_version(),
+        };
+        let Some(tenure_key) = self.tenure_keys.get(&tenure_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedTenureKey);
+        };
+        let apply_selector = ApplyTrustSelector {
+            source_scope: provenance.source_scope(),
+            target: request.target(),
+            principal: auth_claim.principal(),
+            writer: writer_context.writer(),
+            key: auth_claim.key(),
+            algorithm: auth_claim.algorithm(),
+            algorithm_version: auth_claim.algorithm_version(),
+        };
+        let Some(apply_key) = self.apply_keys.get(&apply_selector) else {
+            return Err(ManagedFabricApplyAdmissionError::UntrustedApplyKey);
+        };
+        let tenure_signature = parse_reference_signature(proof.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let tenure_transcript = proof
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureTranscript)?;
+        tenure_key
+            .verifying_key
+            .verify_strict(tenure_transcript.as_bytes(), &tenure_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidTenureSignature)?;
+        let request_signature = parse_reference_signature(authentication.signature())
+            .ok_or(ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+        let request_transcript = request
+            .signing_transcript()
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestTranscript)?;
+        apply_key
+            .verify_strict(request_transcript.as_bytes(), &request_signature)
+            .map_err(|_| ManagedFabricApplyAdmissionError::InvalidRequestSignature)?;
+
+        let proof_envelope_digest = proof
+            .envelope_digest()
+            .map_err(ManagedFabricApplyAdmissionError::Digest)?;
+        let tenure_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-tenure-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                proof_authority.authority().as_bytes(),
+                proof_authority.key().as_bytes(),
+                proof.nonce(),
+            ],
+        )?;
+        let request_nonce_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-request-nonce.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                auth_claim.principal().as_bytes(),
+                writer_context.writer().as_bytes(),
+                auth_claim.key().as_bytes(),
+                auth_claim.nonce(),
+            ],
+        )?;
+        let temporal = request.temporal();
+        let temporal_lineage_identity = managed_fabric_replay_identity(
+            b"paraegox.runtime.managed-model-agent-stack-temporal-lineage.sha256.v1",
+            &[
+                provenance.source_scope().as_bytes(),
+                request.target().as_bytes(),
+                temporal.constraint_id().as_bytes(),
+            ],
+        )?;
+        Ok(AuthenticatedManagedModelAgentStackApplyV1 {
+            proof_envelope_digest,
+            tenure_nonce_identity,
+            request_nonce_identity,
+            temporal_lineage_identity,
+        })
+    }
+
+    pub(crate) fn verify_artifact_managed_model_agent_stack_apply_request(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+        reading: ClockReading,
+    ) -> Result<VerifiedArtifactManagedModelAgentStackApplyIngressV1, ManagedFabricApplyAdmissionError>
+    {
+        let authenticated =
+            self.authenticate_artifact_managed_model_agent_stack_apply_request(request)?;
+        let temporal = request.temporal();
+        if temporal.target_clock_domain() != reading.domain() {
+            return Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch);
+        }
+        if temporal.target_clock_generation() != reading.generation() {
+            return Err(ManagedFabricApplyAdmissionError::ClockGenerationMismatch);
+        }
+        if temporal.original_budget().value() > self.maximum_budget.value() {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExceedsPolicy);
+        }
+        if temporal.remaining_budget().value() == 0 {
+            return Err(ManagedFabricApplyAdmissionError::BudgetExpired);
+        }
+        let admitted_at_nanos = reading.now().value();
+        let deadline_nanos = admitted_at_nanos
+            .checked_add(temporal.remaining_budget().value())
+            .filter(|_| admitted_at_nanos != 0)
+            .ok_or(ManagedFabricApplyAdmissionError::DeadlineOverflow)?;
+        Ok(VerifiedArtifactManagedModelAgentStackApplyIngressV1 {
+            authenticated,
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation: reading.generation(),
+        })
+    }
+
     /// Authenticates one strict PXAR v8 while keeping replay identities
     /// independent from both PXAR-v6 Fabric and PXAR-v7 fixed-stack owners.
     pub(crate) fn authenticate_distributed_agent_stack_apply_request(
@@ -1606,6 +1743,62 @@ pub(crate) struct VerifiedManagedModelAgentStackApplyIngressV1 {
     admitted_at_nanos: u64,
     deadline_nanos: u64,
     clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedArtifactManagedModelAgentStackApplyIngressV1 {
+    authenticated: AuthenticatedManagedModelAgentStackApplyV1,
+    admitted_at_nanos: u64,
+    deadline_nanos: u64,
+    clock_generation: paraegox_kernel::time::ClockGeneration,
+}
+
+impl VerifiedArtifactManagedModelAgentStackApplyIngressV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admitted_at_nanos: u64,
+        deadline_nanos: u64,
+        clock_generation: paraegox_kernel::time::ClockGeneration,
+        identity_seed: u8,
+    ) -> Self {
+        assert!(
+            identity_seed != 0,
+            "test replay identity seed must be nonzero"
+        );
+        Self {
+            authenticated: AuthenticatedManagedModelAgentStackApplyV1 {
+                proof_envelope_digest: Digest32::from_bytes([0xb0; 32]),
+                tenure_nonce_identity: Digest32::from_bytes([0xb1; 32]),
+                request_nonce_identity: Digest32::from_bytes([identity_seed; 32]),
+                temporal_lineage_identity: Digest32::from_bytes(
+                    [identity_seed.wrapping_add(1); 32],
+                ),
+            },
+            admitted_at_nanos,
+            deadline_nanos,
+            clock_generation,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn authenticated(self) -> AuthenticatedManagedModelAgentStackApplyV1 {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub(crate) const fn admitted_at_nanos(self) -> u64 {
+        self.admitted_at_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn deadline_nanos(self) -> u64 {
+        self.deadline_nanos
+    }
+
+    #[must_use]
+    pub(crate) const fn clock_generation(self) -> paraegox_kernel::time::ClockGeneration {
+        self.clock_generation
+    }
 }
 
 impl VerifiedManagedModelAgentStackApplyIngressV1 {
@@ -4465,6 +4658,63 @@ mod tests {
             b'A'..=b'F' => value - b'A' + 10,
             _ => panic!("fixture must contain hexadecimal digits"),
         }
+    }
+
+    fn decode_fixture_hex(input: &str) -> Vec<u8> {
+        let value = input.trim_end_matches('\n');
+        assert_eq!(value.len() % 2, 0, "fixture hex length must be even");
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]))
+            .collect()
+    }
+
+    #[test]
+    fn artifact_pxar_v12_reuses_strict_owner_authentication_and_clock_admission() {
+        let request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+            &decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"
+            )),
+        )
+        .expect("shared PXAR v12 fixture");
+        let (admission, _) =
+            python_fixture_admission_for_target_and_budget(0x05, 6_000_083);
+        let generation = ClockGeneration::try_new(3).expect("fixture generation");
+        let reading = ClockReading::new(
+            ClockDomainRef::from_bytes([0x0a; 16]),
+            generation,
+            MonotonicInstant::from_ticks(100),
+        );
+        let verified = admission
+            .policy
+            .verify_artifact_managed_model_agent_stack_apply_request(&request, reading)
+            .expect("shared PXAR v12 must authenticate and admit");
+
+        assert_eq!(verified.clock_generation(), generation);
+        assert_eq!(verified.admitted_at_nanos(), 100);
+        assert_eq!(verified.deadline_nanos(), 6_000_183);
+        assert_eq!(
+            verified.authenticated().proof_envelope_digest(),
+            admission
+                .policy
+                .authenticate_artifact_managed_model_agent_stack_apply_request(&request)
+                .expect("shared PXAR v12 must authenticate")
+                .proof_envelope_digest(),
+        );
+        assert_eq!(
+            admission
+                .policy
+                .verify_artifact_managed_model_agent_stack_apply_request(
+                    &request,
+                    ClockReading::new(
+                        ClockDomainRef::from_bytes([0x0b; 16]),
+                        generation,
+                        MonotonicInstant::from_ticks(100),
+                    ),
+                ),
+            Err(ManagedFabricApplyAdmissionError::ClockDomainMismatch),
+        );
     }
 
     #[test]
