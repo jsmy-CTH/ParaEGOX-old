@@ -2168,6 +2168,19 @@ impl ManagedModelAgentStackTerminalReceiptV1 {
         Ok(self.facts)
     }
 
+    /// Revalidates every request-owned PXMT fact without consulting transport state.
+    ///
+    /// Durable Controller snapshots use this seam to prove that an archived PXMT
+    /// still names the exact PXAR v12 request. Channel selection and Ed25519
+    /// verification remain separate mutating-reopen responsibilities.
+    pub fn validate_artifact_request_correlation(
+        &self,
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> Result<ManagedModelAgentStackTerminalFactsV1, ManagedModelAgentStackPlanError> {
+        self.facts.validate_against_artifact_request(request)?;
+        Ok(self.facts)
+    }
+
     #[must_use]
     pub const fn facts(&self) -> ManagedModelAgentStackTerminalFactsV1 {
         self.facts

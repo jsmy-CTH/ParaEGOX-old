@@ -11,13 +11,16 @@ use core::{fmt, str::FromStr};
 use ed25519_dalek::Signature;
 use paraegox_artifact::{ArtifactConfigCommitmentV1, ArtifactContractError, ArtifactObjectRefV1};
 use paraegox_kernel::digest::{Digest32, Digest32Builder, DigestBuildError};
+use paraegox_runtime_contracts::apply::ExpectedActive;
 use paraegox_runtime_contracts::managed_fabric_plan::{
     ManagedFabricApplyTerminalOutcomeV1, ManagedFabricTargetExecutionV1, ManagedFabricTargetModeV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
-    ArtifactExecutionBindingV1, ManagedModelAgentStackApplyRequestV1,
-    ManagedModelAgentStackPlanError, ManagedModelAgentStackTargetModeV1,
-    ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptV1,
+    ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ArtifactBoundManagedModelAgentStackTargetExecutionV1, ArtifactExecutionBindingV1,
+    ManagedModelAgentStackApplyRequestV1, ManagedModelAgentStackPlanError,
+    ManagedModelAgentStackTargetModeV1, ManagedModelAgentStackTerminalOutcomeV1,
+    ManagedModelAgentStackTerminalReceiptV1,
 };
 use paraegox_runtime_contracts::managed_service::ManagedServiceGeneration;
 use paraegox_runtime_contracts::provenance::{SourcePlanRevision, TargetSliceDigest};
@@ -31,6 +34,7 @@ use crate::managed_fabric_producer::{
     ManagedFabricControllerProvisioningV1, VerifiedManagedFabricProducerContextV1,
 };
 use crate::managed_model_agent_stack_producer::{
+    ArtifactBoundManagedModelAgentStackPlanContentV2,
     FreshManagedModelAgentStackApplyV1, ManagedModelAgentStackActivationV1,
     ManagedModelAgentStackDesiredPlanV1, ManagedModelAgentStackProducerError,
     produce_managed_model_agent_stack_empty_request_v1,
@@ -58,6 +62,19 @@ const EXTERNAL_ADMISSION_DIGEST_DOMAIN: &[u8] = b"paraegox.deployment.external-a
 const EXTERNAL_RECORD_DIGEST_DOMAIN: &[u8] =
     b"paraegox.deployment.external-operation-record.sha256.v1";
 const EXTERNAL_RECEIPT_DIGEST_DOMAIN: &[u8] = b"paraegox.deployment.external-receipt.sha256.v1";
+const ARTIFACT_STATE_V2_HEADER_BYTES: usize = 192;
+const ARTIFACT_STATE_V2_CHECKSUM_BYTES: usize = 32;
+const MAX_ARTIFACT_STATE_V2_BYTES: usize = 16_614;
+const MAX_ARTIFACT_PLAN_CONTENT_V2_BYTES: usize = 2_758;
+const MAX_ARTIFACT_TARGET_EXECUTION_V11_BYTES: usize = 2_506;
+const MAX_ARTIFACT_APPLY_REQUEST_V12_BYTES: usize = 6_630;
+const MAX_ARTIFACT_TERMINAL_RECEIPT_V1_BYTES: usize = 2_048;
+const ARTIFACT_STATE_V2_CHECKSUM_DOMAIN: &[u8] =
+    b"paraegox.deployment.artifact-bound-managed-model-agent-stack-state.sha256.v2";
+const ARTIFACT_CUTOVER_MARKER_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.deployment.artifact-external-cutover-marker.sha256.v1";
+const ARTIFACT_DESIRED_DIGEST_DOMAIN: &[u8] =
+    b"paraegox.deployment.artifact-bound-managed-model-agent-stack-desired.sha256.v1";
 
 /// DeploymentController-owned D0b operation identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -867,6 +884,747 @@ impl FromStr for DeploymentReceiptRefV1 {
         }
         Ok(decoded)
     }
+}
+
+/// Durable phase byte of one Artifact-bound PXMJ v2 snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactExternalControllerPhaseV2 {
+    Admitted,
+    Committed,
+    Applying,
+    ActiveReady,
+    Failed,
+    Uncertain,
+}
+
+impl ArtifactExternalControllerPhaseV2 {
+    const fn phase_byte(self) -> u8 {
+        match self {
+            Self::Admitted => b'A',
+            Self::Committed => b'C',
+            Self::Applying => b'P',
+            Self::ActiveReady => b'R',
+            Self::Failed => b'F',
+            Self::Uncertain => b'U',
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+        match value {
+            b'A' => Ok(Self::Admitted),
+            b'C' => Ok(Self::Committed),
+            b'P' => Ok(Self::Applying),
+            b'R' => Ok(Self::ActiveReady),
+            b'F' => Ok(Self::Failed),
+            b'U' => Ok(Self::Uncertain),
+            _ => Err(ManagedModelAgentStackApplyControllerError::InvalidState),
+        }
+    }
+}
+
+/// Fully-owned semantic input for one canonical PXMJ v2 snapshot.
+pub(crate) struct ArtifactExternalControllerStateInputV2 {
+    pub(crate) phase: ArtifactExternalControllerPhaseV2,
+    pub(crate) controller_snapshot_sequence: NonZeroU64,
+    pub(crate) request: ArtifactExternalDeploymentRequestV1,
+    pub(crate) admission: ArtifactExternalDeploymentAdmissionV1,
+    pub(crate) plan_content: Option<ArtifactBoundManagedModelAgentStackPlanContentV2>,
+    pub(crate) execution: Option<ArtifactBoundManagedModelAgentStackTargetExecutionV1>,
+    pub(crate) runtime_request: Option<ArtifactBoundManagedModelAgentStackApplyRequestV1>,
+    pub(crate) runtime_terminal: Option<ManagedModelAgentStackTerminalReceiptV1>,
+    pub(crate) records: Vec<ArtifactExternalDeploymentRecordV1>,
+    pub(crate) receipt: Option<ArtifactExternalDeploymentReceiptV1>,
+}
+
+/// Canonical self-contained Artifact-bound Controller state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactExternalControllerStateV2 {
+    phase: ArtifactExternalControllerPhaseV2,
+    controller_snapshot_sequence: NonZeroU64,
+    request: ArtifactExternalDeploymentRequestV1,
+    admission: ArtifactExternalDeploymentAdmissionV1,
+    plan_content: Option<ArtifactBoundManagedModelAgentStackPlanContentV2>,
+    execution: Option<ArtifactBoundManagedModelAgentStackTargetExecutionV1>,
+    runtime_request: Option<ArtifactBoundManagedModelAgentStackApplyRequestV1>,
+    runtime_terminal: Option<ManagedModelAgentStackTerminalReceiptV1>,
+    records: Vec<ArtifactExternalDeploymentRecordV1>,
+    receipt: Option<ArtifactExternalDeploymentReceiptV1>,
+}
+
+impl ArtifactExternalControllerStateV2 {
+    pub(crate) fn try_new(
+        input: ArtifactExternalControllerStateInputV2,
+    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+        let state = Self {
+            phase: input.phase,
+            controller_snapshot_sequence: input.controller_snapshot_sequence,
+            request: input.request,
+            admission: input.admission,
+            plan_content: input.plan_content,
+            execution: input.execution,
+            runtime_request: input.runtime_request,
+            runtime_terminal: input.runtime_terminal,
+            records: input.records,
+            receipt: input.receipt,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    #[must_use]
+    pub(crate) const fn phase(&self) -> ArtifactExternalControllerPhaseV2 {
+        self.phase
+    }
+
+    #[must_use]
+    pub(crate) const fn controller_snapshot_sequence(&self) -> NonZeroU64 {
+        self.controller_snapshot_sequence
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &ArtifactExternalDeploymentRequestV1 {
+        &self.request
+    }
+
+    #[must_use]
+    pub(crate) const fn admission(&self) -> &ArtifactExternalDeploymentAdmissionV1 {
+        &self.admission
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_request(
+        &self,
+    ) -> Option<&ArtifactBoundManagedModelAgentStackApplyRequestV1> {
+        self.runtime_request.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) const fn runtime_terminal(
+        &self,
+    ) -> Option<&ManagedModelAgentStackTerminalReceiptV1> {
+        self.runtime_terminal.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn records(&self) -> &[ArtifactExternalDeploymentRecordV1] {
+        &self.records
+    }
+
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> Option<&ArtifactExternalDeploymentReceiptV1> {
+        self.receipt.as_ref()
+    }
+
+    pub(crate) fn cutover_marker_digest(
+        &self,
+    ) -> Result<Digest32, ManagedModelAgentStackApplyControllerError> {
+        artifact_external_cutover_marker_digest(&self.request, &self.admission)
+    }
+
+    pub(crate) fn encode(
+        &self,
+    ) -> Result<Box<[u8]>, ManagedModelAgentStackApplyControllerError> {
+        self.validate()?;
+        let plan_content = self
+            .plan_content
+            .as_ref()
+            .map_or(&[][..], |value| value.canonical_bytes());
+        let execution = self
+            .execution
+            .as_ref()
+            .map_or(&[][..], |value| value.canonical_wire());
+        let runtime_request = self
+            .runtime_request
+            .as_ref()
+            .map_or(&[][..], |value| value.canonical_wire());
+        let runtime_terminal = self
+            .runtime_terminal
+            .as_ref()
+            .map_or(&[][..], |value| value.canonical_wire());
+        let record_bytes = self
+            .records
+            .len()
+            .checked_mul(EXTERNAL_RECORD_BYTES)
+            .ok_or(ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let receipt_bytes = usize::from(self.receipt.is_some())
+            .checked_mul(EXTERNAL_RECEIPT_BYTES)
+            .ok_or(ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let body_len = EXTERNAL_REQUEST_BYTES
+            .checked_add(EXTERNAL_ADMISSION_BYTES)
+            .and_then(|value| value.checked_add(plan_content.len()))
+            .and_then(|value| value.checked_add(execution.len()))
+            .and_then(|value| value.checked_add(runtime_request.len()))
+            .and_then(|value| value.checked_add(runtime_terminal.len()))
+            .and_then(|value| value.checked_add(record_bytes))
+            .and_then(|value| value.checked_add(receipt_bytes))
+            .ok_or(ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let frame_len = ARTIFACT_STATE_V2_HEADER_BYTES
+            .checked_add(body_len)
+            .and_then(|value| value.checked_add(ARTIFACT_STATE_V2_CHECKSUM_BYTES))
+            .ok_or(ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        if frame_len > MAX_ARTIFACT_STATE_V2_BYTES {
+            return Err(ManagedModelAgentStackApplyControllerError::StateTooLarge);
+        }
+        let plan_content_len = u32::try_from(plan_content.len())
+            .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let execution_len = u32::try_from(execution.len())
+            .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let runtime_request_len = u32::try_from(runtime_request.len())
+            .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let runtime_terminal_len = u32::try_from(runtime_terminal.len())
+            .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let record_count = u16::try_from(self.records.len())
+            .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let receipt_count = if self.receipt.is_some() { 1_u16 } else { 0 };
+        let body_len_u32 = u32::try_from(body_len)
+            .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let frame_len_u32 = u32::try_from(frame_len)
+            .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let mut wire = Vec::with_capacity(frame_len);
+        wire.extend_from_slice(b"PXMJ");
+        wire.extend_from_slice(&2_u16.to_be_bytes());
+        wire.extend_from_slice(&(ARTIFACT_STATE_V2_HEADER_BYTES as u16).to_be_bytes());
+        wire.extend_from_slice(&frame_len_u32.to_be_bytes());
+        wire.push(self.phase.phase_byte());
+        wire.extend_from_slice(&[0; 3]);
+        wire.extend_from_slice(&self.controller_snapshot_sequence.get().to_be_bytes());
+        wire.extend_from_slice(self.admission.controller_store_instance());
+        wire.extend_from_slice(&self.admission.admission_sequence().get().to_be_bytes());
+        wire.extend_from_slice(
+            &self
+                .receipt
+                .as_ref()
+                .map_or(0, |value| value.receipt_sequence().get())
+                .to_be_bytes(),
+        );
+        if let Some(runtime_request) = &self.runtime_request {
+            wire.extend_from_slice(&1_u64.to_be_bytes());
+            let ExpectedActive::Exact(predecessor) = runtime_request
+                .control_commitment()
+                .control()
+                .expected_active()
+            else {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            };
+            wire.extend_from_slice(predecessor.value().as_bytes());
+            wire.extend_from_slice(
+                self.plan_content
+                    .as_ref()
+                    .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?
+                    .digest()
+                    .value()
+                    .as_bytes(),
+            );
+        } else {
+            wire.extend_from_slice(&[0; 72]);
+        }
+        wire.extend_from_slice(&(EXTERNAL_REQUEST_BYTES as u32).to_be_bytes());
+        wire.extend_from_slice(&(EXTERNAL_ADMISSION_BYTES as u32).to_be_bytes());
+        wire.extend_from_slice(&plan_content_len.to_be_bytes());
+        wire.extend_from_slice(&execution_len.to_be_bytes());
+        wire.extend_from_slice(&runtime_request_len.to_be_bytes());
+        wire.extend_from_slice(&runtime_terminal_len.to_be_bytes());
+        wire.extend_from_slice(&record_count.to_be_bytes());
+        wire.extend_from_slice(&receipt_count.to_be_bytes());
+        wire.extend_from_slice(&body_len_u32.to_be_bytes());
+        wire.extend_from_slice(&[0; 16]);
+        if wire.len() != ARTIFACT_STATE_V2_HEADER_BYTES {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        wire.extend_from_slice(self.request.canonical_wire());
+        wire.extend_from_slice(self.admission.canonical_wire());
+        wire.extend_from_slice(plan_content);
+        wire.extend_from_slice(execution);
+        wire.extend_from_slice(runtime_request);
+        wire.extend_from_slice(runtime_terminal);
+        for record in &self.records {
+            wire.extend_from_slice(record.canonical_wire());
+        }
+        if let Some(receipt) = &self.receipt {
+            wire.extend_from_slice(receipt.canonical_wire());
+        }
+        let checksum = artifact_state_v2_checksum(&wire)?;
+        wire.extend_from_slice(checksum.as_bytes());
+        Ok(wire.into_boxed_slice())
+    }
+
+    pub(crate) fn decode(
+        frame: &[u8],
+    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+        if frame.len() < ARTIFACT_STATE_V2_HEADER_BYTES + ARTIFACT_STATE_V2_CHECKSUM_BYTES {
+            return Err(ManagedModelAgentStackApplyControllerError::StateTruncated);
+        }
+        if frame.len() > MAX_ARTIFACT_STATE_V2_BYTES {
+            return Err(ManagedModelAgentStackApplyControllerError::StateTooLarge);
+        }
+        if frame.get(0..4) != Some(b"PXMJ".as_slice())
+            || read_u16_at(frame, 4) != Some(2)
+            || read_u16_at(frame, 6) != Some(ARTIFACT_STATE_V2_HEADER_BYTES as u16)
+            || read_u32_at(frame, 8) != u32::try_from(frame.len()).ok()
+            || frame[13..16] != [0; 3]
+            || frame[176..192].iter().any(|byte| *byte != 0)
+            || read_u32_at(frame, 144) != Some(EXTERNAL_REQUEST_BYTES as u32)
+            || read_u32_at(frame, 148) != Some(EXTERNAL_ADMISSION_BYTES as u32)
+        {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        let phase = ArtifactExternalControllerPhaseV2::decode(frame[12])?;
+        let controller_snapshot_sequence = NonZeroU64::new(
+            read_u64_at(frame, 16)
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        )
+        .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?;
+        let plan_content_len = usize::try_from(
+            read_u32_at(frame, 152)
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        )
+        .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let execution_len = usize::try_from(
+            read_u32_at(frame, 156)
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        )
+        .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let runtime_request_len = usize::try_from(
+            read_u32_at(frame, 160)
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        )
+        .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let runtime_terminal_len = usize::try_from(
+            read_u32_at(frame, 164)
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        )
+        .map_err(|_| ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let record_count = usize::from(
+            read_u16_at(frame, 168)
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        );
+        let receipt_count = usize::from(
+            read_u16_at(frame, 170)
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        );
+        if plan_content_len > MAX_ARTIFACT_PLAN_CONTENT_V2_BYTES
+            || execution_len > MAX_ARTIFACT_TARGET_EXECUTION_V11_BYTES
+            || runtime_request_len > MAX_ARTIFACT_APPLY_REQUEST_V12_BYTES
+            || runtime_terminal_len > MAX_ARTIFACT_TERMINAL_RECEIPT_V1_BYTES
+            || record_count > 3
+            || receipt_count > 1
+        {
+            return Err(ManagedModelAgentStackApplyControllerError::StateTooLarge);
+        }
+        let record_bytes = record_count
+            .checked_mul(EXTERNAL_RECORD_BYTES)
+            .ok_or(ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let receipt_bytes = receipt_count
+            .checked_mul(EXTERNAL_RECEIPT_BYTES)
+            .ok_or(ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        let body_len = EXTERNAL_REQUEST_BYTES
+            .checked_add(EXTERNAL_ADMISSION_BYTES)
+            .and_then(|value| value.checked_add(plan_content_len))
+            .and_then(|value| value.checked_add(execution_len))
+            .and_then(|value| value.checked_add(runtime_request_len))
+            .and_then(|value| value.checked_add(runtime_terminal_len))
+            .and_then(|value| value.checked_add(record_bytes))
+            .and_then(|value| value.checked_add(receipt_bytes))
+            .ok_or(ManagedModelAgentStackApplyControllerError::StateTooLarge)?;
+        if read_u32_at(frame, 172) != u32::try_from(body_len).ok()
+            || ARTIFACT_STATE_V2_HEADER_BYTES
+                .checked_add(body_len)
+                .and_then(|value| value.checked_add(ARTIFACT_STATE_V2_CHECKSUM_BYTES))
+                != Some(frame.len())
+        {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        let checksum_offset = frame.len() - ARTIFACT_STATE_V2_CHECKSUM_BYTES;
+        let checksum = Digest32::from_bytes(
+            frame[checksum_offset..]
+                .try_into()
+                .map_err(|_| ManagedModelAgentStackApplyControllerError::InvalidState)?,
+        );
+        if artifact_state_v2_checksum(&frame[..checksum_offset])? != checksum {
+            return Err(ManagedModelAgentStackApplyControllerError::StateChecksumMismatch);
+        }
+        let mut cursor = Cursor {
+            frame: &frame[ARTIFACT_STATE_V2_HEADER_BYTES..checksum_offset],
+            position: 0,
+        };
+        let request = ArtifactExternalDeploymentRequestV1::decode(
+            cursor.take(EXTERNAL_REQUEST_BYTES)?,
+        )?;
+        let admission = ArtifactExternalDeploymentAdmissionV1::decode(
+            cursor.take(EXTERNAL_ADMISSION_BYTES)?,
+            &request,
+        )?;
+        let plan_content_wire = cursor.take(plan_content_len)?;
+        let execution_wire = cursor.take(execution_len)?;
+        let runtime_request_wire = cursor.take(runtime_request_len)?;
+        let runtime_terminal_wire = cursor.take(runtime_terminal_len)?;
+        let (plan_content, execution, runtime_request) = if plan_content_len == 0
+            && execution_len == 0
+            && runtime_request_len == 0
+        {
+            (None, None, None)
+        } else {
+            if plan_content_len == 0 || execution_len == 0 || runtime_request_len == 0 {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+            let execution =
+                ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(execution_wire)?;
+            let plan_content = ArtifactBoundManagedModelAgentStackPlanContentV2::decode(
+                execution.projection().target(),
+                plan_content_wire,
+            )?;
+            let runtime_request =
+                ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(runtime_request_wire)?;
+            (Some(plan_content), Some(execution), Some(runtime_request))
+        };
+        let runtime_terminal = if runtime_terminal_wire.is_empty() {
+            None
+        } else {
+            Some(ManagedModelAgentStackTerminalReceiptV1::decode(
+                runtime_terminal_wire,
+            )?)
+        };
+        let mut records = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            let previous = records.last();
+            records.push(ArtifactExternalDeploymentRecordV1::decode(
+                cursor.take(EXTERNAL_RECORD_BYTES)?,
+                &request,
+                &admission,
+                previous,
+            )?);
+        }
+        let receipt = if receipt_count == 0 {
+            None
+        } else {
+            let terminal = records
+                .last()
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?;
+            Some(ArtifactExternalDeploymentReceiptV1::decode(
+                cursor.take(EXTERNAL_RECEIPT_BYTES)?,
+                &request,
+                &admission,
+                terminal,
+            )?)
+        };
+        cursor.finish()?;
+        let decoded = Self::try_new(ArtifactExternalControllerStateInputV2 {
+            phase,
+            controller_snapshot_sequence,
+            request,
+            admission,
+            plan_content,
+            execution,
+            runtime_request,
+            runtime_terminal,
+            records,
+            receipt,
+        })?;
+        if decoded.encode()?.as_ref() != frame {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        Ok(decoded)
+    }
+
+    fn validate(&self) -> Result<(), ManagedModelAgentStackApplyControllerError> {
+        validate_request_admission(&self.request, &self.admission)?;
+        if self.admission.admission_sequence().get() != 1 || self.records.len() > 3 {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        let plan_presence = [
+            self.plan_content.is_some(),
+            self.execution.is_some(),
+            self.runtime_request.is_some(),
+        ];
+        if plan_presence.iter().any(|present| *present)
+            && plan_presence.iter().any(|present| !*present)
+        {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        if let (Some(plan_content), Some(execution), Some(runtime_request)) = (
+            &self.plan_content,
+            &self.execution,
+            &self.runtime_request,
+        ) {
+            validate_artifact_runtime_prefix(
+                &self.request,
+                &self.admission,
+                plan_content,
+                execution,
+                runtime_request,
+            )?;
+        } else if self.runtime_terminal.is_some() {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        if let (Some(runtime_request), Some(runtime_terminal)) =
+            (&self.runtime_request, &self.runtime_terminal)
+        {
+            runtime_terminal.validate_artifact_request_correlation(runtime_request)?;
+        }
+        let mut previous = None;
+        for record in &self.records {
+            validate_record_owner(record, &self.request, &self.admission)?;
+            if ArtifactExternalDeploymentRecordV1::decode(
+                record.canonical_wire(),
+                &self.request,
+                &self.admission,
+                previous,
+            )? != *record
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+            validate_artifact_record_progress(record, self.runtime_request.as_ref(), self.runtime_terminal.as_ref())?;
+            previous = Some(record);
+        }
+        if let Some(receipt) = &self.receipt {
+            let terminal = self
+                .records
+                .last()
+                .ok_or(ManagedModelAgentStackApplyControllerError::InvalidState)?;
+            if receipt.receipt_sequence().get() != 1
+                || ArtifactExternalDeploymentReceiptV1::decode(
+                    receipt.canonical_wire(),
+                    &self.request,
+                    &self.admission,
+                    terminal,
+                )? != *receipt
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+        }
+        validate_artifact_state_shape(self)
+    }
+}
+
+fn artifact_external_cutover_marker_digest(
+    request: &ArtifactExternalDeploymentRequestV1,
+    admission: &ArtifactExternalDeploymentAdmissionV1,
+) -> Result<Digest32, ManagedModelAgentStackApplyControllerError> {
+    validate_request_admission(request, admission)?;
+    let mut digest = Digest32Builder::try_new(ARTIFACT_CUTOVER_MARKER_DIGEST_DOMAIN)?;
+    digest.field_bytes(admission.controller_store_instance())?;
+    digest.field_u64(admission.admission_sequence().get())?;
+    digest.field_digest(&request.request_digest())?;
+    digest.field_digest(&admission.admission_digest())?;
+    let digest = digest.finish();
+    require_nonzero_digest(digest)?;
+    Ok(digest)
+}
+
+fn validate_artifact_runtime_prefix(
+    deployment_request: &ArtifactExternalDeploymentRequestV1,
+    admission: &ArtifactExternalDeploymentAdmissionV1,
+    plan_content: &ArtifactBoundManagedModelAgentStackPlanContentV2,
+    execution: &ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+    runtime_request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+) -> Result<(), ManagedModelAgentStackApplyControllerError> {
+    if plan_content.binding() != deployment_request.binding()
+        || execution.binding() != deployment_request.binding()
+        || plan_content.execution() != execution
+        || runtime_request.target_execution() != execution
+        || plan_content.target() != runtime_request.target()
+    {
+        return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+    }
+    let ExpectedActive::Exact(predecessor) = runtime_request
+        .control_commitment()
+        .control()
+        .expected_active()
+    else {
+        return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+    };
+    require_nonzero_digest(*predecessor.value())?;
+    let marker = artifact_external_cutover_marker_digest(deployment_request, admission)?;
+    let provenance = runtime_request.provenance();
+    let mut digest = Digest32Builder::try_new(ARTIFACT_DESIRED_DIGEST_DOMAIN)?;
+    digest.field_digest(&marker)?;
+    digest.field_bytes(runtime_request.target().as_bytes())?;
+    digest.field_bytes(provenance.source_scope().as_bytes())?;
+    digest.field_bytes(provenance.source_plan().as_bytes())?;
+    digest.field_u64(provenance.source_revision().value())?;
+    digest.field_bytes(predecessor.value().as_bytes())?;
+    digest.field_digest(&deployment_request.request_digest())?;
+    digest.field_digest(&admission.admission_digest())?;
+    digest.field_digest(&plan_content.digest().value())?;
+    digest.field_bytes(execution.canonical_wire())?;
+    if digest.finish() != *provenance.source_plan_digest().value() {
+        return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+    }
+    Ok(())
+}
+
+fn validate_artifact_record_progress(
+    record: &ArtifactExternalDeploymentRecordV1,
+    runtime_request: Option<&ArtifactBoundManagedModelAgentStackApplyRequestV1>,
+    runtime_terminal: Option<&ManagedModelAgentStackTerminalReceiptV1>,
+) -> Result<(), ManagedModelAgentStackApplyControllerError> {
+    let progress = record.progress();
+    let Some(runtime_request) = runtime_request else {
+        if progress.deployment_revision != 0
+            || progress.controller_snapshot_sequence != 0
+            || !all_zero_32(progress.desired_head_digest)
+            || !all_zero_32(progress.runtime_apply_request_digest)
+            || !all_zero_32(progress.runtime_terminal_receipt_digest)
+        {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        return Ok(());
+    };
+    if progress.deployment_revision != 1
+        || progress.controller_snapshot_sequence != 2
+        || progress.desired_head_digest != *runtime_request.target_slice_digest().value().as_bytes()
+        || (!all_zero_32(progress.runtime_apply_request_digest)
+            && progress.runtime_apply_request_digest
+                != *runtime_request.envelope_request_digest().as_bytes())
+    {
+        return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+    }
+    match runtime_terminal {
+        Some(terminal) => {
+            if record.state().is_terminal()
+                && progress.runtime_terminal_receipt_digest
+                    != *terminal.receipt_digest().as_bytes()
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+            if !record.state().is_terminal()
+                && !all_zero_32(progress.runtime_terminal_receipt_digest)
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+        }
+        None if !all_zero_32(progress.runtime_terminal_receipt_digest) => {
+            return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn validate_artifact_state_shape(
+    state: &ArtifactExternalControllerStateV2,
+) -> Result<(), ManagedModelAgentStackApplyControllerError> {
+    let record_states: Vec<_> = state.records.iter().map(|record| record.state()).collect();
+    let plan_present = state.runtime_request.is_some();
+    let sequence = state.controller_snapshot_sequence.get();
+    match state.phase {
+        ArtifactExternalControllerPhaseV2::Admitted => {
+            if sequence != 1
+                || plan_present
+                || state.runtime_terminal.is_some()
+                || !state.records.is_empty()
+                || state.receipt.is_some()
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+        }
+        ArtifactExternalControllerPhaseV2::Committed => {
+            if sequence != 2
+                || !plan_present
+                || state.runtime_terminal.is_some()
+                || record_states != [ArtifactExternalDeploymentRecordStateV1::Committed]
+                || state.receipt.is_some()
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+        }
+        ArtifactExternalControllerPhaseV2::Applying => {
+            if sequence != 3
+                || !plan_present
+                || state.runtime_terminal.is_some()
+                || record_states
+                    != [
+                        ArtifactExternalDeploymentRecordStateV1::Committed,
+                        ArtifactExternalDeploymentRecordStateV1::Applying,
+                    ]
+                || state.receipt.is_some()
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+        }
+        ArtifactExternalControllerPhaseV2::ActiveReady => {
+            if sequence != 4
+                || !plan_present
+                || record_states
+                    != [
+                        ArtifactExternalDeploymentRecordStateV1::Committed,
+                        ArtifactExternalDeploymentRecordStateV1::Applying,
+                        ArtifactExternalDeploymentRecordStateV1::ActiveReady,
+                    ]
+                || state.receipt.is_none()
+                || state.runtime_terminal.as_ref().map(|terminal| {
+                    terminal.facts().state().outcome()
+                }) != Some(ManagedModelAgentStackTerminalOutcomeV1::ActiveReady)
+            {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+        }
+        ArtifactExternalControllerPhaseV2::Failed
+        | ArtifactExternalControllerPhaseV2::Uncertain => {
+            let terminal_state = if state.phase == ArtifactExternalControllerPhaseV2::Failed {
+                ArtifactExternalDeploymentRecordStateV1::Failed
+            } else {
+                ArtifactExternalDeploymentRecordStateV1::Uncertain
+            };
+            let valid_prefix = match record_states.as_slice() {
+                [terminal] if *terminal == terminal_state => sequence == 2 && !plan_present,
+                [ArtifactExternalDeploymentRecordStateV1::Committed, terminal]
+                    if *terminal == terminal_state =>
+                {
+                    sequence == 3 && plan_present
+                }
+                [
+                    ArtifactExternalDeploymentRecordStateV1::Committed,
+                    ArtifactExternalDeploymentRecordStateV1::Applying,
+                    terminal,
+                ] if *terminal == terminal_state => sequence == 4 && plan_present,
+                _ => false,
+            };
+            if !valid_prefix || state.receipt.is_none() {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+            if record_states.len() < 3 && state.runtime_terminal.is_some() {
+                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+            }
+            if let Some(runtime_terminal) = &state.runtime_terminal {
+                let expected_phase = match runtime_terminal.facts().state().outcome() {
+                    ManagedModelAgentStackTerminalOutcomeV1::NoEffectRejected
+                    | ManagedModelAgentStackTerminalOutcomeV1::Quarantined => {
+                        ArtifactExternalControllerPhaseV2::Failed
+                    }
+                    ManagedModelAgentStackTerminalOutcomeV1::Uncertain => {
+                        ArtifactExternalControllerPhaseV2::Uncertain
+                    }
+                    ManagedModelAgentStackTerminalOutcomeV1::ActiveReady
+                    | ManagedModelAgentStackTerminalOutcomeV1::EmptyExactZero => {
+                        return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+                    }
+                };
+                if state.phase != expected_phase {
+                    return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+                }
+            }
+        }
+    }
+    if state.receipt.is_some()
+        && state
+            .records
+            .last()
+            .is_none_or(|record| record.state().state_byte() != state.phase.phase_byte())
+    {
+        return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+    }
+    Ok(())
+}
+
+fn artifact_state_v2_checksum(
+    frame_without_checksum: &[u8],
+) -> Result<Digest32, ManagedModelAgentStackApplyControllerError> {
+    let mut checksum = Digest32Builder::try_new(ARTIFACT_STATE_V2_CHECKSUM_DOMAIN)?;
+    checksum.field_bytes(frame_without_checksum)?;
+    let checksum = checksum.finish();
+    require_nonzero_digest(checksum)?;
+    Ok(checksum)
 }
 
 fn validate_request_admission(
@@ -2286,6 +3044,11 @@ mod tests {
     use crate::managed_fabric_apply::{
         ManagedFabricApplyJournalV1, ManagedFabricControllerStateV1, tests as fabric_tests,
     };
+    use crate::managed_model_agent_stack_producer::{
+        ArtifactBoundManagedModelAgentStackDesiredInputV1,
+        ArtifactBoundManagedModelAgentStackDesiredPlanV1,
+        produce_artifact_bound_managed_model_agent_stack_request_v1,
+    };
 
     const RUNTIME_KEY: ApplyAuthKeyRef = ApplyAuthKeyRef::from_bytes([0x38; 16]);
 
@@ -2338,7 +3101,7 @@ mod tests {
             "pxamr1:{}:1:{}:{}",
             "a0".repeat(32),
             "a2".repeat(16),
-            "ef84d5cb34af9263ce2b933f3d0e4e45f9896f6805fb54e5841b5c91950110f",
+            "ef84d5cb34af9263ce2b933f3d0e4e45f9896f6805fb54e5841b5c91950110f3",
         )
         .parse::<MaterializationReceiptRefV1>()
         .expect("primary materialization Receipt ref");
@@ -3337,5 +4100,428 @@ mod tests {
                 .phase(),
             ManagedModelAgentStackApplyPhaseV1::Uncertain
         );
+    }
+
+    fn artifact_runtime_prefix() -> (
+        ArtifactExternalDeploymentRequestV1,
+        ArtifactExternalDeploymentAdmissionV1,
+        ArtifactBoundManagedModelAgentStackPlanContentV2,
+        ArtifactBoundManagedModelAgentStackTargetExecutionV1,
+        ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) {
+        let deployment_request = artifact_external_request();
+        let admission = ArtifactExternalDeploymentAdmissionV1::try_new(
+            [0x46; 32],
+            NonZeroU64::new(1).expect("admission sequence"),
+            &deployment_request,
+        )
+        .expect("PXDK");
+        let state = active_fabric_state();
+        let controller = fabric_tests::controller_signer();
+        let provisioning = fabric_tests::provisioning();
+        let context = state
+            .verified_current_context(&controller, &provisioning)
+            .expect("verified Fabric context");
+        let predecessor = state.desired().expect("Fabric desired");
+        let predecessor_request = state.request().expect("Fabric request");
+        let requested = activation(provider(0x83), &state);
+        let desired = ArtifactBoundManagedModelAgentStackDesiredPlanV1::try_activate(
+            ArtifactBoundManagedModelAgentStackDesiredInputV1 {
+                context: &context,
+                cutover_marker_digest: artifact_external_cutover_marker_digest(
+                    &deployment_request,
+                    &admission,
+                )
+                .expect("cutover marker"),
+                predecessor_revision: predecessor.revision(),
+                predecessor_execution: predecessor.execution(),
+                predecessor_slice_digest: predecessor_request.target_slice_digest(),
+                deployment_request_digest: deployment_request.request_digest(),
+                deployment_admission_digest: admission.admission_digest(),
+                binding: deployment_request.binding(),
+                activation: &requested,
+            },
+        )
+        .expect("Artifact-bound desired");
+        let runtime_request = produce_artifact_bound_managed_model_agent_stack_request_v1(
+            &context,
+            &desired,
+            fresh(0xa0),
+            &controller,
+        )
+        .expect("PXAR12");
+        (
+            deployment_request,
+            admission,
+            desired.plan_content().clone(),
+            desired.execution().clone(),
+            runtime_request,
+        )
+    }
+
+    fn signed_artifact_active_receipt(
+        request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    ) -> ManagedModelAgentStackTerminalReceiptV1 {
+        let generation = |value| {
+            Some(ManagedServiceGeneration::try_new(value).expect("service generation"))
+        };
+        let state = ManagedModelAgentStackTerminalStateV1::try_new(
+            ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
+            ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
+            ManagedModelAgentStackTerminalHeadV1::CommittedIncoming,
+            generation(7),
+            generation(8),
+            generation(9),
+        )
+        .expect("ActiveReady terminal state");
+        let evidence = ManagedModelAgentStackTerminalEvidenceV1::try_new(
+            ManagedModelAgentStackTerminalEvidenceFieldsV1 {
+                physical_binding_census: 2,
+                census_complete: true,
+                fabric_ready: true,
+                model_ready: true,
+                agent_ready: true,
+                fabric_to_agent_dependency_ready: true,
+                model_to_agent_dependency_ready: true,
+                exact_zero: false,
+                quarantined: false,
+                resource_census_digest: Digest32::from_bytes([0xa1; 32]),
+                raw_outcome_digest: Digest32::from_bytes([0xa2; 32]),
+                completion_runtime_host_epoch: 12,
+                completion_snapshot_sequence: 13,
+                selection_clock_generation: request.temporal().target_clock_generation(),
+                selection_observed_at_nanos: 14,
+            },
+        )
+        .expect("ActiveReady evidence");
+        let facts = ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(
+            request, state, evidence,
+        )
+        .expect("Artifact PXMT facts");
+        let channel = fabric_tests::channel();
+        let auth = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
+            channel,
+            RUNTIME_KEY,
+            ApplyAuthAlgorithm::try_new(1).expect("algorithm"),
+            1,
+        )
+        .expect("PXMT auth");
+        let draft = ManagedModelAgentStackTerminalReceiptDraftV1::try_new_artifact_bound(
+            request, facts, channel, auth,
+        )
+        .expect("PXMT draft");
+        let runtime: SigningKey = fabric_tests::runtime_signer();
+        let signature = runtime.sign(
+            draft
+                .signing_transcript()
+                .expect("PXMT transcript")
+                .as_bytes(),
+        );
+        draft.finalize(&signature.to_bytes()).expect("signed PXMT")
+    }
+
+    fn rewrite_artifact_state_checksum(frame: &mut [u8]) {
+        let checksum_offset = frame.len() - ARTIFACT_STATE_V2_CHECKSUM_BYTES;
+        let checksum = artifact_state_v2_checksum(&frame[..checksum_offset])
+            .expect("PXMJ2 checksum");
+        frame[checksum_offset..].copy_from_slice(checksum.as_bytes());
+    }
+
+    #[test]
+    fn artifact_external_controller_state_v2_reopens_every_durable_prefix() {
+        let (request, admission, plan_content, execution, runtime_request) =
+            artifact_runtime_prefix();
+        let admitted = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Admitted,
+                controller_snapshot_sequence: NonZeroU64::new(1).expect("sequence"),
+                request: request.clone(),
+                admission: admission.clone(),
+                plan_content: None,
+                execution: None,
+                runtime_request: None,
+                runtime_terminal: None,
+                records: Vec::new(),
+                receipt: None,
+            },
+        )
+        .expect("PXMJ2-A");
+        let admitted_wire = admitted.encode().expect("PXMJ2-A wire");
+        assert_eq!(admitted_wire.len(), 752);
+        assert_eq!(
+            ArtifactExternalControllerStateV2::decode(&admitted_wire).expect("reopen A"),
+            admitted,
+        );
+
+        let desired_head = *runtime_request.target_slice_digest().value();
+        let committed_progress = ArtifactExternalDeploymentProgressV1::try_new(
+            NonZeroU64::new(1),
+            NonZeroU64::new(2),
+            Some(desired_head),
+            None,
+            None,
+            None,
+        )
+        .expect("committed progress");
+        let committed_record = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Committed,
+            NonZeroU64::new(1).expect("record sequence"),
+            &request,
+            &admission,
+            committed_progress,
+            None,
+        )
+        .expect("PXDM-C");
+        let committed = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Committed,
+                controller_snapshot_sequence: NonZeroU64::new(2).expect("sequence"),
+                request: request.clone(),
+                admission: admission.clone(),
+                plan_content: Some(plan_content.clone()),
+                execution: Some(execution.clone()),
+                runtime_request: Some(runtime_request.clone()),
+                runtime_terminal: None,
+                records: vec![committed_record.clone()],
+                receipt: None,
+            },
+        )
+        .expect("PXMJ2-C");
+        assert_eq!(
+            ArtifactExternalControllerStateV2::decode(
+                &committed.encode().expect("PXMJ2-C wire")
+            )
+            .expect("reopen C"),
+            committed,
+        );
+
+        let applying_progress = ArtifactExternalDeploymentProgressV1::try_new(
+            NonZeroU64::new(1),
+            NonZeroU64::new(2),
+            Some(desired_head),
+            Some(runtime_request.envelope_request_digest()),
+            None,
+            Some([0x54; 16]),
+        )
+        .expect("applying progress");
+        let applying_record = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Applying,
+            NonZeroU64::new(2).expect("record sequence"),
+            &request,
+            &admission,
+            applying_progress,
+            Some(&committed_record),
+        )
+        .expect("PXDM-P");
+        let applying = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Applying,
+                controller_snapshot_sequence: NonZeroU64::new(3).expect("sequence"),
+                request: request.clone(),
+                admission: admission.clone(),
+                plan_content: Some(plan_content.clone()),
+                execution: Some(execution.clone()),
+                runtime_request: Some(runtime_request.clone()),
+                runtime_terminal: None,
+                records: vec![committed_record.clone(), applying_record.clone()],
+                receipt: None,
+            },
+        )
+        .expect("PXMJ2-P");
+        assert_eq!(
+            ArtifactExternalControllerStateV2::decode(
+                &applying.encode().expect("PXMJ2-P wire")
+            )
+            .expect("reopen P"),
+            applying,
+        );
+
+        let runtime_terminal = signed_artifact_active_receipt(&runtime_request);
+        let active_progress = ArtifactExternalDeploymentProgressV1::try_new(
+            NonZeroU64::new(1),
+            NonZeroU64::new(2),
+            Some(desired_head),
+            Some(runtime_request.envelope_request_digest()),
+            Some(runtime_terminal.receipt_digest()),
+            Some([0x54; 16]),
+        )
+        .expect("active progress");
+        let active_record = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::ActiveReady,
+            NonZeroU64::new(3).expect("record sequence"),
+            &request,
+            &admission,
+            active_progress,
+            Some(&applying_record),
+        )
+        .expect("PXDM-R");
+        let receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+            NonZeroU64::new(1).expect("receipt sequence"),
+            &request,
+            &admission,
+            &active_record,
+        )
+        .expect("PXDO-R");
+        let active = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::ActiveReady,
+                controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
+                request: request.clone(),
+                admission: admission.clone(),
+                plan_content: Some(plan_content.clone()),
+                execution: Some(execution.clone()),
+                runtime_request: Some(runtime_request.clone()),
+                runtime_terminal: Some(runtime_terminal.clone()),
+                records: vec![
+                    committed_record.clone(),
+                    applying_record.clone(),
+                    active_record,
+                ],
+                receipt: Some(receipt),
+            },
+        )
+        .expect("PXMJ2-R");
+        let active_wire = active.encode().expect("PXMJ2-R wire");
+        assert_eq!(&active_wire[..4], b"PXMJ");
+        assert_eq!(u16::from_be_bytes([active_wire[4], active_wire[5]]), 2);
+        assert_eq!(active_wire[12], b'R');
+        assert_eq!(
+            ArtifactExternalControllerStateV2::decode(&active_wire).expect("reopen R"),
+            active,
+        );
+
+        let failed_progress = ArtifactExternalDeploymentProgressV1::try_new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some([0x55; 16]),
+        )
+        .expect("pre-C failed progress");
+        let failed_record = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Failed,
+            NonZeroU64::new(1).expect("record sequence"),
+            &request,
+            &admission,
+            failed_progress,
+            None,
+        )
+        .expect("PXDM-F");
+        let failed_receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+            NonZeroU64::new(1).expect("receipt sequence"),
+            &request,
+            &admission,
+            &failed_record,
+        )
+        .expect("PXDO-F");
+        let failed = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Failed,
+                controller_snapshot_sequence: NonZeroU64::new(2).expect("sequence"),
+                request: request.clone(),
+                admission: admission.clone(),
+                plan_content: None,
+                execution: None,
+                runtime_request: None,
+                runtime_terminal: None,
+                records: vec![failed_record],
+                receipt: Some(failed_receipt),
+            },
+        )
+        .expect("PXMJ2-F pre-C");
+        assert_eq!(
+            ArtifactExternalControllerStateV2::decode(&failed.encode().expect("PXMJ2-F wire"))
+                .expect("reopen F"),
+            failed,
+        );
+
+        let uncertain_record = ArtifactExternalDeploymentRecordV1::try_new(
+            ArtifactExternalDeploymentRecordStateV1::Uncertain,
+            NonZeroU64::new(3).expect("record sequence"),
+            &request,
+            &admission,
+            applying_progress,
+            Some(&applying_record),
+        )
+        .expect("PXDM-U");
+        let uncertain_receipt = ArtifactExternalDeploymentReceiptV1::try_new(
+            NonZeroU64::new(1).expect("receipt sequence"),
+            &request,
+            &admission,
+            &uncertain_record,
+        )
+        .expect("PXDO-U");
+        let uncertain = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Uncertain,
+                controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
+                request,
+                admission,
+                plan_content: Some(plan_content),
+                execution: Some(execution),
+                runtime_request: Some(runtime_request),
+                runtime_terminal: None,
+                records: vec![committed_record, applying_record, uncertain_record],
+                receipt: Some(uncertain_receipt),
+            },
+        )
+        .expect("PXMJ2-U post-P without PXMT");
+        assert_eq!(
+            ArtifactExternalControllerStateV2::decode(
+                &uncertain.encode().expect("PXMJ2-U wire")
+            )
+            .expect("reopen U"),
+            uncertain,
+        );
+    }
+
+    #[test]
+    fn artifact_external_controller_state_v2_rejects_header_and_phase_drift() {
+        let (request, admission, _, _, _) = artifact_runtime_prefix();
+        let state = ArtifactExternalControllerStateV2::try_new(
+            ArtifactExternalControllerStateInputV2 {
+                phase: ArtifactExternalControllerPhaseV2::Admitted,
+                controller_snapshot_sequence: NonZeroU64::new(1).expect("sequence"),
+                request,
+                admission,
+                plan_content: None,
+                execution: None,
+                runtime_request: None,
+                runtime_terminal: None,
+                records: Vec::new(),
+                receipt: None,
+            },
+        )
+        .expect("PXMJ2-A");
+        let wire = state.encode().expect("PXMJ2-A wire");
+        for mut drift in [
+            {
+                let mut value = wire.to_vec();
+                value[12] = b'C';
+                value
+            },
+            {
+                let mut value = wire.to_vec();
+                value[16..24].copy_from_slice(&2_u64.to_be_bytes());
+                value
+            },
+            {
+                let mut value = wire.to_vec();
+                value[64..72].copy_from_slice(&1_u64.to_be_bytes());
+                value
+            },
+            {
+                let mut value = wire.to_vec();
+                value[168..170].copy_from_slice(&1_u16.to_be_bytes());
+                value
+            },
+        ] {
+            rewrite_artifact_state_checksum(&mut drift);
+            assert!(ArtifactExternalControllerStateV2::decode(&drift).is_err());
+        }
+        let mut trailing = wire.to_vec();
+        trailing.push(0);
+        assert!(ArtifactExternalControllerStateV2::decode(&trailing).is_err());
     }
 }
