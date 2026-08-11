@@ -3272,6 +3272,9 @@ mod artifact_external_store {
     const NEXT_NAME: &str = ".artifact-external.pxmj.next";
     const LIFECYCLE_ROOT_NAME: &str = "operator-v1";
     const LIFECYCLE_OWNER_LOCK_NAME: &str = "owner.lock";
+    const LIFECYCLE_RECORD_NAME: &str = "lifecycle-v1.json";
+    const LIFECYCLE_RECORD_NEXT_NAME: &str = "lifecycle-v1.tmp";
+    const LIFECYCLE_CONTROL_SOCKET_NAME: &str = "control-v1.sock";
     const DIRECTORY_MODE_BITS: u32 = 0o700;
     const FILE_MODE_BITS: u32 = 0o600;
     const MODE_MASK: u32 = 0o7777;
@@ -3918,6 +3921,26 @@ mod artifact_external_store {
         ))
     }
 
+    fn validate_lifecycle_root_entries(
+        lifecycle_root: &DirectoryHandle,
+    ) -> Result<(), ArtifactExternalControllerStoreFailureV1> {
+        let admitted = [
+            OsString::from(LIFECYCLE_OWNER_LOCK_NAME),
+            OsString::from(LIFECYCLE_RECORD_NAME),
+            OsString::from(LIFECYCLE_RECORD_NEXT_NAME),
+            OsString::from(LIFECYCLE_CONTROL_SOCKET_NAME),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if !scan_names(lifecycle_root)?
+            .into_iter()
+            .all(|name| admitted.contains(&name))
+        {
+            return Err(ArtifactExternalControllerStoreFailureV1::Owner);
+        }
+        Ok(())
+    }
+
     fn open_regular_at(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -4456,6 +4479,7 @@ mod artifact_external_store {
                     };
                 }
             };
+        validate_lifecycle_root_entries(&lifecycle_root)?;
         let (lifecycle_lock, lifecycle_lock_identity) = match open_optional_regular_at(
             &lifecycle_root,
             OsStr::new(LIFECYCLE_OWNER_LOCK_NAME),
@@ -4502,6 +4526,7 @@ mod artifact_external_store {
                 OsStr::new(LIFECYCLE_ROOT_NAME),
                 lifecycle_root.identity,
             )?;
+            validate_lifecycle_root_entries(&lifecycle_root)?;
             validate_named_regular(
                 &lifecycle_root,
                 OsStr::new(LIFECYCLE_OWNER_LOCK_NAME),
@@ -5355,7 +5380,6 @@ impl DeveloperArtifactExternalControllerInvocationV1 {
         self.changed
     }
 
-    #[must_use]
     pub fn result(
         &self,
     ) -> Result<
@@ -8396,6 +8420,17 @@ mod tests {
             Err(ArtifactExternalControllerStoreFailureV1::Contended),
         );
         lifecycle_lock.unlock().expect("release lifecycle owner");
+
+        fs::write(lifecycle_root.join("unexpected"), b"unexpected")
+            .expect("create unexpected lifecycle entry");
+        let invalid = ArtifactExternalDeploymentControllerStoreV1::query(
+            &mut authority,
+            request.operation_id(),
+        );
+        assert_eq!(
+            invalid.into_result(),
+            Err(ArtifactExternalControllerStoreFailureV1::Owner),
+        );
     }
 
     #[test]
