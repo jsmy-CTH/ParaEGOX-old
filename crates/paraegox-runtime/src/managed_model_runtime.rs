@@ -901,7 +901,8 @@ mod tests {
         fn resolve_artifact(
             &self,
             _execution: &ArtifactBoundManagedModelAgentStackTargetExecutionV1,
-        ) -> Result<RuntimeResolvedArtifactModelBackendV1, RuntimeModelBackendResolveError> {
+        ) -> Result<RuntimeResolvedArtifactModelBackendV1, RuntimeModelBackendResolveError>
+        {
             self.artifact_calls.fetch_add(1, Ordering::SeqCst);
             Ok(RuntimeResolvedArtifactModelBackendV1::new(
                 self.execution.clone(),
