@@ -2345,8 +2345,7 @@ impl ArtifactStoreSnapshotV1 {
                 return Err(ArtifactContractError::InvalidSnapshot);
             }
             if operation.receipt().is_none()
-                && (missing_receipt.replace(index).is_some()
-                    || index + 1 != self.operations.len())
+                && (missing_receipt.replace(index).is_some() || index + 1 != self.operations.len())
             {
                 return Err(ArtifactContractError::InvalidSnapshot);
             }
