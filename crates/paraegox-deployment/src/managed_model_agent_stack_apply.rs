@@ -34,10 +34,9 @@ use crate::managed_fabric_producer::{
     ManagedFabricControllerProvisioningV1, VerifiedManagedFabricProducerContextV1,
 };
 use crate::managed_model_agent_stack_producer::{
-    ArtifactBoundManagedModelAgentStackPlanContentV2,
-    FreshManagedModelAgentStackApplyV1, ManagedModelAgentStackActivationV1,
-    ManagedModelAgentStackDesiredPlanV1, ManagedModelAgentStackProducerError,
-    produce_managed_model_agent_stack_empty_request_v1,
+    ArtifactBoundManagedModelAgentStackPlanContentV2, FreshManagedModelAgentStackApplyV1,
+    ManagedModelAgentStackActivationV1, ManagedModelAgentStackDesiredPlanV1,
+    ManagedModelAgentStackProducerError, produce_managed_model_agent_stack_empty_request_v1,
     produce_managed_model_agent_stack_request_v1,
     validate_managed_model_agent_stack_empty_request_v1,
     validate_managed_model_agent_stack_request_v1,
@@ -1021,9 +1020,7 @@ impl ArtifactExternalControllerStateV2 {
         artifact_external_cutover_marker_digest(&self.request, &self.admission)
     }
 
-    pub(crate) fn encode(
-        &self,
-    ) -> Result<Box<[u8]>, ManagedModelAgentStackApplyControllerError> {
+    pub(crate) fn encode(&self) -> Result<Box<[u8]>, ManagedModelAgentStackApplyControllerError> {
         self.validate()?;
         let plan_content = self
             .plan_content
@@ -1148,9 +1145,7 @@ impl ArtifactExternalControllerStateV2 {
         Ok(wire.into_boxed_slice())
     }
 
-    pub(crate) fn decode(
-        frame: &[u8],
-    ) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
+    pub(crate) fn decode(frame: &[u8]) -> Result<Self, ManagedModelAgentStackApplyControllerError> {
         if frame.len() < ARTIFACT_STATE_V2_HEADER_BYTES + ARTIFACT_STATE_V2_CHECKSUM_BYTES {
             return Err(ManagedModelAgentStackApplyControllerError::StateTruncated);
         }
@@ -1247,9 +1242,8 @@ impl ArtifactExternalControllerStateV2 {
             frame: &frame[ARTIFACT_STATE_V2_HEADER_BYTES..checksum_offset],
             position: 0,
         };
-        let request = ArtifactExternalDeploymentRequestV1::decode(
-            cursor.take(EXTERNAL_REQUEST_BYTES)?,
-        )?;
+        let request =
+            ArtifactExternalDeploymentRequestV1::decode(cursor.take(EXTERNAL_REQUEST_BYTES)?)?;
         let admission = ArtifactExternalDeploymentAdmissionV1::decode(
             cursor.take(EXTERNAL_ADMISSION_BYTES)?,
             &request,
@@ -1258,25 +1252,24 @@ impl ArtifactExternalControllerStateV2 {
         let execution_wire = cursor.take(execution_len)?;
         let runtime_request_wire = cursor.take(runtime_request_len)?;
         let runtime_terminal_wire = cursor.take(runtime_terminal_len)?;
-        let (plan_content, execution, runtime_request) = if plan_content_len == 0
-            && execution_len == 0
-            && runtime_request_len == 0
-        {
-            (None, None, None)
-        } else {
-            if plan_content_len == 0 || execution_len == 0 || runtime_request_len == 0 {
-                return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
-            }
-            let execution =
-                ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(execution_wire)?;
-            let plan_content = ArtifactBoundManagedModelAgentStackPlanContentV2::decode(
-                execution.projection().target(),
-                plan_content_wire,
-            )?;
-            let runtime_request =
-                ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(runtime_request_wire)?;
-            (Some(plan_content), Some(execution), Some(runtime_request))
-        };
+        let (plan_content, execution, runtime_request) =
+            if plan_content_len == 0 && execution_len == 0 && runtime_request_len == 0 {
+                (None, None, None)
+            } else {
+                if plan_content_len == 0 || execution_len == 0 || runtime_request_len == 0 {
+                    return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
+                }
+                let execution =
+                    ArtifactBoundManagedModelAgentStackTargetExecutionV1::decode(execution_wire)?;
+                let plan_content = ArtifactBoundManagedModelAgentStackPlanContentV2::decode(
+                    execution.projection().target(),
+                    plan_content_wire,
+                )?;
+                let runtime_request = ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(
+                    runtime_request_wire,
+                )?;
+                (Some(plan_content), Some(execution), Some(runtime_request))
+            };
         let runtime_terminal = if runtime_terminal_wire.is_empty() {
             None
         } else {
@@ -1341,11 +1334,9 @@ impl ArtifactExternalControllerStateV2 {
         {
             return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
         }
-        if let (Some(plan_content), Some(execution), Some(runtime_request)) = (
-            &self.plan_content,
-            &self.execution,
-            &self.runtime_request,
-        ) {
+        if let (Some(plan_content), Some(execution), Some(runtime_request)) =
+            (&self.plan_content, &self.execution, &self.runtime_request)
+        {
             validate_artifact_runtime_prefix(
                 &self.request,
                 &self.admission,
@@ -1373,7 +1364,11 @@ impl ArtifactExternalControllerStateV2 {
             {
                 return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
             }
-            validate_artifact_record_progress(record, self.runtime_request.as_ref(), self.runtime_terminal.as_ref())?;
+            validate_artifact_record_progress(
+                record,
+                self.runtime_request.as_ref(),
+                self.runtime_terminal.as_ref(),
+            )?;
             previous = Some(record);
         }
         if let Some(receipt) = &self.receipt {
@@ -1482,8 +1477,7 @@ fn validate_artifact_record_progress(
     match runtime_terminal {
         Some(terminal) => {
             if record.state().is_terminal()
-                && progress.runtime_terminal_receipt_digest
-                    != *terminal.receipt_digest().as_bytes()
+                && progress.runtime_terminal_receipt_digest != *terminal.receipt_digest().as_bytes()
             {
                 return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
             }
@@ -1552,9 +1546,11 @@ fn validate_artifact_state_shape(
                         ArtifactExternalDeploymentRecordStateV1::ActiveReady,
                     ]
                 || state.receipt.is_none()
-                || state.runtime_terminal.as_ref().map(|terminal| {
-                    terminal.facts().state().outcome()
-                }) != Some(ManagedModelAgentStackTerminalOutcomeV1::ActiveReady)
+                || state
+                    .runtime_terminal
+                    .as_ref()
+                    .map(|terminal| terminal.facts().state().outcome())
+                    != Some(ManagedModelAgentStackTerminalOutcomeV1::ActiveReady)
             {
                 return Err(ManagedModelAgentStackApplyControllerError::InvalidState);
             }
@@ -4162,9 +4158,8 @@ mod tests {
     fn signed_artifact_active_receipt(
         request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
     ) -> ManagedModelAgentStackTerminalReceiptV1 {
-        let generation = |value| {
-            Some(ManagedServiceGeneration::try_new(value).expect("service generation"))
-        };
+        let generation =
+            |value| Some(ManagedServiceGeneration::try_new(value).expect("service generation"));
         let state = ManagedModelAgentStackTerminalStateV1::try_new(
             ManagedModelAgentStackTerminalOutcomeV1::ActiveReady,
             ManagedModelAgentStackTerminalLifecycleEffectV1::MayHaveStarted,
@@ -4194,10 +4189,9 @@ mod tests {
             },
         )
         .expect("ActiveReady evidence");
-        let facts = ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(
-            request, state, evidence,
-        )
-        .expect("Artifact PXMT facts");
+        let facts =
+            ManagedModelAgentStackTerminalFactsV1::try_new_artifact_bound(request, state, evidence)
+                .expect("Artifact PXMT facts");
         let channel = fabric_tests::channel();
         let auth = ManagedModelAgentStackTerminalAuthClaimV1::try_new(
             channel,
@@ -4222,8 +4216,8 @@ mod tests {
 
     fn rewrite_artifact_state_checksum(frame: &mut [u8]) {
         let checksum_offset = frame.len() - ARTIFACT_STATE_V2_CHECKSUM_BYTES;
-        let checksum = artifact_state_v2_checksum(&frame[..checksum_offset])
-            .expect("PXMJ2 checksum");
+        let checksum =
+            artifact_state_v2_checksum(&frame[..checksum_offset]).expect("PXMJ2 checksum");
         frame[checksum_offset..].copy_from_slice(checksum.as_bytes());
     }
 
@@ -4231,8 +4225,8 @@ mod tests {
     fn artifact_external_controller_state_v2_reopens_every_durable_prefix() {
         let (request, admission, plan_content, execution, runtime_request) =
             artifact_runtime_prefix();
-        let admitted = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let admitted =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Admitted,
                 controller_snapshot_sequence: NonZeroU64::new(1).expect("sequence"),
                 request: request.clone(),
@@ -4243,9 +4237,8 @@ mod tests {
                 runtime_terminal: None,
                 records: Vec::new(),
                 receipt: None,
-            },
-        )
-        .expect("PXMJ2-A");
+            })
+            .expect("PXMJ2-A");
         let admitted_wire = admitted.encode().expect("PXMJ2-A wire");
         assert_eq!(admitted_wire.len(), 752);
         assert_eq!(
@@ -4272,8 +4265,8 @@ mod tests {
             None,
         )
         .expect("PXDM-C");
-        let committed = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let committed =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Committed,
                 controller_snapshot_sequence: NonZeroU64::new(2).expect("sequence"),
                 request: request.clone(),
@@ -4284,14 +4277,11 @@ mod tests {
                 runtime_terminal: None,
                 records: vec![committed_record.clone()],
                 receipt: None,
-            },
-        )
-        .expect("PXMJ2-C");
+            })
+            .expect("PXMJ2-C");
         assert_eq!(
-            ArtifactExternalControllerStateV2::decode(
-                &committed.encode().expect("PXMJ2-C wire")
-            )
-            .expect("reopen C"),
+            ArtifactExternalControllerStateV2::decode(&committed.encode().expect("PXMJ2-C wire"))
+                .expect("reopen C"),
             committed,
         );
 
@@ -4313,8 +4303,8 @@ mod tests {
             Some(&committed_record),
         )
         .expect("PXDM-P");
-        let applying = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let applying =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Applying,
                 controller_snapshot_sequence: NonZeroU64::new(3).expect("sequence"),
                 request: request.clone(),
@@ -4325,14 +4315,11 @@ mod tests {
                 runtime_terminal: None,
                 records: vec![committed_record.clone(), applying_record.clone()],
                 receipt: None,
-            },
-        )
-        .expect("PXMJ2-P");
+            })
+            .expect("PXMJ2-P");
         assert_eq!(
-            ArtifactExternalControllerStateV2::decode(
-                &applying.encode().expect("PXMJ2-P wire")
-            )
-            .expect("reopen P"),
+            ArtifactExternalControllerStateV2::decode(&applying.encode().expect("PXMJ2-P wire"))
+                .expect("reopen P"),
             applying,
         );
 
@@ -4362,8 +4349,8 @@ mod tests {
             &active_record,
         )
         .expect("PXDO-R");
-        let active = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let active =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::ActiveReady,
                 controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
                 request: request.clone(),
@@ -4378,9 +4365,8 @@ mod tests {
                     active_record,
                 ],
                 receipt: Some(receipt),
-            },
-        )
-        .expect("PXMJ2-R");
+            })
+            .expect("PXMJ2-R");
         let active_wire = active.encode().expect("PXMJ2-R wire");
         assert_eq!(&active_wire[..4], b"PXMJ");
         assert_eq!(u16::from_be_bytes([active_wire[4], active_wire[5]]), 2);
@@ -4415,8 +4401,8 @@ mod tests {
             &failed_record,
         )
         .expect("PXDO-F");
-        let failed = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let failed =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Failed,
                 controller_snapshot_sequence: NonZeroU64::new(2).expect("sequence"),
                 request: request.clone(),
@@ -4427,9 +4413,8 @@ mod tests {
                 runtime_terminal: None,
                 records: vec![failed_record],
                 receipt: Some(failed_receipt),
-            },
-        )
-        .expect("PXMJ2-F pre-C");
+            })
+            .expect("PXMJ2-F pre-C");
         assert_eq!(
             ArtifactExternalControllerStateV2::decode(&failed.encode().expect("PXMJ2-F wire"))
                 .expect("reopen F"),
@@ -4452,8 +4437,8 @@ mod tests {
             &uncertain_record,
         )
         .expect("PXDO-U");
-        let uncertain = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let uncertain =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Uncertain,
                 controller_snapshot_sequence: NonZeroU64::new(4).expect("sequence"),
                 request,
@@ -4464,14 +4449,11 @@ mod tests {
                 runtime_terminal: None,
                 records: vec![committed_record, applying_record, uncertain_record],
                 receipt: Some(uncertain_receipt),
-            },
-        )
-        .expect("PXMJ2-U post-P without PXMT");
+            })
+            .expect("PXMJ2-U post-P without PXMT");
         assert_eq!(
-            ArtifactExternalControllerStateV2::decode(
-                &uncertain.encode().expect("PXMJ2-U wire")
-            )
-            .expect("reopen U"),
+            ArtifactExternalControllerStateV2::decode(&uncertain.encode().expect("PXMJ2-U wire"))
+                .expect("reopen U"),
             uncertain,
         );
     }
@@ -4479,8 +4461,8 @@ mod tests {
     #[test]
     fn artifact_external_controller_state_v2_rejects_header_and_phase_drift() {
         let (request, admission, _, _, _) = artifact_runtime_prefix();
-        let state = ArtifactExternalControllerStateV2::try_new(
-            ArtifactExternalControllerStateInputV2 {
+        let state =
+            ArtifactExternalControllerStateV2::try_new(ArtifactExternalControllerStateInputV2 {
                 phase: ArtifactExternalControllerPhaseV2::Admitted,
                 controller_snapshot_sequence: NonZeroU64::new(1).expect("sequence"),
                 request,
@@ -4491,9 +4473,8 @@ mod tests {
                 runtime_terminal: None,
                 records: Vec::new(),
                 receipt: None,
-            },
-        )
-        .expect("PXMJ2-A");
+            })
+            .expect("PXMJ2-A");
         let wire = state.encode().expect("PXMJ2-A wire");
         for mut drift in [
             {
