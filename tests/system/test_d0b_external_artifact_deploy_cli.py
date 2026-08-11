@@ -75,6 +75,18 @@ def _require_exact_binary() -> Path:
     return binary.resolve(strict=True)
 
 
+def _require_console_program() -> Path:
+    configured = shutil.which("paraegox-console")
+    assert configured is not None, (
+        "the locked Python environment must expose the internal paraegox-console entrypoint"
+    )
+    console = Path(configured).resolve(strict=True)
+    metadata = console.lstat()
+    assert stat.S_ISREG(metadata.st_mode) and not console.is_symlink()
+    assert metadata.st_mode & 0o111
+    return console
+
+
 def _copy_exact_binary(source: Path, target: Path) -> None:
     shutil.copyfile(source, target)
     target.chmod(0o755)
@@ -107,13 +119,13 @@ def _write_config(path: Path, state_root: Path, fabric_port: int) -> None:
     assert stat.S_IMODE(metadata.st_mode) == 0o600
 
 
-def _environment(root: Path) -> dict[str, str]:
+def _environment(root: Path, console: Path) -> dict[str, str]:
     temporary = root / "tmp"
     temporary.mkdir(mode=0o700)
     return {
         "HOME": os.fspath(root),
         "TMPDIR": os.fspath(temporary),
-        "PATH": "/usr/bin:/bin",
+        "PATH": os.pathsep.join((os.fspath(console.parent), "/usr/bin", "/bin")),
         "TERM": "xterm-256color",
         "LANG": "C.UTF-8",
     }
@@ -312,6 +324,7 @@ def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins() 
     assert os.name == "posix" and Path("/proc").is_dir()
     assert os.geteuid() != 0 and os.getegid() != 0
     source_binary = _require_exact_binary()
+    console = _require_console_program()
 
     with tempfile.TemporaryDirectory(prefix=".paraegox-d0b-", dir=Path.home()) as raw:
         root = Path(raw).resolve(strict=True)
@@ -320,7 +333,7 @@ def test_d0b_external_artifact_reaches_active_ready_replays_queries_and_joins() 
         binary_directory.mkdir(mode=0o700)
         binary = binary_directory / "paraegox"
         _copy_exact_binary(source_binary, binary)
-        environment = _environment(root)
+        environment = _environment(root, console)
         state_root = root / "state"
         config_path = root / "paraegox.toml"
         _write_config(config_path, state_root, _reserve_loopback_port())
