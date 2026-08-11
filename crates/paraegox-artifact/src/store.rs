@@ -16,8 +16,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use nix::dir::Dir;
-use nix::fcntl::{OFlag, open, openat, renameat};
-use nix::sys::stat::{Mode, fchmod, mkdirat};
+use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
+use nix::sys::stat::{Mode, fchmod, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, getegid, geteuid, unlinkat};
 use rustix::fs::{RenameFlags, renameat_with};
 
@@ -365,6 +365,7 @@ enum StoreError {
     NotFound,
     Contended,
     PublicationUncertain(Option<MaterializationOperationV1>),
+    OwnerEffectUnknown,
     Owner,
     Io,
 }
@@ -381,7 +382,7 @@ impl StoreError {
             Self::PublicationUncertain(operation) => {
                 ArtifactStoreFailureV1::PublicationUncertain { operation }
             }
-            Self::Owner => ArtifactStoreFailureV1::Owner,
+            Self::OwnerEffectUnknown | Self::Owner => ArtifactStoreFailureV1::Owner,
             Self::Io => ArtifactStoreFailureV1::Io,
         }
     }
@@ -394,11 +395,18 @@ impl StoreError {
             Self::ConfigurationMismatch => ArtifactStoreReadFailureV1::ConfigurationMismatch,
             Self::NotFound => ArtifactStoreReadFailureV1::NotFound,
             Self::Contended => ArtifactStoreReadFailureV1::Contended,
-            Self::UnsafePath | Self::Owner | Self::PublicationUncertain(_) => {
+            Self::UnsafePath
+            | Self::OwnerEffectUnknown
+            | Self::Owner
+            | Self::PublicationUncertain(_) => {
                 ArtifactStoreReadFailureV1::Owner
             }
             Self::Io => ArtifactStoreReadFailureV1::Io,
         }
+    }
+
+    const fn owner_effect_unknown(&self) -> bool {
+        matches!(self, Self::OwnerEffectUnknown)
     }
 }
 
@@ -431,15 +439,15 @@ impl ChangeTracker {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
-    device: u64,
-    inode: u64,
+    device: i128,
+    inode: i128,
 }
 
 impl FileIdentity {
     fn from_metadata(metadata: &Metadata) -> Self {
         Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            device: i128::from(metadata.dev()),
+            inode: i128::from(metadata.ino()),
         }
     }
 }
@@ -1605,6 +1613,58 @@ fn pin_or_create_state_root(
     }
 }
 
+fn named_identity(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+) -> Result<Option<FileIdentity>, StoreError> {
+    let metadata = match fstatat(&parent.file, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(_) => return Err(StoreError::Io),
+    };
+    Ok(Some(FileIdentity {
+        device: i128::from(metadata.st_dev),
+        inode: i128::from(metadata.st_ino),
+    }))
+}
+
+fn validate_cleanup_identity(
+    actual: Option<FileIdentity>,
+    expected: FileIdentity,
+) -> Result<(), StoreError> {
+    if actual != Some(expected) {
+        return Err(StoreError::Owner);
+    }
+    Ok(())
+}
+
+fn cleanup_created_regular(
+    parent: &DirectoryHandle,
+    name: &str,
+    file: &File,
+    identity: FileIdentity,
+) -> Result<(), StoreError> {
+    validate_cleanup_identity(named_identity(parent, OsStr::new(name))?, identity)?;
+    unlinkat(&parent.file, name, UnlinkatFlags::NoRemoveDir).map_err(|_| StoreError::Io)?;
+    let metadata = file.metadata();
+    let parent_sync = parent.file.sync_all();
+    let absence = (|| {
+        revalidate_directory(parent)?;
+        if named_identity(parent, OsStr::new(name))?.is_some()
+            || scan_names(parent)?.contains(OsStr::new(name))
+        {
+            return Err(StoreError::Owner);
+        }
+        Ok(())
+    })();
+    let metadata = metadata.map_err(|_| StoreError::Io)?;
+    if FileIdentity::from_metadata(&metadata) != identity || metadata.nlink() != 0 {
+        return Err(StoreError::Owner);
+    }
+    parent_sync.map_err(|_| StoreError::Io)?;
+    absence
+}
+
 fn create_regular(
     parent: &DirectoryHandle,
     name: &str,
@@ -1624,13 +1684,27 @@ fn create_regular(
         }
     })?;
     let file = File::from(owned);
-    fchmod(&file, FILE_MODE).map_err(|_| StoreError::Io)?;
-    let metadata = file.metadata().map_err(|_| StoreError::Io)?;
-    validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
-    if metadata.len() != 0 {
-        return Err(StoreError::Owner);
+    let identity = FileIdentity::from_metadata(
+        &file
+            .metadata()
+            .map_err(|_| StoreError::OwnerEffectUnknown)?,
+    );
+    let prepared = (|| {
+        fchmod(&file, FILE_MODE).map_err(|_| StoreError::Io)?;
+        let metadata = file.metadata().map_err(|_| StoreError::Io)?;
+        validate_regular_metadata(&metadata, parent.owner_uid, parent.owner_gid)?;
+        if FileIdentity::from_metadata(&metadata) != identity || metadata.len() != 0 {
+            return Err(StoreError::Owner);
+        }
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        if cleanup_created_regular(parent, name, &file, identity).is_err() {
+            return Err(StoreError::OwnerEffectUnknown);
+        }
+        return Err(error);
     }
-    Ok((file, FileIdentity::from_metadata(&metadata)))
+    Ok((file, identity))
 }
 
 fn write_new_exact(
@@ -1984,9 +2058,7 @@ fn open_or_initialize_store(
     )
 }
 
-fn validate_initial_snapshot_shape(
-    snapshot: &ArtifactStoreSnapshotV1,
-) -> Result<(), StoreError> {
+fn validate_initial_snapshot_shape(snapshot: &ArtifactStoreSnapshotV1) -> Result<(), StoreError> {
     if snapshot.snapshot_sequence().get() != 1
         || snapshot.operation_high_water() != 1
         || snapshot.object_high_water() != 0
@@ -2883,11 +2955,19 @@ fn run_materialize(
     let mut store = match open_or_initialize_store(authority, &binding, request, &mut tracker) {
         Ok(store) => store,
         Err(error) => {
+            if error.owner_effect_unknown() {
+                tracker.ambiguous();
+            }
             return ArtifactStoreInvocationV1::failure(tracker.change(), error.into_public());
         }
     };
     let result =
         drive_materialization(&mut store, authority, &binding, request, pair, &mut tracker);
+    if let Err(error) = &result
+        && error.owner_effect_unknown()
+    {
+        tracker.ambiguous();
+    }
     finish_locked(store, tracker, result)
 }
 
@@ -2955,6 +3035,29 @@ mod tests {
         assert_eq!(tracker.change(), ArtifactStoreChangeV1::Changed);
         tracker.ambiguous();
         assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unknown);
+    }
+
+    #[test]
+    fn cleanup_identity_guard_rejects_missing_or_replaced_entry() {
+        let expected = FileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        assert_eq!(validate_cleanup_identity(Some(expected), expected), Ok(()));
+        assert_eq!(
+            validate_cleanup_identity(None, expected),
+            Err(StoreError::Owner),
+        );
+        assert_eq!(
+            validate_cleanup_identity(
+                Some(FileIdentity {
+                    device: 7,
+                    inode: 12,
+                }),
+                expected,
+            ),
+            Err(StoreError::Owner),
+        );
     }
 
     #[test]
