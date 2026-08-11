@@ -397,7 +397,7 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
 
         let agent_generation = next_generation(core.snapshot.agent_generation_high_water)?;
         core.commit_agent_start_intent(fabric, agent_generation)?;
-        if let Err(error) = core
+        if core
             .start_agent(
                 predecessor.control,
                 request.target_execution().embedded(),
@@ -405,8 +405,8 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
                 model_dependency,
             )
             .await
+            .is_err()
         {
-            record_d0b_runtime_diagnostic(&error);
             let model_exact = core.shutdown_model().await;
             let terminal = if model_exact {
                 Some(core.commit_agent_quarantined(
@@ -2637,13 +2637,6 @@ fn build_artifact_pre_cutover_no_effect_terminal(
         .response_signer
         .sign(draft.signing_transcript()?.as_bytes());
     Ok(draft.finalize(&signature.to_bytes())?)
-}
-
-fn record_d0b_runtime_diagnostic(error: &ManagedModelAgentStackRuntimeError) {
-    let Ok(path) = std::env::var("PARAEGOX_D0B_RUNTIME_DIAGNOSTIC_PATH") else {
-        return;
-    };
-    let _ = std::fs::write(path, format!("{error:?}\n"));
 }
 
 fn validate_artifact_cutover_request(
