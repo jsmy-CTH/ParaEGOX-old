@@ -2,6 +2,7 @@
 members = [
   "crates/paraegox-agent-contracts",
   "crates/paraegox-agent-service",
+  "crates/paraegox-artifact",
   "crates/paraegox-deployment",
   "crates/paraegox-evidence",
   "crates/paraegox-fabric",
@@ -39,6 +40,7 @@ zeroize = { version = "=1.8.2", default-features = false, features = ["alloc"] }
 zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_tls"] }
 paraegox-agent-contracts = { path = "crates/paraegox-agent-contracts" }
 paraegox-agent-service = { path = "crates/paraegox-agent-service" }
+paraegox-artifact = { path = "crates/paraegox-artifact" }
 paraegox-deployment = { path = "crates/paraegox-deployment" }
 paraegox-evidence = { path = "crates/paraegox-evidence" }
 paraegox-fabric = { path = "crates/paraegox-fabric" }

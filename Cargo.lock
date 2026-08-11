@@ -1623,6 +1623,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "paraegox-artifact"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "nix",
+ "paraegox-kernel",
+ "rustix",
+ "sha2",
+]
+
+[[package]]
 name = "paraegox-deployment"
 version = "0.1.0"
 dependencies = [
