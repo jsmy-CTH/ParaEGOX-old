@@ -2698,10 +2698,6 @@ fn open_or_initialize_store_observed(
         .into_iter()
         .map(OsString::from)
         .collect::<BTreeSet<_>>();
-    let lock_objects = [STORE_LOCK_NAME, OBJECTS_NAME]
-        .into_iter()
-        .map(OsString::from)
-        .collect::<BTreeSet<_>>();
     let complete = [STORE_LOCK_NAME, OBJECTS_NAME, STORE_SNAPSHOT_NAME]
         .into_iter()
         .map(OsString::from)
