@@ -1435,10 +1435,11 @@ fn inspect_initial_staging(
                 initial_staging_operation(&snapshot, operation_id)
             }?;
             drop(objects);
-            Ok(operation.map_or(
-                InitialStagingInspection::NotFound,
-                |operation| InitialStagingInspection::Operation(Box::new(operation)),
-            ))
+            Ok(
+                operation.map_or(InitialStagingInspection::NotFound, |operation| {
+                    InitialStagingInspection::Operation(Box::new(operation))
+                }),
+            )
         } else {
             Err(StoreError::Owner)
         }
