@@ -1641,12 +1641,7 @@ fn run_query_observed(
     }
     if !has_final {
         if has_staging {
-            match inspect_initial_staging_observed(
-                &state_root,
-                &binding,
-                operation_id,
-                observer,
-            ) {
+            match inspect_initial_staging_observed(&state_root, &binding, operation_id, observer) {
                 Ok(InitialStagingInspection::Operation(operation)) => {
                     return ArtifactStoreInvocationV1::failure(
                         ArtifactStoreChangeV1::Unchanged,
@@ -2004,12 +1999,7 @@ fn validate_held_initial_lock(
     if FileIdentity::from_metadata(&metadata) != lock_identity || metadata.len() != 0 {
         return Err(StoreError::Owner);
     }
-    validate_named_regular(
-        staging,
-        OsStr::new(STORE_LOCK_NAME),
-        lock_identity,
-        Some(0),
-    )
+    validate_named_regular(staging, OsStr::new(STORE_LOCK_NAME), lock_identity, Some(0))
 }
 
 fn seal_locked_initial_prefix(
@@ -2079,10 +2069,7 @@ fn seal_locked_initial_prefix(
     } else {
         None
     };
-    public_staging
-        .file
-        .sync_all()
-        .map_err(|_| StoreError::Io)?;
+    public_staging.file.sync_all().map_err(|_| StoreError::Io)?;
     state_root
         .leaf
         .file
@@ -2110,11 +2097,8 @@ fn seal_locked_initial_prefix(
     }
     validate_held_initial_lock(&reopened_staging, lock, lock_identity)?;
     if let Some(identity) = objects_claim {
-        let objects = reopen_named_directory(
-            &reopened_staging,
-            OsStr::new(OBJECTS_NAME),
-            identity,
-        )?;
+        let objects =
+            reopen_named_directory(&reopened_staging, OsStr::new(OBJECTS_NAME), identity)?;
         exact_names(&objects, &[])?;
         drop(objects);
     }
@@ -5176,7 +5160,10 @@ mod tests {
         assert!(observer.fired);
         assert_eq!(query.change(), ArtifactStoreChangeV1::Unchanged);
         assert_eq!(
-            query.result().expect("query follows appeared final").operation(),
+            query
+                .result()
+                .expect("query follows appeared final")
+                .operation(),
             &expected,
         );
     }
@@ -5218,16 +5205,15 @@ mod tests {
         let binding = fixture.authority.binding.clone();
         let mut authority = SwapWhenPathExistsAuthority {
             trigger: fixture.state_root().to_path_buf(),
-            displaced: fixture.state_root().with_file_name("state-created-displaced"),
+            displaced: fixture
+                .state_root()
+                .with_file_name("state-created-displaced"),
             binding,
             swapped: false,
         };
 
-        let invocation = ArtifactStoreV1::materialize(
-            &mut authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let invocation =
+            ArtifactStoreV1::materialize(&mut authority, &fixture.request, &fixture.pair);
         assert!(authority.swapped);
         assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
         assert_eq!(
@@ -5248,16 +5234,15 @@ mod tests {
             .join(OBJECTS_NAME);
         let mut authority = SwapWhenPathExistsAuthority {
             trigger,
-            displaced: fixture.state_root().with_file_name("state-prefix-displaced"),
+            displaced: fixture
+                .state_root()
+                .with_file_name("state-prefix-displaced"),
             binding,
             swapped: false,
         };
 
-        let invocation = ArtifactStoreV1::materialize(
-            &mut authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let invocation =
+            ArtifactStoreV1::materialize(&mut authority, &fixture.request, &fixture.pair);
         assert!(authority.swapped);
         assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
         assert_eq!(
@@ -5283,11 +5268,8 @@ mod tests {
             changed_config: config(0x7e),
         };
 
-        let invocation = ArtifactStoreV1::materialize(
-            &mut authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let invocation =
+            ArtifactStoreV1::materialize(&mut authority, &fixture.request, &fixture.pair);
         assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
         assert_eq!(
             invocation
@@ -5312,11 +5294,8 @@ mod tests {
             changed_config: config(0x7f),
         };
 
-        let invocation = ArtifactStoreV1::materialize(
-            &mut authority,
-            &fixture.request,
-            &fixture.pair,
-        );
+        let invocation =
+            ArtifactStoreV1::materialize(&mut authority, &fixture.request, &fixture.pair);
         assert_eq!(invocation.change(), ArtifactStoreChangeV1::Unknown);
         assert_eq!(
             invocation
@@ -5695,28 +5674,20 @@ mod tests {
 
     #[test]
     fn injected_unlock_failure_never_overrides_known_primary_error() {
-        for primary in [StoreError::Owner, StoreError::Capacity, StoreError::NotFound] {
+        for primary in [
+            StoreError::Owner,
+            StoreError::Capacity,
+            StoreError::NotFound,
+        ] {
             assert_eq!(
                 merge_primary_release::<()>(Err(primary.clone()), Err(StoreError::Io)),
                 Err(primary),
             );
         }
         for (operation_byte, primary, expected) in [
-            (
-                0x72,
-                StoreError::Owner,
-                ArtifactStoreFailureV1::Owner,
-            ),
-            (
-                0x73,
-                StoreError::Capacity,
-                ArtifactStoreFailureV1::Capacity,
-            ),
-            (
-                0x74,
-                StoreError::NotFound,
-                ArtifactStoreFailureV1::NotFound,
-            ),
+            (0x72, StoreError::Owner, ArtifactStoreFailureV1::Owner),
+            (0x73, StoreError::Capacity, ArtifactStoreFailureV1::Capacity),
+            (0x74, StoreError::NotFound, ArtifactStoreFailureV1::NotFound),
         ] {
             let mut fixture = TestStoreFixture::new(b"primary-before-unlock ", operation_byte);
             let (store, _binding, _tracker) = open_materializing_fixture(&mut fixture);
