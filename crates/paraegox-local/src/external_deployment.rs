@@ -17,8 +17,7 @@ use paraegox_deployment::{
     DeveloperArtifactExternalControllerAuthorityRecheckFailureV1,
     DeveloperArtifactExternalControllerAuthorityV1, DeveloperArtifactExternalControllerFailureV1,
     DeveloperArtifactExternalControllerInvocationV1, DeveloperArtifactExternalControllerPhaseV1,
-    DeveloperArtifactExternalControllerProjectionV1,
-    DeveloperArtifactExternalControllerV1,
+    DeveloperArtifactExternalControllerProjectionV1, DeveloperArtifactExternalControllerV1,
 };
 use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
     ArtifactExecutionBindingV1, artifact_execution_profile_commitment_v1,
@@ -143,19 +142,17 @@ impl ProjectionV1 {
             state: Some(state),
             profile: Some(PROFILE),
             artifact_object_ref: Some(projection.object_ref().to_string()),
-            materialization_receipt_ref: Some(
-                projection.materialization_receipt_ref().to_string(),
-            ),
-            generation: projection.lifecycle_generation().map(|value| lower_hex(&value)),
+            materialization_receipt_ref: Some(projection.materialization_receipt_ref().to_string()),
+            generation: projection
+                .lifecycle_generation()
+                .map(|value| lower_hex(&value)),
             deployment_revision: projection
                 .deployment_revision()
                 .map(|value| value.get().to_string()),
             controller_snapshot_sequence: projection
                 .committed_controller_snapshot_sequence()
                 .map(|value| value.get().to_string()),
-            deployment_receipt_ref: projection
-                .deployment_receipt_ref()
-                .map(ToOwned::to_owned),
+            deployment_receipt_ref: projection.deployment_receipt_ref().map(ToOwned::to_owned),
             runtime_apply_request_digest: projection
                 .runtime_apply_request_digest()
                 .map(|value| lower_hex(value.as_bytes())),

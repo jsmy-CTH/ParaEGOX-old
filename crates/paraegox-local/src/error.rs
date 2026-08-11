@@ -274,9 +274,7 @@ impl LocalProcessError {
             }
             Self::ArtifactExternalDeployNotFound => "deployment operation was not found",
             Self::ArtifactExternalDeployFailed => "deployment operation failed",
-            Self::ArtifactExternalDeployUncertain => {
-                "deployment operation outcome is uncertain"
-            }
+            Self::ArtifactExternalDeployUncertain => "deployment operation outcome is uncertain",
             Self::ArtifactExternalDeployOwner => {
                 "deployment owner could not complete the operation"
             }
