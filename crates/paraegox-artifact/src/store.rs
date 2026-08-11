@@ -362,6 +362,7 @@ enum StoreError {
     Conflict,
     Capacity,
     NotFound,
+    AlreadyExists,
     Contended,
     PublicationUncertain(Option<Box<MaterializationOperationV1>>),
     OwnerEffectUnknown,
@@ -377,6 +378,7 @@ impl StoreError {
             Self::ReferenceMismatch | Self::Conflict => ArtifactStoreFailureV1::Conflict,
             Self::Capacity => ArtifactStoreFailureV1::Capacity,
             Self::NotFound => ArtifactStoreFailureV1::NotFound,
+            Self::AlreadyExists => ArtifactStoreFailureV1::Owner,
             Self::Contended => ArtifactStoreFailureV1::Contended,
             Self::PublicationUncertain(operation) => {
                 ArtifactStoreFailureV1::PublicationUncertain { operation }
@@ -393,6 +395,7 @@ impl StoreError {
             }
             Self::ConfigurationMismatch => ArtifactStoreReadFailureV1::ConfigurationMismatch,
             Self::NotFound => ArtifactStoreReadFailureV1::NotFound,
+            Self::AlreadyExists => ArtifactStoreReadFailureV1::Owner,
             Self::Contended => ArtifactStoreReadFailureV1::Contended,
             Self::UnsafePath
             | Self::OwnerEffectUnknown
@@ -431,6 +434,10 @@ impl ChangeTracker {
 
     fn ambiguous(&mut self) {
         self.ambiguous_effect = true;
+    }
+
+    fn restore(&mut self, checkpoint: Self) {
+        *self = checkpoint;
     }
 }
 
@@ -1338,21 +1345,32 @@ fn permitted_next(
     Ok(operation_id)
 }
 
+struct ValidatedNext {
+    snapshot: ArtifactStoreSnapshotV1,
+    operation_id: ArtifactOperationIdV1,
+    bytes: Box<[u8]>,
+    identity: FileIdentity,
+}
+
 fn read_and_validate_next(
     store: &LockedStore,
-    binding: &ArtifactStoreAuthorityBindingV1,
-) -> Result<Option<(ArtifactStoreSnapshotV1, ArtifactOperationIdV1)>, StoreError> {
+) -> Result<Option<ValidatedNext>, StoreError> {
     let names = scan_names(&store.root)?;
     if !names.contains(OsStr::new(STORE_SNAPSHOT_NEXT_NAME)) {
         return Ok(None);
     }
-    let (candidate, _, _) = decode_snapshot(&store.root, STORE_SNAPSHOT_NEXT_NAME)?;
-    if candidate.config_commitment() != binding.config_commitment() {
-        return Err(StoreError::ConfigurationMismatch);
+    let (candidate, bytes, identity) = decode_snapshot(&store.root, STORE_SNAPSHOT_NEXT_NAME)?;
+    if candidate.config_commitment() != store.snapshot.config_commitment() {
+        return Err(StoreError::Owner);
     }
     let next = validate_candidate_filesystem(&store.objects, candidate)?;
     let operation_id = permitted_next(&store.snapshot, &next)?;
-    Ok(Some((next, operation_id)))
+    Ok(Some(ValidatedNext {
+        snapshot: next,
+        operation_id,
+        bytes,
+        identity,
+    }))
 }
 
 fn root_selection(state_root: &DirectoryHandle) -> Result<(bool, bool), StoreError> {
@@ -1435,11 +1453,7 @@ fn inspect_initial_staging(
                 initial_staging_operation(&snapshot, operation_id)
             }?;
             drop(objects);
-            Ok(
-                operation.map_or(InitialStagingInspection::NotFound, |operation| {
-                    InitialStagingInspection::Operation(Box::new(operation))
-                }),
-            )
+            Ok(InitialStagingInspection::Operation(Box::new(operation)))
         } else {
             Err(StoreError::Owner)
         }
@@ -1552,16 +1566,19 @@ fn run_query(
     let result = (|| {
         require_same_authority(authority, &binding)?;
         let active_operation = store.snapshot.operation(operation_id).cloned();
-        if let Some((_, next_operation_id)) = read_and_validate_next(&store, &binding)? {
+        if let Some(next) = read_and_validate_next(&store)? {
             if active_operation
                 .as_ref()
                 .is_some_and(|operation| operation.terminal().is_some())
             {
                 return Ok(active_operation.expect("checked as present"));
             }
-            if next_operation_id == operation_id {
+            if next.operation_id == operation_id {
                 return Err(StoreError::PublicationUncertain(
-                    active_operation.map(Box::new),
+                    next.snapshot
+                        .operation(operation_id)
+                        .cloned()
+                        .map(Box::new),
                 ));
             }
             return Err(StoreError::Owner);
@@ -1591,7 +1608,7 @@ fn run_read_verified(
         open_final_locked(state_root, &binding, LockMode::Shared).map_err(StoreError::into_read)?;
     let result = (|| {
         require_same_authority(authority, &binding)?;
-        let next = read_and_validate_next(&store, &binding)?;
+        let next = read_and_validate_next(&store)?;
         let operation = store
             .snapshot
             .operation(receipt_ref.operation_id())
@@ -1632,7 +1649,10 @@ fn pin_or_create_state_root(
     binding: &ArtifactStoreAuthorityBindingV1,
     tracker: &mut ChangeTracker,
 ) -> Result<StateRootHandle, StoreError> {
-    let (parent, leaf_name) = open_state_parent(binding.state_root())?;
+    let (parent, leaf_name) = open_state_parent(binding.state_root()).map_err(|error| match error {
+        StoreError::NotFound => StoreError::UnsafePath,
+        other => other,
+    })?;
     match open_state_leaf_at(&parent, &leaf_name) {
         Ok(leaf) => Ok(StateRootHandle {
             parent,
@@ -1641,13 +1661,33 @@ fn pin_or_create_state_root(
         }),
         Err(StoreError::NotFound) => {
             revalidate_directory(&parent)?;
-            mkdirat(&parent.file, leaf_name.as_os_str(), DIRECTORY_MODE).map_err(|error| {
-                if error == nix::errno::Errno::EEXIST {
-                    StoreError::Owner
-                } else {
-                    StoreError::Io
+            match mkdirat(&parent.file, leaf_name.as_os_str(), DIRECTORY_MODE) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::EEXIST) => {
+                    let expected_parent = parent.identity;
+                    parent.file.sync_all().map_err(|_| StoreError::Io)?;
+                    drop(parent);
+                    let (reopened_parent, reopened_leaf_name) =
+                        open_state_parent(binding.state_root())?;
+                    if reopened_parent.identity != expected_parent
+                        || reopened_leaf_name != leaf_name
+                    {
+                        return Err(StoreError::Owner);
+                    }
+                    let reopened_leaf = open_state_leaf_at(&reopened_parent, &leaf_name)
+                        .map_err(|error| match error {
+                            StoreError::NotFound => StoreError::PublicationUncertain(None),
+                            other => other,
+                        })?;
+                    require_same_authority(authority, binding)?;
+                    return Ok(StateRootHandle {
+                        parent: reopened_parent,
+                        leaf_name,
+                        leaf: reopened_leaf,
+                    });
                 }
-            })?;
+                Err(_) => return Err(StoreError::Io),
+            }
             let mut durability_proven = false;
             let result = (|| {
                 parent.file.sync_all().map_err(|_| StoreError::Io)?;
@@ -1747,7 +1787,7 @@ fn create_regular(
     )
     .map_err(|error| {
         if error == nix::errno::Errno::EEXIST {
-            StoreError::Owner
+            StoreError::AlreadyExists
         } else {
             StoreError::Io
         }
@@ -1795,20 +1835,27 @@ fn write_new_exact(
 
 fn create_and_lock_staging(staging: &DirectoryHandle) -> Result<(File, FileIdentity), StoreError> {
     let (lock, identity) = create_regular(staging, STORE_LOCK_NAME, OFlag::O_RDWR)?;
-    lock.sync_all().map_err(|_| StoreError::Io)?;
-    staging.file.sync_all().map_err(|_| StoreError::Io)?;
+    let durable_prefix = (|| {
+        lock.sync_all().map_err(|_| StoreError::Io)?;
+        staging.file.sync_all().map_err(|_| StoreError::Io)?;
+        validate_named_regular(staging, OsStr::new(STORE_LOCK_NAME), identity, Some(0))
+    })();
+    if durable_prefix.is_err() {
+        drop(lock);
+        return Err(StoreError::OwnerEffectUnknown);
+    }
     lock.try_lock().map_err(|error| match error {
         TryLockError::WouldBlock => StoreError::Contended,
         TryLockError::Error(_) => StoreError::Io,
     })?;
-    if let Err(error) =
-        validate_named_regular(staging, OsStr::new(STORE_LOCK_NAME), identity, Some(0))
-    {
-        let _ = lock.unlock();
-        drop(lock);
-        return Err(error);
-    }
     Ok((lock, identity))
+}
+
+fn classify_bootstrap_lock_collision(error: StoreError) -> StoreError {
+    match error {
+        StoreError::Contended => StoreError::Contended,
+        _ => StoreError::PublicationUncertain(None),
+    }
 }
 
 fn create_objects_directory(staging: &DirectoryHandle) -> Result<DirectoryHandle, StoreError> {
@@ -1925,6 +1972,85 @@ fn seal_initial_prefix(
     Ok((state_root, reopened_staging, reopened_objects))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialRenameState {
+    Staging,
+    Final,
+    Ambiguous,
+}
+
+struct InitialDirectoryClaim<'a> {
+    directory_identity: FileIdentity,
+    objects_identity: FileIdentity,
+    lock_identity: FileIdentity,
+    snapshot_identity: FileIdentity,
+    snapshot_bytes: &'a [u8],
+}
+
+fn initial_directory_matches(
+    parent: &DirectoryHandle,
+    name: &str,
+    claim: &InitialDirectoryClaim<'_>,
+) -> bool {
+    let validation = (|| {
+        let directory = reopen_named_directory(
+            parent,
+            OsStr::new(name),
+            claim.directory_identity,
+        )?;
+        exact_names(
+            &directory,
+            &[STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME],
+        )?;
+        validate_named_regular(
+            &directory,
+            OsStr::new(STORE_LOCK_NAME),
+            claim.lock_identity,
+            Some(0),
+        )?;
+        let (snapshot_bytes, snapshot_identity) = read_regular_bounded(
+            &directory,
+            OsStr::new(STORE_SNAPSHOT_NAME),
+            MAX_SNAPSHOT_BYTES,
+            false,
+        )?;
+        if snapshot_identity != claim.snapshot_identity
+            || snapshot_bytes.as_ref() != claim.snapshot_bytes
+        {
+            return Err(StoreError::Owner);
+        }
+        let objects = reopen_named_directory(
+            &directory,
+            OsStr::new(OBJECTS_NAME),
+            claim.objects_identity,
+        )?;
+        exact_names(&objects, &[])?;
+        drop(objects);
+        drop(directory);
+        Ok(())
+    })();
+    validation.is_ok()
+}
+
+fn classify_initial_rename_error(
+    state_root: &StateRootHandle,
+    claim: &InitialDirectoryClaim<'_>,
+) -> InitialRenameState {
+    match root_selection(&state_root.leaf) {
+        Ok((false, true))
+            if initial_directory_matches(&state_root.leaf, STORE_STAGING_NAME, claim) =>
+        {
+            InitialRenameState::Staging
+        }
+        Ok((true, false))
+            if initial_directory_matches(&state_root.leaf, STORE_ROOT_NAME, claim) =>
+        {
+            InitialRenameState::Final
+        }
+        _ => InitialRenameState::Ambiguous,
+    }
+}
+
 struct InitialPublicationInput {
     state_root: StateRootHandle,
     staging: DirectoryHandle,
@@ -1992,21 +2118,37 @@ fn publish_initial_staging(
         if has_final || !has_staging {
             return Err(StoreError::Owner);
         }
-        renameat_with(
+        let publish_checkpoint = *tracker;
+        tracker.ambiguous();
+        if renameat_with(
             &state_root.leaf.file,
             STORE_STAGING_NAME,
             &state_root.leaf.file,
             STORE_ROOT_NAME,
             RenameFlags::NOREPLACE,
         )
-        .map_err(|error| {
-            if error == rustix::io::Errno::EXIST {
-                StoreError::Owner
-            } else {
-                StoreError::Io
+        .is_err()
+        {
+            let claim = InitialDirectoryClaim {
+                directory_identity: staging_identity,
+                objects_identity,
+                lock_identity,
+                snapshot_identity,
+                snapshot_bytes: &snapshot_bytes,
+            };
+            match classify_initial_rename_error(&state_root, &claim) {
+                InitialRenameState::Staging => {
+                    tracker.restore(publish_checkpoint);
+                    drop(reopened_staging);
+                    return Err(StoreError::Io);
+                }
+                InitialRenameState::Final => {}
+                InitialRenameState::Ambiguous => {
+                    drop(reopened_staging);
+                    return Err(StoreError::PublicationUncertain(None));
+                }
             }
-        })?;
-        tracker.ambiguous();
+        }
         drop(reopened_staging);
         state_root
             .leaf
@@ -2085,25 +2227,134 @@ fn open_or_initialize_store(
     }
 
     let staging = if has_staging {
-        open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?
-    } else {
-        revalidate_directory(&state_root.leaf)?;
-        mkdirat(&state_root.leaf.file, STORE_STAGING_NAME, DIRECTORY_MODE).map_err(|error| {
-            if error == nix::errno::Errno::EEXIST {
-                StoreError::Owner
-            } else {
-                StoreError::Io
+        match open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME)) {
+            Ok(staging) => staging,
+            Err(error) => {
+                let (final_after_race, staging_after_race) = root_selection(&state_root.leaf)?;
+                if final_after_race && !staging_after_race {
+                    return open_final_locked(state_root, binding, LockMode::Exclusive);
+                }
+                if final_after_race && staging_after_race {
+                    return Err(StoreError::Owner);
+                }
+                if !staging_after_race {
+                    return Err(StoreError::PublicationUncertain(None));
+                }
+                return Err(error);
             }
-        })?;
-        state_root
-            .leaf
-            .file
-            .sync_all()
-            .map_err(|_| StoreError::Io)?;
-        open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?
+        }
+    } else {
+        let staging_checkpoint = *tracker;
+        tracker.ambiguous();
+        revalidate_directory(&state_root.leaf)?;
+        if mkdirat(&state_root.leaf.file, STORE_STAGING_NAME, DIRECTORY_MODE).is_err() {
+            tracker.restore(staging_checkpoint);
+            let (final_after_race, staging_after_race) = root_selection(&state_root.leaf)?;
+            if final_after_race && !staging_after_race {
+                return open_final_locked(state_root, binding, LockMode::Exclusive);
+            }
+            if final_after_race && staging_after_race {
+                return Err(StoreError::Owner);
+            }
+            if !staging_after_race {
+                return Err(StoreError::PublicationUncertain(None));
+            }
+            open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))
+                .map_err(|_| StoreError::PublicationUncertain(None))?
+        } else {
+            let created = open_directory_at(&state_root.leaf, OsStr::new(STORE_STAGING_NAME))?;
+            let created_identity = created.identity;
+            exact_names(&created, &[])?;
+            created.file.sync_all().map_err(|_| StoreError::Io)?;
+            state_root
+                .leaf
+                .file
+                .sync_all()
+                .map_err(|_| StoreError::Io)?;
+            let reopened = reopen_named_directory(
+                &state_root.leaf,
+                OsStr::new(STORE_STAGING_NAME),
+                created_identity,
+            )?;
+            exact_names(&reopened, &[])?;
+            drop(created);
+            tracker.restore(staging_checkpoint);
+            reopened
+        }
     };
-    let names = scan_names(&staging)?;
-    let empty = BTreeSet::new();
+    let names_before_lock = scan_names(&staging)?;
+    if !names_before_lock.is_empty()
+        && !names_before_lock.contains(OsStr::new(STORE_LOCK_NAME))
+    {
+        return Err(StoreError::Owner);
+    }
+
+    let (lock, lock_identity) = if names_before_lock.is_empty() {
+        let lock_checkpoint = *tracker;
+        tracker.ambiguous();
+        match create_and_lock_staging(&staging) {
+            Ok(locked) => {
+                tracker.restore(lock_checkpoint);
+                locked
+            }
+            Err(StoreError::AlreadyExists) => {
+                tracker.restore(lock_checkpoint);
+                acquire_lock(&staging, LockMode::Exclusive)
+                    .map_err(classify_bootstrap_lock_collision)?
+            }
+            Err(error) => {
+                if !error.owner_effect_unknown() {
+                    tracker.restore(lock_checkpoint);
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        acquire_lock(&staging, LockMode::Exclusive)?
+    };
+
+    let (final_after_lock, staging_after_lock) = match root_selection(&state_root.leaf) {
+        Ok(selection) => selection,
+        Err(error) => {
+            let unlock = lock.unlock().map_err(|_| StoreError::Io);
+            drop(lock);
+            drop(staging);
+            unlock?;
+            return Err(error);
+        }
+    };
+    if final_after_lock && !staging_after_lock {
+        let unlock = lock.unlock().map_err(|_| StoreError::Io);
+        drop(lock);
+        drop(staging);
+        unlock?;
+        return open_final_locked(state_root, binding, LockMode::Exclusive);
+    }
+    if final_after_lock && staging_after_lock {
+        let unlock = lock.unlock().map_err(|_| StoreError::Io);
+        drop(lock);
+        drop(staging);
+        unlock?;
+        return Err(StoreError::Owner);
+    }
+    if !staging_after_lock {
+        let unlock = lock.unlock().map_err(|_| StoreError::Io);
+        drop(lock);
+        drop(staging);
+        unlock?;
+        return Err(StoreError::PublicationUncertain(None));
+    }
+
+    let names = match scan_names(&staging) {
+        Ok(names) => names,
+        Err(error) => {
+            let unlock = lock.unlock().map_err(|_| StoreError::Io);
+            drop(lock);
+            drop(staging);
+            unlock?;
+            return Err(error);
+        }
+    };
     let lock_only = [STORE_LOCK_NAME]
         .into_iter()
         .map(OsString::from)
@@ -2116,22 +2367,19 @@ fn open_or_initialize_store(
         .into_iter()
         .map(OsString::from)
         .collect::<BTreeSet<_>>();
-    if names != empty && names != lock_only && names != lock_objects && names != complete {
+    if names != lock_only && names != lock_objects && names != complete {
+        let unlock = lock.unlock().map_err(|_| StoreError::Io);
+        drop(lock);
+        drop(staging);
+        unlock?;
         return Err(StoreError::Owner);
     }
-
-    let (lock, lock_identity) = if names == empty {
-        create_and_lock_staging(&staging)?
-    } else {
-        acquire_lock(&staging, LockMode::Exclusive)?
-    };
     continue_initialization(
         authority,
         binding,
         state_root,
         staging,
         names,
-        empty,
         lock_only,
         complete,
         lock,
@@ -2165,9 +2413,28 @@ fn validate_initial_snapshot_shape(snapshot: &ArtifactStoreSnapshotV1) -> Result
 fn initial_staging_operation(
     snapshot: &ArtifactStoreSnapshotV1,
     operation_id: ArtifactOperationIdV1,
-) -> Result<Option<MaterializationOperationV1>, StoreError> {
+) -> Result<MaterializationOperationV1, StoreError> {
     validate_initial_snapshot_shape(snapshot)?;
-    Ok(snapshot.operation(operation_id).cloned())
+    let operation = snapshot.operations().first().ok_or(StoreError::Owner)?;
+    if operation.operation_id() != operation_id {
+        return Err(StoreError::Owner);
+    }
+    Ok(operation.clone())
+}
+
+fn validate_initial_request(
+    snapshot: &ArtifactStoreSnapshotV1,
+    request: &MaterializationRequestV1,
+) -> Result<(), StoreError> {
+    validate_initial_snapshot_shape(snapshot)?;
+    let operation = snapshot.operations().first().ok_or(StoreError::Owner)?;
+    if operation.operation_id() != request.operation_id() {
+        return Err(StoreError::Owner);
+    }
+    if operation.request() != request {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2177,7 +2444,6 @@ fn continue_initialization(
     state_root: StateRootHandle,
     staging: DirectoryHandle,
     names: BTreeSet<OsString>,
-    empty: BTreeSet<OsString>,
     lock_only: BTreeSet<OsString>,
     complete: BTreeSet<OsString>,
     lock: File,
@@ -2191,7 +2457,9 @@ fn continue_initialization(
         if final_after_lock || !staging_after_lock {
             return Err(StoreError::Owner);
         }
-        let objects = if names == empty || names == lock_only {
+        let prefix_checkpoint = *tracker;
+        let objects = if names == lock_only {
+            tracker.ambiguous();
             create_objects_directory(&staging)?
         } else {
             let objects = open_directory_at(&staging, OsStr::new(OBJECTS_NAME))?;
@@ -2206,10 +2474,7 @@ fn continue_initialization(
                 return Err(StoreError::ConfigurationMismatch);
             }
             let snapshot = validate_candidate_filesystem(&objects, candidate)?;
-            validate_initial_snapshot_shape(&snapshot)?;
-            if snapshot.operations()[0].request() != request {
-                return Err(StoreError::Conflict);
-            }
+            validate_initial_request(&snapshot, request)?;
             let (state_root, staging, objects) = seal_initial_prefix(
                 state_root,
                 staging,
@@ -2254,6 +2519,7 @@ fn continue_initialization(
             lock_identity,
             None,
         )?;
+        tracker.restore(prefix_checkpoint);
         require_same_authority(authority, binding)?;
         let instance = draw_store_instance()?;
         let sequence = NonZeroU64::new(1).expect("one is nonzero");
@@ -2269,6 +2535,7 @@ fn continue_initialization(
         let snapshot_bytes = snapshot
             .encode_canonical()
             .map_err(|_| StoreError::Capacity)?;
+        tracker.ambiguous();
         let snapshot_identity = write_new_exact(&staging, STORE_SNAPSHOT_NAME, &snapshot_bytes)?;
         staging.file.sync_all().map_err(|_| StoreError::Io)?;
         let objects_identity = objects.identity;
@@ -2319,10 +2586,116 @@ fn cleanup_owned_next(
     drop(file);
     root.file.sync_all().map_err(|_| StoreError::Io)?;
     revalidate_directory(root)?;
-    if scan_names(root)?.contains(OsStr::new(STORE_SNAPSHOT_NEXT_NAME)) {
-        return Err(StoreError::Owner);
+    exact_names(root, &[STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME])
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotRenameState {
+    OldWithNext,
+    NewWithoutNext,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotRenameObservation<'a> {
+    expected_active_identity: FileIdentity,
+    expected_active_bytes: &'a [u8],
+    active_identity: FileIdentity,
+    active_bytes: &'a [u8],
+    expected_next_identity: FileIdentity,
+    expected_next_bytes: &'a [u8],
+    named_next_identity: Option<FileIdentity>,
+    observed_next: Option<(FileIdentity, &'a [u8])>,
+    stable_root: bool,
+    root_with_next: bool,
+}
+
+fn classify_snapshot_rename_observation(
+    observation: &SnapshotRenameObservation<'_>,
+) -> SnapshotRenameState {
+    if observation.active_identity == observation.expected_active_identity
+        && observation.active_bytes == observation.expected_active_bytes
+        && observation.named_next_identity == Some(observation.expected_next_identity)
+        && observation.observed_next
+            == Some((
+                observation.expected_next_identity,
+                observation.expected_next_bytes,
+            ))
+        && observation.root_with_next
+    {
+        SnapshotRenameState::OldWithNext
+    } else if observation.active_identity == observation.expected_next_identity
+        && observation.active_bytes == observation.expected_next_bytes
+        && observation.named_next_identity.is_none()
+        && observation.stable_root
+    {
+        SnapshotRenameState::NewWithoutNext
+    } else {
+        SnapshotRenameState::Ambiguous
     }
-    Ok(())
+}
+
+fn classify_snapshot_rename_error(
+    store: &LockedStore,
+    next_bytes: &[u8],
+    next_identity: FileIdentity,
+) -> SnapshotRenameState {
+    let observed = (|| {
+        let (active_bytes, active_identity) = read_regular_bounded(
+            &store.root,
+            OsStr::new(STORE_SNAPSHOT_NAME),
+            MAX_SNAPSHOT_BYTES,
+            false,
+        )?;
+        let named_next = named_identity(&store.root, OsStr::new(STORE_SNAPSHOT_NEXT_NAME))?;
+        let names = scan_names(&store.root)?;
+        let stable = [STORE_LOCK_NAME, STORE_SNAPSHOT_NAME, OBJECTS_NAME]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<BTreeSet<_>>();
+        let with_next = [
+            STORE_LOCK_NAME,
+            STORE_SNAPSHOT_NAME,
+            STORE_SNAPSHOT_NEXT_NAME,
+            OBJECTS_NAME,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+        let objects = reopen_named_directory(
+            &store.root,
+            OsStr::new(OBJECTS_NAME),
+            store.objects.identity,
+        )?;
+        drop(objects);
+        let observed_next = if named_next == Some(next_identity) {
+            let (observed_next, observed_next_identity) = read_regular_bounded(
+                &store.root,
+                OsStr::new(STORE_SNAPSHOT_NEXT_NAME),
+                MAX_SNAPSHOT_BYTES,
+                false,
+            )?;
+            Some((observed_next, observed_next_identity))
+        } else {
+            None
+        };
+        let observation = SnapshotRenameObservation {
+            expected_active_identity: store.snapshot_identity,
+            expected_active_bytes: &store.snapshot_bytes,
+            active_identity,
+            active_bytes: &active_bytes,
+            expected_next_identity: next_identity,
+            expected_next_bytes: next_bytes,
+            named_next_identity: named_next,
+            observed_next: observed_next
+                .as_ref()
+                .map(|(bytes, identity)| (*identity, bytes.as_ref())),
+            stable_root: names == stable,
+            root_with_next: names == with_next,
+        };
+        Ok(classify_snapshot_rename_observation(&observation))
+    })();
+    observed.unwrap_or(SnapshotRenameState::Ambiguous)
 }
 
 fn commit_successor(
@@ -2391,20 +2764,30 @@ fn commit_successor(
         }
         return Err(error);
     }
-    if let Err(error) = renameat(
+    let publish_checkpoint = *tracker;
+    tracker.ambiguous();
+    if renameat(
         &store.root.file,
         STORE_SNAPSHOT_NEXT_NAME,
         &store.root.file,
         STORE_SNAPSHOT_NAME,
-    ) {
-        if cleanup_owned_next(&store.root, next_identity).is_err() {
-            tracker.ambiguous();
-            return Err(StoreError::Owner);
+    )
+    .is_err()
+    {
+        match classify_snapshot_rename_error(store, &bytes, next_identity) {
+            SnapshotRenameState::OldWithNext => {
+                if cleanup_owned_next(&store.root, next_identity).is_err() {
+                    return Err(StoreError::Owner);
+                }
+                tracker.restore(publish_checkpoint);
+                return Err(StoreError::Io);
+            }
+            SnapshotRenameState::NewWithoutNext => {}
+            SnapshotRenameState::Ambiguous => {
+                return Err(StoreError::PublicationUncertain(operation));
+            }
         }
-        let _ = error;
-        return Err(StoreError::Io);
     }
-    tracker.ambiguous();
     store
         .root
         .file
@@ -2413,6 +2796,9 @@ fn commit_successor(
     let (candidate, active_bytes, active_identity) =
         decode_snapshot(&store.root, STORE_SNAPSHOT_NAME)
             .map_err(|_| StoreError::PublicationUncertain(operation.clone()))?;
+    if active_identity != next_identity {
+        return Err(StoreError::Owner);
+    }
     if active_bytes != bytes {
         return Err(StoreError::PublicationUncertain(operation));
     }
@@ -2439,7 +2825,7 @@ fn commit_successor(
     validate_named_regular(
         &public_root,
         OsStr::new(STORE_SNAPSHOT_NAME),
-        active_identity,
+        next_identity,
         Some(u64::try_from(active_bytes.len()).map_err(|_| StoreError::Owner)?),
     )?;
     let active = validate_candidate_filesystem(&public_objects, candidate)?;
@@ -2462,23 +2848,40 @@ fn settle_existing_next(
     request: &MaterializationRequestV1,
     tracker: &mut ChangeTracker,
 ) -> Result<(), StoreError> {
-    let Some((next, operation_id)) = read_and_validate_next(store, binding)? else {
+    let Some(next) = read_and_validate_next(store)? else {
         return Ok(());
     };
-    let operation = next.operation(operation_id).ok_or(StoreError::Owner)?;
-    if operation_id != request.operation_id() || operation.request() != request {
+    let operation = next
+        .snapshot
+        .operation(next.operation_id)
+        .cloned()
+        .ok_or(StoreError::Owner)?;
+    if next.operation_id != request.operation_id() || operation.request() != request {
         return Err(StoreError::Owner);
     }
     revalidate_public_store(store, true)?;
     require_same_authority(authority, binding)?;
-    renameat(
+    let publish_checkpoint = *tracker;
+    tracker.ambiguous();
+    if renameat(
         &store.root.file,
         STORE_SNAPSHOT_NEXT_NAME,
         &store.root.file,
         STORE_SNAPSHOT_NAME,
     )
-    .map_err(|_| StoreError::PublicationUncertain(Some(Box::new(operation.clone()))))?;
-    tracker.ambiguous();
+    .is_err()
+    {
+        match classify_snapshot_rename_error(store, &next.bytes, next.identity) {
+            SnapshotRenameState::OldWithNext => {
+                tracker.restore(publish_checkpoint);
+                return Err(StoreError::Io);
+            }
+            SnapshotRenameState::NewWithoutNext => {}
+            SnapshotRenameState::Ambiguous => {
+                return Err(StoreError::PublicationUncertain(Some(Box::new(operation))));
+            }
+        }
+    }
     store
         .root
         .file
@@ -2486,12 +2889,10 @@ fn settle_existing_next(
         .map_err(|_| StoreError::PublicationUncertain(Some(Box::new(operation.clone()))))?;
     let (candidate, bytes, identity) = decode_snapshot(&store.root, STORE_SNAPSHOT_NAME)
         .map_err(|_| StoreError::PublicationUncertain(Some(Box::new(operation.clone()))))?;
-    if bytes.as_ref()
-        != next
-            .encode_canonical()
-            .map_err(|_| StoreError::Owner)?
-            .as_ref()
-    {
+    if identity != next.identity {
+        return Err(StoreError::Owner);
+    }
+    if bytes != next.bytes {
         return Err(StoreError::PublicationUncertain(Some(Box::new(
             operation.clone(),
         ))));
@@ -2519,11 +2920,11 @@ fn settle_existing_next(
     validate_named_regular(
         &public_root,
         OsStr::new(STORE_SNAPSHOT_NAME),
-        identity,
+        next.identity,
         Some(u64::try_from(bytes.len()).map_err(|_| StoreError::Owner)?),
     )?;
     let reopened = validate_candidate_filesystem(&public_objects, candidate)?;
-    if reopened != next {
+    if reopened != next.snapshot {
         return Err(StoreError::PublicationUncertain(Some(Box::new(
             operation.clone(),
         ))));
@@ -2543,12 +2944,46 @@ enum PairPublication {
     NoEffectFailure,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoreFaultPoint {
+    ExistingChildBeforeObjectsSync,
+    ExistingChildBeforeObjectsReopen,
+    ExistingChildBeforeChildReopen,
+    ExistingChildBeforeFileSync,
+    ExistingChildBeforeChildSync,
+    ExistingChildBeforeParentSync,
+    ExistingChildBeforeParentReopen,
+    ExistingChildBeforeFinalChildReopen,
+    PairMkdirFailureBeforeObjectsSync,
+    PairMkdirFailureBeforeObjectsReopen,
+}
+
+trait StoreFaultObserver {
+    fn checkpoint(&mut self, point: StoreFaultPoint) -> Result<(), StoreError>;
+}
+
+struct NoStoreFaultObserver;
+
+impl StoreFaultObserver for NoStoreFaultObserver {
+    fn checkpoint(&mut self, _point: StoreFaultPoint) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+fn recovery_fault_checkpoint(
+    observer: &mut dyn StoreFaultObserver,
+    point: StoreFaultPoint,
+) -> Result<(), StoreError> {
+    observer.checkpoint(point).map_err(|_| StoreError::Owner)
+}
+
 fn sync_partial_child(
     root: &DirectoryHandle,
     objects: &DirectoryHandle,
     child_name: &str,
     expected_ref: ArtifactObjectRefV1,
     expected_identity: FileIdentity,
+    observer: &mut dyn StoreFaultObserver,
 ) -> Result<u64, StoreError> {
     let child = open_directory_at(objects, OsStr::new(child_name))?;
     if child.identity != expected_identity {
@@ -2563,6 +2998,7 @@ fn sync_partial_child(
             drop(child);
             return Err(StoreError::Owner);
         }
+        recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeFileSync)?;
         file.sync_all().map_err(|_| StoreError::Io)?;
         drop(file);
     }
@@ -2570,10 +3006,17 @@ fn sync_partial_child(
         drop(child);
         return Err(StoreError::Owner);
     }
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeChildSync)?;
     child.file.sync_all().map_err(|_| StoreError::Io)?;
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeParentSync)?;
     objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeParentReopen)?;
     let reopened_objects =
         reopen_named_directory(root, OsStr::new(OBJECTS_NAME), objects.identity)?;
+    recovery_fault_checkpoint(
+        observer,
+        StoreFaultPoint::ExistingChildBeforeFinalChildReopen,
+    )?;
     let reopened_child =
         reopen_named_directory(&reopened_objects, OsStr::new(child_name), child.identity)?;
     if validate_partial_pair_entry(&reopened_child, expected_ref)? != facts {
@@ -2594,6 +3037,7 @@ fn sync_complete_child(
     child_name: &str,
     expected_pair: &VerifiedArtifactPairV1,
     expected_identity: FileIdentity,
+    observer: &mut dyn StoreFaultObserver,
 ) -> Result<VerifiedArtifactPairV1, StoreError> {
     let child = open_directory_at(objects, OsStr::new(child_name))?;
     if child.identity != expected_identity {
@@ -2602,19 +3046,28 @@ fn sync_complete_child(
     }
     let (manifest, _) = open_regular_at(&child, OsStr::new(MANIFEST_NAME), OFlag::O_RDONLY)?;
     let (payload, _) = open_regular_at(&child, OsStr::new(PAYLOAD_NAME), OFlag::O_RDONLY)?;
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeFileSync)?;
     manifest.sync_all().map_err(|_| StoreError::Io)?;
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeFileSync)?;
     payload.sync_all().map_err(|_| StoreError::Io)?;
     drop(payload);
     drop(manifest);
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeChildSync)?;
     child.file.sync_all().map_err(|_| StoreError::Io)?;
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeParentSync)?;
     objects.file.sync_all().map_err(|_| StoreError::Io)?;
     let pair = strict_pair_from_directory(&child)?;
     if &pair != expected_pair {
         drop(child);
         return Err(StoreError::Owner);
     }
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeParentReopen)?;
     let reopened_objects =
         reopen_named_directory(root, OsStr::new(OBJECTS_NAME), objects.identity)?;
+    recovery_fault_checkpoint(
+        observer,
+        StoreFaultPoint::ExistingChildBeforeFinalChildReopen,
+    )?;
     let reopened_child =
         reopen_named_directory(&reopened_objects, OsStr::new(child_name), child.identity)?;
     let reopened_pair = strict_pair_from_directory(&reopened_child)?;
@@ -2634,17 +3087,30 @@ fn recover_pair_from_existing_child(
     store: &LockedStore,
     pair: &VerifiedArtifactPairV1,
     tracker: &mut ChangeTracker,
+    observer: &mut dyn StoreFaultObserver,
 ) -> Result<PairPublication, StoreError> {
     tracker.ambiguous();
-    store.objects.file.sync_all().map_err(|_| StoreError::Io)?;
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeObjectsSync)?;
+    store
+        .objects
+        .file
+        .sync_all()
+        .map_err(|_| StoreError::Owner)?;
+    recovery_fault_checkpoint(
+        observer,
+        StoreFaultPoint::ExistingChildBeforeObjectsReopen,
+    )?;
     let objects = reopen_named_directory(
         &store.root,
         OsStr::new(OBJECTS_NAME),
         store.objects.identity,
-    )?;
+    )
+    .map_err(|_| StoreError::Owner)?;
     let child_name = object_directory_name(pair.object_ref());
+    recovery_fault_checkpoint(observer, StoreFaultPoint::ExistingChildBeforeChildReopen)?;
     let (child_identity, facts) =
-        strict_partial_child(&objects, OsStr::new(&child_name), pair.object_ref())?;
+        strict_partial_child(&objects, OsStr::new(&child_name), pair.object_ref())
+            .map_err(|_| StoreError::Owner)?;
     let complete_names = [MANIFEST_NAME, PAYLOAD_NAME]
         .into_iter()
         .map(OsString::from)
@@ -2655,9 +3121,17 @@ fn recover_pair_from_existing_child(
         .map(|(name, _)| name.clone())
         .collect::<BTreeSet<_>>();
     let result = if actual_names == complete_names {
-        sync_complete_child(&store.root, &objects, &child_name, pair, child_identity)
-            .map(Box::new)
-            .map(PairPublication::Complete)
+        sync_complete_child(
+            &store.root,
+            &objects,
+            &child_name,
+            pair,
+            child_identity,
+            observer,
+        )
+        .map_err(|_| StoreError::Owner)
+        .map(Box::new)
+        .map(PairPublication::Complete)
     } else {
         sync_partial_child(
             &store.root,
@@ -2665,8 +3139,10 @@ fn recover_pair_from_existing_child(
             &child_name,
             pair.object_ref(),
             child_identity,
+            observer,
         )
         .map(PairPublication::Quarantined)
+        .map_err(|_| StoreError::Owner)
     };
     drop(objects);
     result
@@ -2702,25 +3178,51 @@ fn publish_pair_file(
     Ok(())
 }
 
-fn publish_or_recover_pair(
+fn publish_or_recover_pair_observed(
     store: &LockedStore,
     pair: &VerifiedArtifactPairV1,
     tracker: &mut ChangeTracker,
+    observer: &mut dyn StoreFaultObserver,
 ) -> Result<PairPublication, StoreError> {
     revalidate_public_store(store, false)?;
     let child_name = object_directory_name(pair.object_ref());
     let names = scan_names(&store.objects)?;
     if names.contains(OsStr::new(&child_name)) {
-        return recover_pair_from_existing_child(store, pair, tracker);
+        return recover_pair_from_existing_child(store, pair, tracker, observer);
     }
 
-    if let Err(error) = mkdirat(&store.objects.file, child_name.as_str(), DIRECTORY_MODE) {
-        let after = scan_names(&store.objects)?;
-        if !after.contains(OsStr::new(&child_name)) {
-            let _ = error;
+    if mkdirat(&store.objects.file, child_name.as_str(), DIRECTORY_MODE).is_err() {
+        let checkpoint = *tracker;
+        tracker.ambiguous();
+        recovery_fault_checkpoint(
+            observer,
+            StoreFaultPoint::PairMkdirFailureBeforeObjectsSync,
+        )?;
+        store
+            .objects
+            .file
+            .sync_all()
+            .map_err(|_| StoreError::Owner)?;
+        recovery_fault_checkpoint(
+            observer,
+            StoreFaultPoint::PairMkdirFailureBeforeObjectsReopen,
+        )?;
+        let reopened_objects = reopen_named_directory(
+            &store.root,
+            OsStr::new(OBJECTS_NAME),
+            store.objects.identity,
+        )
+        .map_err(|_| StoreError::Owner)?;
+        let after = scan_names(&reopened_objects).map_err(|_| StoreError::Owner)?;
+        drop(reopened_objects);
+        if after == names && !after.contains(OsStr::new(&child_name)) {
+            tracker.restore(checkpoint);
             return Ok(PairPublication::NoEffectFailure);
         }
-        return recover_pair_from_existing_child(store, pair, tracker);
+        if after.contains(OsStr::new(&child_name)) {
+            return recover_pair_from_existing_child(store, pair, tracker, observer);
+        }
+        return Err(StoreError::Owner);
     }
     tracker.ambiguous();
     let child = open_directory_at(&store.objects, OsStr::new(&child_name))?;
@@ -2756,14 +3258,24 @@ fn publish_or_recover_pair(
             &child_name,
             pair,
             child_identity,
+            observer,
         );
         drop(reopened_objects);
         verified
     })();
     match publication {
         Ok(verified) => Ok(PairPublication::Complete(Box::new(verified))),
-        Err(_) => recover_pair_from_existing_child(store, pair, tracker),
+        Err(_) => recover_pair_from_existing_child(store, pair, tracker, observer),
     }
+}
+
+fn publish_or_recover_pair(
+    store: &LockedStore,
+    pair: &VerifiedArtifactPairV1,
+    tracker: &mut ChangeTracker,
+) -> Result<PairPublication, StoreError> {
+    let mut observer = NoStoreFaultObserver;
+    publish_or_recover_pair_observed(store, pair, tracker, &mut observer)
 }
 
 fn commit_receipt(
@@ -3142,6 +3654,22 @@ fn run_materialize(
 mod tests {
     use super::*;
 
+    struct FailingObserver {
+        target: StoreFaultPoint,
+        seen: Vec<StoreFaultPoint>,
+    }
+
+    impl StoreFaultObserver for FailingObserver {
+        fn checkpoint(&mut self, point: StoreFaultPoint) -> Result<(), StoreError> {
+            self.seen.push(point);
+            if point == self.target {
+                Err(StoreError::Io)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn config(byte: u8) -> ArtifactConfigCommitmentV1 {
         ArtifactConfigCommitmentV1::try_from_bytes([byte; 32]).expect("nonzero config")
     }
@@ -3198,10 +3726,57 @@ mod tests {
         assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unchanged);
         tracker.ambiguous();
         assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unknown);
+        tracker.restore(ChangeTracker::default());
+        assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unchanged);
         tracker.committed();
         assert_eq!(tracker.change(), ArtifactStoreChangeV1::Changed);
         tracker.ambiguous();
         assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unknown);
+    }
+
+    #[test]
+    fn recovery_faults_map_to_owner_with_unknown_change() {
+        for point in [
+            StoreFaultPoint::ExistingChildBeforeObjectsSync,
+            StoreFaultPoint::ExistingChildBeforeObjectsReopen,
+            StoreFaultPoint::ExistingChildBeforeChildReopen,
+            StoreFaultPoint::ExistingChildBeforeFileSync,
+            StoreFaultPoint::ExistingChildBeforeChildSync,
+            StoreFaultPoint::ExistingChildBeforeParentSync,
+            StoreFaultPoint::ExistingChildBeforeParentReopen,
+            StoreFaultPoint::ExistingChildBeforeFinalChildReopen,
+            StoreFaultPoint::PairMkdirFailureBeforeObjectsSync,
+            StoreFaultPoint::PairMkdirFailureBeforeObjectsReopen,
+        ] {
+            let mut observer = FailingObserver {
+                target: point,
+                seen: Vec::new(),
+            };
+            let mut tracker = ChangeTracker::default();
+            tracker.ambiguous();
+            assert_eq!(
+                recovery_fault_checkpoint(&mut observer, point),
+                Err(StoreError::Owner),
+            );
+            assert_eq!(observer.seen, vec![point]);
+            assert_eq!(tracker.change(), ArtifactStoreChangeV1::Unknown);
+        }
+    }
+
+    #[test]
+    fn bootstrap_lock_collision_is_one_shot_and_never_guesses_owner() {
+        assert_eq!(
+            classify_bootstrap_lock_collision(StoreError::Contended),
+            StoreError::Contended,
+        );
+        assert_eq!(
+            classify_bootstrap_lock_collision(StoreError::Owner),
+            StoreError::PublicationUncertain(None),
+        );
+        assert_eq!(
+            classify_bootstrap_lock_collision(StoreError::Io),
+            StoreError::PublicationUncertain(None),
+        );
     }
 
     #[test]
@@ -3224,6 +3799,71 @@ mod tests {
                 expected,
             ),
             Err(StoreError::Owner),
+        );
+    }
+
+    #[test]
+    fn snapshot_rename_settle_requires_exact_old_or_new_inode_state() {
+        let active_identity = FileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        let next_identity = FileIdentity {
+            device: 7,
+            inode: 12,
+        };
+        let replacement_identity = FileIdentity {
+            device: 7,
+            inode: 13,
+        };
+        let old = b"old snapshot";
+        let next = b"next snapshot";
+        let base = SnapshotRenameObservation {
+            expected_active_identity: active_identity,
+            expected_active_bytes: old,
+            active_identity,
+            active_bytes: old,
+            expected_next_identity: next_identity,
+            expected_next_bytes: next,
+            named_next_identity: Some(next_identity),
+            observed_next: Some((next_identity, next)),
+            stable_root: false,
+            root_with_next: true,
+        };
+        assert_eq!(
+            classify_snapshot_rename_observation(&base),
+            SnapshotRenameState::OldWithNext,
+        );
+        assert_eq!(
+            classify_snapshot_rename_observation(&SnapshotRenameObservation {
+                active_identity: next_identity,
+                active_bytes: next,
+                named_next_identity: None,
+                observed_next: None,
+                stable_root: true,
+                root_with_next: false,
+                ..base
+            }),
+            SnapshotRenameState::NewWithoutNext,
+        );
+        assert_eq!(
+            classify_snapshot_rename_observation(&SnapshotRenameObservation {
+                active_identity: replacement_identity,
+                active_bytes: next,
+                named_next_identity: None,
+                observed_next: None,
+                stable_root: true,
+                root_with_next: false,
+                ..base
+            }),
+            SnapshotRenameState::Ambiguous,
+        );
+        assert_eq!(
+            classify_snapshot_rename_observation(&SnapshotRenameObservation {
+                root_with_next: false,
+                ..base
+            }),
+            SnapshotRenameState::Ambiguous,
         );
     }
 
@@ -3264,7 +3904,11 @@ mod tests {
         let operation_id = initial.operations()[0].operation_id();
         assert_eq!(
             initial_staging_operation(&initial, operation_id),
-            Ok(Some(initial.operations()[0].clone())),
+            Ok(initial.operations()[0].clone()),
+        );
+        assert_eq!(
+            initial_staging_operation(&initial, operation(0x23)),
+            Err(StoreError::Owner),
         );
         let materializing = MaterializingRecordV1::new(initial.operations()[0].admission());
         let progressed = initial
@@ -3273,6 +3917,33 @@ mod tests {
         assert_eq!(
             initial_staging_operation(&progressed, operation_id),
             Err(StoreError::Owner),
+        );
+    }
+
+    #[test]
+    fn complete_initial_staging_keeps_operation_attribution_distinct_from_request_drift() {
+        let (initial, _) = initial_snapshot();
+        let durable = initial.operations()[0].request();
+        let different_operation = MaterializationRequestV1::new(
+            operation(0x23),
+            durable.config_commitment(),
+            durable.object_ref(),
+        );
+        assert_eq!(
+            validate_initial_request(&initial, &different_operation),
+            Err(StoreError::Owner),
+        );
+
+        let other_pair = VerifiedArtifactPairV1::from_payload(b"request-drift-test ")
+            .expect("valid request drift pair");
+        let request_drift = MaterializationRequestV1::new(
+            durable.operation_id(),
+            durable.config_commitment(),
+            other_pair.object_ref(),
+        );
+        assert_eq!(
+            validate_initial_request(&initial, &request_drift),
+            Err(StoreError::Conflict),
         );
     }
 
