@@ -205,7 +205,7 @@ pub enum ArtifactStoreFailureV1 {
 
 impl ArtifactStoreFailureV1 {
     #[must_use]
-    pub const fn operation(&self) -> Option<&MaterializationOperationV1> {
+    pub fn operation(&self) -> Option<&MaterializationOperationV1> {
         match self {
             Self::PublicationUncertain { operation } => operation.as_deref(),
             Self::UnsafePath
