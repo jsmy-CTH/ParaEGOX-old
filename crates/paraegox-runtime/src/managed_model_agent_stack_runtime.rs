@@ -26,7 +26,9 @@ use paraegox_runtime_contracts::managed_model_agent_stack_plan::{
     ManagedModelAgentStackTerminalOutcomeV1, ManagedModelAgentStackTerminalReceiptDraftV1,
     ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackTerminalStateV1,
 };
-use paraegox_runtime_contracts::managed_service::{ManagedServiceGeneration, ManagedServiceId};
+use paraegox_runtime_contracts::managed_service::{
+    ManagedServiceGeneration, ManagedServiceId, ManagedServiceLifecycleStage,
+};
 use paraegox_runtime_contracts::reference_control::ReferenceChannelBindingV1;
 use paraegox_runtime_contracts::wire::{ApplyAuthAlgorithm, ApplyAuthKeyRef};
 
@@ -202,6 +204,7 @@ fn artifact_runtime_compile_time_anchor() {
     let _ = ArtifactManagedModelAgentStackRuntimeCore::cutover;
     let _ = ArtifactManagedModelAgentStackRuntimeCore::authenticated_terminal_replay;
     let _ = ArtifactManagedModelAgentStackRuntimeCore::retains_live_resources;
+    let _ = ArtifactManagedModelAgentStackRuntimeCore::shutdown;
     let _ = artifact_cutover_outcome_contract_anchor;
 }
 
@@ -242,6 +245,48 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
 
     fn retains_live_resources(&self) -> bool {
         self.model.is_some() || self.agent.is_some() || self.handle.is_some()
+    }
+
+    pub(crate) async fn shutdown(
+        &mut self,
+        fabric: &mut ManagedFabricRuntimeCore,
+    ) -> Result<(), ManagedModelAgentStackRuntimeError> {
+        if self.snapshot.phase == ManagedModelAgentStackDurablePhase::ExactZero
+            && !self.retains_live_resources()
+        {
+            return Ok(());
+        }
+        if self.snapshot.phase != ManagedModelAgentStackDurablePhase::ActiveReady {
+            return Err(ManagedModelAgentStackRuntimeError::ShutdownUncertain);
+        }
+
+        let reading = self.clock.reading()?;
+        self.commit_transition(
+            fabric,
+            artifact_agent_retire_intent_transition(&self.snapshot, reading)?,
+        )?;
+        self.revoke_handle()?;
+        self.shutdown_agent().await?;
+
+        self.commit_transition(
+            fabric,
+            artifact_model_retire_intent_transition(&self.snapshot)?,
+        )?;
+        if !self.shutdown_model().await {
+            return Err(ManagedModelAgentStackRuntimeError::ModelCleanupUncertain);
+        }
+
+        self.commit_transition(
+            fabric,
+            artifact_fabric_stop_intent_transition(&self.snapshot)?,
+        )?;
+        if !fabric.stop_live_for_stack().await? {
+            return Err(ManagedModelAgentStackRuntimeError::ShutdownUncertain);
+        }
+        self.commit_transition(
+            fabric,
+            artifact_retired_exact_zero_transition(&self.snapshot)?,
+        )
     }
 
     pub(crate) async fn cutover(
@@ -469,6 +514,27 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
             self.model = None;
         }
         exact_zero
+    }
+
+    async fn shutdown_agent(&mut self) -> Result<(), ManagedAgentAssemblyError> {
+        let Some(mut agent) = self.agent.take() else {
+            self.handle = None;
+            return Ok(());
+        };
+        self.handle = None;
+        if let Err(error) = agent.shutdown().await {
+            self.agent = Some(agent);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn revoke_handle(&mut self) -> Result<(), ManagedModelAgentStackRuntimeError> {
+        self.handle_broker
+            .revoke()
+            .map_err(|_| ManagedModelAgentStackRuntimeError::HandleBrokerUnavailable)?;
+        self.handle = None;
+        Ok(())
     }
 
     fn commit_agent_start_intent(
@@ -2208,6 +2274,157 @@ fn artifact_agent_start_intent_transition(
     Ok(transition)
 }
 
+fn artifact_agent_retire_intent_transition(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+    reading: ClockReading,
+) -> Result<ArtifactManagedModelAgentStackSnapshotTransitionV2, ManagedModelAgentStackRuntimeError>
+{
+    if snapshot.phase != ManagedModelAgentStackDurablePhase::ActiveReady {
+        return Err(ManagedModelAgentStackRuntimeError::InvalidDurableState);
+    }
+    let active = snapshot
+        .active
+        .clone()
+        .ok_or(ManagedModelAgentStackRuntimeError::InvalidDurableState)?;
+    let mut transition = snapshot.transition();
+    transition.phase = ManagedModelAgentStackDurablePhase::AgentRetireIntent;
+    transition.pending = Some(ArtifactManagedModelAgentStackDurablePendingV2 {
+        kind: ArtifactManagedModelAgentStackPendingKindV2::RetireCurrentArtifactV12,
+        fabric_generation: Some(active.fabric_generation),
+        model_generation: Some(active.model_generation),
+        agent_generation: Some(active.agent_generation),
+        admitted_clock_generation: reading.generation(),
+        admitted_at_nanos: reading.now().value(),
+        deadline_nanos: artifact_retire_deadline(&active.request, reading)?,
+        response_channel: active.response_channel,
+        request: active.request,
+    });
+    transition.physical_binding_census = 2;
+    transition.census_complete = true;
+    transition.fabric_ready = true;
+    transition.model_ready = true;
+    transition.agent_ready = true;
+    transition.fabric_to_agent_dependency_ready = true;
+    transition.model_to_agent_dependency_ready = true;
+    transition.quarantine_reason = None;
+    Ok(transition)
+}
+
+fn artifact_model_retire_intent_transition(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+) -> Result<ArtifactManagedModelAgentStackSnapshotTransitionV2, ManagedModelAgentStackRuntimeError>
+{
+    if snapshot.phase != ManagedModelAgentStackDurablePhase::AgentRetireIntent {
+        return Err(ManagedModelAgentStackRuntimeError::InvalidDurableState);
+    }
+    let mut transition = snapshot.transition();
+    transition.phase = ManagedModelAgentStackDurablePhase::ModelRetireIntent;
+    transition.physical_binding_census = 0;
+    transition.census_complete = true;
+    transition.fabric_ready = true;
+    transition.model_ready = true;
+    transition.agent_ready = false;
+    transition.fabric_to_agent_dependency_ready = false;
+    transition.model_to_agent_dependency_ready = false;
+    transition.quarantine_reason = None;
+    Ok(transition)
+}
+
+fn artifact_fabric_stop_intent_transition(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+) -> Result<ArtifactManagedModelAgentStackSnapshotTransitionV2, ManagedModelAgentStackRuntimeError>
+{
+    if snapshot.phase != ManagedModelAgentStackDurablePhase::ModelRetireIntent {
+        return Err(ManagedModelAgentStackRuntimeError::InvalidDurableState);
+    }
+    let mut transition = snapshot.transition();
+    transition.phase = ManagedModelAgentStackDurablePhase::FabricStopIntent;
+    transition.physical_binding_census = 0;
+    transition.census_complete = true;
+    transition.fabric_ready = true;
+    transition.model_ready = false;
+    transition.agent_ready = false;
+    transition.fabric_to_agent_dependency_ready = false;
+    transition.model_to_agent_dependency_ready = false;
+    transition.quarantine_reason = None;
+    Ok(transition)
+}
+
+fn artifact_retired_exact_zero_transition(
+    snapshot: &ArtifactManagedModelAgentStackSnapshotV2,
+) -> Result<ArtifactManagedModelAgentStackSnapshotTransitionV2, ManagedModelAgentStackRuntimeError>
+{
+    if snapshot.phase != ManagedModelAgentStackDurablePhase::FabricStopIntent {
+        return Err(ManagedModelAgentStackRuntimeError::InvalidDurableState);
+    }
+    let mut transition = snapshot.transition();
+    transition.phase = ManagedModelAgentStackDurablePhase::ExactZero;
+    transition.active = None;
+    transition.pending = None;
+    transition.physical_binding_census = 0;
+    transition.census_complete = true;
+    transition.fabric_ready = false;
+    transition.model_ready = false;
+    transition.agent_ready = false;
+    transition.fabric_to_agent_dependency_ready = false;
+    transition.model_to_agent_dependency_ready = false;
+    transition.quarantine_reason = None;
+    Ok(transition)
+}
+
+fn artifact_retire_deadline(
+    request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
+    reading: ClockReading,
+) -> Result<u64, ManagedModelAgentStackRuntimeError> {
+    let execution = request.target_execution().embedded();
+    let fabric = execution
+        .managed_agent_stack()
+        .fabric()
+        .service()
+        .ok_or(ManagedModelAgentStackRuntimeError::InvalidDurableState)?;
+    let agent = execution
+        .managed_agent_stack()
+        .agent()
+        .ok_or(ManagedModelAgentStackRuntimeError::InvalidDurableState)?
+        .service();
+    let model = execution
+        .model()
+        .ok_or(ManagedModelAgentStackRuntimeError::InvalidDurableState)?
+        .service();
+    let budgets = [
+        agent
+            .lifecycle_budgets()
+            .for_stage(ManagedServiceLifecycleStage::Drain)
+            .value(),
+        agent
+            .lifecycle_budgets()
+            .for_stage(ManagedServiceLifecycleStage::Stop)
+            .value(),
+        model
+            .lifecycle_budgets()
+            .for_stage(ManagedServiceLifecycleStage::Drain)
+            .value(),
+        model
+            .lifecycle_budgets()
+            .for_stage(ManagedServiceLifecycleStage::Stop)
+            .value(),
+        fabric
+            .lifecycle_budgets()
+            .for_stage(ManagedServiceLifecycleStage::Drain)
+            .value(),
+        fabric
+            .lifecycle_budgets()
+            .for_stage(ManagedServiceLifecycleStage::Stop)
+            .value(),
+    ];
+    let budget = budgets.into_iter().try_fold(0_u64, u64::checked_add);
+    reading
+        .now()
+        .value()
+        .checked_add(budget.ok_or(ManagedModelAgentStackRuntimeError::DeadlineOverflow)?)
+        .ok_or(ManagedModelAgentStackRuntimeError::DeadlineOverflow)
+}
+
 fn artifact_writer_fence(
     request: &ArtifactBoundManagedModelAgentStackApplyRequestV1,
     proof_envelope_digest: Digest32,
@@ -3199,6 +3416,100 @@ mod tests {
                 .as_ref()
                 .and_then(|pending| pending.agent_generation),
             Some(agent_generation),
+        );
+    }
+
+    #[test]
+    fn artifact_owner_constructs_exact_retire_chain_from_active_ready() {
+        let request =
+            ArtifactBoundManagedModelAgentStackApplyRequestV1::decode(&decode_fixture_hex(
+                include_str!("../../../tests/fixtures/wire/artifact_f0_pxar_v12.hex"),
+            ))
+            .expect("shared PXAR12 fixture");
+        let projection = request.target_execution().projection().clone();
+        let projection_digest = stack_projection_digest(&projection).expect("projection digest");
+        let active = ArtifactManagedModelAgentStackSnapshotV2::decode(
+            &decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_active_ready.hex"
+            )),
+            [0x44; 32],
+            Digest32::from_bytes([0x55; 32]),
+            projection_digest,
+            &projection,
+        )
+        .expect("shared active-ready PXMA2 fixture");
+        let reading = ClockReading::new(
+            request.temporal().target_clock_domain(),
+            request.temporal().target_clock_generation(),
+            paraegox_kernel::time::MonotonicInstant::from_ticks(100),
+        );
+
+        let agent_retire = active
+            .try_successor_at_epoch(
+                9,
+                artifact_agent_retire_intent_transition(&active, reading)
+                    .expect("agent-retire transition"),
+                &projection,
+            )
+            .expect("agent-retire successor");
+        assert_eq!(
+            agent_retire.canonical_wire(),
+            decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_retire_current.hex"
+            ))
+        );
+        assert_eq!(
+            agent_retire
+                .pending
+                .as_ref()
+                .expect("retire pending")
+                .deadline_nanos,
+            9_009_000_178
+        );
+
+        let model_retire = agent_retire
+            .try_successor_at_epoch(
+                9,
+                artifact_model_retire_intent_transition(&agent_retire)
+                    .expect("model-retire transition"),
+                &projection,
+            )
+            .expect("model-retire successor");
+        assert_eq!(
+            model_retire.canonical_wire(),
+            decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_model_retire.hex"
+            ))
+        );
+
+        let fabric_stop = model_retire
+            .try_successor_at_epoch(
+                9,
+                artifact_fabric_stop_intent_transition(&model_retire)
+                    .expect("Fabric-stop transition"),
+                &projection,
+            )
+            .expect("Fabric-stop successor");
+        assert_eq!(
+            fabric_stop.canonical_wire(),
+            decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_pending_fabric_stop.hex"
+            ))
+        );
+
+        let exact_zero = fabric_stop
+            .try_successor_at_epoch(
+                9,
+                artifact_retired_exact_zero_transition(&fabric_stop)
+                    .expect("retired exact-zero transition"),
+                &projection,
+            )
+            .expect("retired exact-zero successor");
+        assert_eq!(
+            exact_zero.canonical_wire(),
+            decode_fixture_hex(include_str!(
+                "../../../tests/fixtures/wire/artifact_f0_pxma_v2_exact_zero_after_retire.hex"
+            ))
         );
     }
 
