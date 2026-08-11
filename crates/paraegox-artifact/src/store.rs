@@ -398,9 +398,7 @@ impl StoreError {
             Self::UnsafePath
             | Self::OwnerEffectUnknown
             | Self::Owner
-            | Self::PublicationUncertain(_) => {
-                ArtifactStoreReadFailureV1::Owner
-            }
+            | Self::PublicationUncertain(_) => ArtifactStoreReadFailureV1::Owner,
             Self::Io => ArtifactStoreReadFailureV1::Io,
         }
     }
@@ -1379,7 +1377,7 @@ fn inspect_initial_staging(
                 Err(StoreError::ConfigurationMismatch)
             } else {
                 let snapshot = validate_candidate_filesystem(&objects, candidate)?;
-                Ok(snapshot.operation(operation_id).cloned())
+                initial_staging_operation(&snapshot, operation_id)
             }
         } else {
             Err(StoreError::Owner)
@@ -2077,6 +2075,14 @@ fn validate_initial_snapshot_shape(snapshot: &ArtifactStoreSnapshotV1) -> Result
         return Err(StoreError::Owner);
     }
     Ok(())
+}
+
+fn initial_staging_operation(
+    snapshot: &ArtifactStoreSnapshotV1,
+    operation_id: ArtifactOperationIdV1,
+) -> Result<Option<MaterializationOperationV1>, StoreError> {
+    validate_initial_snapshot_shape(snapshot)?;
+    Ok(snapshot.operation(operation_id).cloned())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3092,15 +3098,19 @@ mod tests {
     }
 
     #[test]
-    fn complete_initial_staging_rejects_materializing_successor() {
+    fn complete_initial_staging_query_rejects_materializing_successor() {
         let (initial, _) = initial_snapshot();
-        assert_eq!(validate_initial_snapshot_shape(&initial), Ok(()));
+        let operation_id = initial.operations()[0].operation_id();
+        assert_eq!(
+            initial_staging_operation(&initial, operation_id),
+            Ok(Some(initial.operations()[0].clone())),
+        );
         let materializing = MaterializingRecordV1::new(initial.operations()[0].admission());
         let progressed = initial
             .try_successor(ArtifactSnapshotSuccessorV1::Materializing { materializing })
             .expect("valid materializing successor");
         assert_eq!(
-            validate_initial_snapshot_shape(&progressed),
+            initial_staging_operation(&progressed, operation_id),
             Err(StoreError::Owner),
         );
     }
