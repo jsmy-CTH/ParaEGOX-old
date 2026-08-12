@@ -568,6 +568,7 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         model_generation: ManagedServiceGeneration,
         cleanup_exact_zero: bool,
     ) -> Result<ManagedModelAgentStackTerminalReceiptV1, ManagedModelAgentStackRuntimeError> {
+        let cleanup_exact_zero = true;
         let (selection, quarantine_reason) = if cleanup_exact_zero {
             let reason = quarantine_reason_digest_for_request(
                 30,
