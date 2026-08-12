@@ -3153,17 +3153,13 @@ impl RunningStack<'_> {
     }
 
     fn refresh_node_status(&mut self) -> Result<(), LocalProcessError> {
-        let bootstrap = DeveloperLocalReferenceBootstrapV1::read_owner_private_file(
-            self.layout.pxnb_bootstrap_path(),
-        )
-        .map_err(|_| LocalProcessError::NodeBootstrap)?;
         self.owners
             .as_mut()
             .expect("owners exist until joined shutdown")
             .node_a
             .as_mut()
             .expect("NodeDaemon exists after successful startup")
-            .refresh_latest_status(&bootstrap)
+            .refresh_latest_status()
     }
 
     fn deployment_input(
@@ -4399,6 +4395,8 @@ struct RunningNodeDaemon {
     child: Option<Child>,
     status: NodeStatusV1,
     status_observed_at: Instant,
+    management_client: NodeManagementClientV1<DeveloperLocalNodeManagementEndpointV1>,
+    management_target: NodeManagementTargetV1,
     observation_bootstrap: Option<(PathBuf, NodeObservationBootstrapFileIdentityV1)>,
 }
 
@@ -4447,6 +4445,18 @@ impl RunningNodeDaemon {
         bootstrap: &DeveloperLocalReferenceBootstrapV1,
         expected_status: NodeStatusV1,
     ) -> Result<Self, LocalProcessError> {
+        let management_endpoint = DeveloperLocalNodeManagementEndpointV1::try_from_bootstrap(
+            bootstrap,
+            DEVELOPER_NODE_EXCHANGE_TIMEOUT,
+        )
+        .map_err(|_| LocalProcessError::NodeStartup)?;
+        let management_target = NodeManagementTargetV1::try_new(
+            bootstrap.identity().node_id(),
+            bootstrap.management_endpoint_ref(),
+            bootstrap.tenure().node_incarnation(),
+            bootstrap.tenure().registration_epoch(),
+        )
+        .map_err(|_| LocalProcessError::NodeStartup)?;
         let executable = env::current_exe().map_err(|_| LocalProcessError::NodeStartup)?;
         let mut command = Command::new(executable);
         #[cfg(not(test))]
@@ -4486,6 +4496,11 @@ impl RunningNodeDaemon {
             child: Some(child),
             status: expected_status,
             status_observed_at: Instant::now(),
+            management_client: NodeManagementClientV1::new(
+                management_endpoint,
+                bootstrap.identity().node_id(),
+            ),
+            management_target,
             observation_bootstrap: observation_bootstrap
                 .map(|(path, identity)| (path.to_path_buf(), identity)),
         };
@@ -4554,14 +4569,11 @@ impl RunningNodeDaemon {
             thread::sleep(DEVELOPER_NODE_POLL_INTERVAL);
         }
 
-        self.refresh_status(bootstrap)
+        self.refresh_status()
     }
 
-    fn refresh_status(
-        &mut self,
-        bootstrap: &DeveloperLocalReferenceBootstrapV1,
-    ) -> Result<(), LocalProcessError> {
-        let status = self.read_latest_status(bootstrap)?;
+    fn refresh_status(&mut self) -> Result<(), LocalProcessError> {
+        let status = self.read_latest_status()?;
         if status != self.status {
             return Err(LocalProcessError::NodeStartup);
         }
@@ -4570,11 +4582,8 @@ impl RunningNodeDaemon {
         Ok(())
     }
 
-    fn refresh_latest_status(
-        &mut self,
-        bootstrap: &DeveloperLocalReferenceBootstrapV1,
-    ) -> Result<(), LocalProcessError> {
-        let status = self.read_latest_status(bootstrap)?;
+    fn refresh_latest_status(&mut self) -> Result<(), LocalProcessError> {
+        let status = self.read_latest_status()?;
         if !node_status_is_monotonic_successor(&self.status, &status) {
             return Err(LocalProcessError::NodeStartup);
         }
@@ -4583,30 +4592,15 @@ impl RunningNodeDaemon {
         Ok(())
     }
 
-    fn read_latest_status(
-        &self,
-        bootstrap: &DeveloperLocalReferenceBootstrapV1,
-    ) -> Result<NodeStatusV1, LocalProcessError> {
-        let endpoint = DeveloperLocalNodeManagementEndpointV1::try_from_bootstrap(
-            bootstrap,
-            DEVELOPER_NODE_EXCHANGE_TIMEOUT,
-        )
-        .map_err(|_| LocalProcessError::NodeStartup)?;
-        let target = NodeManagementTargetV1::try_new(
-            bootstrap.identity().node_id(),
-            bootstrap.management_endpoint_ref(),
-            bootstrap.tenure().node_incarnation(),
-            bootstrap.tenure().registration_epoch(),
-        )
-        .map_err(|_| LocalProcessError::NodeStartup)?;
+    fn read_latest_status(&mut self) -> Result<NodeStatusV1, LocalProcessError> {
         let mut request_id = [0_u8; 16];
         getrandom::fill(&mut request_id).map_err(|_| LocalProcessError::NodeStartup)?;
         if request_id.iter().all(|byte| *byte == 0) {
             return Err(LocalProcessError::NodeStartup);
         }
-        let mut client = NodeManagementClientV1::new(endpoint, bootstrap.identity().node_id());
-        let response = client
-            .latest(request_id, target)
+        let response = self
+            .management_client
+            .latest(request_id, self.management_target)
             .map_err(|_| LocalProcessError::NodeStartup)?;
         response
             .status_value()
