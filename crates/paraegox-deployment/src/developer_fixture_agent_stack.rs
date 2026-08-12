@@ -1875,6 +1875,12 @@ pub fn run_developer_artifact_external_model_agent_stack_v1(
             (None, Some(ArtifactExternalControllerPhaseV2::Uncertain))
         }
     };
+    eprintln!(
+        "D0B-EXCHANGE-DIAGNOSTIC:outcome={:?},missing={missing_terminal_phase:?}",
+        runtime_terminal
+            .as_ref()
+            .map(|receipt| receipt.facts().state().outcome())
+    );
 
     let mut controller =
         DeveloperArtifactExternalControllerResidentV1::open(authority, request.operation_id())?;
