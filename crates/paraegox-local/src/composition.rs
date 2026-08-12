@@ -482,6 +482,7 @@ pub(crate) fn run_prepared_artifact_external_owner(
             return Err::<(), LocalProcessError>(primary).and(cleanup);
         }
     };
+    stack.refresh_node_status()?;
     let runtime_ready = stack.runtime().ready();
     let request_digest = outcome
         .projection()
@@ -3151,6 +3152,20 @@ impl RunningStack<'_> {
         self.owners().runtime()
     }
 
+    fn refresh_node_status(&mut self) -> Result<(), LocalProcessError> {
+        let bootstrap = DeveloperLocalReferenceBootstrapV1::read_owner_private_file(
+            self.layout.pxnb_bootstrap_path(),
+        )
+        .map_err(|_| LocalProcessError::NodeBootstrap)?;
+        self.owners
+            .as_mut()
+            .expect("owners exist until joined shutdown")
+            .node_a
+            .as_mut()
+            .expect("NodeDaemon exists after successful startup")
+            .refresh_status(&bootstrap)
+    }
+
     fn deployment_input(
         &self,
         failure: LocalProcessError,
@@ -4539,6 +4554,13 @@ impl RunningNodeDaemon {
             thread::sleep(DEVELOPER_NODE_POLL_INTERVAL);
         }
 
+        self.refresh_status(bootstrap)
+    }
+
+    fn refresh_status(
+        &mut self,
+        bootstrap: &DeveloperLocalReferenceBootstrapV1,
+    ) -> Result<(), LocalProcessError> {
         let endpoint = DeveloperLocalNodeManagementEndpointV1::try_from_bootstrap(
             bootstrap,
             DEVELOPER_NODE_EXCHANGE_TIMEOUT,
