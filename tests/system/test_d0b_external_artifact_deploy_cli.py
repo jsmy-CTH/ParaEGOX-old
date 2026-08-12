@@ -158,6 +158,9 @@ def _invoke_json(
     if process.returncode != expected_returncode:
         print(f"D0B-STDOUT:{process.stdout.decode(errors='backslashreplace')}")
         print(f"D0B-STDERR:{process.stderr.decode(errors='backslashreplace')}")
+        diagnostic = Path("/tmp/paraegox-d0b-model-diagnostic.txt")
+        if diagnostic.is_file():
+            print(f"D0B-MODEL-DIAGNOSTIC:{diagnostic.read_text(encoding='utf-8')}")
     assert process.returncode == expected_returncode, (
         arguments,
         process.returncode,

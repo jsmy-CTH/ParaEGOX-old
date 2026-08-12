@@ -369,6 +369,10 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         {
             Ok(dependency) => dependency,
             Err(error) => {
+                let _ = std::fs::write(
+                    "/tmp/paraegox-d0b-model-diagnostic.txt",
+                    format!("{error:?}\n"),
+                );
                 let terminal = match model_start_cleanup_exact_zero(&error) {
                     Some(true) => Some(core.commit_model_terminal(
                         fabric,
