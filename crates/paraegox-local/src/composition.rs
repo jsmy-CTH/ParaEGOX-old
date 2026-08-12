@@ -3163,7 +3163,7 @@ impl RunningStack<'_> {
             .node_a
             .as_mut()
             .expect("NodeDaemon exists after successful startup")
-            .refresh_status(&bootstrap)
+            .refresh_latest_status(&bootstrap)
     }
 
     fn deployment_input(
@@ -4561,6 +4561,32 @@ impl RunningNodeDaemon {
         &mut self,
         bootstrap: &DeveloperLocalReferenceBootstrapV1,
     ) -> Result<(), LocalProcessError> {
+        let status = self.read_latest_status(bootstrap)?;
+        if status != self.status {
+            return Err(LocalProcessError::NodeStartup);
+        }
+        self.status = status;
+        self.status_observed_at = Instant::now();
+        Ok(())
+    }
+
+    fn refresh_latest_status(
+        &mut self,
+        bootstrap: &DeveloperLocalReferenceBootstrapV1,
+    ) -> Result<(), LocalProcessError> {
+        let status = self.read_latest_status(bootstrap)?;
+        if !node_status_is_monotonic_successor(&self.status, &status) {
+            return Err(LocalProcessError::NodeStartup);
+        }
+        self.status = status;
+        self.status_observed_at = Instant::now();
+        Ok(())
+    }
+
+    fn read_latest_status(
+        &self,
+        bootstrap: &DeveloperLocalReferenceBootstrapV1,
+    ) -> Result<NodeStatusV1, LocalProcessError> {
         let endpoint = DeveloperLocalNodeManagementEndpointV1::try_from_bootstrap(
             bootstrap,
             DEVELOPER_NODE_EXCHANGE_TIMEOUT,
@@ -4582,15 +4608,10 @@ impl RunningNodeDaemon {
         let response = client
             .latest(request_id, target)
             .map_err(|_| LocalProcessError::NodeStartup)?;
-        let status = response
+        response
             .status_value()
-            .ok_or(LocalProcessError::NodeStartup)?;
-        if status != &self.status {
-            return Err(LocalProcessError::NodeStartup);
-        }
-        self.status = status.clone();
-        self.status_observed_at = Instant::now();
-        Ok(())
+            .cloned()
+            .ok_or(LocalProcessError::NodeStartup)
     }
 
     fn shutdown_and_join(mut self) -> Result<(), LocalProcessError> {
@@ -4646,6 +4667,19 @@ impl RunningNodeDaemon {
         self.child.take();
         Err(LocalProcessError::JoinedShutdown)
     }
+}
+
+fn node_status_is_monotonic_successor(current: &NodeStatusV1, next: &NodeStatusV1) -> bool {
+    if next.status_sequence() == current.status_sequence() {
+        return next == current;
+    }
+    next.status_sequence() > current.status_sequence()
+        && next.node_id() == current.node_id()
+        && next.node_incarnation() == current.node_incarnation()
+        && next.registration_epoch() == current.registration_epoch()
+        && next.management_endpoint_ref() == current.management_endpoint_ref()
+        && next.feature_report() == current.feature_report()
+        && next.freshness_budget_nanos() == current.freshness_budget_nanos()
 }
 
 impl Drop for RunningNodeDaemon {
@@ -6829,6 +6863,63 @@ mod tests {
             .expect("persisted RuntimeHost status");
         assert_eq!(persisted.status_sequence(), 1);
         assert_eq!(persisted.runtime_hosts().len(), 1);
+    }
+
+    #[test]
+    fn post_activation_node_refresh_accepts_only_a_monotonic_same_tenure_status() {
+        let state_root = fresh_state_root("node-post-activation-refresh");
+        let (_, fabric_listen) = ephemeral_fabric_listen();
+        let config = fixture_config(&state_root, &fabric_listen);
+        let mut cleanup = TestCleanup {
+            state_root,
+            socket_directory: None,
+        };
+        let manifest = identity::load_or_create(&config).expect("identity manifest");
+        let prepared_layout = layout::prepare(&config, &manifest).expect("prepared layout");
+        cleanup.socket_directory = Some(prepared_layout.socket_directory().to_path_buf());
+        let identities = derive_identities(&manifest).expect("derived identities");
+        let bootstrap = new_developer_local_node_bootstrap(&prepared_layout, identities)
+            .expect("reference Node bootstrap");
+        let mut owner = DurableNodeDaemonV1::open(
+            bootstrap.state_root(),
+            bootstrap.identity(),
+            bootstrap.tenure(),
+            bootstrap.management_endpoint_ref(),
+            bootstrap.initial_feature_report(),
+        )
+        .expect("reference Node store");
+        let initial = owner
+            .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS)
+            .expect("publish initial Node status");
+
+        let runtime_host_id = RuntimeHostId::from_bytes([0xa1; 16]);
+        let endpoint = RuntimeApplyEndpointDescriptorV1::try_new(
+            RuntimeApplyEndpointRefV1::try_from_bytes([0xa2; 16])
+                .expect("Runtime endpoint reference"),
+            runtime_host_id,
+            1,
+            "paraegox/v1/nodes/a1/runtime/a1/apply",
+            [0xa3; 16],
+            [0xa4; 32],
+        )
+        .expect("Runtime endpoint descriptor");
+        let runtime_status =
+            RuntimeHostStatusV1::try_new(1, 1, RuntimeHostLivenessV1::Live, endpoint)
+                .expect("RuntimeHost status");
+        owner
+            .observe_runtime_host(runtime_status)
+            .expect("observe RuntimeHost status");
+        let successor = owner
+            .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS)
+            .expect("publish successor Node status");
+
+        assert!(node_status_is_monotonic_successor(&initial, &initial));
+        assert!(node_status_is_monotonic_successor(&initial, &successor));
+        assert!(!node_status_is_monotonic_successor(&successor, &initial));
+        assert_eq!(initial.status_sequence(), 1);
+        assert_eq!(successor.status_sequence(), 2);
+        assert!(initial.runtime_hosts().is_empty());
+        assert_eq!(successor.runtime_hosts().len(), 1);
     }
 
     fn loopback_composition_provider(
