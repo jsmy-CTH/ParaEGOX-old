@@ -1007,7 +1007,7 @@ pub(crate) fn spawn_artifact_external_supervisor(
         .arg(&generation)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|_| LocalProcessError::LifecycleStartup)?;
     Ok(ArtifactExternalSupervisorChildV1 {

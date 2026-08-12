@@ -4574,7 +4574,27 @@ impl RunningNodeDaemon {
         &mut self,
         bootstrap: &DeveloperLocalReferenceBootstrapV1,
     ) -> Result<(), LocalProcessError> {
-        let status = self.read_latest_status(bootstrap)?;
+        let status = match self.read_latest_status(bootstrap) {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("D0B-NODE-REFRESH:read-failed");
+                return Err(error);
+            }
+        };
+        eprintln!(
+            "D0B-NODE-REFRESH:current-seq={}:next-seq={}:node={}:incarnation={}:epoch={}:endpoint={}:feature={}:freshness={}:current-hosts={}:next-hosts={}:next-absolute={}",
+            self.status.status_sequence(),
+            status.status_sequence(),
+            status.node_id() == self.status.node_id(),
+            status.node_incarnation() == self.status.node_incarnation(),
+            status.registration_epoch() == self.status.registration_epoch(),
+            status.management_endpoint_ref() == self.status.management_endpoint_ref(),
+            status.feature_report() == self.status.feature_report(),
+            status.freshness_budget_nanos() == self.status.freshness_budget_nanos(),
+            self.status.runtime_hosts().len(),
+            status.runtime_hosts().len(),
+            status.valid_until_unix_nanos().is_some(),
+        );
         if !node_status_is_monotonic_successor(&self.status, &status) {
             return Err(LocalProcessError::NodeStartup);
         }
