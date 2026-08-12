@@ -64,6 +64,10 @@ PUBLIC_DEVELOPER_LOCAL_SYMBOLS = {
     "run_developer_provisioned_model_agent_stack_v1",
     "deactivate_developer_fixture_model_agent_stack_v1",
     "deactivate_developer_provisioned_model_agent_stack_v1",
+    "DeveloperArtifactExternalModelAgentStackInputV1",
+    "DeveloperArtifactExternalModelAgentStackOutcomeV1",
+    "DeveloperArtifactExternalModelAgentStackError",
+    "run_developer_artifact_external_model_agent_stack_v1",
     "DeveloperFixtureDistributedCoordinatorV1",
     "DeveloperFixtureDistributedTransportV1",
     "DeveloperFixtureDistributedTargetV1",
@@ -94,6 +98,19 @@ PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS = {
     "DeveloperDeploymentAgentBootstrapStartOutcomeV1",
     "start_developer_deployment_agent_bootstrap_v1",
 }
+PUBLIC_ARTIFACT_EXTERNAL_CONTROLLER_SYMBOLS = {
+    "ArtifactDeploymentOperationIdV1",
+    "DeveloperArtifactExternalControllerAuthorityBindingV1",
+    "DeveloperArtifactExternalControllerAuthorityRecheckFailureV1",
+    "DeveloperArtifactExternalControllerAuthorityV1",
+    "DeveloperArtifactExternalControllerFailureV1",
+    "DeveloperArtifactExternalControllerInvocationV1",
+    "DeveloperArtifactExternalControllerPhaseV1",
+    "DeveloperArtifactExternalControllerProjectionV1",
+    "DeveloperArtifactExternalControllerRequestV1",
+    "DeveloperArtifactExternalControllerTerminalOutcomeV1",
+    "DeveloperArtifactExternalControllerV1",
+}
 DEVELOPER_LOCAL_ENTRYPOINT = (
     "paraegox_deployment::{DeveloperLocalPeerIdentityV1, "
     "DeveloperLocalTenureAuthorityIdentityBytesV1, "
@@ -117,7 +134,11 @@ DEVELOPER_LOCAL_ENTRYPOINT = (
     "run_developer_fixture_model_agent_stack_v1, "
     "run_developer_provisioned_model_agent_stack_v1, "
     "deactivate_developer_fixture_model_agent_stack_v1, "
-    "deactivate_developer_provisioned_model_agent_stack_v1}"
+    "deactivate_developer_provisioned_model_agent_stack_v1, "
+    "DeveloperArtifactExternalModelAgentStackInputV1, "
+    "DeveloperArtifactExternalModelAgentStackOutcomeV1, "
+    "DeveloperArtifactExternalModelAgentStackError, "
+    "run_developer_artifact_external_model_agent_stack_v1}"
 )
 DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT = (
     "paraegox_deployment::{DeveloperFixtureDistributedCoordinatorV1, "
@@ -143,6 +164,19 @@ DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT = (
     "DeveloperDeploymentAgentBootstrapReadyV1, "
     "DeveloperDeploymentAgentBootstrapStartOutcomeV1, "
     "start_developer_deployment_agent_bootstrap_v1}"
+)
+ARTIFACT_EXTERNAL_CONTROLLER_ENTRYPOINT = (
+    "paraegox_deployment::{ArtifactDeploymentOperationIdV1, "
+    "DeveloperArtifactExternalControllerAuthorityBindingV1, "
+    "DeveloperArtifactExternalControllerAuthorityRecheckFailureV1, "
+    "DeveloperArtifactExternalControllerAuthorityV1, "
+    "DeveloperArtifactExternalControllerFailureV1, "
+    "DeveloperArtifactExternalControllerInvocationV1, "
+    "DeveloperArtifactExternalControllerPhaseV1, "
+    "DeveloperArtifactExternalControllerProjectionV1, "
+    "DeveloperArtifactExternalControllerRequestV1, "
+    "DeveloperArtifactExternalControllerTerminalOutcomeV1, "
+    "DeveloperArtifactExternalControllerV1}"
 )
 
 
@@ -243,6 +277,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT,
         DEVELOPER_DEPLOYMENT_ENTRYPOINT,
         DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT,
+        ARTIFACT_EXTERNAL_CONTROLLER_ENTRYPOINT,
     ]
     assert package["consumers"] == [
         "paraegox-tenure-authority",
@@ -305,7 +340,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         for api in governance["public_apis"]
         if str(api["module"]).replace("-", "_") == "paraegox_deployment"
     ]
-    assert len(public_rows) == 4
+    assert len(public_rows) == 5
     public_rows_by_symbols = {
         frozenset(str(symbol) for symbol in row["symbols"]): row for row in public_rows
     }
@@ -315,6 +350,7 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
         frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS),
         frozenset(PUBLIC_DEVELOPER_DEPLOYMENT_SYMBOLS),
         frozenset(PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS),
+        frozenset(PUBLIC_ARTIFACT_EXTERNAL_CONTROLLER_SYMBOLS),
     }
     compatibility = public_rows_by_symbols[process_symbols]["compatibility"]
     for command in (
@@ -356,6 +392,17 @@ def test_governance_claims_exact_one_shot_controller_vertical_without_second_res
     developer_compatibility = public_rows_by_symbols[
         frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS)
     ]["compatibility"]
+    artifact_controller_row = public_rows_by_symbols[
+        frozenset(PUBLIC_ARTIFACT_EXTERNAL_CONTROLLER_SYMBOLS)
+    ]
+    assert artifact_controller_row["owner"] == (
+        "DeveloperLocal external-Artifact DeploymentController owner"
+    )
+    assert artifact_controller_row["consumers"] == [
+        "paraegox-local D0b external-artifact deployment composition"
+    ]
+    assert "sole Controller owner" in artifact_controller_row["compatibility"]
+    assert "never falls back to compiled D0a" in artifact_controller_row["compatibility"]
     assert "real durable Controller" in developer_compatibility
     assert "move-only two-phase owner path" in developer_compatibility
     assert "authentication nonce must equal the challenge query nonce byte-for-byte" in (

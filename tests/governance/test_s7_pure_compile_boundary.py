@@ -75,6 +75,10 @@ PUBLIC_DEVELOPER_LOCAL_SYMBOLS = {
     "run_developer_provisioned_model_agent_stack_v1",
     "deactivate_developer_fixture_model_agent_stack_v1",
     "deactivate_developer_provisioned_model_agent_stack_v1",
+    "DeveloperArtifactExternalModelAgentStackInputV1",
+    "DeveloperArtifactExternalModelAgentStackOutcomeV1",
+    "DeveloperArtifactExternalModelAgentStackError",
+    "run_developer_artifact_external_model_agent_stack_v1",
     "DeveloperFixtureDistributedCoordinatorV1",
     "DeveloperFixtureDistributedTransportV1",
     "DeveloperFixtureDistributedTargetV1",
@@ -105,6 +109,19 @@ PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS = {
     "DeveloperDeploymentAgentBootstrapStartOutcomeV1",
     "start_developer_deployment_agent_bootstrap_v1",
 }
+PUBLIC_ARTIFACT_EXTERNAL_CONTROLLER_SYMBOLS = {
+    "ArtifactDeploymentOperationIdV1",
+    "DeveloperArtifactExternalControllerAuthorityBindingV1",
+    "DeveloperArtifactExternalControllerAuthorityRecheckFailureV1",
+    "DeveloperArtifactExternalControllerAuthorityV1",
+    "DeveloperArtifactExternalControllerFailureV1",
+    "DeveloperArtifactExternalControllerInvocationV1",
+    "DeveloperArtifactExternalControllerPhaseV1",
+    "DeveloperArtifactExternalControllerProjectionV1",
+    "DeveloperArtifactExternalControllerRequestV1",
+    "DeveloperArtifactExternalControllerTerminalOutcomeV1",
+    "DeveloperArtifactExternalControllerV1",
+}
 DEVELOPER_LOCAL_ENTRYPOINT = (
     "paraegox_deployment::{DeveloperLocalPeerIdentityV1, "
     "DeveloperLocalTenureAuthorityIdentityBytesV1, "
@@ -128,7 +145,11 @@ DEVELOPER_LOCAL_ENTRYPOINT = (
     "run_developer_fixture_model_agent_stack_v1, "
     "run_developer_provisioned_model_agent_stack_v1, "
     "deactivate_developer_fixture_model_agent_stack_v1, "
-    "deactivate_developer_provisioned_model_agent_stack_v1}"
+    "deactivate_developer_provisioned_model_agent_stack_v1, "
+    "DeveloperArtifactExternalModelAgentStackInputV1, "
+    "DeveloperArtifactExternalModelAgentStackOutcomeV1, "
+    "DeveloperArtifactExternalModelAgentStackError, "
+    "run_developer_artifact_external_model_agent_stack_v1}"
 )
 DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT = (
     "paraegox_deployment::{DeveloperFixtureDistributedCoordinatorV1, "
@@ -147,6 +168,19 @@ DEVELOPER_DEPLOYMENT_ENTRYPOINT = (
     "DeveloperDeploymentOwnerV1, DeveloperDeploymentReadyV1, "
     "DeveloperDeploymentStartOutcomeV1, DeveloperDeploymentErrorV1, "
     "start_developer_deployment_v1}"
+)
+ARTIFACT_EXTERNAL_CONTROLLER_ENTRYPOINT = (
+    "paraegox_deployment::{ArtifactDeploymentOperationIdV1, "
+    "DeveloperArtifactExternalControllerAuthorityBindingV1, "
+    "DeveloperArtifactExternalControllerAuthorityRecheckFailureV1, "
+    "DeveloperArtifactExternalControllerAuthorityV1, "
+    "DeveloperArtifactExternalControllerFailureV1, "
+    "DeveloperArtifactExternalControllerInvocationV1, "
+    "DeveloperArtifactExternalControllerPhaseV1, "
+    "DeveloperArtifactExternalControllerProjectionV1, "
+    "DeveloperArtifactExternalControllerRequestV1, "
+    "DeveloperArtifactExternalControllerTerminalOutcomeV1, "
+    "DeveloperArtifactExternalControllerV1}"
 )
 DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT = (
     "paraegox_deployment::{DeveloperDeploymentAgentBootstrapStartFieldsV1, "
@@ -536,6 +570,7 @@ def test_s7_c_pure_compile_types_remain_private_behind_exact_process_facades() -
         DEVELOPER_DISTRIBUTED_FIXTURE_ENTRYPOINT,
         DEVELOPER_DEPLOYMENT_ENTRYPOINT,
         DEVELOPER_AGENT_BOOTSTRAP_ENTRYPOINT,
+        ARTIFACT_EXTERNAL_CONTROLLER_ENTRYPOINT,
     ]
     assert deployment_row["consumers"] == [
         "paraegox-tenure-authority",
@@ -556,6 +591,7 @@ def test_s7_c_pure_compile_types_remain_private_behind_exact_process_facades() -
         frozenset(PUBLIC_DEVELOPER_LOCAL_SYMBOLS),
         frozenset(PUBLIC_DEVELOPER_DEPLOYMENT_SYMBOLS),
         frozenset(PUBLIC_DEVELOPER_AGENT_BOOTSTRAP_SYMBOLS),
+        frozenset(PUBLIC_ARTIFACT_EXTERNAL_CONTROLLER_SYMBOLS),
     }
 
     deployment_manifest = _load_toml(DEPLOYMENT_ROOT / "Cargo.toml")
