@@ -749,6 +749,19 @@ impl ManagedModelAssembly {
             }
             ManagedServiceStartupOutcome::Failed { stage, fact } => {
                 let cleanup = assembly.shutdown().await;
+                #[cfg(debug_assertions)]
+                {
+                    let diagnostic = format!(
+                        "stage={stage:?},fact={fact:?},drain={:?},stop={:?},exact_zero={}\n",
+                        cleanup.drain(),
+                        cleanup.stop(),
+                        cleanup.exact_zero()
+                    );
+                    let _ = std::fs::write(
+                        "/tmp/paraegox-d0b-model-diagnostic.txt",
+                        diagnostic,
+                    );
+                }
                 Err(ManagedModelAssemblyError::StartupFailed {
                     stage,
                     fact,
