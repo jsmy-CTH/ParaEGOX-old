@@ -605,7 +605,7 @@ async fn unit_callback_fact<F>(
 where
     F: Future<Output = ManagedServiceCompletion<()>>,
 {
-    match tokio::time::timeout(duration(budget), catch_callback(callback)).await {
+    match bounded_callback(callback, budget).await {
         Ok(Ok(completion)) if completion.attempt != expected => ManagedServiceStageFact::Fenced,
         Ok(Ok(ManagedServiceCompletion {
             outcome: Ok(()), ..
@@ -627,7 +627,7 @@ async fn readiness_callback_fact<F>(
 where
     F: Future<Output = ManagedServiceCompletion<ManagedServiceReadiness>>,
 {
-    match tokio::time::timeout(duration(budget), catch_callback(callback)).await {
+    match bounded_callback(callback, budget).await {
         Ok(Ok(completion)) if completion.attempt != expected => ManagedServiceStageFact::Fenced,
         Ok(Ok(ManagedServiceCompletion {
             outcome: Ok(ManagedServiceReadiness::Ready),
@@ -643,6 +643,34 @@ where
         })) => ManagedServiceStageFact::Failed,
         Ok(Err(())) => ManagedServiceStageFact::Panicked,
         Err(_) => ManagedServiceStageFact::TimedOut,
+    }
+}
+
+async fn bounded_callback<F>(
+    callback: F,
+    budget: paraegox_kernel::time::BoundedDuration,
+) -> Result<Result<F::Output, ()>, ()>
+where
+    F: Future,
+{
+    callback_before_timeout(
+        catch_callback(callback),
+        tokio::time::sleep(duration(budget)),
+    )
+    .await
+}
+
+async fn callback_before_timeout<C, T>(callback: C, timeout: T) -> Result<C::Output, ()>
+where
+    C: Future,
+    T: Future<Output = ()>,
+{
+    tokio::pin!(callback);
+    tokio::pin!(timeout);
+    tokio::select! {
+        biased;
+        output = &mut callback => Ok(output),
+        () = &mut timeout => Err(()),
     }
 }
 
@@ -727,7 +755,7 @@ impl std::error::Error for ManagedServiceAssemblyError {}
 
 #[cfg(test)]
 mod tests {
-    use core::future::pending;
+    use core::future::{pending, ready};
     use std::sync::{Arc, Mutex};
 
     use paraegox_kernel::time::{BoundedDuration, ClockDomainRef, ClockGeneration};
@@ -740,7 +768,7 @@ mod tests {
         ManagedServiceAssembly, ManagedServiceAttempt, ManagedServiceCompletion,
         ManagedServiceContext, ManagedServiceFuture, ManagedServiceImplementation,
         ManagedServiceLifecycle, ManagedServiceReadiness, ManagedServiceStageFact,
-        ManagedServiceStartupOutcome,
+        ManagedServiceStartupOutcome, callback_before_timeout,
     };
     use crate::runtime_clock::RuntimeClock;
     use crate::task_registry::{CancellationSource, CancellationView};
@@ -922,6 +950,21 @@ mod tests {
             .lock()
             .unwrap_or_else(|_| panic!("event log must remain usable"))
             .clone()
+    }
+
+    #[tokio::test]
+    async fn synchronous_completion_wins_a_same_poll_timeout_boundary() {
+        let attempt = ManagedServiceAttempt::new(
+            ManagedServiceId::from_bytes([0x61; 16]),
+            generation(7),
+            ManagedServiceLifecycleStage::Prepare,
+        );
+        let completion = ManagedServiceCompletion::succeeded(attempt, ());
+
+        assert_eq!(
+            callback_before_timeout(ready(Ok::<_, ()>(completion)), ready(())).await,
+            Ok(Ok(completion))
+        );
     }
 
     #[tokio::test(start_paused = true)]
