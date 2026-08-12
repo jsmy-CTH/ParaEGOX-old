@@ -482,7 +482,10 @@ pub(crate) fn run_prepared_artifact_external_owner(
             return Err::<(), LocalProcessError>(primary).and(cleanup);
         }
     };
-    stack.refresh_node_status()?;
+    stack.refresh_node_status().map_err(|error| {
+        eprintln!("D0B-POST-ACTIVATION:node-refresh:{error:?}");
+        error
+    })?;
     let runtime_ready = stack.runtime().ready();
     let request_digest = outcome
         .projection()
@@ -504,12 +507,19 @@ pub(crate) fn run_prepared_artifact_external_owner(
         runtime_ready.runtime_store_instance_id(),
         runtime_ready.runtime_response_key_ref(),
         runtime_ready.runtime_response_public_key(),
-    )?;
+    )
+    .map_err(|error| {
+        eprintln!("D0B-POST-ACTIVATION:receipt:{error:?}");
+        error
+    })?;
     let conversation_result = (|| {
         let handle = stack
             .runtime()
             .claim_model_agent_handle(outcome.model_agent_terminal_receipt())
-            .map_err(|_| LocalProcessError::ConversationCapability)?;
+            .map_err(|_| {
+                eprintln!("D0B-POST-ACTIVATION:handle");
+                LocalProcessError::ConversationCapability
+            })?;
         let bounds = LocalConversationBounds::try_new(
             AgentConversationDeckRunId::try_from_bytes(*manifest.deck_run_id())
                 .map_err(|_| LocalProcessError::ConversationConfiguration)?,
@@ -518,8 +528,13 @@ pub(crate) fn run_prepared_artifact_external_owner(
             config.profile().request_deadline_budget(),
             config.profile().command_capacity(),
             config.profile().operation_timeout(),
-        )?;
-        HeadlessConversationRunner { control }.run(ConversationRunInput {
+        )
+        .map_err(|error| {
+            eprintln!("D0B-POST-ACTIVATION:bounds:{error:?}");
+            error
+        })?;
+        HeadlessConversationRunner { control }
+            .run(ConversationRunInput {
             handle,
             config: bounds,
             ipc_socket_path: layout.agent_ipc_socket_path().to_path_buf(),
@@ -537,7 +552,11 @@ pub(crate) fn run_prepared_artifact_external_owner(
             local_deployment_projection: None,
             expected_uid: Uid::effective().as_raw(),
             expected_gid: Gid::effective().as_raw(),
-        })
+            })
+            .map_err(|error| {
+                eprintln!("D0B-POST-ACTIVATION:runner:{error:?}");
+                error
+            })
     })();
     let cleanup = stack.cleanup();
     conversation_result.and(cleanup)
