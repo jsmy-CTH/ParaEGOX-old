@@ -369,6 +369,7 @@ impl ArtifactManagedModelAgentStackRuntimeCore {
         {
             Ok(dependency) => dependency,
             Err(error) => {
+                eprintln!("D0B-MODEL-DIAGNOSTIC:{error:?}");
                 let terminal = match model_start_cleanup_exact_zero(&error) {
                     Some(true) => Some(core.commit_model_terminal(
                         fabric,
