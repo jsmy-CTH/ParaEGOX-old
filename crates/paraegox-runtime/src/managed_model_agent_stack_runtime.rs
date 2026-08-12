@@ -59,6 +59,7 @@ use crate::managed_model_runtime::{
     ManagedModelAssembly, ManagedModelAssemblyError, ManagedModelDependencyHandle,
     RuntimeModelBackendResolverV1,
 };
+use crate::managed_service_assembly::ManagedServiceStageFact;
 use crate::runtime_clock::{RuntimeClock, RuntimeClockError};
 use crate::task_registry::CancellationSource;
 
@@ -3152,6 +3153,11 @@ fn quarantine_reason_digest_for_request(
 
 fn model_start_cleanup_exact_zero(error: &ManagedModelAgentStackRuntimeError) -> Option<bool> {
     match error {
+        ManagedModelAgentStackRuntimeError::Model(ManagedModelAssemblyError::StartupFailed {
+            stage: ManagedServiceLifecycleStage::Readiness,
+            fact: ManagedServiceStageFact::NotReady,
+            ..
+        }) => Some(true),
         ManagedModelAgentStackRuntimeError::Model(ManagedModelAssemblyError::StartupFailed {
             cleanup,
             ..
