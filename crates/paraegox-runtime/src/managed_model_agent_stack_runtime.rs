@@ -3153,6 +3153,10 @@ fn quarantine_reason_digest_for_request(
 fn model_start_cleanup_exact_zero(error: &ManagedModelAgentStackRuntimeError) -> Option<bool> {
     match error {
         ManagedModelAgentStackRuntimeError::Model(ManagedModelAssemblyError::StartupFailed {
+            stage: ManagedServiceLifecycleStage::Prepare,
+            ..
+        }) => Some(true),
+        ManagedModelAgentStackRuntimeError::Model(ManagedModelAssemblyError::StartupFailed {
             cleanup,
             ..
         }) => Some(cleanup.exact_zero()),
