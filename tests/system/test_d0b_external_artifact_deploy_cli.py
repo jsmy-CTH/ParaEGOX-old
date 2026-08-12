@@ -128,6 +128,7 @@ def _environment(root: Path, console: Path) -> dict[str, str]:
         "PATH": os.pathsep.join((os.fspath(console.parent), "/usr/bin", "/bin")),
         "TERM": "xterm-256color",
         "LANG": "C.UTF-8",
+        "PARAEGOX_TEST_D0B_MODEL_DIAGNOSTIC": os.fspath(root / "model-diagnostic.txt"),
     }
 
 
@@ -158,6 +159,9 @@ def _invoke_json(
     if process.returncode != expected_returncode:
         print(f"D0B-STDOUT:{process.stdout.decode(errors='backslashreplace')}")
         print(f"D0B-STDERR:{process.stderr.decode(errors='backslashreplace')}")
+        diagnostic = Path(environment["PARAEGOX_TEST_D0B_MODEL_DIAGNOSTIC"])
+        if diagnostic.is_file():
+            print(f"D0B-MODEL-DIAGNOSTIC:{diagnostic.read_text(encoding='utf-8')}")
     assert process.returncode == expected_returncode, (
         arguments,
         process.returncode,

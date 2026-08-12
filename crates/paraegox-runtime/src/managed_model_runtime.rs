@@ -749,6 +749,16 @@ impl ManagedModelAssembly {
             }
             ManagedServiceStartupOutcome::Failed { stage, fact } => {
                 let cleanup = assembly.shutdown().await;
+                #[cfg(debug_assertions)]
+                if let Some(path) = std::env::var_os("PARAEGOX_TEST_D0B_MODEL_DIAGNOSTIC") {
+                    let diagnostic = format!(
+                        "stage={stage:?},fact={fact:?},drain={:?},stop={:?},exact_zero={}\n",
+                        cleanup.drain(),
+                        cleanup.stop(),
+                        cleanup.exact_zero()
+                    );
+                    let _ = std::fs::write(path, diagnostic);
+                }
                 Err(ManagedModelAssemblyError::StartupFailed {
                     stage,
                     fact,
