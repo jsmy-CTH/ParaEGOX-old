@@ -4678,8 +4678,6 @@ fn node_status_is_monotonic_successor(current: &NodeStatusV1, next: &NodeStatusV
         && next.node_incarnation() == current.node_incarnation()
         && next.registration_epoch() == current.registration_epoch()
         && next.management_endpoint_ref() == current.management_endpoint_ref()
-        && next.feature_report() == current.feature_report()
-        && next.freshness_budget_nanos() == current.freshness_budget_nanos()
 }
 
 impl Drop for RunningNodeDaemon {
@@ -6910,7 +6908,7 @@ mod tests {
             .observe_runtime_host(runtime_status)
             .expect("observe RuntimeHost status");
         let successor = owner
-            .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS)
+            .publish_status(MAX_NODE_STATUS_FRESHNESS_NANOS - 1)
             .expect("publish successor Node status");
 
         assert!(node_status_is_monotonic_successor(&initial, &initial));
@@ -6918,6 +6916,10 @@ mod tests {
         assert!(!node_status_is_monotonic_successor(&successor, &initial));
         assert_eq!(initial.status_sequence(), 1);
         assert_eq!(successor.status_sequence(), 2);
+        assert_ne!(
+            initial.freshness_budget_nanos(),
+            successor.freshness_budget_nanos()
+        );
         assert!(initial.runtime_hosts().is_empty());
         assert_eq!(successor.runtime_hosts().len(), 1);
     }
